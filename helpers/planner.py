@@ -8764,6 +8764,7 @@ class PipelineWorker(QThread):
                 mk = "hunyuan"
 
         import subprocess
+        _regen_ltx_backend = ""
         # VRAM guard: make sure no old CUDA context (e.g., Qwen3-VL) is eating VRAM before regen
         _vram_release("before clip regen")
 
@@ -8909,6 +8910,7 @@ class PipelineWorker(QThread):
                 _saved_settings = {}
 
             if _hidden_wangp_ltx:
+                _regen_ltx_backend = "wangp"
                 bridge = _ltx23_bridge_config_global()
                 wangp_root = str(bridge.get("wangp_root") or '').strip()
                 if not wangp_root or not os.path.isdir(wangp_root):
@@ -9162,17 +9164,69 @@ class PipelineWorker(QThread):
                     "--audio-skip-step", "0",
                     "--max-batch-size", "2",
                 ]
+                int4_extra_args = list(native_extra_args)
                 if str(end_image_path or '').strip():
                     native_extra_args += ["--image", str(end_image_path).strip(), str(max(0, min(240, int(frames) - 1))), "1.0"]
                 if native_extra_args:
                     args.append("--extra")
                     args.extend(native_extra_args)
 
+                _preferred_backend = "auto"
+                for _backend_source in (
+                    (clip_entry or {}).get("ltx23_backend"),
+                    rec.get("ltx23_backend"),
+                    ((manifest.get("settings") or {}).get("ltx23_backend") if isinstance(manifest.get("settings"), dict) else None),
+                ):
+                    _backend_text = str(_backend_source or "").strip().lower()
+                    if _backend_text in {"int4", "native"}:
+                        _preferred_backend = _backend_text
+                        break
+                try:
+                    try:
+                        from helpers import planner_ltx_int4 as _planner_ltx_int4  # type: ignore
+                    except Exception:
+                        import planner_ltx_int4 as _planner_ltx_int4  # type: ignore
+                    _selection = _planner_ltx_int4.build_auto_planner_command(
+                        app_root=_root(),
+                        native_command=args,
+                        prompt=str(prompt or ''),
+                        negative_prompt=str(negative or ''),
+                        output_path=str(out_file),
+                        width=int(width),
+                        height=int(height),
+                        num_frames=min(241, int(frames)),
+                        frame_rate=float(fps),
+                        num_inference_steps=int(steps),
+                        seed=int(seed) if seed is not None else 1234,
+                        shift=5.0,
+                        start_image=str(img_path or ''),
+                        end_image=str(end_image_path or ''),
+                        loras=[],
+                        audio_path=_regen_lipsync_audio if use_audio_conditioning else "",
+                        audio_start_time=0.0,
+                        audio_max_duration=(float(frames) / float(max(1, int(fps)))) if use_audio_conditioning else 0.0,
+                        spatial_upsampler_path=str(spatial_upsampler),
+                        extra_args=int4_extra_args,
+                        preferred_backend=_preferred_backend,
+                    )
+                    args = list(_selection.get("command") or args)
+                    _regen_ltx_backend = str(_selection.get("backend") or "native")
+                    _regen_backend_reason = str(_selection.get("reason") or "")
+                except Exception as _select_exc:
+                    if _preferred_backend == "int4":
+                        raise RuntimeError(
+                            f"This clip was assigned to LTX INT4, but recreate could not prepare it: "
+                            f"{type(_select_exc).__name__}: {_select_exc}"
+                        ) from _select_exc
+                    _regen_ltx_backend = "native"
+                    _regen_backend_reason = f"INT4 selection failed; native fallback: {type(_select_exc).__name__}: {_select_exc}"
+
                 log_file = os.path.join(clips_dir, f"{sid}.ltx23.log.txt")
                 Path(log_file).parent.mkdir(parents=True, exist_ok=True)
                 with open(log_file, "a", encoding="utf-8", errors="ignore") as lf:
-                    lf.write(f"[planner] native FrameVision LTX regen settings: frames={frames} fps={fps} resolution={resolution} end_image={end_image_path or '<none>'} audio={_regen_lipsync_audio or '<none>'}\n")
-                    lf.write("[planner] native FrameVision LTX regen cmd:\n")
+                    lf.write(f"[planner] FrameVision LTX regen backend={_regen_ltx_backend} reason={_regen_backend_reason}\n")
+                    lf.write(f"[planner] FrameVision LTX regen settings: frames={frames} fps={fps} resolution={resolution} end_image={end_image_path or '<none>'} audio={_regen_lipsync_audio or '<none>'}\n")
+                    lf.write("[planner] FrameVision LTX regen cmd:\n")
                     lf.write(" ".join([str(x) for x in args]) + "\n\n")
                     lf.flush()
                     subprocess.run(args, cwd=str(_root()), stdout=lf, stderr=lf, check=True)
@@ -9229,6 +9283,9 @@ class PipelineWorker(QThread):
             clip_entry["model_key"] = str(mk or model_key)
             clip_entry["video_model"] = str(mk or model_key)
             if mk == "ltx23":
+                if _regen_ltx_backend:
+                    rec["ltx23_backend"] = str(_regen_ltx_backend)
+                    clip_entry["ltx23_backend"] = str(_regen_ltx_backend)
                 clip_entry["use_transition_lora"] = bool(use_transition_lora)
                 if end_image_path:
                     clip_entry["end_image_file"] = str(end_image_path)
@@ -9254,6 +9311,8 @@ class PipelineWorker(QThread):
             manifest["paths"]["clips"] = clips_list
             if mk == "ltx23":
                 manifest.setdefault("settings", {})["use_transition_lora"] = bool(use_transition_lora)
+                if _regen_ltx_backend:
+                    manifest["settings"]["ltx23_backend"] = str(_regen_ltx_backend)
             _safe_write_json(manifest_path, manifest)
         except Exception:
             pass
@@ -17123,6 +17182,10 @@ class PipelineWorker(QThread):
                     tts_tokenizer_path=str(_qwen3tts_tokenizer_path()),
                     llm_json_call=_qwen_json_call,
                     llm_settings=(self.job.encoding if isinstance(self.job.encoding, dict) else None),
+                    resume_existing=bool(
+                        isinstance(self.job.encoding, dict)
+                        and self.job.encoding.get("planner_resume_run")
+                    ),
                     log_path=str(tts_log_early),
                     stop_requested=lambda: bool(self._stop_requested),
                     log_callback=lambda msg: self.signals.log.emit(str(msg)),
@@ -17169,7 +17232,8 @@ class PipelineWorker(QThread):
                                 lora_multiplier: float = 1.0, use_transition_lora: bool = True,
                                 extra_loras: Optional[List[Dict[str, Any]]] = None,
                                 image_end_path: str = "", audio_path: str = "",
-                                audio_max_duration: float = 0.0, log_path: Optional[str] = None) -> None:
+                                audio_max_duration: float = 0.0, log_path: Optional[str] = None,
+                                preferred_backend: str = "auto") -> str:
                 cli = _root() / "helpers" / "ltx23_vram_lab_cli.py"
                 if not cli.exists():
                     raise RuntimeError(f"Missing CLI: {cli}")
@@ -17256,12 +17320,18 @@ class PipelineWorker(QThread):
                     "--audio-skip-step", "0",
                     "--max-batch-size", "2",
                 ]
+                # Keep the official guidance list separate from native-only image/LoRA
+                # arguments. The Planner INT4 adapter receives structured conditions and
+                # adapters before its --extra remainder.
+                int4_extra_args = list(extra_args)
+                planner_loras: List[tuple[str, float]] = []
                 if bool(use_transition_lora):
                     # Public FrameVision-native LTX must not pull transition LoRAs from the old Wan2GP bridge.
                     # The hidden Wan2GP workflow can keep its own bridge path elsewhere; this path stays native.
                     transition_lora = _ltx23_native_find_file(["models", "ltx23", "loras", "ltx2.3-transition.safetensors"], "FRAMEVISION_LTX23_TRANSITION_LORA")
                     if transition_lora and os.path.isfile(transition_lora):
                         extra_args += ["--lora", transition_lora, "0.5"]
+                        planner_loras.append((str(transition_lora), 0.5))
                 for _lor in (extra_loras or []):
                     try:
                         _lp = str((_lor or {}).get("path") or "").strip()
@@ -17269,12 +17339,64 @@ class PipelineWorker(QThread):
                     except Exception:
                         continue
                     if _lp and os.path.isfile(_lp):
-                        extra_args += ["--lora", _lp, str(max(0.5, min(1.5, _lm)))]
+                        _safe_lora_strength = max(0.5, min(1.5, _lm))
+                        extra_args += ["--lora", _lp, str(_safe_lora_strength)]
+                        planner_loras.append((_lp, float(_safe_lora_strength)))
                 if str(image_end_path or '').strip():
                     extra_args += ["--image", str(image_end_path).strip(), str(max(0, min(240, int(frames) - 1))), "1.0"]
                 if extra_args:
                     args.append("--extra")
                     args.extend(extra_args)
+
+                selected_backend = "native"
+                backend_reason = "Planner INT4 adapter unavailable; native command kept unchanged"
+                try:
+                    try:
+                        from helpers import planner_ltx_int4 as _planner_ltx_int4  # type: ignore
+                    except Exception:
+                        import planner_ltx_int4 as _planner_ltx_int4  # type: ignore
+                    _selection = _planner_ltx_int4.build_auto_planner_command(
+                        app_root=_root(),
+                        native_command=args,
+                        prompt=str(prompt or ''),
+                        negative_prompt=str(negative or ''),
+                        output_path=str(out_path),
+                        width=int(width),
+                        height=int(height),
+                        num_frames=min(241, int(frames)),
+                        frame_rate=float(fps),
+                        num_inference_steps=int(steps),
+                        seed=int(seed) if seed is not None else 1234,
+                        shift=5.0,
+                        start_image=str(image_path or ''),
+                        end_image=str(image_end_path or ''),
+                        loras=planner_loras,
+                        audio_path=audio_path if use_audio_conditioning else "",
+                        audio_start_time=0.0,
+                        audio_max_duration=float(audio_max_duration or 0.0),
+                        spatial_upsampler_path=str(spatial_upsampler),
+                        extra_args=int4_extra_args,
+                        preferred_backend=str(preferred_backend or "auto"),
+                    )
+                    args = list(_selection.get("command") or args)
+                    selected_backend = str(_selection.get("backend") or "native")
+                    backend_reason = str(_selection.get("reason") or "")
+                except Exception as _select_exc:
+                    # Missing INT4 keeps the proven native route. Once this Planner
+                    # run explicitly selected INT4, however, do not silently mix a
+                    # native clip into the same resume/review job.
+                    if str(preferred_backend or "auto").strip().lower() == "int4":
+                        raise RuntimeError(
+                            f"Planner selected LTX INT4, but its command could not be prepared: "
+                            f"{type(_select_exc).__name__}: {_select_exc}"
+                        ) from _select_exc
+                    selected_backend = "native"
+                    backend_reason = f"INT4 selection failed; native fallback: {type(_select_exc).__name__}: {_select_exc}"
+                try:
+                    self.signals.log.emit(f"[ltx23] backend -> {selected_backend} ({backend_reason})")
+                except Exception:
+                    pass
+
                 try:
                     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
                 except Exception:
@@ -17345,11 +17467,62 @@ class PipelineWorker(QThread):
                         raise subprocess.CalledProcessError(rc, args)
                 if stop_after_current:
                     self._stop_requested = True
+                return selected_backend
 
             def step_video_clips_ltx23() -> None:
                 shots = _load_shots_list(shots_path)
                 if not shots:
                     raise RuntimeError("shots.json is empty; cannot generate video clips")
+
+                ltx23_backend = "native"
+                ltx23_backend_reason = "INT4 helper/model not available"
+                _stored_ltx23_backend = ""
+                try:
+                    _stored_ltx23_backend = str(
+                        ((manifest.get("settings") or {}).get("ltx23_backend")
+                         if isinstance(manifest.get("settings"), dict) else "")
+                        or ""
+                    ).strip().lower()
+                    if _stored_ltx23_backend not in {"int4", "native"}:
+                        _prior_backend_obj = _safe_read_json(clips_manifest_path) if os.path.isfile(clips_manifest_path) else {}
+                        _stored_ltx23_backend = str(
+                            (_prior_backend_obj.get("ltx23_backend") if isinstance(_prior_backend_obj, dict) else "")
+                            or ""
+                        ).strip().lower()
+                except Exception:
+                    _stored_ltx23_backend = ""
+                try:
+                    try:
+                        from helpers import planner_ltx_int4 as _planner_ltx_int4  # type: ignore
+                    except Exception:
+                        import planner_ltx_int4 as _planner_ltx_int4  # type: ignore
+                    _int4_status = _planner_ltx_int4.int4_install_status(_root())
+                    _int4_ready = bool((_int4_status or {}).get("ok"))
+                    # Once a Planner job has actually recorded INT4, resume is
+                    # strict. Never downgrade its remaining/recreated clips to
+                    # FP16/FP8 just because the INT4 folder was moved or broken.
+                    if _stored_ltx23_backend == "int4":
+                        if not _int4_ready:
+                            raise RuntimeError(
+                                "This Planner job already uses LTX INT4, but the INT4 installation is no longer ready: "
+                                + str((_int4_status or {}).get("message") or "unknown INT4 installation error")
+                            )
+                        ltx23_backend = "int4"
+                        ltx23_backend_reason = "resume locked to the job's recorded INT4 backend"
+                    elif _int4_ready:
+                        ltx23_backend = "int4"
+                        ltx23_backend_reason = str((_int4_status or {}).get("message") or "complete INT4 install detected")
+                    else:
+                        ltx23_backend = "native"
+                        ltx23_backend_reason = str((_int4_status or {}).get("message") or ltx23_backend_reason)
+                except Exception as _backend_exc:
+                    if _stored_ltx23_backend == "int4":
+                        raise
+                    ltx23_backend = "native"
+                    ltx23_backend_reason = f"INT4 detection failed: {type(_backend_exc).__name__}: {_backend_exc}"
+                self.signals.log.emit(
+                    f"[ltx23] automatic backend -> {ltx23_backend} ({ltx23_backend_reason})"
+                )
 
                 lipsync_plan_obj: Dict[str, Any] = {}
                 lipsync_shot_map: Dict[str, Dict[str, Any]] = {}
@@ -17448,6 +17621,7 @@ class PipelineWorker(QThread):
                     "end_imgs_fp": end_imgs_fp,
                     "extra_loras": _planner_ltx23_extra_loras_fingerprint(extra_loras),
                     "lipsync_plan_fp": lipsync_plan_fp,
+                    "ltx23_backend": ltx23_backend,
                 }, sort_keys=True))
 
                 prior = _safe_read_json(clips_manifest_path) if os.path.exists(clips_manifest_path) else {}
@@ -17470,6 +17644,7 @@ class PipelineWorker(QThread):
                         manifest["settings"]["video_profile"] = prof
                         manifest["settings"]["use_transition_lora"] = bool(use_transition_lora)
                         manifest["settings"]["ltx23_extra_loras"] = _planner_ltx23_extra_loras_fingerprint(extra_loras)
+                        manifest["settings"]["ltx23_backend"] = ltx23_backend
                         _safe_write_json(manifest_path, manifest)
                         return
 
@@ -17600,6 +17775,7 @@ class PipelineWorker(QThread):
                         "sliding_window_overlap": sliding_window_overlap,
                         "guidance_phases": guidance_phases,
                         "denoising_strength": denoising_strength,
+                        "ltx23_backend": ltx23_backend,
                     }, sort_keys=True))
                     if os.path.isfile(out_file) and os.path.getsize(out_file) > 1024:
                         prev = existing_intents.get(sid) or str(rec.get("clip_intent_fp") or '')
@@ -17615,6 +17791,7 @@ class PipelineWorker(QThread):
                                 "resolution": str(resolution),
                                 "model_key": "ltx23",
                                 "video_model": "ltx23",
+                                "ltx23_backend": ltx23_backend,
                                 "use_transition_lora": bool(use_transition_lora),
                                 "ltx23_extra_loras": _planner_ltx23_extra_loras_fingerprint(extra_loras),
                                 "end_image_file": end_image_path,
@@ -17673,6 +17850,7 @@ class PipelineWorker(QThread):
                     if end_image_path:
                         self.signals.log.emit(f"[ltx23] {sid}: end image -> {end_image_path}")
                     self.signals.progress.emit(min(99, 72 + int((i - 1) * (25 / max(1, len(shots))))))
+                    actual_backend = ltx23_backend
                     try:
                         with open(log_file, "w", encoding="utf-8", errors="ignore") as lf:
                             lf.write(f"[planner] {sid}\n")
@@ -17681,7 +17859,7 @@ class PipelineWorker(QThread):
                             lf.write(f"[planner] frames: {frames} fps: {fps} steps: {steps} seed: {seed}\n")
                             lf.write(f"[planner] resolution: {resolution}\n\n")
                             lf.flush()
-                            _run_ltx23_clip(
+                            actual_backend = _run_ltx23_clip(
                                 prompt=prompt,
                                 negative=negative,
                                 image_path=img_path,
@@ -17702,6 +17880,7 @@ class PipelineWorker(QThread):
                                 audio_path=clip_audio_path,
                                 audio_max_duration=float(dsec),
                                 log_path=log_file,
+                                preferred_backend=ltx23_backend,
                             )
                     except subprocess.CalledProcessError as e:
                         raise RuntimeError(f"LTX 2.3 failed for {sid}. See log: {log_file}\n{e}") from e
@@ -17718,6 +17897,7 @@ class PipelineWorker(QThread):
                         "resolution": str(resolution),
                         "model_key": "ltx23",
                         "video_model": "ltx23",
+                        "ltx23_backend": actual_backend,
                         "use_transition_lora": bool(use_transition_lora),
                         "ltx23_extra_loras": _planner_ltx23_extra_loras_fingerprint(extra_loras),
                         "lipsync_audio_file": clip_audio_path,
@@ -17731,6 +17911,7 @@ class PipelineWorker(QThread):
                         rec2["clip_file"] = out_file
                         rec2["model_key"] = "ltx23"
                         rec2["video_model"] = "ltx23"
+                        rec2["ltx23_backend"] = actual_backend
                         rec2["use_transition_lora"] = bool(use_transition_lora)
                         rec2["ltx23_extra_loras"] = _planner_ltx23_extra_loras_fingerprint(extra_loras)
                         rec2["lipsync_audio_file"] = clip_audio_path
@@ -17746,6 +17927,7 @@ class PipelineWorker(QThread):
                     manifest.setdefault("settings", {})["video_engine"] = "ltx23"
                     manifest["settings"]["video_model"] = "ltx23"
                     manifest["settings"]["video_profile"] = prof
+                    manifest["settings"]["ltx23_backend"] = actual_backend
                     manifest["settings"]["lipsync_enabled"] = bool(getattr(self.job, "lipsync_enabled", False))
                     manifest["settings"]["lipsync_plan_fingerprint"] = lipsync_plan_fp
                     _safe_write_json(manifest_path, manifest)
@@ -17776,9 +17958,15 @@ class PipelineWorker(QThread):
                             )
                             if not _derived:
                                 raise RuntimeError(f"Could not extract last frame from {sid} to seed {_next_sid}.")
-                _safe_write_json(clips_manifest_path, {"fingerprint": clip_fingerprint, "clips": clips_out, "profile": prof})
+                _safe_write_json(clips_manifest_path, {
+                    "fingerprint": clip_fingerprint,
+                    "clips": clips_out,
+                    "profile": prof,
+                    "ltx23_backend": ltx23_backend,
+                })
                 manifest.setdefault("paths", {})["clips_dir"] = clips_dir
                 manifest["paths"]["clips"] = clips_out
+                manifest.setdefault("settings", {})["ltx23_backend"] = ltx23_backend
                 _safe_write_json(manifest_path, manifest)
 
 
@@ -23343,6 +23531,8 @@ class PlannerPane(QWidget):
                 job = self._build_job()
             except Exception as e:
                 QMessageBox.warning(self, "Cannot start", str(e))
+                return
+            if not self._preflight_lipsync_before_generate(job):
                 return
             try:
                 _LOGGER.log_probe(f"Generate clicked: {job.job_id}")
@@ -30369,6 +30559,35 @@ These prompts override the normal reused Own Storymode prompts for the video sta
 
         return out
 
+    def _preflight_lipsync_before_generate(self, job: PlannerJob) -> bool:
+        """Reject impossible uploaded lip-sync transcripts before expensive work starts."""
+        try:
+            if not bool(getattr(job, "lipsync_enabled", False)):
+                return True
+            if str(getattr(job, "lipsync_source", "generated") or "generated").strip().lower() != "uploaded":
+                return True
+            transcript_path = str(getattr(job, "lipsync_transcript_path", "") or "").strip()
+            target_duration = float(getattr(job, "approx_duration_sec", 0) or 0.0)
+            try:
+                from helpers import planner_lipsync as _planner_lipsync_preflight  # type: ignore
+            except Exception:
+                import planner_lipsync as _planner_lipsync_preflight  # type: ignore
+            result = _planner_lipsync_preflight.preflight_uploaded_transcript(
+                transcript_path, target_duration
+            )
+            if bool((result or {}).get("ok", False)):
+                return True
+            message = str((result or {}).get("message") or "The uploaded lip-sync transcript cannot fit the selected duration.")
+            QMessageBox.warning(self, "Lip-sync transcript does not fit", message)
+            return False
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Cannot check lip-sync transcript",
+                f"The transcript could not be checked before generation:\n{exc}",
+            )
+            return False
+
     def _build_job(self) -> PlannerJob:
         prompt = (self.prompt_edit.toPlainText() or '').strip()
         own_story = False
@@ -31404,6 +31623,8 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         try:
             if self._worker and self._worker.isRunning():
                 job = self._build_job()
+                if not self._preflight_lipsync_before_generate(job):
+                    return
                 output_base = (self.out_dir_edit.text() or '').strip() or self._default_out_dir()
                 output_base = _abspath_from_root(output_base)
                 title = _auto_title_from_prompt(job.prompt)
@@ -31419,6 +31640,9 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             job = self._build_job()
         except Exception as e:
             QMessageBox.warning(self, "Cannot start", str(e))
+            return
+
+        if not self._preflight_lipsync_before_generate(job):
             return
 
         try:

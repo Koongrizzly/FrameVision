@@ -20,8 +20,14 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
-LIPSYNC_ENGINE_VERSION = "planner_lipsync_v1.1"
+LIPSYNC_ENGINE_VERSION = "planner_lipsync_v1.2"
 _MAX_TEMPO = 1.28
+_BASE_WORDS_PER_SEC = 1.55
+# Use the same practical headroom as the real audio fitter.  The old planner
+# rejected text at 1.55 words/sec before TTS, even though the allowed gentle
+# tempo correction could safely fit almost 2 words/sec.
+_ALLOCATION_WORDS_PER_SEC = _BASE_WORDS_PER_SEC * _MAX_TEMPO * 0.98
+_PREFLIGHT_USABLE_RATIO = 0.96
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -51,6 +57,86 @@ def _write_json(path: str, obj: Any) -> None:
     _write_text(path, json.dumps(obj, indent=2, ensure_ascii=False))
 
 
+def preflight_uploaded_transcript(transcript_path: str, target_duration_sec: float) -> Dict[str, Any]:
+    """Cheap Generate-click validation before story planning or model loading.
+
+    This deliberately blocks only transcripts that cannot fit even with the same
+    gentle tempo allowance used by the real fitter.  Borderline-but-feasible text
+    is allowed through; exact per-shot fitting still happens later after the shot
+    list exists.
+    """
+    path = str(transcript_path or "").strip()
+    target = max(0.0, _safe_float(target_duration_sec))
+    if not path or not os.path.isfile(path):
+        return {
+            "ok": False,
+            "reason": "missing",
+            "message": "The selected lip-sync transcript file could not be found.",
+            "word_count": 0,
+            "target_duration_sec": target,
+        }
+
+    raw = _read_text(path)
+    cues = _parse_timed_transcript(raw)
+    if cues:
+        spoken_text = _collapse(" ".join(str(item.get("text") or "") for item in cues))
+        timed_end = max((_safe_float(item.get("end_sec")) for item in cues), default=0.0)
+    else:
+        spoken_text = _collapse(" ".join(_sentence_units(raw)))
+        timed_end = 0.0
+    words = len(spoken_text.split())
+    if words <= 0:
+        return {
+            "ok": False,
+            "reason": "empty",
+            "message": "The selected lip-sync transcript contains no readable spoken text.",
+            "word_count": 0,
+            "target_duration_sec": target,
+        }
+
+    normal_seconds = words / _BASE_WORDS_PER_SEC
+    minimum_text_seconds = words / max(0.1, _ALLOCATION_WORDS_PER_SEC)
+    minimum_project_seconds = minimum_text_seconds / _PREFLIGHT_USABLE_RATIO
+    if timed_end > 0.0:
+        minimum_project_seconds = max(minimum_project_seconds, timed_end)
+
+    # Round the useful recommendation up to the Planner's normal 5-second step.
+    recommended = int(math.ceil(max(5.0, minimum_project_seconds) / 5.0) * 5)
+    too_long = target <= 0.0 or minimum_project_seconds > target + 0.25
+
+    if too_long:
+        if timed_end > target + 0.25:
+            detail = (
+                f"Its last timed subtitle ends at {timed_end:.1f}s, but the selected project duration is "
+                f"{target:.1f}s."
+            )
+        else:
+            detail = (
+                f"It has {words} words and needs at least about {minimum_project_seconds:.1f}s, even with "
+                f"the allowed gentle speech fitting. The selected project duration is {target:.1f}s."
+            )
+        message = (
+            detail
+            + f"\n\nSet the Planner duration to at least {recommended} seconds, or shorten the transcript, "
+              "before starting. Nothing has been generated yet."
+        )
+    else:
+        message = ""
+
+    return {
+        "ok": not too_long,
+        "reason": "too_long" if too_long else "ok",
+        "message": message,
+        "word_count": words,
+        "target_duration_sec": round(target, 3),
+        "estimated_normal_speech_sec": round(normal_seconds, 3),
+        "minimum_project_duration_sec": round(minimum_project_seconds, 3),
+        "recommended_duration_sec": recommended,
+        "timed_end_sec": round(timed_end, 3),
+        "has_timing": bool(cues),
+    }
+
+
 def _read_json(path: str) -> Any:
     try:
         return json.loads(_read_text(path))
@@ -76,6 +162,40 @@ def _file_ok(path: str, minimum: int = 256) -> bool:
         return bool(path and os.path.isfile(path) and os.path.getsize(path) >= int(minimum))
     except Exception:
         return False
+
+
+def _stable_llm_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Keep only narration-writing settings that can change generated speech.
+
+    The Planner encoding dictionary also contains transient resume/review flags.
+    Including those flags in the lip-sync fingerprint made every Resume look like
+    a new narration job, which restarted TTS and invalidated every clip intent.
+    """
+    src = settings if isinstance(settings, dict) else {}
+    keys = (
+        "own_llama_enabled",
+        "own_llama_runner_path",
+        "own_llama_model_path",
+        "own_llama_template_kind",
+        "own_llama_template_value",
+        "own_llama_ctx_size",
+        "own_llama_top_p",
+    )
+    return {key: src.get(key) for key in keys if key in src}
+
+
+def _prepared_plan_assets_ok(prior: Any, narration_wav: str) -> bool:
+    if not isinstance(prior, dict) or not _file_ok(narration_wav, 512):
+        return False
+    shot_items = prior.get("shots") if isinstance(prior.get("shots"), list) else []
+    if not shot_items:
+        return False
+    for item in shot_items:
+        if not isinstance(item, dict):
+            return False
+        if bool(item.get("audio_conditioned")) and not _file_ok(str(item.get("audio_file") or "")):
+            return False
+    return True
 
 
 def _clean_visual_text(value: Any) -> str:
@@ -323,7 +443,7 @@ def _build_lipsync_windows(shots_obj: Any, timeline: Sequence[Dict[str, Any]]) -
             end = shot_end - 0.04
         available = max(0.55, end - start)
         # Conservative budget: the line should fit without cutting or extreme tempo.
-        max_words = max(3, min(20, int(math.floor(available * 1.55))))
+        max_words = max(3, min(20, int(math.floor(available * _ALLOCATION_WORDS_PER_SEC))))
         min_words = max(2, int(math.floor(max_words * (0.55 if not final else 0.65))))
         windows.append(
             {
@@ -384,13 +504,20 @@ def _allocate_plain_text_to_windows(text: str, windows: Sequence[Dict[str, Any]]
     desired_segments = max(1, min(len(windows), max(len(units), int(math.ceil(len(tokens) / 7.0)))))
     selected = _even_window_subset(windows, desired_segments)
     capacity = sum(int(item.get("max_words") or 0) for item in selected)
+    # A sentence-count-based subset can be too small for a perfectly usable
+    # transcript.  Expand across every planned shot before declaring failure.
+    if len(tokens) > capacity and len(selected) < len(windows):
+        selected = [dict(item) for item in windows]
+        capacity = sum(int(item.get("max_words") or 0) for item in selected)
     if len(tokens) > capacity:
-        approximate = len(tokens) / 1.55
+        approximate = len(tokens) / _BASE_WORDS_PER_SEC
+        minimum = len(tokens) / max(0.1, _ALLOCATION_WORDS_PER_SEC)
         available = sum(_safe_float(item.get("available_sec")) for item in selected)
         raise RuntimeError(
-            f"The uploaded transcript has {len(tokens)} words but the selected lip-sync shots safely fit about "
-            f"{capacity} words. It needs roughly {approximate:.1f}s of speaking time and only {available:.1f}s is available. "
-            "Increase the Planner duration or shorten the transcript; no words were removed."
+            f"The transcript still cannot fit the completed shot timeline: {len(tokens)} words need at least about "
+            f"{minimum:.1f}s after gentle fitting, while {available:.1f}s is available. "
+            "This should normally be caught before generation; increase the Planner duration and resume. "
+            "No words were removed."
         )
     segments: List[Dict[str, Any]] = []
     cursor = 0
@@ -644,12 +771,17 @@ def _strict_fit_audio(
 ) -> Tuple[float, float]:
     available = max(0.45, float(available))
     source_duration = max(0.01, float(source_duration))
-    tempo = max(1.0, source_duration / max(0.01, available * 0.97))
+    # Keep a small end margin, but do not reject a line that genuinely fits.
+    # The old 3% margin could fail a 9.4s line inside a 9.6s shot even though
+    # the allowed gentle tempo adjustment was sufficient.
+    fit_window = max(0.01, available * 0.99)
+    tempo = max(1.0, source_duration / fit_window)
     if tempo > _MAX_TEMPO:
-        minimum = source_duration / _MAX_TEMPO
+        minimum = source_duration / (_MAX_TEMPO * 0.99)
         raise RuntimeError(
-            f"Speech section {label} needs about {minimum:.1f}s but its video window is only "
-            f"{available:.1f}s. Increase the Planner duration or shorten that transcript section; words were not cut."
+            f"Speech section {label} needs about {minimum:.1f}s including the lip-sync safety margin, "
+            f"but its video window is only {available:.1f}s. Increase the Planner duration or shorten "
+            "that transcript section; words were not cut."
         )
     filters: List[str] = []
     if abs(tempo - 1.0) > 0.005:
@@ -753,7 +885,11 @@ def _synthesise_segments(
             if raw_duration <= 0.01:
                 raise RuntimeError(f"Could not measure TTS duration for {segment['beat_id']}.")
             available = max(0.45, float(segment.get("available_sec") or 0.45))
-            if allow_generated_shorten and raw_duration > available * _MAX_TEMPO and len(str(segment.get("text") or '').split()) > 3:
+            if (
+                allow_generated_shorten
+                and raw_duration > available * 0.99 * _MAX_TEMPO
+                and len(str(segment.get("text") or '').split()) > 3
+            ):
                 ratio = (available * 1.16) / max(0.1, raw_duration)
                 target_words = max(3, int(math.floor(len(str(segment["text"]).split()) * ratio)))
                 shortened = _shorten_generated_line(str(segment["text"]), target_words)
@@ -1128,6 +1264,7 @@ def prepare_lipsync_assets(
     tts_tokenizer_path: str,
     llm_json_call: Callable[..., Tuple[Optional[Any], str]],
     llm_settings: Optional[Dict[str, Any]] = None,
+    resume_existing: bool = False,
     log_path: str = "",
     stop_requested: Optional[Callable[[], bool]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
@@ -1180,7 +1317,7 @@ def prepare_lipsync_assets(
                 "voice_sample": _file_fingerprint(stable_voice_sample) if stable_voice_sample else {},
                 "tts_model": _file_fingerprint(tts_model_path),
                 "tts_tokenizer": _file_fingerprint(tts_tokenizer_path),
-                "llm_settings": (llm_settings or {}) if source_mode == "generated" else {},
+                "llm_settings": _stable_llm_settings(llm_settings) if source_mode == "generated" else {},
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -1188,11 +1325,17 @@ def prepare_lipsync_assets(
     )
     plan_path = os.path.join(audio_dir, "lipsync_plan.json")
     prior = _read_json(plan_path) if os.path.isfile(plan_path) else {}
-    if isinstance(prior, dict) and prior.get("fingerprint") == fingerprint and _file_ok(narration_wav, 512):
-        shot_items = prior.get("shots") if isinstance(prior.get("shots"), list) else []
-        if shot_items and all((not item.get("audio_conditioned")) or _file_ok(str(item.get("audio_file") or "")) for item in shot_items if isinstance(item, dict)):
+    if _prepared_plan_assets_ok(prior, narration_wav):
+        if prior.get("fingerprint") == fingerprint:
             if log_callback:
                 log_callback("[lip-sync] reusing prepared narration and per-shot audio")
+            return prior
+        if bool(resume_existing):
+            # Compatibility path for jobs created before resume flags were removed
+            # from the fingerprint. Preserve the old plan fingerprint so already
+            # rendered LTX clips keep their matching intent fingerprints.
+            if log_callback:
+                log_callback("[lip-sync] resume: reusing existing narration/audio; transient Planner flags were ignored")
             return prior
 
     try:
