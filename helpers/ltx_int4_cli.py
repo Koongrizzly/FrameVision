@@ -15,6 +15,7 @@ Current scope:
 - synchronized generated audio, plus uploaded-audio A2V through normal two-stage with frozen audio latents.
 - workload-aware model/group/sequential CPU offload selected from the FrameVision VRAM profile.
 - latent-first Stage 2 teardown so VAE/vocoder decode never overlaps the quant transformer.
+- spill-free temporal VAE window decoding with immediate CPU handoff for long clips.
 
 The two-stage SDNQ route loads the existing raw LTX 2.3 x2 spatial-upscaler
 checkpoint directly into Diffusers and keeps Stage 1/upsample/Stage 2 as
@@ -158,7 +159,7 @@ def _select_sdnq_offload_policy(
     stage: str = "stage1",
     input_mode: str = "text-to-video",
     int4_24_stage2_full_max_work: float = 4.40,
-    int4_24_i2v_stage1_full_max_work: float = 0.65,
+    int4_24_i2v_stage1_full_max_work: float = 0.45,
     int4_24_i2v_stage2_full_max_work: float = 1.25,
 ) -> Dict[str, Any]:
     """Choose the residency policy for one specific denoise stage.
@@ -243,7 +244,9 @@ def _select_sdnq_offload_policy(
         # I2V uses substantially more activation memory than T2V.  Keep the
         # proven 121-frame 704p fast path unchanged, but stop treating every
         # quarter-area Stage 1 workload as safe.  The first guarded boundary
-        # begins above the measured 169-frame Stage 1 workload.
+        # begins above the measured 169-frame Stage 1 workload; the 241-frame
+        # 704p I2V Stage 1 now uses a 24-block synchronous group instead of
+        # loading the entire transformer and touching Windows shared memory.
         full_limit = (
             float(int4_24_i2v_stage1_full_max_work) if is_i2v else 1.50
         )
@@ -531,6 +534,348 @@ def _cpu_tensor(value: Any) -> Any:
         return value.detach().to(device="cpu")
     except Exception:
         return value
+
+
+def _set_vae_spatial_tiling(
+    vae: Any,
+    *,
+    enabled: bool,
+    tile_height: int = 512,
+    tile_width: int = 512,
+    stride_height: int = 448,
+    stride_width: int = 448,
+) -> str:
+    """Configure only spatial VAE tiling.
+
+    LTX 2.3 has a separate temporal/framewise decode path.  Spatial tiling by
+    itself does not solve long-video decode pressure because every temporal
+    activation is still present at once.  The final decode therefore uses the
+    streaming temporal helper below and enables spatial tiling only for very
+    small VRAM profiles or unusually large output resolutions.
+    """
+
+    details = []
+    if enabled:
+        enable = getattr(vae, "enable_tiling", None)
+        if callable(enable):
+            try:
+                enable(
+                    tile_sample_min_height=int(tile_height),
+                    tile_sample_min_width=int(tile_width),
+                    tile_sample_stride_height=int(stride_height),
+                    tile_sample_stride_width=int(stride_width),
+                )
+            except TypeError:
+                enable()
+            details.append("enable_tiling()")
+        if hasattr(vae, "use_tiling"):
+            setattr(vae, "use_tiling", True)
+            details.append("use_tiling=True")
+        if not bool(getattr(vae, "use_tiling", False)):
+            raise RuntimeError("The video VAE did not enable spatial tiling")
+    else:
+        disable = getattr(vae, "disable_tiling", None)
+        if callable(disable):
+            disable()
+            details.append("disable_tiling()")
+        if hasattr(vae, "use_tiling"):
+            setattr(vae, "use_tiling", False)
+            details.append("use_tiling=False")
+        if bool(getattr(vae, "use_tiling", False)):
+            raise RuntimeError("The video VAE still reports spatial tiling enabled")
+    return ", ".join(details) or ("spatial tiling enabled" if enabled else "spatial tiling disabled")
+
+
+def _select_video_decode_plan(
+    *,
+    profile_gb: int,
+    width: int,
+    height: int,
+    num_frames: int,
+    extra: Iterable[str],
+) -> Dict[str, Any]:
+    """Choose a spill-free temporal VAE decode window.
+
+    A full 241-frame 1280x704 decode retained roughly 13.6 GB of live tensors
+    and made the CUDA allocator reserve 35 GB, which forced Windows to back
+    about 12.7 GB with shared GPU memory.  Decoding overlapping temporal
+    windows keeps the same official causal/blended behavior while ensuring
+    only one window resides on CUDA at a time.
+    """
+
+    profile = int(profile_gb)
+    pixels = max(1, int(width) * int(height))
+    if profile >= 24:
+        if pixels <= 1280 * 720:
+            window = 48
+        elif pixels <= 1920 * 1088:
+            window = 32
+        else:
+            window = 24
+    elif profile >= 16:
+        window = 32 if pixels <= 1280 * 720 else 24
+    elif profile >= 12:
+        window = 24 if pixels <= 1280 * 720 else 16
+    else:
+        window = 16
+
+    window = _int_option(
+        extra,
+        ("--sdnq-decode-window-frames", "--sdnq_decode_window_frames"),
+        window,
+    )
+    overlap = _int_option(
+        extra,
+        ("--sdnq-decode-overlap-frames", "--sdnq_decode_overlap_frames"),
+        8,
+    )
+    spatial_override = str(
+        _extra_option(
+            extra,
+            ("--sdnq-decode-spatial-tiling", "--sdnq_decode_spatial_tiling"),
+            "auto",
+        )
+        or "auto"
+    ).strip().lower()
+
+    # LTX video latents use 8x temporal compression.  Keep both values aligned
+    # so every emitted section starts on a real latent boundary.
+    temporal_ratio = 8
+    window = max(16, (int(window) // temporal_ratio) * temporal_ratio)
+    overlap = max(temporal_ratio, (int(overlap) // temporal_ratio) * temporal_ratio)
+    if overlap >= window:
+        overlap = temporal_ratio
+    stride = window - overlap
+
+    if spatial_override in {"1", "true", "yes", "on", "enabled"}:
+        spatial_tiling = True
+    elif spatial_override in {"0", "false", "no", "off", "disabled"}:
+        spatial_tiling = False
+    else:
+        spatial_tiling = bool(profile <= 12 or pixels > 1920 * 1088)
+
+    return {
+        "window_frames": int(window),
+        "stride_frames": int(stride),
+        "overlap_frames": int(overlap),
+        "spatial_tiling": bool(spatial_tiling),
+        "temporal_streaming": bool(int(num_frames) > int(window)),
+    }
+
+
+def _streaming_temporal_vae_decode(
+    *,
+    vae: Any,
+    latents: Any,
+    torch_module: Any,
+    target_num_frames: int,
+    window_frames: int,
+    stride_frames: int,
+    spatial_tiling: bool,
+    sample_memory: Optional[Any] = None,
+) -> Tuple[Any, Dict[str, Any]]:
+    """Decode LTX video latents in overlapping temporal windows.
+
+    This mirrors Diffusers' official ``_temporal_tiled_decode`` overlap and
+    blending rules, but moves each completed window to system RAM immediately.
+    The stock helper keeps every decoded window on CUDA until the final concat,
+    which is unnecessary for an inference-only FrameVision export and can still
+    build a large reservation on Windows.
+    """
+
+    if latents is None or not hasattr(latents, "shape") or len(latents.shape) != 5:
+        raise RuntimeError("Expected 5D LTX video latents for temporal VAE decode")
+
+    temporal_ratio = int(getattr(vae, "temporal_compression_ratio", 8) or 8)
+    if temporal_ratio <= 0:
+        temporal_ratio = 8
+    latent_window = max(1, int(window_frames) // temporal_ratio)
+    latent_stride = max(1, int(stride_frames) // temporal_ratio)
+    effective_window = latent_window * temporal_ratio
+    effective_stride = latent_stride * temporal_ratio
+    overlap_frames = max(0, effective_window - effective_stride)
+    latent_frames = int(latents.shape[2])
+    expected_frames = min(
+        int(target_num_frames),
+        (latent_frames - 1) * temporal_ratio + 1,
+    )
+
+    original = {
+        "use_tiling": getattr(vae, "use_tiling", None),
+        "use_framewise_decoding": getattr(vae, "use_framewise_decoding", None),
+        "tile_sample_min_height": getattr(vae, "tile_sample_min_height", None),
+        "tile_sample_min_width": getattr(vae, "tile_sample_min_width", None),
+        "tile_sample_stride_height": getattr(vae, "tile_sample_stride_height", None),
+        "tile_sample_stride_width": getattr(vae, "tile_sample_stride_width", None),
+    }
+
+    # We own temporal chunking here.  Leave Diffusers' own framewise route off
+    # to avoid nested temporal splitting; spatial tiling remains independently
+    # available for lower-memory cards.
+    if hasattr(vae, "use_framewise_decoding"):
+        setattr(vae, "use_framewise_decoding", False)
+    spatial_status = _set_vae_spatial_tiling(vae, enabled=bool(spatial_tiling))
+
+    decode_device = getattr(vae, "device", None)
+    if decode_device is None:
+        try:
+            decode_device = next(vae.parameters()).device
+        except Exception:
+            decode_device = torch_module.device("cuda")
+
+    output_chunks = []
+    previous_cpu = None
+    emitted_frames = 0
+    decoded_chunks = 0
+    starts = list(range(0, latent_frames, latent_stride))
+    try:
+        for chunk_index, latent_start in enumerate(starts, start=1):
+            if emitted_frames >= expected_frames:
+                break
+            latent_tile_cpu = latents[
+                :, :, latent_start : latent_start + latent_window + 1, :, :
+            ]
+            # A final single latent after the first window produces one sample
+            # frame which the official algorithm discards for non-first tiles.
+            if latent_start > 0 and int(latent_tile_cpu.shape[2]) <= 1:
+                break
+
+            latent_tile_cuda = latent_tile_cpu.to(
+                device=decode_device, dtype=getattr(vae, "dtype", torch_module.bfloat16)
+            )
+            if bool(getattr(vae.config, "timestep_conditioning", False)):
+                decode_timestep = torch_module.zeros(
+                    (latent_tile_cuda.shape[0],),
+                    device=latent_tile_cuda.device,
+                    dtype=latent_tile_cuda.dtype,
+                )
+            else:
+                decode_timestep = None
+
+            with torch_module.inference_mode():
+                decoded_cuda = vae.decode(
+                    latent_tile_cuda, decode_timestep, return_dict=False
+                )[0]
+            if latent_start > 0:
+                decoded_cuda = decoded_cuda[:, :, :-1, :, :]
+            # Convert during the device transfer.  ``decoded.float().cpu()``
+            # first creates a second full-size FP32 tensor on CUDA.  Clone on
+            # CPU outside inference_mode so overlap blending may update it.
+            current_cpu = decoded_cuda.to(
+                device="cpu", dtype=torch_module.float32
+            ).clone()
+
+            if previous_cpu is not None and overlap_frames > 0:
+                blend_extent = min(
+                    int(previous_cpu.shape[2]),
+                    int(current_cpu.shape[2]),
+                    int(overlap_frames),
+                )
+                if blend_extent > 0:
+                    for frame_index in range(blend_extent):
+                        alpha = float(frame_index) / float(blend_extent)
+                        current_cpu[:, :, frame_index, :, :] = (
+                            previous_cpu[:, :, -blend_extent + frame_index, :, :]
+                            * (1.0 - alpha)
+                            + current_cpu[:, :, frame_index, :, :] * alpha
+                        )
+
+            take = effective_stride + (1 if previous_cpu is None else 0)
+            take = min(take, int(current_cpu.shape[2]), expected_frames - emitted_frames)
+            if take > 0:
+                output_chunks.append(current_cpu[:, :, :take, :, :].contiguous())
+                emitted_frames += int(take)
+            previous_cpu = current_cpu
+            decoded_chunks += 1
+
+            del latent_tile_cuda, decoded_cuda, decode_timestep
+            if callable(sample_memory):
+                sample_memory()
+            print(
+                f"[ltx-status] Final VAE decode window {decoded_chunks}: "
+                f"{emitted_frames}/{expected_frames} frames",
+                flush=True,
+            )
+
+        if emitted_frames < expected_frames:
+            raise RuntimeError(
+                "Temporal VAE decode ended early: "
+                f"decoded {emitted_frames}/{expected_frames} frames"
+            )
+        decoded = torch_module.cat(output_chunks, dim=2)[:, :, :expected_frames]
+    finally:
+        for name, value in original.items():
+            if value is not None and hasattr(vae, name):
+                try:
+                    setattr(vae, name, value)
+                except Exception:
+                    pass
+
+    return decoded, {
+        "chunks": int(decoded_chunks),
+        "window_frames": int(effective_window),
+        "stride_frames": int(effective_stride),
+        "overlap_frames": int(overlap_frames),
+        "spatial_tiling": bool(spatial_tiling),
+        "spatial_tiling_status": spatial_status,
+        "decoded_frames": int(expected_frames),
+    }
+
+
+def _remove_diffusers_hooks_recursive(module: Any) -> Tuple[int, Tuple[str, ...]]:
+    """Remove Diffusers HookRegistry hooks from a module and all children.
+
+    ``DiffusionPipeline.remove_all_hooks()`` primarily handles pipeline-level
+    and Accelerate hooks. Group offloading registers HookRegistry entries on
+    leaf modules, so those must be detached explicitly before a normal ``.to``
+    and full VAE decode.
+    """
+
+    if module is None or not hasattr(module, "named_modules"):
+        return 0, ()
+
+    removed = []
+    # Snapshot the module list first because removing a hook rewrites forward
+    # methods and may mutate registry internals.
+    for module_name, submodule in list(module.named_modules()):
+        registry = getattr(submodule, "_diffusers_hook", None)
+        if registry is None:
+            continue
+        hook_order = list(
+            getattr(registry, "_hook_order", list(getattr(registry, "hooks", {}).keys()))
+        )
+        for hook_name in reversed(hook_order):
+            registry.remove_hook(hook_name, recurse=False)
+            removed.append(f"{module_name or '<root>'}:{hook_name}")
+        if not getattr(registry, "hooks", {}):
+            try:
+                delattr(submodule, "_diffusers_hook")
+            except Exception:
+                pass
+    return len(removed), tuple(removed)
+
+
+def _remove_pipeline_diffusers_hooks(pipe: Any) -> Tuple[int, Tuple[str, ...]]:
+    total_removed = 0
+    samples = []
+    sample_limit = 32
+    for component_name in (
+        "transformer",
+        "text_encoder",
+        "connectors",
+        "vae",
+        "audio_vae",
+        "vocoder",
+    ):
+        component = getattr(pipe, component_name, None)
+        count, names = _remove_diffusers_hooks_recursive(component)
+        total_removed += count
+        remaining = sample_limit - len(samples)
+        if remaining > 0:
+            samples.extend(f"{component_name}.{name}" for name in names[:remaining])
+    if total_removed > len(samples):
+        samples.append(f"... +{total_removed - len(samples)} more")
+    return total_removed, tuple(samples)
 
 
 def _load_ltx23_spatial_upsampler(
@@ -1137,9 +1482,9 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         ),
         float(
             os.environ.get(
-                "FRAMEVISION_LTX_SDNQ_INT4_I2V_STAGE1_FULL_MAX_WORK", "0.65"
+                "FRAMEVISION_LTX_SDNQ_INT4_I2V_STAGE1_FULL_MAX_WORK", "0.45"
             )
-            or 0.65
+            or 0.45
         ),
     )
     int4_24_i2v_stage2_full_max_work = _float_option(
@@ -1324,7 +1669,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         )
         return (
             f"component_group_offload_{transformer_group}_of_"
-            f"{selected_policy['block_count']}_blocks{stream_suffix}+leaf_decode"
+            f"{selected_policy['block_count']}_blocks{stream_suffix}+leaf_aux_components"
         )
 
     try:
@@ -1360,7 +1705,8 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
     )
     ctx["ltx_sdnq_decode_offload_guard"] = (
         "stage-aware: Stage 1 and Stage 2 policies are independent; "
-        "boundary INT4 Stage 2 disables CUDA prefetch"
+        "boundary INT4 Stage 2 disables CUDA prefetch; final decode removes "
+        "leaf HookRegistry entries and streams overlapping temporal VAE windows to CPU"
     )
     ctx["ltx_sdnq_offload_mode"] = (
         f"Stage1={stage1_offload_mode}; Stage2="
@@ -2032,6 +2378,10 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
                     "Could not remove Stage 1 Accelerate hooks before the "
                     f"Stage 2 residency switch: {type(exc).__name__}: {exc}"
                 ) from exc
+            switch_hook_count, switch_hook_names = _remove_pipeline_diffusers_hooks(pipe)
+            ctx["ltx_sdnq_stage2_switch_diffusers_hooks_removed"] = str(switch_hook_count)
+            if switch_hook_names:
+                ctx["ltx_sdnq_stage2_switch_diffusers_hook_names"] = " | ".join(switch_hook_names)
             try:
                 pipe.to("cpu", silence_dtype_warnings=True)
             except TypeError:
@@ -2106,6 +2456,10 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
                 "Could not remove Stage 2 group-offload hooks before latent "
                 f"decode: {type(exc).__name__}: {exc}"
             ) from exc
+        decode_hook_count, decode_hook_names = _remove_pipeline_diffusers_hooks(pipe)
+        ctx["ltx_sdnq_stage2_diffusers_hooks_removed"] = str(decode_hook_count)
+        if decode_hook_names:
+            ctx["ltx_sdnq_stage2_diffusers_hook_names"] = " | ".join(decode_hook_names)
         try:
             pipe.to("cpu", silence_dtype_warnings=True)
         except TypeError:
@@ -2119,8 +2473,8 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         _sync_cuda()
         teardown_after = _cuda_text(torch_module)
         ctx["ltx_sdnq_stage2_decode_teardown"] = (
-            f"hooks removed; pipeline moved to CPU; before={teardown_before}; "
-            f"after={teardown_after}"
+            f"pipeline/Accelerate hooks removed; {decode_hook_count} nested Diffusers hooks removed; "
+            f"pipeline moved to CPU; before={teardown_before}; after={teardown_after}"
         )
         ctx["ltx_sdnq_stage2_decode_teardown_time_s"] = (
             f"{time.perf_counter() - teardown_t0:.3f}"
@@ -2135,28 +2489,59 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         _begin_memory_phase("decode")
         decode_t0 = time.perf_counter()
 
-        # Decode video with only the VAE on CUDA. This mirrors Diffusers'
-        # output_type='np' branch with the default decode_timestep=0.0, but it
-        # runs after the transformer and group-offload hooks are gone.
+        # Decode video with only the split VAE on CUDA.  Spatial tiling alone
+        # cannot solve a long-video decode because all 241 temporal activations
+        # still coexist.  Stream overlapping temporal windows instead and move
+        # every completed section directly to CPU before decoding the next one.
         video_vae = pipe.vae
         video_decode_t0 = time.perf_counter()
+        decode_plan = _select_video_decode_plan(
+            profile_gb=profile_gb,
+            width=target_width,
+            height=target_height,
+            num_frames=num_frames,
+            extra=extra,
+        )
+        ctx["ltx_sdnq_video_decode_plan"] = (
+            f"temporal window={decode_plan['window_frames']}f, "
+            f"stride={decode_plan['stride_frames']}f, "
+            f"overlap={decode_plan['overlap_frames']}f, "
+            f"spatial_tiling={'on' if decode_plan['spatial_tiling'] else 'off'}"
+        )
+        ctx["ltx_sdnq_video_decode_mode"] = (
+            "streaming temporal VAE decode; one overlapping window on CUDA at a time; "
+            "completed windows transferred directly to CPU; nested group-offload hooks removed"
+        )
+        print(
+            "[ltx-status] Final video decode: spill-free temporal windows "
+            f"{decode_plan['window_frames']}f/{decode_plan['stride_frames']}f "
+            f"(spatial tiling {'on' if decode_plan['spatial_tiling'] else 'off'})",
+            flush=True,
+        )
+        decoded_video = None
         try:
             video_vae.to("cuda")
-            decode_video_latents = video_latents_final.to(
-                device="cuda", dtype=video_vae.dtype
+            decoded_video, decode_stats = _streaming_temporal_vae_decode(
+                vae=video_vae,
+                latents=video_latents_final,
+                torch_module=torch_module,
+                target_num_frames=num_frames,
+                window_frames=int(decode_plan["window_frames"]),
+                stride_frames=int(decode_plan["stride_frames"]),
+                spatial_tiling=bool(decode_plan["spatial_tiling"]),
+                sample_memory=lambda: _sample_driver_free("decode"),
             )
-            if bool(getattr(video_vae.config, "timestep_conditioning", False)):
-                decode_timestep = torch_module.zeros(
-                    (decode_video_latents.shape[0],),
-                    device=decode_video_latents.device,
-                    dtype=decode_video_latents.dtype,
-                )
-            else:
-                decode_timestep = None
-            decoded_video = video_vae.decode(
-                decode_video_latents, decode_timestep, return_dict=False
-            )[0]
-            decoded_video = decoded_video.float().cpu()
+            ctx["ltx_sdnq_video_decode_chunks"] = str(decode_stats["chunks"])
+            ctx["ltx_sdnq_video_decode_window_frames"] = str(decode_stats["window_frames"])
+            ctx["ltx_sdnq_video_decode_stride_frames"] = str(decode_stats["stride_frames"])
+            ctx["ltx_sdnq_video_decode_overlap_frames"] = str(decode_stats["overlap_frames"])
+            ctx["ltx_sdnq_video_decode_spatial_tiling"] = (
+                "enabled" if decode_stats["spatial_tiling"] else "disabled"
+            )
+            ctx["ltx_sdnq_vae_tiling"] = (
+                "pipeline preparation used spatial tiling for I2V encoding; final decode used "
+                f"temporal CPU-streaming with {decode_stats['spatial_tiling_status']}"
+            )
             video = pipe.video_processor.postprocess_video(
                 decoded_video, output_type="np"
             )
@@ -2166,7 +2551,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
             except Exception:
                 pass
             try:
-                del decode_video_latents, decoded_video
+                del decoded_video
             except Exception:
                 pass
             gc.collect()
@@ -2197,9 +2582,10 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
                 decode_audio_latents = audio_latents_final.to(
                     device="cuda", dtype=audio_vae.dtype
                 )
-                generated_mel = audio_vae.decode(
-                    decode_audio_latents, return_dict=False
-                )[0].float().cpu()
+                with torch_module.inference_mode():
+                    generated_mel = audio_vae.decode(
+                        decode_audio_latents, return_dict=False
+                    )[0].float().cpu()
             finally:
                 try:
                     audio_vae.to("cpu")
@@ -2218,8 +2604,9 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
             try:
                 vocoder.to("cuda")
                 vocoder_dtype = getattr(vocoder, "dtype", torch_module.float32)
-                audio = vocoder(generated_mel.to(device="cuda", dtype=vocoder_dtype))
-                audio = audio.float().cpu()
+                with torch_module.inference_mode():
+                    audio = vocoder(generated_mel.to(device="cuda", dtype=vocoder_dtype))
+                    audio = audio.float().cpu()
             finally:
                 try:
                     vocoder.to("cpu")
@@ -2455,7 +2842,10 @@ def _write_report(path: Path, ctx: Dict[str, Any], exception_text: str = "") -> 
         "ltx_sdnq_stage1_min_driver_free_gb", "ltx_sdnq_stage2_peak_allocated_gb",
         "ltx_sdnq_stage2_peak_reserved_gb", "ltx_sdnq_stage2_min_driver_free_gb",
         "ltx_sdnq_peak_allocated_gb", "ltx_sdnq_peak_reserved_gb", "ltx_sdnq_min_driver_free_gb",
-        "ltx_sdnq_vram_safety_result",
+        "ltx_sdnq_vram_safety_result", "ltx_sdnq_video_decode_plan",
+        "ltx_sdnq_video_decode_chunks", "ltx_sdnq_video_decode_window_frames",
+        "ltx_sdnq_video_decode_stride_frames", "ltx_sdnq_video_decode_overlap_frames",
+        "ltx_sdnq_video_decode_spatial_tiling", "ltx_sdnq_video_decode_time_s",
         "ltx_int4_conditioning_mask_guard", "ltx_int4_conditioning_mask_rewrites",
         "ltx_int4_conditioning_mask_last_move", "output_path",
     ]

@@ -6,11 +6,12 @@ from __future__ import annotations
 Drop this file in:
     FrameVision/helpers/ltx23_ui.py
 
-Expected companion file:
-    FrameVision/helpers/ltx23_vram_lab_cli.py
+Expected companion files:
+    FrameVision/helpers/ltx23_vram_lab_cli.py  (FP16/FP8 only)
+    FrameVision/helpers/ltx_int4_cli.py         (INT4 only)
 
-The widget intentionally drives the existing CLI instead of editing or duplicating
-VRAM Lab / LTX logic. It can be imported into FrameVision or launched directly
+The widget keeps the proven FP16/FP8 CLI untouched and routes INT4 to a
+separate helper instead of mixing quant code into native VRAM Lab / LTX logic. It can be imported into FrameVision or launched directly
 for testing:
     python helpers/ltx23_ui.py
 """
@@ -66,6 +67,8 @@ from PySide6.QtCore import QUrl
 HERE = Path(__file__).resolve().parent
 APP_ROOT = HERE.parent if HERE.name.lower() == "helpers" else HERE
 DEFAULT_CLI_PATH = APP_ROOT / "helpers" / "ltx23_vram_lab_cli.py"
+INT4_CLI_PATH = APP_ROOT / "helpers" / "ltx_int4_cli.py"
+INT4_MODEL_RELATIVE = Path("models") / "ltx23_int4"
 DEFAULT_LTX_ROOT = APP_ROOT
 OLD_DEFAULT_LTX_ROOTS = {str(Path(r"C:\ltx23")).lower(), str(Path(r"C:\ltx")).lower()}
 DEFAULT_PYTHON = DEFAULT_LTX_ROOT / "environments" / ".ltx23" / "python.exe"
@@ -1051,19 +1054,8 @@ class LTX23RunnerWidget(QWidget):
         )
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
-        # Do not save on every tiny edit. Prompt boxes can emit textChanged for
-        # every keystroke, and writing/refreshing JSON that often makes typing
-        # feel delayed on slower disks or when the UI is embedded in FrameVision.
-        self._save_timer.setInterval(2500)
+        self._save_timer.setInterval(650)
         self._save_timer.timeout.connect(lambda: self._save_settings(silent=True))
-        self._prompt_save_timer = QTimer(self)
-        self._prompt_save_timer.setSingleShot(True)
-        self._prompt_save_timer.setInterval(8000)
-        self._prompt_save_timer.timeout.connect(lambda: self._save_settings(silent=True))
-        self._command_preview_timer = QTimer(self)
-        self._command_preview_timer.setSingleShot(True)
-        self._command_preview_timer.setInterval(1000)
-        self._command_preview_timer.timeout.connect(self._refresh_command_preview)
         self._vram_profile_autofill_timer = QTimer(self)
         self._vram_profile_autofill_timer.setSingleShot(True)
         self._vram_profile_autofill_timer.setInterval(650)
@@ -1685,11 +1677,23 @@ class LTX23RunnerWidget(QWidget):
 
         if hasattr(self, "audio_hint_label"):
             if is_a2v:
-                self.audio_hint_label.setText(
-                    "Prompt + audio file passes the audio into official LTX a2vid_two_stage using --audio-path. "
-                    "LTX should build the video around that sound and output baked audio/video. "
-                    "This mode needs the distilled LoRA and spatial upsampler paths in the Quality tab."
-                )
+                is_int4 = False
+                try:
+                    is_int4 = self._selected_model_variant() == "INT4"
+                except Exception:
+                    pass
+                if is_int4:
+                    self.audio_hint_label.setText(
+                        "INT4 uses the normal two-stage workflow. The selected audio is encoded once, kept frozen "
+                        "through both stages to drive the video, and the original waveform is baked into the output. "
+                        "This does not use two_stages_hq or the native VRAM Lab CLI."
+                    )
+                else:
+                    self.audio_hint_label.setText(
+                        "Prompt + audio file passes the audio into official LTX a2vid_two_stage using --audio-path. "
+                        "LTX should build the video around that sound and output baked audio/video. "
+                        "This mode needs the distilled LoRA and spatial upsampler paths in the Quality tab."
+                    )
             elif is_remux:
                 self.audio_hint_label.setText(
                     "Prompt only ignores the audio while LTX generates the picture, then FFmpeg copies the video stream "
@@ -1944,7 +1948,7 @@ class LTX23RunnerWidget(QWidget):
         self.ffmpeg_row = PathRow("FFmpeg", "ffmpeg", mode="file", file_filter="FFmpeg (ffmpeg.exe ffmpeg);;All files (*.*)")
         self._align_path_row_labels([self.ltx_root_row, self.python_row, self.cli_row, self.checkpoint_row, self.gemma_row, self.output_dir_row, self.report_row, self.deep_log_row, self.ffmpeg_row])
         self.model_variant_combo = WheelGuardComboBox()
-        self.model_variant_combo.addItems(["FP16", "FP8"])
+        self.model_variant_combo.addItems(["FP16", "FP8", "INT4"])
         self.auto_fill_model_paths_btn = QPushButton("Auto fill selected")
         self.auto_fill_model_paths_btn.clicked.connect(self._auto_fill_selected_model_paths)
         model_preset_row = QWidget()
@@ -1957,12 +1961,12 @@ class LTX23RunnerWidget(QWidget):
         self.quantization_combo = WheelGuardComboBox()
         self.quantization_combo.addItems(QUANTIZATION_MODE_CHOICES)
         self._set_combo(self.quantization_combo, QUANTIZATION_MODE_NONE)
-        self._set_tooltip(self.model_variant_combo, "Choose which installed LTX checkpoint path to auto-fill.")
+        self._set_tooltip(self.model_variant_combo, "Choose FP16/FP8 on the untouched native VRAM Lab CLI, or INT4 on the isolated ltx_int4_cli.py route.")
         self._set_tooltip(self.auto_fill_model_paths_btn, "Auto-fill LTX root, env, checkpoint, Gemma, output and tool paths for the selected model.")
         self._set_tooltip(self.quantization_combo, "Quantization is off by default. FP8 modes are experimental and must be selected manually.")
         self._set_tooltip(self.ltx_root_row, "Portable LTX root folder. Default is the FrameVision install root; models, outputs and portable settings stay under this root.")
         self._set_tooltip(self.python_row, "Python executable from the LTX environment, usually under the FrameVision install root: environments\\.ltx23\\python.exe.")
-        self._set_tooltip(self.cli_row, "LTX VRAM Lab wrapper script. Default is helpers\\ltx23_vram_lab_cli.py inside the FrameVision install root.")
+        self._set_tooltip(self.cli_row, "FP16/FP8 use helpers\\ltx23_vram_lab_cli.py. INT4 uses the separate helpers\\ltx_int4_cli.py. The UI switches this path automatically.")
         self._set_tooltip(self.checkpoint_row, "Main LTX 2.3 checkpoint / safetensors file. This is the large model file.")
         self._set_tooltip(self.gemma_row, "Gemma text encoder folder. Usually leave this unchanged once it works.")
         self._set_tooltip(self.output_dir_row, "Folder where generated videos are saved. Default is under the LTX root output folder.")
@@ -3092,7 +3096,9 @@ class LTX23RunnerWidget(QWidget):
         self.cli_row.setText(s["cli_path"])
         self.checkpoint_row.setText(s["checkpoint_path"])
         if hasattr(self, "model_variant_combo"):
-            self._set_combo(self.model_variant_combo, self._infer_model_variant_from_checkpoint(s.get("checkpoint_path", "")))
+            loaded_variant = self._infer_model_variant_from_checkpoint(s.get("checkpoint_path", ""))
+            self._set_combo(self.model_variant_combo, loaded_variant)
+            self._apply_model_variant_route(loaded_variant, update_checkpoint=False)
         if hasattr(self, "quantization_combo"):
             self._apply_quantization_availability()
         self.gemma_row.setText(s["gemma_root"])
@@ -3109,7 +3115,8 @@ class LTX23RunnerWidget(QWidget):
         self._loading = False
         self._update_frame_spin_limit(clamp=True)
         self._update_extended_frames_warning()
-        self._apply_auto_vram_settings(update_hint=True)
+        if self._selected_model_variant() != "INT4":
+            self._apply_auto_vram_settings(update_hint=True)
         self._update_fast_iclora_route_controls()
         self._update_flash_attention_status()
         self._refresh_command_preview()
@@ -3730,9 +3737,123 @@ class LTX23RunnerWidget(QWidget):
         finally:
             self.fast_iclora_route_check.blockSignals(False)
 
+    def _build_int4_command(self, *, prepare_video_inputs: bool = False) -> Tuple[str, List[str], Path, List[str]]:
+        """Build the isolated INT4 command without touching native VRAM Lab state."""
+        python_exe = self.python_row.text() or str(DEFAULT_PYTHON)
+        cli_path = str(INT4_CLI_PATH)
+        self._normalize_resolution_for_pipeline()
+        output_path = self._make_output_path()
+        audio_mode = AUDIO_MODE_COMPAT_MAP.get(self.audio_mode_combo.currentText(), AUDIO_MODE_DISABLED)
+        # Native FP16/FP8 keeps using a2vid_two_stage.  Isolated INT4 maps the
+        # same UI mode onto its normal Euler two_stages backend.
+        pipeline_name = "two_stages" if audio_mode == AUDIO_MODE_A2V else self._effective_pipeline()
+        if pipeline_name not in {"one_stage", "two_stages"}:
+            raise RuntimeError("INT4 currently supports one_stage and normal two_stages only. two_stages_hq remains on FP16/FP8.")
+        if audio_mode == AUDIO_MODE_A2V:
+            audio_path = self.audio_row.text().strip()
+            if not audio_path:
+                raise RuntimeError("Select an audio file for INT4 Prompt + audio file mode.")
+            if not Path(audio_path).is_file():
+                raise RuntimeError(f"INT4 reference audio file not found: {audio_path}")
+        if getattr(self, "latent_preview_enabled_check", None) is not None and self.latent_preview_enabled_check.isChecked():
+            raise RuntimeError("Latent Preview is not connected to the isolated INT4 CLI yet.")
+        if self.enhance_prompt_check.isChecked():
+            raise RuntimeError("Prompt enhancement is not connected to the isolated INT4 CLI yet.")
+
+        prepared_video_frames = self._prepare_video_input_frames() if prepare_video_inputs else {}
+        start_video_text = self.start_video_row.text().strip() if hasattr(self, "start_video_row") else ""
+        start_image = (
+            prepared_video_frames.get("start")
+            or self._prepared_frame_for_video("start", start_video_text)
+            or self.start_media_row.text().strip()
+        )
+        end_video_text = self.end_video_row.text().strip() if hasattr(self, "end_video_row") else ""
+        end_image = (
+            prepared_video_frames.get("end")
+            or self._prepared_frame_for_video("end", end_video_text)
+            or self.end_media_row.text().strip()
+        )
+        references = [path for path in self._split_paths(self.reference_images_edit.text()) if path]
+        if end_image:
+            raise RuntimeError("INT4 end-image conditioning is not connected yet. Clear the end image or use FP16/FP8.")
+        if references:
+            raise RuntimeError("INT4 reference-image conditioning is not connected yet. Clear references or use FP16/FP8.")
+        if self._user_lora_cli_args():
+            raise RuntimeError("INT4 LoRA loading is not connected yet. Disable LoRAs or use FP16/FP8.")
+
+        profile = self._effective_vram_profile_key(str(self.vram_profile_combo.currentText() or "24"))
+        args = [
+            cli_path,
+            "--pipeline", pipeline_name,
+            "--vram-profile", profile,
+            "--model-root", self.checkpoint_row.text().strip(),
+            "--prompt", self.prompt_edit.toPlainText().strip(),
+            "--output-path", str(output_path),
+            "--height", str(self.height_spin.value()),
+            "--width", str(self.width_spin.value()),
+            "--num-frames", str(self.frames_spin.value()),
+            "--frame-rate", str(self.fps_spin.value()),
+            "--num-inference-steps", str(self.steps_spin.value()),
+            "--seed", str(self.seed_spin.value()),
+            "--shift", f"{self.shift_spin.value():g}",
+            "--ltx-root", self.ltx_root_row.text(),
+            "--report-path", self.report_row.text(),
+            "--attention-backend", "auto",
+        ]
+        negative_prompt = self.negative_edit.toPlainText().strip()
+        if negative_prompt:
+            args.extend(["--negative-prompt", negative_prompt])
+        if start_image:
+            args.extend([
+                "--i2v-image", start_image,
+                "--i2v-image-frame", str(self.start_image_frame_spin.value()),
+                "--i2v-image-strength", f"{self.start_image_strength_spin.value():g}",
+            ])
+        if hasattr(self, "normalize_input_image_check") and not self.normalize_input_image_check.isChecked():
+            args.append("--no-normalize-input-image")
+        if pipeline_name == "two_stages" and self.spatial_upsampler_row.text().strip():
+            args.extend(["--spatial-upsampler-path", self.spatial_upsampler_row.text().strip()])
+        if audio_mode == AUDIO_MODE_A2V:
+            args.extend([
+                "--audio-path", self.audio_row.text().strip(),
+                "--audio-start-time", f"{self.audio_start_spin.value():g}",
+            ])
+            if self.audio_max_duration_spin.value() > 0:
+                args.extend(["--audio-max-duration", f"{self.audio_max_duration_spin.value():g}"])
+        if self.no_boundary_echo_check.isChecked():
+            args.append("--no-boundary-echo")
+        if self.deep_lifecycle_check.isChecked():
+            args.extend([
+                "--deep-log-interval", str(self.deep_interval_spin.value()),
+                "--deep-log-max-events", str(self.deep_max_events_spin.value()),
+                "--deep-log-path", self.deep_log_row.text(),
+                "--deep-lifecycle-log",
+            ])
+
+        extra: List[str] = [
+            "--video-cfg-guidance-scale", f"{self.video_cfg_spin.value():g}",
+            "--video-stg-guidance-scale", f"{self.video_stg_spin.value():g}",
+            "--video-rescale-scale", f"{self.video_rescale_spin.value():g}",
+            "--audio-cfg-guidance-scale", f"{self.audio_cfg_spin.value():g}",
+            "--audio-stg-guidance-scale", f"{self.audio_stg_spin.value():g}",
+            "--audio-rescale-scale", f"{self.audio_rescale_spin.value():g}",
+            "--a2v-guidance-scale", f"{self.a2v_guidance_spin.value():g}",
+            "--v2a-guidance-scale", f"{self.v2a_guidance_spin.value():g}",
+        ]
+        custom_extra = self.extra_args_edit.toPlainText().strip()
+        if custom_extra:
+            extra.extend(shlex.split(custom_extra, posix=os.name != "nt"))
+        if extra:
+            args.append("--extra")
+            args.extend(extra)
+        return python_exe, args, output_path, extra
+
     def build_command(self, *, randomize_seed: bool = False, prepare_video_inputs: bool = False) -> Tuple[str, List[str], Path, List[str]]:
         if randomize_seed and self.random_seed_check.isChecked():
             self.seed_spin.setValue(int(time.time() * 1000) % 2_147_483_647)
+
+        if self._selected_model_variant() == "INT4":
+            return self._build_int4_command(prepare_video_inputs=prepare_video_inputs)
 
         if self._is_auto_vram_profile_mode():
             auto_result = self._apply_auto_vram_settings(update_hint=True) or {}
@@ -3941,21 +4062,30 @@ class LTX23RunnerWidget(QWidget):
 
 
     def validate_before_run(self) -> bool:
+        is_int4 = self._selected_model_variant() == "INT4"
         checks = [
             (self.python_row.text(), "Python executable is empty."),
-            (self.cli_row.text(), "LTX CLI path is empty."),
-            (self.checkpoint_row.text(), "Checkpoint path is empty."),
-            (self.gemma_row.text(), "Gemma root is empty."),
+            (str(INT4_CLI_PATH) if is_int4 else self.cli_row.text(), "LTX CLI path is empty."),
+            (self.checkpoint_row.text(), "INT4 model folder is empty." if is_int4 else "Checkpoint path is empty."),
+            ("not-needed" if is_int4 else self.gemma_row.text(), "Gemma root is empty."),
             (self.prompt_edit.toPlainText().strip(), "Prompt is empty."),
         ]
         for value, message in checks:
             if not str(value or "").strip():
                 QMessageBox.warning(self, "LTX 2.3", message)
                 return False
-        cli_path = Path(self.cli_row.text())
+        cli_path = INT4_CLI_PATH if is_int4 else Path(self.cli_row.text())
         if not cli_path.exists():
             QMessageBox.warning(self, "LTX 2.3", f"CLI file not found:\n{cli_path}")
             return False
+        if is_int4:
+            model_root = Path(self.checkpoint_row.text().strip())
+            required = [model_root / "model_index.json", model_root / "transformer" / "config.json", model_root / "text_encoder" / "config.json"]
+            missing = [str(path) for path in required if not path.exists()]
+            if not model_root.is_dir() or missing:
+                detail = "\n".join(missing) if missing else str(model_root)
+                QMessageBox.warning(self, "LTX 2.3 INT4", "INT4 model folder is incomplete:\n" + detail)
+                return False
 
         audio_mode = AUDIO_MODE_COMPAT_MAP.get(self.audio_mode_combo.currentText(), AUDIO_MODE_DISABLED)
         audio_path = self.audio_row.text().strip()
@@ -3980,7 +4110,7 @@ class LTX23RunnerWidget(QWidget):
                 QMessageBox.warning(self, "LTX 2.3", f"FFmpeg not found:\n{ffmpeg}")
                 return False
 
-        if not self._ensure_auto_vram_settings_supported():
+        if not is_int4 and not self._ensure_auto_vram_settings_supported():
             return False
 
         pipeline_name = self._effective_pipeline()
@@ -4002,13 +4132,6 @@ class LTX23RunnerWidget(QWidget):
             QMessageBox.warning(self, "LTX 2.3", f"Could not prepare video input frame:\n{type(exc).__name__}: {exc}")
             return
         self.active_output_path = output_path
-        for timer_name in ("_prompt_save_timer", "_command_preview_timer"):
-            timer = getattr(self, timer_name, None)
-            try:
-                if timer is not None and timer.isActive():
-                    timer.stop()
-            except Exception:
-                pass
         output_path.parent.mkdir(parents=True, exist_ok=True)
         Path(self.report_row.text()).parent.mkdir(parents=True, exist_ok=True)
         Path(self.deep_log_row.text()).parent.mkdir(parents=True, exist_ok=True)
@@ -4719,7 +4842,7 @@ class LTX23RunnerWidget(QWidget):
         for edit in [
             self.prompt_edit, self.negative_edit, self.extra_args_edit,
         ]:
-            edit.textChanged.connect(self._text_settings_changed)
+            edit.textChanged.connect(self._settings_changed)
         for line in [
             self.reference_images_edit, self.output_name_edit, self.disable_lora_extra_args_edit,
         ]:
@@ -4916,12 +5039,62 @@ class LTX23RunnerWidget(QWidget):
 
     def _checkpoint_for_variant(self, root: Path, variant: str) -> Path:
         token = str(variant or "FP16").strip().upper()
+        if token == "INT4":
+            return root / INT4_MODEL_RELATIVE
         rel = FP8_CHECKPOINT_RELATIVE if token == "FP8" else FP16_CHECKPOINT_RELATIVE
         return root / rel
 
     def _infer_model_variant_from_checkpoint(self, value: Any) -> str:
-        text = str(value or "").lower()
+        text = str(value or "").strip().replace("\\", "/").rstrip("/").lower()
+        folder_name = text.rsplit("/", 1)[-1] if text else ""
+        # The installed split-folder model is models/ltx23_int4. Keep the old
+        # ltx_int4 spelling recognized too so stale settings cannot accidentally
+        # send a quant folder into the native FP16/FP8 CLI.
+        if folder_name in {"ltx23_int4", "ltx_int4"} or folder_name.endswith("_int4"):
+            return "INT4"
         return "FP8" if "fp8" in text else "FP16"
+
+    def _selected_model_variant(self) -> str:
+        # Safety first: a recognized INT4 split-model folder must always use the
+        # isolated ltx_int4_cli.py, even when an older settings file restored the
+        # combo as FP16. This prevents the native VRAM Lab CLI from ever receiving
+        # the INT4 directory as --checkpoint-path.
+        inferred = self._infer_model_variant_from_checkpoint(
+            self.checkpoint_row.text() if hasattr(self, "checkpoint_row") else ""
+        )
+        if inferred == "INT4":
+            return "INT4"
+        if hasattr(self, "model_variant_combo"):
+            token = self.model_variant_combo.currentText().strip().upper()
+            if token in {"FP16", "FP8", "INT4"}:
+                return token
+        return inferred
+
+    def _apply_model_variant_route(self, variant: str = "", *, update_checkpoint: bool = False) -> None:
+        token = str(variant or self._selected_model_variant()).strip().upper() or "FP16"
+        is_int4 = token == "INT4"
+        if hasattr(self, "cli_row"):
+            self.cli_row.setText(str(INT4_CLI_PATH if is_int4 else DEFAULT_CLI_PATH))
+        if hasattr(self, "checkpoint_row"):
+            self.checkpoint_row.mode = "dir" if is_int4 else "file"
+            self.checkpoint_row.label.setText("INT4 model folder" if is_int4 else "Checkpoint")
+            self.checkpoint_row.file_filter = "All files (*.*)" if is_int4 else "Safetensors (*.safetensors);;All files (*.*)"
+            self._set_tooltip(
+                self.checkpoint_row,
+                "Local split-folder INT4 model, normally models\\ltx23_int4." if is_int4
+                else "Main LTX 2.3 checkpoint / safetensors file. This is the large model file.",
+            )
+            if update_checkpoint:
+                root = self._portable_ltx_root_for_autofill()
+                self.checkpoint_row.setText(str(self._checkpoint_for_variant(root, token)))
+        if hasattr(self, "vram_lab_combo"):
+            self.vram_lab_combo.setEnabled(not is_int4)
+            self._set_tooltip(
+                self.vram_lab_combo,
+                "The native VRAM Lab toggle applies only to FP16/FP8. INT4 uses its isolated CLI and never imports ltx23_vram_lab_cli.py."
+                if is_int4 else
+                "Simple VRAM Lab toggle. ON uses the safe VRAM Lab mode. OFF disables VRAM Lab and runs without that protection layer.",
+            )
 
     def _sync_model_variant_from_checkpoint(self) -> None:
         if self._loading or not hasattr(self, "model_variant_combo"):
@@ -4934,21 +5107,17 @@ class LTX23RunnerWidget(QWidget):
                 self._set_combo(self.model_variant_combo, variant)
             finally:
                 self._loading = old_loading
+        self._apply_model_variant_route(variant, update_checkpoint=False)
         self._apply_quantization_availability(variant)
 
     def _model_variant_changed(self) -> None:
         if self._loading or not hasattr(self, "model_variant_combo"):
             return
         variant = self.model_variant_combo.currentText().strip().upper() or "FP16"
-        # Selecting FP16/FP8 must actually switch the checkpoint path. Before this,
-        # the combo could say FP16 while the saved checkpoint still pointed at the
-        # FP8 file, making tests look like "FP8 off" while still loading FP8.
+        # Model routing is strict: native FP16/FP8 always use the untouched native
+        # CLI; INT4 always uses the separate quant CLI and split model folder.
         try:
-            root = self._portable_ltx_root_for_autofill()
-            wanted = self._checkpoint_for_variant(root, variant)
-            current = Path(str(self.checkpoint_row.text()).strip()) if hasattr(self, "checkpoint_row") else Path()
-            if str(current).lower() != str(wanted).lower():
-                self.checkpoint_row.setText(str(wanted))
+            self._apply_model_variant_route(variant, update_checkpoint=True)
         except Exception:
             pass
         if hasattr(self, "quantization_combo"):
@@ -4964,10 +5133,18 @@ class LTX23RunnerWidget(QWidget):
             return
         token = (variant or (self.model_variant_combo.currentText() if hasattr(self, "model_variant_combo") else "FP16")).strip().upper()
         is_fp8 = token == "FP8"
+        is_int4 = token == "INT4"
 
         self.quantization_combo.blockSignals(True)
         try:
-            if not is_fp8:
+            if is_int4:
+                self._set_combo(self.quantization_combo, QUANTIZATION_MODE_NONE)
+                self.quantization_combo.setEnabled(False)
+                self._set_tooltip(
+                    self.quantization_combo,
+                    "INT4 is already pre-quantized and runs only through the isolated ltx_int4_cli.py.",
+                )
+            elif not is_fp8:
                 self._set_combo(self.quantization_combo, QUANTIZATION_MODE_NONE)
                 self.quantization_combo.setEnabled(False)
                 self._set_tooltip(
@@ -4995,8 +5172,9 @@ class LTX23RunnerWidget(QWidget):
 
         self.ltx_root_row.setText(str(root))
         self.python_row.setText(str(python_path))
-        self.cli_row.setText(str(DEFAULT_CLI_PATH))
+        self.cli_row.setText(str(INT4_CLI_PATH if variant == "INT4" else DEFAULT_CLI_PATH))
         self.checkpoint_row.setText(str(self._checkpoint_for_variant(root, variant)))
+        self._apply_model_variant_route(variant, update_checkpoint=False)
         if hasattr(self, "quantization_combo"):
             # Safe default for both variants. FP8 quantization modes are explicit
             # manual tests only; do not turn them on from Auto Fill.
@@ -5015,41 +5193,11 @@ class LTX23RunnerWidget(QWidget):
         if self._loading:
             return
         self._update_extended_frames_warning()
-        self._apply_auto_vram_settings(update_hint=True)
+        if self._selected_model_variant() != "INT4":
+            self._apply_auto_vram_settings(update_hint=True)
         self._update_fast_iclora_route_controls()
         self._refresh_command_preview()
         self._queue_settings_save()
-
-    def _text_settings_changed(self, *args: Any) -> None:
-        """Cheap path for prompt/negative/extra-args typing.
-
-        These fields can change many times per second.  The normal settings path
-        recalculates Auto VRAM values, rebuilds the command preview, and queues a
-        JSON write, which makes long prompt typing feel like the UI is catching
-        up seconds later.  Delay the expensive parts until the user pauses.
-        """
-        if self._loading:
-            return
-        self._queue_command_preview_refresh()
-        self._queue_prompt_settings_save()
-
-    def _queue_command_preview_refresh(self) -> None:
-        if self._loading:
-            return
-        timer = getattr(self, "_command_preview_timer", None)
-        if timer is not None:
-            timer.start()
-        else:
-            self._refresh_command_preview()
-
-    def _queue_prompt_settings_save(self) -> None:
-        if self._loading:
-            return
-        timer = getattr(self, "_prompt_save_timer", None)
-        if timer is not None:
-            timer.start()
-        else:
-            self._queue_settings_save()
 
     def _queue_settings_save(self) -> None:
         if self._loading:
@@ -5455,13 +5603,8 @@ class LTX23RunnerWidget(QWidget):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
     def closeEvent(self, event: Any) -> None:
-        for timer_name in ("_save_timer", "_prompt_save_timer", "_command_preview_timer"):
-            timer = getattr(self, timer_name, None)
-            try:
-                if timer is not None and timer.isActive():
-                    timer.stop()
-            except Exception:
-                pass
+        if self._save_timer.isActive():
+            self._save_timer.stop()
         self._save_settings(silent=True)
         super().closeEvent(event)
 
