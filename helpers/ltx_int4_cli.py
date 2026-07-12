@@ -145,6 +145,14 @@ def _snap_group_blocks(requested: int, block_count: int) -> int:
     return max(choices) if choices else 1
 
 
+def _select_stepped_group(work_factor: float, steps: Tuple[Tuple[float, int], ...], fallback: int) -> int:
+    """Return the first group size whose workload ceiling contains the job."""
+    for ceiling, group_blocks in steps:
+        if float(work_factor) <= float(ceiling):
+            return int(group_blocks)
+    return int(fallback)
+
+
 def _select_sdnq_offload_policy(
     *,
     weight_dtype: str,
@@ -158,18 +166,29 @@ def _select_sdnq_offload_policy(
     workflow: str = "one_stage",
     stage: str = "stage1",
     input_mode: str = "text-to-video",
+    automation_enabled: bool = True,
     int4_24_stage2_full_max_work: float = 4.40,
     int4_24_i2v_stage1_full_max_work: float = 0.45,
     int4_24_i2v_stage2_full_max_work: float = 1.25,
 ) -> Dict[str, Any]:
     """Choose the residency policy for one specific denoise stage.
 
-    T2V and I2V are calibrated separately.  The 24 GB I2V fast path remains
-    unchanged for the proven 121-frame 704p workload, while larger I2V jobs
-    switch to synchronous, non-prefetched transformer groups before Windows
-    shared-memory paging begins.  T2V keeps its wider proven fast boundary.
+    The workload unit is resolution × frames relative to the original
+    832×448×241 calibration point.  This makes every boundary automatically
+    move with resolution instead of treating frame count as the only source of
+    pressure.
 
-    INT8 and 12/16 GB profiles retain the established conservative policy.
+    The 24 GB two-stage I2V path preserves the measured fast 121-frame route
+    and the proven guarded 217/241-frame route.  The 16 GB and 12 GB planners
+    start with smaller resident transformer groups and step down earlier:
+
+    * 16 GB: Stage 1 gets an extra guard near the 180-frame/704p workload;
+      Stage 2 reduces from 16 to 12 resident blocks at the same boundary.
+    * 12 GB: Stage 1 starts reducing around the 121-frame/704p workload;
+      Stage 2 is already strongly grouped by that point.
+
+    Manual mode/group overrides still win.  Disabling the automatic planner
+    selects a fixed per-card fallback instead of applying workload thresholds.
     """
 
     dtype_text = str(weight_dtype or "unknown").strip().lower()
@@ -199,6 +218,10 @@ def _select_sdnq_offload_policy(
         float(max(1, width) * max(1, height) * max(1, num_frames))
         / _BASELINE_WORK_UNITS,
     )
+    equivalent_704_frames = (
+        float(max(1, width) * max(1, height) * max(1, num_frames))
+        / float(1280 * 704)
+    )
     workflow = str(workflow or "one_stage").strip()
     stage = str(stage or "stage1").strip().lower()
     input_mode = str(input_mode or "text-to-video").strip().lower()
@@ -216,7 +239,7 @@ def _select_sdnq_offload_policy(
     }:
         requested_mode = "auto"
 
-    # Explicit user overrides still win.
+    # Explicit user overrides always win over the under-the-hood planner.
     if requested_mode in {"model", "model_offload"}:
         desired = blocks
         mode = "model_cpu_offload"
@@ -235,21 +258,36 @@ def _select_sdnq_offload_policy(
         mode = "group_cpu_offload"
         use_stream = False
         reason = "manual group offload override; prefetch disabled for predictable VRAM"
+    elif variant == "int4" and not bool(automation_enabled):
+        # VRAM Lab OFF in the UI: keep a deterministic fixed policy.  The
+        # temporal VAE decoder remains spill-safe because that is part of the
+        # correct INT4 pipeline, not an optional tuning experiment.
+        if profile_bucket == 24:
+            desired = blocks
+            mode = "model_cpu_offload"
+        elif profile_bucket == 16:
+            desired = 16 if stage == "stage1" else 12
+            mode = "group_cpu_offload"
+        elif profile_bucket == 12:
+            desired = 8 if stage == "stage1" else 4
+            mode = "group_cpu_offload"
+        else:
+            desired = 4 if stage == "stage1" else 2
+            mode = "group_cpu_offload"
+        use_stream = False
+        reason = (
+            f"INT4 automatic VRAM planner disabled; fixed {profile_bucket}GB "
+            f"{stage} policy"
+        )
     elif (
         variant == "int4"
         and profile_bucket == 24
         and workflow == "two_stages"
         and stage == "stage1"
     ):
-        # I2V uses substantially more activation memory than T2V.  Keep the
-        # proven 121-frame 704p fast path unchanged, but stop treating every
-        # quarter-area Stage 1 workload as safe.  The first guarded boundary
-        # begins above the measured 169-frame Stage 1 workload; the 241-frame
-        # 704p I2V Stage 1 now uses a 24-block synchronous group instead of
-        # loading the entire transformer and touching Windows shared memory.
-        full_limit = (
-            float(int4_24_i2v_stage1_full_max_work) if is_i2v else 1.50
-        )
+        # Preserve the proven 121-frame/704p fast path. Larger jobs switch to
+        # synchronous groups before Windows shared-memory paging begins.
+        full_limit = float(int4_24_i2v_stage1_full_max_work) if is_i2v else 1.50
         if work_factor <= full_limit:
             desired = blocks
             mode = "model_cpu_offload"
@@ -293,97 +331,143 @@ def _select_sdnq_offload_policy(
                 f"(work={work_factor:.3f} <= {full_limit:.3f})"
             )
         else:
-            # The measured 704p I2V boundary is much lower than T2V: 121 frames
-            # at work=1.214 leaves only about 0.23 GB driver-free, while 169
-            # frames at work=1.695 reaches zero.  Halve transformer residency
-            # first, then step down gradually as activation pressure grows.
             if is_i2v:
-                if work_factor <= 1.85:
-                    desired = 24
-                elif work_factor <= 2.75:
-                    desired = 14
-                elif work_factor <= 4.00:
-                    desired = 12
-                else:
-                    desired = 8
+                desired = _select_stepped_group(
+                    work_factor,
+                    (
+                        (1.85, 24),
+                        (2.55, 14),
+                        (2.80, 12),
+                        (3.40, 6),
+                        (4.25, 4),
+                    ),
+                    3,
+                )
             else:
-                if work_factor <= 5.50:
-                    desired = 12
-                elif work_factor <= 6.50:
-                    desired = 8
-                else:
-                    desired = 6
+                desired = _select_stepped_group(
+                    work_factor,
+                    ((5.50, 12), (6.50, 8)),
+                    6,
+                )
             mode = "group_cpu_offload"
             use_stream = False
             reason = (
                 f"INT4 24GB {'I2V' if is_i2v else 'T2V'} Stage 2 boundary guard; "
                 f"synchronous groups without CUDA prefetch (work={work_factor:.3f})"
             )
-    else:
-        # Explicit per-quantization/per-VRAM profiles. Stage 1 and Stage 2 are
-        # selected independently so lower cards do not pay Stage-2 transfer
-        # costs during the quarter-area first denoise.
-        if variant == "int4":
-            if profile_bucket == 24:
-                desired = blocks
-                mode = "model_cpu_offload" if work_factor <= 1.25 else "group_cpu_offload"
-            elif profile_bucket == 16:
-                desired = 24 if stage == "stage1" else 24
-                if work_factor > 1.5:
-                    desired = 16
-                if work_factor > 3.0:
-                    desired = 12
-                mode = "group_cpu_offload"
-            elif profile_bucket == 12:
-                desired = 16 if stage == "stage1" else 12
-                if work_factor > 1.5:
-                    desired = 8
-                if work_factor > 3.0:
-                    desired = 6
-                mode = "group_cpu_offload"
-            else:  # 8 GB: INT4-only normal workflow
-                desired = 12 if stage == "stage1" else 8
-                if work_factor > 1.0:
-                    desired = 6 if stage == "stage1" else 4
-                if work_factor > 2.25:
-                    desired = 4 if stage == "stage1" else 2
-                if work_factor > 4.0:
-                    desired = 2 if stage == "stage1" else 1
-                mode = "group_cpu_offload" if desired > 1 else "sequential_cpu_offload"
-        else:  # INT8
-            if profile_bucket == 24:
-                desired = 24
-                if stage == "stage2" and work_factor > 1.25:
-                    desired = 16
-                if work_factor > 2.75:
-                    desired = 12
-                mode = "group_cpu_offload"
-            elif profile_bucket == 16:
-                desired = 12 if stage == "stage1" else 8
-                if work_factor > 1.5:
-                    desired = 6
-                if work_factor > 3.0:
-                    desired = 4
-                mode = "group_cpu_offload"
-            elif profile_bucket == 12:
-                desired = 8 if stage == "stage1" else 4
-                if work_factor > 1.5:
-                    desired = 3
-                if work_factor > 3.0:
-                    desired = 2
-                mode = "group_cpu_offload"
-            else:
-                # UI/CLI Auto redirects 8 GB cards to INT4. Keep an emergency
-                # explicit INT8 policy so a manual command fails slowly rather
-                # than spilling into shared GPU memory.
-                desired = 4 if stage == "stage1" else 2
-                if work_factor > 1.5:
-                    desired = 1
-                mode = "group_cpu_offload" if desired > 1 else "sequential_cpu_offload"
-
-        if int(override_group_blocks or 0) > 0:
-            desired = int(override_group_blocks)
+    elif variant == "int4" and profile_bucket == 24:
+        # One-stage and any future non-standard workflow still receive a real
+        # 24 GB plan. Two-stage Stage 1/Stage 2 were handled by the calibrated
+        # branches above.
+        if work_factor <= 1.25:
+            desired = blocks
+            mode = "model_cpu_offload"
+        else:
+            desired = _select_stepped_group(
+                work_factor,
+                ((2.75, 24), (4.00, 12)),
+                8,
+            )
             mode = "group_cpu_offload"
+        use_stream = False
+        reason = (
+            f"INT4 automatic 24GB {stage} general planner; "
+            f"group={desired} (work={work_factor:.3f})"
+        )
+    elif variant == "int4" and profile_bucket == 16:
+        # A 16 GB card cannot safely hold the complete 10.74 GB transformer plus
+        # 704p activations. Stage 2 therefore begins with 16 blocks. Near the
+        # user's expected ~180-frame/704p boundary (work≈1.80), it steps to 12.
+        if stage == "stage1":
+            desired = _select_stepped_group(
+                work_factor,
+                ((0.45, 24), (0.75, 16), (1.10, 12)),
+                8,
+            )
+        else:
+            desired = _select_stepped_group(
+                work_factor,
+                ((1.75, 16), (2.30, 12), (2.75, 8), (3.40, 6), (4.25, 4)),
+                3,
+            )
+        mode = "group_cpu_offload"
+        use_stream = False
+        reason = (
+            f"INT4 automatic 16GB {stage} planner; resolution/frame-aware "
+            f"group={desired} (work={work_factor:.3f})"
+        )
+    elif variant == "int4" and profile_bucket == 12:
+        # On 12 GB, the same activation workload reaches the boundary roughly
+        # twice as early. Stage 1 begins stepping down around 121 frames at
+        # 704p; Stage 2 uses a 4-block group by that workload.
+        if stage == "stage1":
+            desired = _select_stepped_group(
+                work_factor,
+                ((0.25, 16), (0.45, 12), (0.65, 8), (0.90, 6)),
+                4,
+            )
+        else:
+            desired = _select_stepped_group(
+                work_factor,
+                ((0.65, 8), (1.10, 6), (1.80, 4), (2.75, 3)),
+                2,
+            )
+        mode = "group_cpu_offload"
+        use_stream = False
+        reason = (
+            f"INT4 automatic 12GB {stage} planner; resolution/frame-aware "
+            f"group={desired} (work={work_factor:.3f})"
+        )
+    elif variant == "int4" and profile_bucket == 8:
+        # Emergency 8 GB profile. This is intentionally conservative and may be
+        # slow, but it avoids pretending a 12 GB plan can fit.
+        if stage == "stage1":
+            desired = _select_stepped_group(
+                work_factor,
+                ((0.25, 8), (0.50, 6), (0.80, 4)),
+                2,
+            )
+        else:
+            desired = _select_stepped_group(
+                work_factor,
+                ((0.55, 4), (1.10, 3), (2.00, 2)),
+                1,
+            )
+        mode = "group_cpu_offload" if desired > 1 else "sequential_cpu_offload"
+        use_stream = False
+        reason = (
+            f"INT4 automatic 8GB {stage} emergency planner; "
+            f"group={desired} (work={work_factor:.3f})"
+        )
+    else:
+        # INT8 is not connected to the UI, but retain the prior conservative
+        # fallback for manual commands.
+        if profile_bucket == 24:
+            desired = 24
+            if stage == "stage2" and work_factor > 1.25:
+                desired = 16
+            if work_factor > 2.75:
+                desired = 12
+            mode = "group_cpu_offload"
+        elif profile_bucket == 16:
+            desired = 12 if stage == "stage1" else 8
+            if work_factor > 1.5:
+                desired = 6
+            if work_factor > 3.0:
+                desired = 4
+            mode = "group_cpu_offload"
+        elif profile_bucket == 12:
+            desired = 8 if stage == "stage1" else 4
+            if work_factor > 1.5:
+                desired = 3
+            if work_factor > 3.0:
+                desired = 2
+            mode = "group_cpu_offload"
+        else:
+            desired = 4 if stage == "stage1" else 2
+            if work_factor > 1.5:
+                desired = 1
+            mode = "group_cpu_offload" if desired > 1 else "sequential_cpu_offload"
         use_stream = False
         reason = (
             f"SDNQ {variant.upper()} {profile_bucket}GB {stage} profile; "
@@ -401,10 +485,12 @@ def _select_sdnq_offload_policy(
         "variant": variant,
         "profile_bucket": profile_bucket,
         "work_factor": work_factor,
+        "equivalent_704_frames": equivalent_704_frames,
         "block_count": blocks,
         "group_blocks": group_blocks,
         "mode": mode,
         "override_mode": requested_mode,
+        "automation_enabled": bool(automation_enabled),
         "use_stream": bool(use_stream),
         "reason": reason,
         "stage": stage,
@@ -1501,6 +1587,12 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         ),
     )
     profile_gb = int(str(getattr(args, "vram_profile", "24") or "24"))
+    auto_vram_enabled = bool(getattr(args, "int4_auto_vram", True))
+    ctx["ltx_int4_vram_automation"] = (
+        f"enabled: detected/selected {profile_gb}GB profile with resolution/frame-aware stage planning"
+        if auto_vram_enabled
+        else f"disabled: fixed {profile_gb}GB per-card policy"
+    )
 
     stage1_policy = _select_sdnq_offload_policy(
         weight_dtype=raw_weight_dtype,
@@ -1514,6 +1606,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         workflow=workflow,
         stage="stage1",
         input_mode="image-to-video" if image_path else "text-to-video",
+        automation_enabled=auto_vram_enabled,
         int4_24_stage2_full_max_work=int4_24_stage2_full_max_work,
         int4_24_i2v_stage1_full_max_work=int4_24_i2v_stage1_full_max_work,
         int4_24_i2v_stage2_full_max_work=int4_24_i2v_stage2_full_max_work,
@@ -1530,12 +1623,36 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         workflow=workflow,
         stage="stage2",
         input_mode="image-to-video" if image_path else "text-to-video",
+        automation_enabled=auto_vram_enabled,
         int4_24_stage2_full_max_work=int4_24_stage2_full_max_work,
         int4_24_i2v_stage1_full_max_work=int4_24_i2v_stage1_full_max_work,
         int4_24_i2v_stage2_full_max_work=int4_24_i2v_stage2_full_max_work,
     )
     if workflow != "two_stages":
         stage2_policy = dict(stage1_policy)
+
+    # Long Stage 2 jobs can leave a large amount of inactive allocator cache
+    # reserved after each refinement step. On Windows that reservation can push
+    # otherwise-dead memory into WDDM shared GPU memory for the remaining steps.
+    # Use the same workload boundaries that motivate stronger offload on 12/16GB
+    # cards, while leaving the proven 121/217/241-frame 24GB paths untouched.
+    stage2_allocator_trim_threshold = {24: 2.80, 16: 1.75, 12: 1.10, 8: 0.0}.get(
+        int(stage2_policy.get("profile_bucket", 24)),
+        2.80,
+    )
+    stage2_allocator_trim = bool(
+        workflow == "two_stages"
+        and str(stage2_policy.get("mode", "")) in {"group_cpu_offload", "sequential_cpu_offload"}
+        and float(stage2_policy.get("work_factor", 0.0)) > float(stage2_allocator_trim_threshold)
+    )
+    ctx["ltx_sdnq_stage2_allocator_guard"] = (
+        "enabled: release inactive CUDA allocator cache after refinement steps "
+        f"1-2 (work={float(stage2_policy.get('work_factor', 0.0)):.3f} > "
+        f"{stage2_allocator_trim_threshold:.3f})"
+        if stage2_allocator_trim
+        else "not needed for this workload/profile"
+    )
+    ctx["ltx_sdnq_stage2_allocator_trim_count"] = "0"
 
     def _estimated_group_gb(selected_policy: Dict[str, Any]) -> float:
         return (
@@ -1559,6 +1676,8 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
     )
     ctx["ltx_sdnq_stage1_policy_tier"] = str(stage1_policy["policy_tier"])
     ctx["ltx_sdnq_stage2_policy_tier"] = str(stage2_policy["policy_tier"])
+    ctx["ltx_sdnq_stage1_equivalent_704_frames"] = f"{stage1_policy['equivalent_704_frames']:.1f}"
+    ctx["ltx_sdnq_stage2_equivalent_704_frames"] = f"{stage2_policy['equivalent_704_frames']:.1f}"
     ctx["ltx_sdnq_i2v_fast_path_limits"] = (
         f"24GB Stage1<={int4_24_i2v_stage1_full_max_work:.3f}; "
         f"Stage2<={int4_24_i2v_stage2_full_max_work:.3f}"
@@ -2096,8 +2215,15 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
             f"{float(minimum)/(1024**3):.2f}" if minimum is not None else "unavailable"
         )
 
-    def _make_callback(label: str, expected_steps: int, phase_name: str):
+    def _make_callback(
+        label: str,
+        expected_steps: int,
+        phase_name: str,
+        *,
+        trim_cuda_cache: bool = False,
+    ):
         previous = time.perf_counter()
+        trim_count = 0
 
         def _callback(
             _pipe: Any,
@@ -2105,14 +2231,46 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
             _timestep: int,
             callback_kwargs: Dict[str, Any],
         ) -> Dict[str, Any]:
-            nonlocal previous
+            nonlocal previous, trim_count
             now = time.perf_counter()
             real = now - previous
-            previous = now
             event = f"{label} step {int(step)+1}/{expected_steps} real={real:.3f}s"
             step_events.append(event)
             _sample_driver_free(phase_name)
             print(f"[ltx-step-time] {event}", flush=True)
+
+            # Do this only between Stage 2 refinement steps. ``empty_cache``
+            # never frees live tensors; it returns unused allocator blocks to
+            # the CUDA driver so WDDM does not keep paging a stale 20+ GB cache
+            # through shared GPU memory for the next step.
+            if bool(trim_cuda_cache) and int(step) + 1 < int(expected_steps):
+                try:
+                    _sync_cuda()
+                    before_reserved = float(torch_module.cuda.memory_reserved()) / (1024 ** 3)
+                    before_free = float(torch_module.cuda.mem_get_info()[0]) / (1024 ** 3)
+                    torch_module.cuda.empty_cache()
+                    _sync_cuda()
+                    after_reserved = float(torch_module.cuda.memory_reserved()) / (1024 ** 3)
+                    after_free = float(torch_module.cuda.mem_get_info()[0]) / (1024 ** 3)
+                    trim_count += 1
+                    ctx["ltx_sdnq_stage2_allocator_trim_count"] = str(trim_count)
+                    ctx["ltx_sdnq_stage2_allocator_trim_last"] = (
+                        f"after step {int(step)+1}/{expected_steps}: "
+                        f"reserved {before_reserved:.2f}->{after_reserved:.2f} GB; "
+                        f"driver_free {before_free:.2f}->{after_free:.2f} GB"
+                    )
+                    print(
+                        "[ltx-status] Stage 2 allocator trim: "
+                        f"reserved {before_reserved:.2f}->{after_reserved:.2f} GB; "
+                        f"driver_free {before_free:.2f}->{after_free:.2f} GB",
+                        flush=True,
+                    )
+                    _sample_driver_free(phase_name)
+                except Exception as exc:
+                    ctx["ltx_sdnq_stage2_allocator_trim_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            previous = time.perf_counter()
             return callback_kwargs
 
         return _callback
@@ -2351,7 +2509,12 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
             # shared-memory spill after step 3/3.
             "output_type": "latent",
             "return_dict": False,
-            "callback_on_step_end": _make_callback("sdnq stage2", stage2_steps, "stage2"),
+            "callback_on_step_end": _make_callback(
+                "sdnq stage2",
+                stage2_steps,
+                "stage2",
+                trim_cuda_cache=stage2_allocator_trim,
+            ),
             "callback_on_step_end_tensor_inputs": ["latents"],
             "max_sequence_length": 1024,
         }
@@ -2720,16 +2883,21 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
 # Standalone isolated CLI wrapper
 # ---------------------------------------------------------------------------
 
-def _detect_vram_profile(torch_module: Any) -> int:
+def _detect_vram_total_gb(torch_module: Any) -> float:
     try:
-        total_gb = float(torch_module.cuda.get_device_properties(0).total_memory) / (1024 ** 3)
+        return float(torch_module.cuda.get_device_properties(0).total_memory) / (1024 ** 3)
     except Exception:
-        total_gb = 24.0
+        return 24.0
+
+
+def _detect_vram_profile(torch_module: Any) -> int:
+    total_gb = _detect_vram_total_gb(torch_module)
+    # Consumer cards often report slightly below their marketed capacity in GiB.
     if total_gb >= 23.0:
         return 24
-    if total_gb >= 16.0:
+    if total_gb >= 15.0:
         return 16
-    if total_gb >= 12.0:
+    if total_gb >= 11.0:
         return 12
     return 8
 
@@ -2832,10 +3000,15 @@ def _write_report(path: Path, ctx: Dict[str, Any], exception_text: str = "") -> 
     preferred = [
         "generation_status", "generation_completed", "total_runtime_s",
         "ltx_int4_model_validation", "ltx_int4_input_mode_requested",
+        "requested_vram_profile", "detected_cuda_vram_gb", "resolved_vram_profile_gb",
+        "ltx_int4_vram_lab_toggle", "ltx_int4_vram_automation",
         "ltx_sdnq_input_mode", "ltx_sdnq_pipeline_class", "ltx_sdnq_model_root",
         "ltx_sdnq_workflow", "ltx_sdnq_weight_dtype", "ltx_sdnq_offload_policy",
         "ltx_sdnq_memory_policy_input_mode", "ltx_sdnq_stage1_policy_tier",
-        "ltx_sdnq_stage2_policy_tier", "ltx_sdnq_i2v_fast_path_limits",
+        "ltx_sdnq_stage2_policy_tier", "ltx_sdnq_stage1_equivalent_704_frames",
+        "ltx_sdnq_stage2_equivalent_704_frames", "ltx_sdnq_i2v_fast_path_limits",
+        "ltx_sdnq_stage2_allocator_guard", "ltx_sdnq_stage2_allocator_trim_count",
+        "ltx_sdnq_stage2_allocator_trim_last", "ltx_sdnq_stage2_allocator_trim_error",
         "ltx_sdnq_stage1_offload_policy", "ltx_sdnq_stage2_offload_policy",
         "ltx_sdnq_prompt_peak_allocated_gb", "ltx_sdnq_prompt_peak_reserved_gb",
         "ltx_sdnq_stage1_peak_allocated_gb", "ltx_sdnq_stage1_peak_reserved_gb",
@@ -2873,6 +3046,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pipeline", choices=["one_stage", "two_stages"], default="two_stages")
     parser.add_argument("--model-root", "--sdnq-model-root", dest="sdnq_model_root", required=True)
     parser.add_argument("--vram-profile", choices=["auto", "24", "16", "12", "8"], default="auto")
+    planner = parser.add_mutually_exclusive_group()
+    planner.add_argument(
+        "--int4-auto-vram",
+        dest="int4_auto_vram",
+        action="store_true",
+        help="Enable automatic per-stage INT4 residency planning from detected VRAM, resolution and frames.",
+    )
+    planner.add_argument(
+        "--no-int4-auto-vram",
+        dest="int4_auto_vram",
+        action="store_false",
+        help="Disable workload scaling and use a fixed per-card INT4 residency policy.",
+    )
+    parser.set_defaults(int4_auto_vram=True)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--negative-prompt", default="")
     parser.add_argument("--output-path", required=True)
@@ -2951,9 +3138,14 @@ def main() -> int:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is unavailable in the selected .ltx23 environment.")
 
-        if str(args.vram_profile).lower() == "auto":
+        requested_profile = str(args.vram_profile)
+        detected_total_gb = _detect_vram_total_gb(torch)
+        if requested_profile.lower() == "auto":
             args.vram_profile = str(_detect_vram_profile(torch))
+        ctx["requested_vram_profile"] = requested_profile
+        ctx["detected_cuda_vram_gb"] = f"{detected_total_gb:.2f}"
         ctx["resolved_vram_profile_gb"] = str(args.vram_profile)
+        ctx["ltx_int4_vram_lab_toggle"] = "ON" if bool(args.int4_auto_vram) else "OFF"
 
         if args.deep_lifecycle_log:
             monitor = _CudaMonitor(torch, deep_path, args.deep_log_interval, args.deep_log_max_events)

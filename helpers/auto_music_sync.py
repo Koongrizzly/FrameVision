@@ -617,7 +617,7 @@ def _musicclip_ltx_hard_cap_seconds_from_payload(payload: dict) -> float:
     if not isinstance(settings, dict):
         settings = {}
     backend = str(settings.get("ltx_backend") or payload.get("ltx_backend") or payload.get("generation_backend") or "").strip().lower()
-    has_vramlab_limit = backend == "vramlab" or settings.get("ltx_max_generation_frames") or settings.get("hard_max_ltx_shot_seconds") or settings.get("ltx_max_generation_seconds")
+    has_vramlab_limit = backend in {"int4", "vramlab"} or settings.get("ltx_max_generation_frames") or settings.get("hard_max_ltx_shot_seconds") or settings.get("ltx_max_generation_seconds")
     if not has_vramlab_limit:
         return 0.0
     for key in ("hard_max_ltx_shot_seconds", "ltx_max_generation_seconds", "max_ltx_shot_seconds"):
@@ -715,7 +715,7 @@ def _musicclip_ltx_raw_padding_settings_from_payload(payload: dict) -> tuple[flo
     if not isinstance(settings, dict):
         settings = {}
     backend = str(settings.get("ltx_backend") or payload.get("ltx_backend") or payload.get("generation_backend") or "").strip().lower()
-    if backend != "vramlab" and not (settings.get("ltx_raw_generation_seconds") or payload.get("ltx_raw_generation_seconds")):
+    if backend not in {"int4", "vramlab"} and not (settings.get("ltx_raw_generation_seconds") or payload.get("ltx_raw_generation_seconds")):
         return 0.0, 0, 0.0
     try:
         raw_seconds = float(settings.get("ltx_raw_generation_seconds") or payload.get("ltx_raw_generation_seconds") or 11.0)
@@ -1216,9 +1216,15 @@ def _load_musicclip_planner_bridge():
 
 
 def _load_clip2ltx_bridge():
-    # Own LTX-VRAMLab bridge. This is the copy of the original bridge that calls
-    # helpers/ltx23_vram_lab_cli.py directly. It must not depend on the Wan2GP bridge.
+    # Own LTX-VRAMLab FP16/FP8 bridge. This is the copy of the original bridge
+    # that calls helpers/ltx23_vram_lab_cli.py directly.
     return _musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("clip2ltx_cli.py", "_framevision_clip2ltx_bridge"))
+
+
+def _load_music_ltx_int4_bridge():
+    # Isolated INT4 adapter. It reuses clip2ltx_cli.py planning/assembly but
+    # routes only the generation command to helpers/ltx_int4_cli.py.
+    return _musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("music_ltx_int4.py", "_framevision_music_ltx_int4_bridge"))
 
 
 def _musicclip_default_llama_runner() -> str:
@@ -3593,31 +3599,52 @@ def _segments_from_list(items: list) -> list:
 
 
 
-def _musicclip_load_ltx_bridge_module_for_queue(root_dir: str):
-    """Load helpers/musicclip_planner_bridge.py for headless Queue LTX jobs."""
-    try:
-        import helpers.musicclip_planner_bridge as bridge  # type: ignore
-        return _musicclip_patch_krea2_bridge(bridge)
-    except Exception:
-        pass
-    try:
-        import musicclip_planner_bridge as bridge  # type: ignore
-        return _musicclip_patch_krea2_bridge(bridge)
-    except Exception:
-        pass
+def _musicclip_load_ltx_bridge_module_for_queue(root_dir: str, backend: str = ""):
+    """Load the selected LTX bridge for a headless FrameVision Queue job."""
     import importlib.util
+
     root = Path(str(root_dir or _musicclip_project_root())).resolve()
-    bridge_path = root / "helpers" / "musicclip_planner_bridge.py"
-    if not bridge_path.is_file():
-        bridge_path = root / "musicclip_planner_bridge.py"
-    if not bridge_path.is_file():
-        raise FileNotFoundError(f"musicclip_planner_bridge.py was not found for queued LTX run: {bridge_path}")
-    spec = importlib.util.spec_from_file_location("musicclip_planner_bridge_queue", str(bridge_path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load bridge module spec: {bridge_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[attr-defined]
-    return _musicclip_patch_krea2_bridge(module)
+    selected = str(backend or "").strip().lower().replace("_", "-")
+    if selected in {"int4", "ltx-int4", "ltx23-int4", "sdnq-int4"}:
+        filenames = ["music_ltx_int4.py"]
+    elif selected in {"vramlab", "vram-lab", "ltx-vramlab"}:
+        filenames = ["clip2ltx_cli.py"]
+    elif selected in {"wan2gp", "wangp", "wan-gp", "wgp"}:
+        filenames = ["musicclip_planner_bridge.py"]
+    else:
+        # Old queue payloads did not store the selected backend. Keep them
+        # working while preferring INT4 when that complete installation exists.
+        filenames = ["music_ltx_int4.py", "clip2ltx_cli.py", "musicclip_planner_bridge.py"]
+
+    errors = []
+    for filename in filenames:
+        candidates = [root / "helpers" / filename, root / filename]
+        bridge_path = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if bridge_path is None:
+            errors.append(f"{filename}: file not found")
+            continue
+        try:
+            module_name = f"_framevision_musicclip_queue_{bridge_path.stem}_{abs(hash(str(bridge_path)))}"
+            spec = importlib.util.spec_from_file_location(module_name, str(bridge_path))
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"Could not load module spec: {bridge_path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)  # type: ignore[attr-defined]
+            available = getattr(module, "is_available", None)
+            if callable(available) and not bool(available()):
+                status_fn = getattr(module, "int4_install_status", None)
+                status = status_fn(root) if callable(status_fn) else {}
+                note = str(status.get("message") or "bridge reported unavailable") if isinstance(status, dict) else "bridge reported unavailable"
+                errors.append(f"{filename}: {note}")
+                continue
+            if not callable(getattr(module, "run_all_ltx_director_shots", None)):
+                errors.append(f"{filename}: run_all_ltx_director_shots is missing")
+                continue
+            return _musicclip_patch_krea2_bridge(module)
+        except BaseException as exc:
+            errors.append(f"{filename}: {type(exc).__name__}: {exc}")
+
+    raise FileNotFoundError("No usable queued LTX bridge was found. " + " | ".join(errors))
 
 
 def run_ltx_full_queue_payload(payload_path: str) -> int:
@@ -3634,7 +3661,8 @@ def run_ltx_full_queue_payload(payload_path: str) -> int:
             return 3
 
         root_dir = str(payload.get("root_dir") or _musicclip_project_root())
-        bridge = _musicclip_load_ltx_bridge_module_for_queue(root_dir)
+        selected_backend = str(payload.get("ltx_backend") or payload.get("ltx_generation_backend") or "")
+        bridge = _musicclip_load_ltx_bridge_module_for_queue(root_dir, selected_backend)
 
         def _progress(text):
             msg = str(text or "").strip()
@@ -10554,10 +10582,12 @@ class AutoMusicSyncWidget(QWidget):
         self._visual_thumbs = VisualThumbManager(self, ffmpeg=self._ffmpeg)
 
         # Optional/private LTX bridge files. Missing/broken helpers must not affect public builds.
+        # music_ltx_int4.py = isolated INT4 adapter (preferred when fully installed).
+        # clip2ltx_cli.py = own LTX-VRAMLab FP16/FP8 bridge.
         # musicclip_planner_bridge.py = original/Wan2GP bridge.
-        # clip2ltx_cli.py = own LTX-VRAMLab bridge.
-        self._planner_bridge = _load_musicclip_planner_bridge()
+        self._ltx_int4_bridge = _load_music_ltx_int4_bridge()
         self._ltx_vramlab_bridge = _load_clip2ltx_bridge()
+        self._planner_bridge = _load_musicclip_planner_bridge()
         self._ltx_director_worker = None
         self._ltx_director_running = False
 
@@ -11464,8 +11494,9 @@ class AutoMusicSyncWidget(QWidget):
             self.combo_ltx_generation_backend = QComboBox(self.ltx_section_idea)
             self.combo_ltx_generation_backend.setToolTip(
                 "Choose which backend generates the LTX clips for this Music Clip Creator workflow. "
-                "LTX-VRAMLab uses helpers/clip2ltx_cli.py plus your own helpers/ltx23_vram_lab_cli.py settings. "
-                "Wan2GP is shown only when helpers/musicclip_planner_bridge.py and a valid Wan2GP/wgp.py are found."
+                "LTX INT4 is preferred when helpers/music_ltx_int4.py, helpers/ltx_int4_cli.py, the .ltx23 environment, "
+                "and models/ltx23_int4 are complete. FP16/FP8 remains available through helpers/clip2ltx_cli.py and "
+                "helpers/ltx23_vram_lab_cli.py. Wan2GP is shown only when its bridge and a valid Wan2GP/wgp.py are found."
             )
             backend_form.addRow("LTX Music Workflow:", self.combo_ltx_generation_backend)
             ltx_idea_lay.addLayout(backend_form)
@@ -14924,7 +14955,7 @@ class AutoMusicSyncWidget(QWidget):
             max_ltx = 0.0
 
         backend = self._current_ltx_generation_backend() if hasattr(self, "_current_ltx_generation_backend") else ""
-        if backend == "vramlab":
+        if backend in {"int4", "vramlab"}:
             # Planned/music/audio shot timing should stay just under the 10s hard
             # render limit. Raw LTX renders still get the separate 11s/265f tail for
             # trimming/lipsync breathing room.
@@ -14964,13 +14995,13 @@ class AutoMusicSyncWidget(QWidget):
             "ltx_aspect_mode": "portrait" if ltx_portrait else "landscape",
             # Planned/music/audio shot timing stays just below 10s. Raw LTX renders
             # get a small extra tail for trimming/lipsync breathing room.
-            "ltx_max_generation_seconds": 10.0 if backend == "vramlab" else None,
-            "ltx_max_generation_frames": 241 if backend == "vramlab" else None,
-            "hard_max_ltx_shot_seconds": 9.9 if backend == "vramlab" else None,
-            "ltx_raw_generation_seconds": 11.0 if backend == "vramlab" else None,
-            "ltx_raw_generation_frames": 265 if backend == "vramlab" else None,
-            "ltx_generation_tail_padding_seconds": 1.0 if backend == "vramlab" else None,
-            "ltx_trim_to_planned_shot_seconds": True if backend == "vramlab" else None,
+            "ltx_max_generation_seconds": 10.0 if backend in {"int4", "vramlab"} else None,
+            "ltx_max_generation_frames": 241 if backend in {"int4", "vramlab"} else None,
+            "hard_max_ltx_shot_seconds": 9.9 if backend in {"int4", "vramlab"} else None,
+            "ltx_raw_generation_seconds": 11.0 if backend in {"int4", "vramlab"} else None,
+            "ltx_raw_generation_frames": 265 if backend in {"int4", "vramlab"} else None,
+            "ltx_generation_tail_padding_seconds": 1.0 if backend in {"int4", "vramlab"} else None,
+            "ltx_trim_to_planned_shot_seconds": True if backend in {"int4", "vramlab"} else None,
             "timestamped_microclips_enabled": bool(getattr(self, "check_bridge_timestamped_microclips", None) and self.check_bridge_timestamped_microclips.isChecked()),
             "collage_effect_enabled": bool(getattr(self, "check_bridge_collage_effect", None) and self.check_bridge_collage_effect.isChecked()),
             "avoid_effects_in_first_clip": bool((getattr(self, "check_bridge_avoid_effects_first_clip", None) is None) or self.check_bridge_avoid_effects_first_clip.isChecked()),
@@ -17831,19 +17862,30 @@ class AutoMusicSyncWidget(QWidget):
         worker.start()
 
     def _has_any_ltx_bridge(self) -> bool:
-        return bool(getattr(self, "_ltx_vramlab_bridge", None) is not None or getattr(self, "_planner_bridge", None) is not None)
+        return bool(
+            getattr(self, "_ltx_int4_bridge", None) is not None
+            or getattr(self, "_ltx_vramlab_bridge", None) is not None
+            or getattr(self, "_planner_bridge", None) is not None
+        )
 
     def _current_ltx_bridge(self):
         backend = self._current_ltx_generation_backend() if hasattr(self, "_current_ltx_generation_backend") else ""
+        if backend == "int4":
+            return getattr(self, "_ltx_int4_bridge", None)
         if backend == "vramlab":
             return getattr(self, "_ltx_vramlab_bridge", None)
         if backend == "wan2gp":
             return getattr(self, "_planner_bridge", None)
-        # Safe fallback for startup/old saved settings. Prefer the own workflow when present.
-        return getattr(self, "_ltx_vramlab_bridge", None) or getattr(self, "_planner_bridge", None)
+        # Safe fallback for startup/old saved settings. Prefer INT4 only when its
+        # adapter has already validated the model, environment and runner.
+        return (
+            getattr(self, "_ltx_int4_bridge", None)
+            or getattr(self, "_ltx_vramlab_bridge", None)
+            or getattr(self, "_planner_bridge", None)
+        )
 
     def _refresh_ltx_generation_backend_choices(self) -> None:
-        """Populate Music Clip Creator LTX backend choices from the two real bridge files."""
+        """Populate LTX backends and prefer a complete INT4 installation once."""
         combo = getattr(self, "combo_ltx_generation_backend", None)
         if combo is None:
             return
@@ -17881,33 +17923,24 @@ class AutoMusicSyncWidget(QWidget):
             old = str(combo.currentData() or "")
             combo.blockSignals(True)
             combo.clear()
-            notes = []
+
+            int4_bridge = getattr(self, "_ltx_int4_bridge", None)
+            int4_adapter_file = helpers / "music_ltx_int4.py"
+            int4_cli_file = helpers / "ltx_int4_cli.py"
+            if int4_bridge is not None and int4_adapter_file.is_file() and int4_cli_file.is_file():
+                combo.addItem("LTX INT4 (preferred)", "int4")
 
             vram_bridge = getattr(self, "_ltx_vramlab_bridge", None)
             vram_bridge_file = helpers / "clip2ltx_cli.py"
             raw_vram_cli = helpers / "ltx23_vram_lab_cli.py"
             if vram_bridge is not None and vram_bridge_file.is_file() and raw_vram_cli.is_file():
-                combo.addItem("LTX-VRAMLab", "vramlab")
-                notes.append("LTX-VRAMLab ready: clip2ltx_cli.py + ltx23_vram_lab_cli.py")
-            elif vram_bridge_file.is_file() and raw_vram_cli.is_file():
-                notes.append("LTX-VRAMLab hidden: clip2ltx_cli.py exists but failed to import")
-            elif vram_bridge_file.is_file():
-                notes.append("LTX-VRAMLab hidden: helpers/ltx23_vram_lab_cli.py is missing")
-            else:
-                notes.append("LTX-VRAMLab hidden: helpers/clip2ltx_cli.py is missing")
+                combo.addItem("LTX-VRAMLab (FP16/FP8)", "vramlab")
 
             wan_bridge = getattr(self, "_planner_bridge", None)
             wan_bridge_file = helpers / "musicclip_planner_bridge.py"
-            wan_root_ok, wan_root_note = _wan2gp_root_note(root)
+            wan_root_ok, _wan_root_note = _wan2gp_root_note(root)
             if wan_bridge is not None and wan_bridge_file.is_file() and wan_root_ok:
                 combo.addItem("Wan2GP", "wan2gp")
-                notes.append(f"Wan2GP ready: musicclip_planner_bridge.py + {wan_root_note}")
-            elif wan_bridge_file.is_file() and not wan_root_ok:
-                notes.append(f"Wan2GP hidden: {wan_root_note}")
-            elif wan_bridge_file.is_file():
-                notes.append("Wan2GP hidden: musicclip_planner_bridge.py exists but failed to import")
-            else:
-                notes.append("Wan2GP hidden: helpers/musicclip_planner_bridge.py is missing")
 
             if combo.count() <= 0:
                 combo.addItem("No LTX workflow bridge found", "")
@@ -17915,40 +17948,41 @@ class AutoMusicSyncWidget(QWidget):
             else:
                 combo.setEnabled(True)
                 saved = ""
+                migrated = False
                 try:
                     saved = str(self._settings.get("ltx/generation_backend", self._settings.get("musicclip_ltx_generation_backend", "", str), str) or "").strip().lower()
+                    migrated = bool(int(self._settings.get("ltx/int4_preference_initialized", 0)))
                 except Exception:
                     saved = ""
-                wanted = old if old in {"vramlab", "wan2gp"} else (saved if saved in {"vramlab", "wan2gp"} else "vramlab")
-                idx = -1
-                for i in range(combo.count()):
-                    if str(combo.itemData(i) or "") == wanted:
-                        idx = i
-                        break
-                if idx < 0:
-                    idx = 0
+                    migrated = False
+                available = {str(combo.itemData(i) or "") for i in range(combo.count())}
+                if "int4" in available and not migrated:
+                    wanted = "int4"
+                elif old in available:
+                    wanted = old
+                elif saved in available:
+                    wanted = saved
+                elif "int4" in available:
+                    wanted = "int4"
+                elif "vramlab" in available:
+                    wanted = "vramlab"
+                else:
+                    wanted = next(iter(available), "")
+                idx = next((i for i in range(combo.count()) if str(combo.itemData(i) or "") == wanted), 0)
                 combo.setCurrentIndex(idx)
             combo.blockSignals(False)
             try:
                 self._apply_ltx_backend_duration_limits()
             except Exception:
                 pass
-            # No workflow status label in the UI. The combo itself is the status.
-        except Exception as exc:
+        except Exception:
             try:
                 combo.blockSignals(False)
             except Exception:
                 pass
-            # No workflow status label in the UI. Keep failures out of the normal layout.
 
     def _apply_ltx_backend_duration_limits(self) -> None:
-        """Keep the Smart Scene manual max aligned with the selected LTX backend.
-
-        Own LTX-VRAMLab currently supports up to about 241 frames in this Music
-        Clip Creator workflow. The visible manual planning cap stays just below
-        10 seconds so raw renders have trim/lipsync breathing room. Wan2GP keeps
-        the wider manual range.
-        """
+        """Keep own-LTX backends under the proven Music Clip duration cap."""
         try:
             backend = self._current_ltx_generation_backend()
         except Exception:
@@ -17956,9 +17990,6 @@ class AutoMusicSyncWidget(QWidget):
         try:
             spin = getattr(self, "spin_smart_max_scene_len", None)
             if spin is not None:
-                # Be conservative when the backend is still initializing/unknown: the default
-                # Music Clip Creator LTX path is VramLab, so do not leave this spinbox open
-                # to 30s unless Wan2GP is explicitly selected.
                 max_allowed = 30.0 if backend == "wan2gp" else 9.9
                 try:
                     spin.setRange(0.5, float(max_allowed))
@@ -17971,30 +18002,32 @@ class AutoMusicSyncWidget(QWidget):
                     pass
                 try:
                     if backend == "wan2gp":
-                        spin.setToolTip(
-                            "Manual maximum smart scene length. Auto mode ignores this value and uses source clip stats."
-                        )
+                        spin.setToolTip("Manual maximum smart scene length. Auto mode ignores this value and uses source clip stats.")
+                    elif backend == "int4":
+                        spin.setToolTip("Manual maximum smart scene length for LTX INT4. It stops at 9.9s so the raw render has trim/lipsync breathing room.")
                     else:
-                        spin.setToolTip(
-                            "Manual maximum smart scene length for the LTX-VRAMLab workflow. It stops at 9.9s so the raw 11s render has trim/lipsync breathing room."
-                        )
+                        spin.setToolTip("Manual maximum smart scene length for LTX-VRAMLab FP16/FP8. It stops at 9.9s so the raw render has trim/lipsync breathing room.")
                 except Exception:
                     pass
         except Exception:
             pass
 
     def _current_ltx_generation_backend(self) -> str:
+        valid = {"int4", "vramlab", "wan2gp"}
         combo = getattr(self, "combo_ltx_generation_backend", None)
         if combo is not None:
             value = str(combo.currentData() or "").strip().lower()
-            if value in {"vramlab", "wan2gp"}:
+            if value in valid:
                 return value
         try:
             saved = str(self._settings.get("ltx/generation_backend", self._settings.get("musicclip_ltx_generation_backend", "", str), str) or "").strip().lower()
-            if saved in {"vramlab", "wan2gp"}:
-                return saved
+            if saved in valid:
+                if saved != "int4" or getattr(self, "_ltx_int4_bridge", None) is not None:
+                    return saved
         except Exception:
             pass
+        if getattr(self, "_ltx_int4_bridge", None) is not None:
+            return "int4"
         if getattr(self, "_ltx_vramlab_bridge", None) is not None:
             return "vramlab"
         if getattr(self, "_planner_bridge", None) is not None:
@@ -20548,7 +20581,11 @@ class AutoMusicSyncWidget(QWidget):
                 try:
                     self.combo_ltx_generation_backend.blockSignals(True)
                     backend = str(s.get("ltx/generation_backend", s.get("musicclip_ltx_generation_backend", "", str), str) or "").strip().lower()
-                    if backend in ("vramlab", "wan2gp"):
+                    int4_ready = getattr(self, "_ltx_int4_bridge", None) is not None
+                    int4_migrated = bool(int(s.get("ltx/int4_preference_initialized", 0)))
+                    if int4_ready and not int4_migrated:
+                        self._ltx_combo_set_data(self.combo_ltx_generation_backend, "int4")
+                    elif backend in ("int4", "vramlab", "wan2gp"):
                         self._ltx_combo_set_data(self.combo_ltx_generation_backend, backend)
                 finally:
                     self.combo_ltx_generation_backend.blockSignals(False)
@@ -21082,9 +21119,11 @@ class AutoMusicSyncWidget(QWidget):
         _set("planner_bridge_ltx_export_audio_chunks", _checked("check_bridge_ltx_export_audio_chunks", 1))
         _set("planner_bridge_ltx_fps", int(_spin_value("spin_bridge_ltx_fps", 24)))
         _ltx_backend_value = self._current_ltx_generation_backend() if hasattr(self, "_current_ltx_generation_backend") else ""
-        if _ltx_backend_value in {"vramlab", "wan2gp"}:
+        if _ltx_backend_value in {"int4", "vramlab", "wan2gp"}:
             _set("ltx/generation_backend", _ltx_backend_value)
             _set("musicclip_ltx_generation_backend", _ltx_backend_value)
+            if getattr(self, "_ltx_int4_bridge", None) is not None:
+                _set("ltx/int4_preference_initialized", 1)
         _set("ltx/use_framevision_queue", _checked("check_ltx_use_framevision_queue", 1))
         _set("planner_bridge_last_scene_plan_path", str(getattr(self, "_planner_bridge_last_scene_plan_path", "") or ""))
         _set("planner_bridge_last_prompt_plan_path", str(getattr(self, "_planner_bridge_last_prompt_plan_path", "") or ""))
@@ -21199,9 +21238,11 @@ class AutoMusicSyncWidget(QWidget):
                 s.set("planner_bridge_ltx_fps", int(self.spin_bridge_ltx_fps.value()))
             if getattr(self, "combo_ltx_generation_backend", None) is not None:
                 _ltx_backend_value = self._current_ltx_generation_backend() if hasattr(self, "_current_ltx_generation_backend") else ""
-                if _ltx_backend_value in {"vramlab", "wan2gp"}:
+                if _ltx_backend_value in {"int4", "vramlab", "wan2gp"}:
                     s.set("ltx/generation_backend", _ltx_backend_value)
                     s.set("musicclip_ltx_generation_backend", _ltx_backend_value)
+                    if getattr(self, "_ltx_int4_bridge", None) is not None:
+                        s.set("ltx/int4_preference_initialized", 1)
             if getattr(self, "check_ltx_use_framevision_queue", None) is not None:
                 s.set("ltx/use_framevision_queue", int(self.check_ltx_use_framevision_queue.isChecked()))
             if getattr(self, "edit_ltx_output_dir", None) is not None:
