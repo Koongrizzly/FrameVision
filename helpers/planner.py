@@ -815,7 +815,7 @@ def _pick_flux_klein_models_highest(force_klein_b: int = 0) -> Dict[str, str]:
 
 
 # HiDream (text-to-image) helpers for Planner
-# Priority: Dev 2604 BF16 -> Dev FP8 -> BF16 Dev -> FP8 Base -> BF16 Base.
+# Priority: Dev FP8 -> Dev BF16 -> Dev 2604 BF16 -> FP8 Base -> BF16 Base.
 _HIDREAM_MODEL_INFO = {
     "dev_2604_bf16": {
         "label": "Dev 2604 BF16",
@@ -888,7 +888,7 @@ def _hidream_model_installed(model_key: str) -> bool:
 
 
 def _pick_hidream_model_key() -> str:
-    for key in ("dev_2604_bf16", "dev_fp8", "dev", "base_fp8", "base"):
+    for key in ("dev_fp8", "dev", "dev_2604_bf16", "base_fp8", "base"):
         if _hidream_model_installed(key):
             return key
     return ""
@@ -941,7 +941,7 @@ def _hidream_defaults_for_key(model_key: str) -> Dict[str, Any]:
 
 
 def _hidream_missing_message() -> str:
-    searched = [str(_hidream_model_dir(k)) for k in ("dev_2604_bf16", "dev_fp8", "dev", "base_fp8", "base")]
+    searched = [str(_hidream_model_dir(k)) for k in ("dev_fp8", "dev", "dev_2604_bf16", "base_fp8", "base")]
     return "HiDream selected but no installed model was found. Expected one of:\n" + "\n".join(searched)
 
 
@@ -7702,6 +7702,11 @@ class PlannerJob:
     # Internal: derived encoding targets 
     encoding: Dict[str, Any]
 
+    # Optional LTX audio-conditioned narration. Defaults keep older job.json files compatible.
+    lipsync_enabled: bool = False
+    lipsync_source: str = "generated"  # generated | uploaded
+    lipsync_transcript_path: str = ""
+
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False)
 
@@ -8874,6 +8879,30 @@ class PipelineWorker(QThread):
                 enabled=_ltx_use_end_images,
             )
 
+            _regen_lipsync_item: Dict[str, Any] = {}
+            _regen_lipsync_audio = ""
+            try:
+                _lip_plan_path = str((manifest.get("paths") or {}).get("lipsync_plan_json") or os.path.join(self.out_dir, "audio", "lipsync_plan.json"))
+                if os.path.isfile(_lip_plan_path):
+                    try:
+                        from helpers import planner_lipsync as _planner_lipsync  # type: ignore
+                    except Exception:
+                        import planner_lipsync as _planner_lipsync  # type: ignore
+                    _regen_lipsync_item = _planner_lipsync.load_shot_map(_lip_plan_path).get(sid, {})
+                    _regen_lipsync_audio = str((_regen_lipsync_item or {}).get("audio_file") or '').strip()
+                    if _regen_lipsync_audio and os.path.isfile(_regen_lipsync_audio):
+                        _lip_suffix = str((_regen_lipsync_item or {}).get("prompt_suffix") or '').strip()
+                        if _lip_suffix and _lip_suffix not in str(prompt or ''):
+                            prompt = (str(prompt or '').rstrip() + " " + _lip_suffix).strip()
+                        # Hidden Wan2GP recreation does not expose the proven audio-conditioned CLI route.
+                        # Use the same native FrameVision VRAM-Lab path as the original lip-sync run.
+                        _hidden_wangp_ltx = False
+                    else:
+                        _regen_lipsync_audio = ""
+            except Exception:
+                _regen_lipsync_item = {}
+                _regen_lipsync_audio = ""
+
             try:
                 _saved_settings = _load_planner_settings() or {}
             except Exception:
@@ -9078,10 +9107,12 @@ class PipelineWorker(QThread):
                 except Exception:
                     frames = 241 if int(frames) >= 240 else max(12, min(241, int(frames)))
 
+                _regen_lipsync_audio = str(_regen_lipsync_audio or '').strip()
+                use_audio_conditioning = bool(_regen_lipsync_audio and os.path.isfile(_regen_lipsync_audio))
                 args = [
                     str(py_exe),
                     str(cli),
-                    "--pipeline", "two_stages",
+                    "--pipeline", "a2vid_two_stage" if use_audio_conditioning else "two_stages",
                     "--vram-lab", "safe",
                     "--vram-profile", "auto",
                     "--checkpoint-path", str(checkpoint),
@@ -9101,6 +9132,15 @@ class PipelineWorker(QThread):
                     "--i2v-image-frame", "0",
                     "--i2v-image-strength", "1.0",
                     "--i2v-image-crf", "0",
+                ]
+                if use_audio_conditioning:
+                    _regen_audio_max_duration = float(frames) / float(max(1, int(fps)))
+                    args += [
+                        "--audio-path", _regen_lipsync_audio,
+                        "--audio-start-time", "0",
+                        "--audio-max-duration", f"{_regen_audio_max_duration:.4f}",
+                    ]
+                args += [
                     "--ltx-root", str(ltx_root),
                     "--report-path", str(_root() / "tools" / "vram_lab" / "ltx_vram_lab_integration_report.txt"),
                 ]
@@ -9131,7 +9171,7 @@ class PipelineWorker(QThread):
                 log_file = os.path.join(clips_dir, f"{sid}.ltx23.log.txt")
                 Path(log_file).parent.mkdir(parents=True, exist_ok=True)
                 with open(log_file, "a", encoding="utf-8", errors="ignore") as lf:
-                    lf.write(f"[planner] native FrameVision LTX regen settings: frames={frames} fps={fps} resolution={resolution} end_image={end_image_path or '<none>'}\n")
+                    lf.write(f"[planner] native FrameVision LTX regen settings: frames={frames} fps={fps} resolution={resolution} end_image={end_image_path or '<none>'} audio={_regen_lipsync_audio or '<none>'}\n")
                     lf.write("[planner] native FrameVision LTX regen cmd:\n")
                     lf.write(" ".join([str(x) for x in args]) + "\n\n")
                     lf.flush()
@@ -9192,6 +9232,12 @@ class PipelineWorker(QThread):
                 clip_entry["use_transition_lora"] = bool(use_transition_lora)
                 if end_image_path:
                     clip_entry["end_image_file"] = str(end_image_path)
+                if _regen_lipsync_audio:
+                    _regen_lipsync_text = str((_regen_lipsync_item or {}).get("text") or '')
+                    rec["lipsync_audio_file"] = str(_regen_lipsync_audio)
+                    rec["lipsync_text"] = _regen_lipsync_text
+                    clip_entry["lipsync_audio_file"] = str(_regen_lipsync_audio)
+                    clip_entry["lipsync_text"] = _regen_lipsync_text
             try:
                 clip_entry["duration_sec"] = round(float(frames) / float(max(1, fps)), 2)
             except Exception:
@@ -9619,8 +9665,8 @@ class PipelineWorker(QThread):
             t2i_job["ref_strategy"] = "hidream_ref_edit"
             t2i_job["keep_original_aspect"] = bool(len(hidream_ref_edit_refs) == 1)
             if len(hidream_ref_edit_refs) > 1:
-                t2i_job["width"] = 1920
-                t2i_job["height"] = 1088
+                t2i_job["width"] = 1600
+                t2i_job["height"] = 896
 
         t2i_job["engine"] = _eng
 
@@ -9687,10 +9733,10 @@ class PipelineWorker(QThread):
             _hidream_ref_count = len(list(t2i_job.get("ref_images") or t2i_job.get("refs") or []))
             t2i_job["hidream_model_key"] = _hk
             if str(t2i_job.get("ref_strategy") or '').strip().lower() == "hidream_ref_edit" and _hidream_ref_count > 1:
-                t2i_job["width"] = 1920
-                t2i_job["height"] = 1088
+                t2i_job["width"] = 1600
+                t2i_job["height"] = 896
             else:
-                bw, bh = 1280, 704
+                bw, bh = 1600, 896
                 ww, hh = _apply_aspect_to_size(bw, bh, aspect_mode)
                 t2i_job["width"] = int(ww)
                 t2i_job["height"] = int(hh)
@@ -15145,10 +15191,10 @@ class PipelineWorker(QThread):
                         _hidream_ref_count = len(list(t2i_job.get("ref_images") or t2i_job.get("refs") or []))
                         t2i_job["hidream_model_key"] = _hk
                         if str(t2i_job.get("ref_strategy") or '').strip().lower() == "hidream_ref_edit" and _hidream_ref_count > 1:
-                            t2i_job["width"] = 1920
-                            t2i_job["height"] = 1088
+                            t2i_job["width"] = 1600
+                            t2i_job["height"] = 896
                         else:
-                            bw, bh = 1280, 704
+                            bw, bh = 1600, 896
                             ww, hh = _apply_aspect_to_size(bw, bh, aspect_mode)
                             t2i_job["width"] = int(ww)
                             t2i_job["height"] = int(hh)
@@ -15168,8 +15214,8 @@ class PipelineWorker(QThread):
                             t2i_job["ref_strategy"] = "hidream_ref_edit"
                             t2i_job["keep_original_aspect"] = bool(len(used_ref_files) == 1)
                             if len(used_ref_files) > 1:
-                                t2i_job["width"] = 1920
-                                t2i_job["height"] = 1088
+                                t2i_job["width"] = 1600
+                                t2i_job["height"] = 896
 
                     elif str(_eng).lower().strip() == "lens":
                         # Lens Image uses the Lens UI defaults: 4 steps, CFG 1, offload ON, 1024 base buckets.
@@ -16955,6 +17001,126 @@ class PipelineWorker(QThread):
                     w, h = h, w
                 return max(32, w), max(32, h)
 
+            def _planner_lipsync_tool(exe_name: str) -> str:
+                bin_dir = _root() / "presets" / "bin"
+                candidates = []
+                if os.name == "nt":
+                    candidates.extend([bin_dir / f"{exe_name}.exe", bin_dir / f"{exe_name}.bat", bin_dir / exe_name])
+                else:
+                    candidates.append(bin_dir / exe_name)
+                for candidate in candidates:
+                    try:
+                        if candidate.exists():
+                            return str(candidate)
+                    except Exception:
+                        pass
+                return exe_name
+
+            def step_prepare_ltx_lipsync() -> None:
+                if not bool(getattr(self.job, "lipsync_enabled", False)):
+                    return
+                shots_obj = _safe_read_json(shots_path) if os.path.exists(shots_path) else {}
+                plan_obj = _safe_read_json(plan_path) if os.path.exists(plan_path) else {}
+                shots_list = _load_shots_list(shots_path)
+                if not shots_list:
+                    raise RuntimeError("LTX lip-sync cannot prepare audio because shots.json is empty.")
+
+                try:
+                    from helpers import planner_lipsync as _planner_lipsync  # type: ignore
+                except Exception:
+                    import planner_lipsync as _planner_lipsync  # type: ignore
+
+                root_dir = _root()
+                qwentts_script = root_dir / "helpers" / "qwentts_ui.py"
+                if not qwentts_script.exists():
+                    raise RuntimeError("Missing helpers/qwentts_ui.py (required for LTX lip-sync narration).")
+                if os.name == "nt":
+                    qwentts_python = root_dir / "environments" / ".qwen3tts" / "Scripts" / "python.exe"
+                else:
+                    qwentts_python = root_dir / "environments" / ".qwen3tts" / "bin" / "python"
+                if not qwentts_python.exists():
+                    raise RuntimeError("Qwen3 TTS environment not found. Install Qwen3 TTS via Optional Installs.")
+
+                narration_wav_early = os.path.join(audio_dir, "narration.wav")
+                narration_txt_early = os.path.join(audio_dir, "narration.txt")
+                narration_json_early = os.path.join(audio_dir, "narration.json")
+                tts_log_early = os.path.join(audio_dir, "tts_log.txt")
+                target_duration_early = 0.0
+                for _shot in shots_list:
+                    try:
+                        target_duration_early += max(0.1, float((_shot or {}).get("duration_sec") or 0.0))
+                    except Exception:
+                        pass
+                if target_duration_early <= 0.1:
+                    target_duration_early = float(getattr(self.job, "approx_duration_sec", 0) or 0.0)
+
+                tts_mode = "clone" if str(self.job.narration_mode or "builtin") == "clone" else "custom"
+                result = _planner_lipsync.prepare_lipsync_assets(
+                    root_dir=str(root_dir),
+                    job_id=str(self.job.job_id),
+                    prompt=str(self.job.prompt or ''),
+                    extra_info=str(self.job.extra_info or ''),
+                    language=str(self.job.narration_language or "auto"),
+                    narration_mode=str(self.job.narration_mode or "builtin"),
+                    voice=str(self.job.narration_voice or "ryan"),
+                    voice_sample_path=str(self.job.narration_sample_path or ''),
+                    plan_obj=plan_obj,
+                    shots_obj=shots_obj,
+                    target_duration_sec=float(target_duration_early),
+                    audio_dir=str(audio_dir),
+                    prompts_dir=str(prompts_dir),
+                    narration_wav=str(narration_wav_early),
+                    narration_txt=str(narration_txt_early),
+                    narration_json=str(narration_json_early),
+                    transcript_path=str(transcript_path),
+                    source_mode=str(getattr(self.job, "lipsync_source", "generated") or "generated"),
+                    uploaded_transcript_path=str(getattr(self.job, "lipsync_transcript_path", "") or ""),
+                    ffmpeg_path=str(_planner_lipsync_tool("ffmpeg")),
+                    ffprobe_path=str(_planner_lipsync_tool("ffprobe")),
+                    qwentts_python=str(qwentts_python),
+                    qwentts_script=str(qwentts_script.resolve()),
+                    tts_model_path=str(_qwen3tts_model_path_for_mode(tts_mode)),
+                    tts_tokenizer_path=str(_qwen3tts_tokenizer_path()),
+                    llm_json_call=_qwen_json_call,
+                    llm_settings=(self.job.encoding if isinstance(self.job.encoding, dict) else None),
+                    log_path=str(tts_log_early),
+                    stop_requested=lambda: bool(self._stop_requested),
+                    log_callback=lambda msg: self.signals.log.emit(str(msg)),
+                )
+
+                try:
+                    stable_sample = str(result.get("voice_sample_path") or '').strip()
+                    if stable_sample:
+                        self.job.narration_sample_path = stable_sample
+                except Exception:
+                    pass
+                manifest.setdefault("narration", {}).update({
+                    "enabled": True,
+                    "engine": str(result.get("engine") or "planner_lipsync_v1.0"),
+                    "strategy": "ltx_audio_conditioned_shots",
+                    "lipsync_enabled": True,
+                    "lipsync_source": str(result.get("source_mode") or getattr(self.job, "lipsync_source", "generated")),
+                    "lipsync_fingerprint": str(result.get("fingerprint") or ''),
+                    "voice": str(self.job.narration_voice or "ryan"),
+                    "mode": str(self.job.narration_mode or "builtin"),
+                    "language": str(self.job.narration_language or "auto"),
+                    "sample_path": str(getattr(self.job, "narration_sample_path", "") or ""),
+                    "ref_text": str(result.get("ref_text") or ''),
+                })
+                manifest.setdefault("paths", {}).update({
+                    "narration_wav": narration_wav_early,
+                    "narration_txt": narration_txt_early,
+                    "narration_json": narration_json_early,
+                })
+                try:
+                    for _key, _value in dict(result.get("paths") or {}).items():
+                        if str(_value or '').strip():
+                            manifest["paths"][_key] = str(_value)
+                except Exception:
+                    pass
+                _safe_write_json(manifest_path, manifest)
+                _vram_release("after LTX lip-sync TTS")
+
             def _run_ltx23_clip(*, prompt: str, negative: str, image_path: str, out_path: str,
                                 fps: int, frames: int, steps: int, seed: Optional[int],
                                 resolution: str, flow_shift: float = 5.0,
@@ -16962,7 +17128,8 @@ class PipelineWorker(QThread):
                                 guidance_phases: int = 1, denoising_strength: float = 1.0,
                                 lora_multiplier: float = 1.0, use_transition_lora: bool = True,
                                 extra_loras: Optional[List[Dict[str, Any]]] = None,
-                                image_end_path: str = "", log_path: Optional[str] = None) -> None:
+                                image_end_path: str = "", audio_path: str = "",
+                                audio_max_duration: float = 0.0, log_path: Optional[str] = None) -> None:
                 cli = _root() / "helpers" / "ltx23_vram_lab_cli.py"
                 if not cli.exists():
                     raise RuntimeError(f"Missing CLI: {cli}")
@@ -16991,10 +17158,12 @@ class PipelineWorker(QThread):
                 gemma_root = _ltx23_native_find_file(["models", "ltx23", "text_encoder", "lightricks_gemma_original"], "FRAMEVISION_LTX23_GEMMA_ROOT")
                 spatial_upsampler = _ltx23_native_find_file(["models", "ltx23", "spatial_upsampler", "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"], "FRAMEVISION_LTX23_SPATIAL_UPSAMPLER")
                 width, height = _ltx23_resolution_dims(resolution)
+                audio_path = str(audio_path or '').strip()
+                use_audio_conditioning = bool(audio_path and os.path.isfile(audio_path))
                 args = [
                     str(py_exe),
                     str(cli),
-                    "--pipeline", "two_stages",
+                    "--pipeline", "a2vid_two_stage" if use_audio_conditioning else "two_stages",
                     "--vram-lab", "safe",
                     "--vram-profile", "auto",
                     "--checkpoint-path", str(checkpoint),
@@ -17015,6 +17184,15 @@ class PipelineWorker(QThread):
                     "--i2v-image-frame", "0",
                     "--i2v-image-strength", "1.0",
                     "--i2v-image-crf", "0",
+                ]
+                if use_audio_conditioning:
+                    args += [
+                        "--audio-path", audio_path,
+                        "--audio-start-time", "0",
+                    ]
+                    if float(audio_max_duration or 0.0) > 0.0:
+                        args += ["--audio-max-duration", f"{float(audio_max_duration):.4f}"]
+                args += [
                     "--ltx-root", str(ltx_root),
                     "--report-path", str(_root() / "tools" / "vram_lab" / "ltx_vram_lab_integration_report.txt"),
                 ]
@@ -17132,6 +17310,21 @@ class PipelineWorker(QThread):
                 shots = _load_shots_list(shots_path)
                 if not shots:
                     raise RuntimeError("shots.json is empty; cannot generate video clips")
+
+                lipsync_plan_obj: Dict[str, Any] = {}
+                lipsync_shot_map: Dict[str, Dict[str, Any]] = {}
+                lipsync_plan_fp = ""
+                if bool(getattr(self.job, "lipsync_enabled", False)):
+                    lipsync_plan_path = str((manifest.get("paths") or {}).get("lipsync_plan_json") or os.path.join(audio_dir, "lipsync_plan.json"))
+                    lipsync_plan_obj = _safe_read_json(lipsync_plan_path) if os.path.isfile(lipsync_plan_path) else {}
+                    try:
+                        from helpers import planner_lipsync as _planner_lipsync  # type: ignore
+                    except Exception:
+                        import planner_lipsync as _planner_lipsync  # type: ignore
+                    lipsync_shot_map = _planner_lipsync.load_shot_map(lipsync_plan_obj)
+                    lipsync_plan_fp = str((lipsync_plan_obj or {}).get("fingerprint") or '')
+                    if not lipsync_shot_map:
+                        raise RuntimeError("LTX lip-sync was enabled, but no prepared per-shot audio map was found.")
                 _vram_release("before ltx23")
 
                 id_to_img: Dict[str, str] = {}
@@ -17214,6 +17407,7 @@ class PipelineWorker(QThread):
                     "use_end_images": bool(_ltx_use_end_images),
                     "end_imgs_fp": end_imgs_fp,
                     "extra_loras": _planner_ltx23_extra_loras_fingerprint(extra_loras),
+                    "lipsync_plan_fp": lipsync_plan_fp,
                 }, sort_keys=True))
 
                 prior = _safe_read_json(clips_manifest_path) if os.path.exists(clips_manifest_path) else {}
@@ -17301,6 +17495,14 @@ class PipelineWorker(QThread):
                         end_image_path = ""
                     prompt = str(rec.get("i2v_prompt") or '').strip()
                     negative = str(rec.get("i2v_negative") or '').strip()
+                    lipsync_item = lipsync_shot_map.get(sid, {}) if lipsync_shot_map else {}
+                    clip_audio_path = str((lipsync_item or {}).get("audio_file") or '').strip()
+                    if clip_audio_path and not os.path.isfile(clip_audio_path):
+                        raise RuntimeError(f"[ltx23] Missing prepared lip-sync WAV for shot {sid}: {clip_audio_path}")
+                    if clip_audio_path:
+                        lipsync_suffix = str((lipsync_item or {}).get("prompt_suffix") or '').strip()
+                        if lipsync_suffix:
+                            prompt = (prompt.rstrip() + " " + lipsync_suffix).strip()
 
                     # Duration → frames (same idea as the other video engines).
                     try:
@@ -17352,6 +17554,8 @@ class PipelineWorker(QThread):
                         "resolution": resolution,
                         "flow_shift": flow_shift,
                         "end_image_fp": _file_fingerprint(end_image_path) if end_image_path else "",
+                        "lipsync_audio_fp": _file_fingerprint(clip_audio_path) if clip_audio_path else {},
+                        "lipsync_plan_fp": lipsync_plan_fp,
                         "sliding_window_size": sliding_window_size,
                         "sliding_window_overlap": sliding_window_overlap,
                         "guidance_phases": guidance_phases,
@@ -17374,6 +17578,8 @@ class PipelineWorker(QThread):
                                 "use_transition_lora": bool(use_transition_lora),
                                 "ltx23_extra_loras": _planner_ltx23_extra_loras_fingerprint(extra_loras),
                                 "end_image_file": end_image_path,
+                                "lipsync_audio_file": clip_audio_path,
+                                "lipsync_text": str((lipsync_item or {}).get("text") or ''),
                                 "intent_fp": intent_fp,
                             })
                             try:
@@ -17420,6 +17626,8 @@ class PipelineWorker(QThread):
                         except Exception:
                             pass
                     self.signals.log.emit(f"[ltx23] {sid}: start image -> {img_path}")
+                    if clip_audio_path:
+                        self.signals.log.emit(f"[ltx23] {sid}: lip-sync audio -> {clip_audio_path}")
                     if end_image_path:
                         self.signals.log.emit(f"[ltx23] {sid}: end image -> {end_image_path}")
                     self.signals.progress.emit(min(99, 72 + int((i - 1) * (25 / max(1, len(shots))))))
@@ -17449,6 +17657,8 @@ class PipelineWorker(QThread):
                                 use_transition_lora=use_transition_lora,
                                 extra_loras=extra_loras,
                                 image_end_path=end_image_path,
+                                audio_path=clip_audio_path,
+                                audio_max_duration=float(dsec),
                                 log_path=log_file,
                             )
                     except subprocess.CalledProcessError as e:
@@ -17468,6 +17678,8 @@ class PipelineWorker(QThread):
                         "video_model": "ltx23",
                         "use_transition_lora": bool(use_transition_lora),
                         "ltx23_extra_loras": _planner_ltx23_extra_loras_fingerprint(extra_loras),
+                        "lipsync_audio_file": clip_audio_path,
+                        "lipsync_text": str((lipsync_item or {}).get("text") or ''),
                         "intent_fp": intent_fp,
                     })
                     try:
@@ -17479,6 +17691,8 @@ class PipelineWorker(QThread):
                         rec2["video_model"] = "ltx23"
                         rec2["use_transition_lora"] = bool(use_transition_lora)
                         rec2["ltx23_extra_loras"] = _planner_ltx23_extra_loras_fingerprint(extra_loras)
+                        rec2["lipsync_audio_file"] = clip_audio_path
+                        rec2["lipsync_text"] = str((lipsync_item or {}).get("text") or '')
                         rec2["clip_intent_fp"] = intent_fp
                         rec2["clip_duration_sec"] = round(float(dsec), 2)
                         rec2["ts_clip_done"] = time.time()
@@ -17490,6 +17704,8 @@ class PipelineWorker(QThread):
                     manifest.setdefault("settings", {})["video_engine"] = "ltx23"
                     manifest["settings"]["video_model"] = "ltx23"
                     manifest["settings"]["video_profile"] = prof
+                    manifest["settings"]["lipsync_enabled"] = bool(getattr(self.job, "lipsync_enabled", False))
+                    manifest["settings"]["lipsync_plan_fingerprint"] = lipsync_plan_fp
                     _safe_write_json(manifest_path, manifest)
                     try:
                         if out_file and os.path.isfile(out_file):
@@ -17883,6 +18099,8 @@ class PipelineWorker(QThread):
 
             # Run or skip based on selected video model
             mk = _video_model_key(self.job.encoding.get("video_model") or '')
+            if mk == "ltx23" and bool(getattr(self.job, "lipsync_enabled", False)):
+                _run("Prepare LTX narration lip-sync", step_prepare_ltx_lipsync, 70)
             if mk == "wan22":
                 _run("Video clips (WAN 2.2 Turbo)", step_video_clips_wan22, 95)
             elif mk == "hunyuan":
@@ -19740,8 +19958,10 @@ class PipelineWorker(QThread):
                     "sample_path": str(self.job.narration_sample_path or ''),
                     "language": str(self.job.narration_language or "auto"),
                     # Bump the audio fingerprint when the timed speech engine changes.
-                    "engine": "planner_speech_v2.1",
-                    "strategy": "shot_timed_segments",
+                    "engine": "planner_lipsync_v1.0" if bool(getattr(self.job, "lipsync_enabled", False)) else "planner_speech_v2.1",
+                    "strategy": "ltx_audio_conditioned_shots" if bool(getattr(self.job, "lipsync_enabled", False)) else "shot_timed_segments",
+                    "lipsync_enabled": bool(getattr(self.job, "lipsync_enabled", False)),
+                    "lipsync_source": str(getattr(self.job, "lipsync_source", "generated") or "generated"),
                 })
             except Exception:
                 pass
@@ -19918,92 +20138,106 @@ class PipelineWorker(QThread):
                 narr_wav_ready = False
                 narr_text = ""
                 if bool(self.job.narration_enabled) and (not bool(self.job.silent)):
-                    # Generate a coherent shot-timed narration track.
-                    # The helper keeps all visible Planner controls/API stable, while it:
-                    # - builds fixed speech windows from the assembled timeline;
-                    # - asks Qwen3-VL or the selected own llama for one line per window;
-                    # - synthesizes/fits each line separately; and
-                    # - composes a full-duration narration.wav with the final line near the ending.
-                    plan_obj = _safe_read_json(plan_path) if os.path.exists(plan_path) else {}
-                    shots_obj = _safe_read_json(shots_path) if os.path.exists(shots_path) else {}
-                    timeline_obj = _safe_read_json(timeline_json) if os.path.exists(timeline_json) else {}
-
-                    try:
-                        from helpers import planner_speech as _planner_speech  # type: ignore
-                    except Exception:
-                        import planner_speech as _planner_speech  # type: ignore
-
-                    root_dir = _root()
-                    helpers_qwentts = root_dir / "helpers" / "qwentts_ui.py"
-                    if not helpers_qwentts.exists():
-                        raise RuntimeError("Missing helpers/qwentts_ui.py (required for narration TTS).")
-
-                    if os.name == "nt":
-                        env_py = root_dir / "environments" / ".qwen3tts" / "Scripts" / "python.exe"
+                    speech_result: Dict[str, Any] = {}
+                    prebuilt_lipsync = bool(
+                        getattr(self.job, "lipsync_enabled", False)
+                        and _file_ok(narration_wav, 512)
+                        and _file_ok(narration_json, 10)
+                    )
+                    if prebuilt_lipsync:
+                        speech_result = _safe_read_json(narration_json) or {}
+                        narr_text = str(_safe_read_text(narration_txt) or '').strip()
+                        if not narr_text:
+                            raise RuntimeError("Prepared LTX lip-sync narration has no transcript text.")
+                        narr_wav_ready = True
+                        self.signals.log.emit("[lip-sync] reusing the pre-generated master narration for the final audio mix")
                     else:
-                        env_py = root_dir / "environments" / ".qwen3tts" / "bin" / "python"
-                    if not env_py.exists():
-                        raise RuntimeError("Qwen3 TTS environment not found. Install Qwen3 TTS via Optional Installs.")
+                        if bool(getattr(self.job, "lipsync_enabled", False)):
+                            raise RuntimeError(
+                                "LTX lip-sync narration was not prepared before clip generation. "
+                                "The workflow stopped instead of producing unsynchronized replacement narration."
+                            )
+                        # Normal non-lip-sync narration is generated after assembly from the exact final timeline.
+                        plan_obj = _safe_read_json(plan_path) if os.path.exists(plan_path) else {}
+                        shots_obj = _safe_read_json(shots_path) if os.path.exists(shots_path) else {}
+                        timeline_obj = _safe_read_json(timeline_json) if os.path.exists(timeline_json) else {}
 
-                    mode = "clone" if str(self.job.narration_mode or "builtin") == "clone" else "custom"
-                    ref_text = ""
-                    if mode == "clone":
                         try:
-                            ref_text = str((manifest.get("narration") or {}).get("ref_text") or '').strip()
+                            from helpers import planner_speech as _planner_speech  # type: ignore
                         except Exception:
-                            ref_text = ""
-                        if not ref_text:
+                            import planner_speech as _planner_speech  # type: ignore
+
+                        root_dir = _root()
+                        helpers_qwentts = root_dir / "helpers" / "qwentts_ui.py"
+                        if not helpers_qwentts.exists():
+                            raise RuntimeError("Missing helpers/qwentts_ui.py (required for narration TTS).")
+
+                        if os.name == "nt":
+                            env_py = root_dir / "environments" / ".qwen3tts" / "Scripts" / "python.exe"
+                        else:
+                            env_py = root_dir / "environments" / ".qwen3tts" / "bin" / "python"
+                        if not env_py.exists():
+                            raise RuntimeError("Qwen3 TTS environment not found. Install Qwen3 TTS via Optional Installs.")
+
+                        mode = "clone" if str(self.job.narration_mode or "builtin") == "clone" else "custom"
+                        ref_text = ""
+                        if mode == "clone":
                             try:
-                                _tp = os.path.join(audio_dir, "voice_sample_transcript.txt")
-                                if os.path.exists(_tp):
-                                    ref_text = (_safe_read_text(_tp) or '').strip()
+                                ref_text = str((manifest.get("narration") or {}).get("ref_text") or '').strip()
                             except Exception:
                                 ref_text = ""
+                            if not ref_text:
+                                try:
+                                    _tp = os.path.join(audio_dir, "voice_sample_transcript.txt")
+                                    if os.path.exists(_tp):
+                                        ref_text = (_safe_read_text(_tp) or '').strip()
+                                except Exception:
+                                    ref_text = ""
 
-                    speech_result = _planner_speech.create_story_narration(
-                        root_dir=str(root_dir),
-                        job_id=str(self.job.job_id),
-                        prompt=str(self.job.prompt or ''),
-                        extra_info=str(self.job.extra_info or ''),
-                        language=str(self.job.narration_language or "auto"),
-                        narration_mode=str(self.job.narration_mode or "builtin"),
-                        voice=str(self.job.narration_voice or "ryan"),
-                        voice_sample_path=str(self.job.narration_sample_path or ''),
-                        ref_text=str(ref_text or ''),
-                        plan_obj=plan_obj,
-                        shots_obj=shots_obj,
-                        timeline_obj=timeline_obj,
-                        target_duration_sec=float(duration_sec or 0.0),
-                        audio_dir=str(audio_dir),
-                        prompts_dir=str(prompts_dir),
-                        narration_wav=str(narration_wav),
-                        narration_txt=str(narration_txt),
-                        narration_json=str(narration_json),
-                        transcript_path=str(_transcript_txt or transcript_path or ''),
-                        ffmpeg_path=str(ffmpeg2),
-                        ffprobe_path=str(ffprobe2),
-                        qwentts_python=str(env_py),
-                        qwentts_script=str(helpers_qwentts.resolve()),
-                        tts_model_path=str(_qwen3tts_model_path_for_mode(mode)),
-                        tts_tokenizer_path=str(_qwen3tts_tokenizer_path()),
-                        llm_json_call=_qwen_json_call,
-                        llm_settings=(self.job.encoding if isinstance(self.job.encoding, dict) else None),
-                        log_path=str(tts_log),
-                        stop_requested=lambda: bool(self._stop_requested),
-                        log_callback=lambda msg: self.signals.log.emit(str(msg)),
-                    )
+                        speech_result = _planner_speech.create_story_narration(
+                            root_dir=str(root_dir),
+                            job_id=str(self.job.job_id),
+                            prompt=str(self.job.prompt or ''),
+                            extra_info=str(self.job.extra_info or ''),
+                            language=str(self.job.narration_language or "auto"),
+                            narration_mode=str(self.job.narration_mode or "builtin"),
+                            voice=str(self.job.narration_voice or "ryan"),
+                            voice_sample_path=str(self.job.narration_sample_path or ''),
+                            ref_text=str(ref_text or ''),
+                            plan_obj=plan_obj,
+                            shots_obj=shots_obj,
+                            timeline_obj=timeline_obj,
+                            target_duration_sec=float(duration_sec or 0.0),
+                            audio_dir=str(audio_dir),
+                            prompts_dir=str(prompts_dir),
+                            narration_wav=str(narration_wav),
+                            narration_txt=str(narration_txt),
+                            narration_json=str(narration_json),
+                            transcript_path=str(_transcript_txt or transcript_path or ''),
+                            ffmpeg_path=str(ffmpeg2),
+                            ffprobe_path=str(ffprobe2),
+                            qwentts_python=str(env_py),
+                            qwentts_script=str(helpers_qwentts.resolve()),
+                            tts_model_path=str(_qwen3tts_model_path_for_mode(mode)),
+                            tts_tokenizer_path=str(_qwen3tts_tokenizer_path()),
+                            llm_json_call=_qwen_json_call,
+                            llm_settings=(self.job.encoding if isinstance(self.job.encoding, dict) else None),
+                            log_path=str(tts_log),
+                            stop_requested=lambda: bool(self._stop_requested),
+                            log_callback=lambda msg: self.signals.log.emit(str(msg)),
+                        )
 
-                    narr_text = str(_safe_read_text(narration_txt) or '').strip()
-                    if not narr_text:
-                        raise RuntimeError("Timed narration generated no transcript text.")
-                    if not _file_ok(narration_wav, 512):
-                        raise RuntimeError("Timed narration generated no usable narration.wav.")
+                        narr_text = str(_safe_read_text(narration_txt) or '').strip()
+                        if not narr_text:
+                            raise RuntimeError("Timed narration generated no transcript text.")
+                        if not _file_ok(narration_wav, 512):
+                            raise RuntimeError("Timed narration generated no usable narration.wav.")
+                        narr_wav_ready = True
 
-                    narr_wav_ready = True
                     manifest.setdefault("narration", {}).update({
-                        "engine": str(speech_result.get("engine") or "planner_speech_v2.1"),
-                        "strategy": "shot_timed_segments",
-                        "segment_count": int(speech_result.get("segment_count") or 0),
+                        "engine": "planner_lipsync_v1.0" if prebuilt_lipsync else str(speech_result.get("engine") or "planner_speech_v2.1"),
+                        "strategy": "ltx_audio_conditioned_shots" if prebuilt_lipsync else "shot_timed_segments",
+                        "segment_count": int(speech_result.get("segment_count") or len(speech_result.get("segments") or [])),
                         "target_duration_sec": float(speech_result.get("target_duration_sec") or 0.0),
                         "spoken_duration_sec": float(speech_result.get("spoken_duration_sec") or 0.0),
                         "last_spoken_end_sec": float(speech_result.get("last_spoken_end_sec") or 0.0),
@@ -23438,9 +23672,56 @@ class PlannerPane(QWidget):
         self.btn_voice_sample.clicked.connect(self._browse_voice_sample)
         vsr.addWidget(self.btn_voice_sample)
 
+        # Optional LTX audio-conditioned narration. Hidden for other video backends.
+        self.lipsync_row = QWidget()
+        lsr = QHBoxLayout(self.lipsync_row)
+        lsr.setContentsMargins(0, 0, 0, 0)
+        lsr.setSpacing(10)
+        self.chk_ltx_lipsync = QCheckBox("Lip-sync narration with LTX")
+        self.chk_ltx_lipsync.setToolTip(
+            "Creates the narration before video generation, cuts it into shot-sized WAV files, "
+            "and sends each speaking shot through LTX audio-conditioned generation."
+        )
+        self.chk_ltx_lipsync.toggled.connect(self._sync_lipsync_ui)
+        self.chk_ltx_lipsync.toggled.connect(self._save_lipsync_ui_settings)
+        lsr.addWidget(self.chk_ltx_lipsync)
+        lsr.addWidget(QLabel("Text source"))
+        self.cmb_lipsync_source = QComboBox()
+        self.cmb_lipsync_source.addItem("Created narration", "generated")
+        self.cmb_lipsync_source.addItem("Uploaded transcript", "uploaded")
+        self.cmb_lipsync_source.currentIndexChanged.connect(self._sync_lipsync_ui)
+        self.cmb_lipsync_source.currentIndexChanged.connect(self._save_lipsync_ui_settings)
+        lsr.addWidget(self.cmb_lipsync_source, 1)
+
+        self.lipsync_transcript_row = QWidget()
+        ltr = QHBoxLayout(self.lipsync_transcript_row)
+        ltr.setContentsMargins(0, 0, 0, 0)
+        ltr.setSpacing(10)
+        ltr.addWidget(QLabel("Transcript"))
+        self.lipsync_transcript_path_edit = QLineEdit()
+        self.lipsync_transcript_path_edit.setPlaceholderText("Select TXT, SRT, or VTT transcript")
+        self.lipsync_transcript_path_edit.textChanged.connect(self._save_lipsync_ui_settings)
+        ltr.addWidget(self.lipsync_transcript_path_edit, 1)
+        self.btn_lipsync_transcript = QPushButton("Browse")
+        self.btn_lipsync_transcript.clicked.connect(self._browse_lipsync_transcript)
+        ltr.addWidget(self.btn_lipsync_transcript)
+
+        try:
+            _lipsync_saved = _load_planner_settings() or {}
+            self.chk_ltx_lipsync.setChecked(bool(_lipsync_saved.get("ltx_lipsync_enabled", False)))
+            _source_saved = str(_lipsync_saved.get("ltx_lipsync_source") or "generated").strip().lower()
+            _source_idx = self.cmb_lipsync_source.findData(_source_saved)
+            if _source_idx >= 0:
+                self.cmb_lipsync_source.setCurrentIndex(_source_idx)
+            self.lipsync_transcript_path_edit.setText(str(_lipsync_saved.get("ltx_lipsync_transcript_path") or ""))
+        except Exception:
+            pass
+
         lay.addWidget(self.story_vol_row)
         lay.addWidget(self.narration_row)
         lay.addWidget(self.voice_sample_row)
+        lay.addWidget(self.lipsync_row)
+        lay.addWidget(self.lipsync_transcript_row)
         lay.addWidget(self.music_vol_row)
 
         # Duration slider + manual number box
@@ -27550,7 +27831,78 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             self.voice_sample_row.setVisible(storytelling and is_clone)
         except Exception:
             pass
-    
+        try:
+            self._sync_lipsync_ui()
+        except Exception:
+            pass
+
+    def _save_lipsync_ui_settings(self, _value=None) -> None:
+        try:
+            source = str(self.cmb_lipsync_source.currentData() or "generated")
+        except Exception:
+            source = "generated"
+        try:
+            path = str(self.lipsync_transcript_path_edit.text() or '').strip()
+        except Exception:
+            path = ""
+        try:
+            enabled = bool(self.chk_ltx_lipsync.isChecked())
+        except Exception:
+            enabled = False
+        try:
+            _save_planner_settings({
+                "ltx_lipsync_enabled": enabled,
+                "ltx_lipsync_source": source,
+                "ltx_lipsync_transcript_path": path,
+            })
+        except Exception:
+            pass
+
+    def _sync_lipsync_ui(self, _value=None) -> None:
+        try:
+            storytelling = bool(self.chk_story.isChecked())
+        except Exception:
+            storytelling = False
+        try:
+            ltx_selected = bool(self._is_ltx23_video_model_selected())
+        except Exception:
+            ltx_selected = False
+        try:
+            enabled = bool(self.chk_ltx_lipsync.isChecked())
+        except Exception:
+            enabled = False
+        try:
+            source = str(self.cmb_lipsync_source.currentData() or "generated").strip().lower()
+        except Exception:
+            source = "generated"
+        visible = bool(storytelling and ltx_selected)
+        try:
+            self.lipsync_row.setVisible(visible)
+            self.chk_ltx_lipsync.setEnabled(visible)
+            self.cmb_lipsync_source.setEnabled(visible and enabled)
+        except Exception:
+            pass
+        try:
+            self.lipsync_transcript_row.setVisible(visible and enabled and source == "uploaded")
+        except Exception:
+            pass
+
+    def _browse_lipsync_transcript(self) -> None:
+        try:
+            fn, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select narration transcript",
+                "",
+                "Transcript files (*.txt *.srt *.vtt);;All files (*.*)",
+            )
+        except Exception:
+            fn = ""
+        if fn:
+            try:
+                self.lipsync_transcript_path_edit.setText(str(fn))
+            except Exception:
+                pass
+        self._sync_lipsync_ui()
 
     def _sync_chain_start_image_ui(self) -> None:
         """Show/hide the optional user-supplied first start image controls for the chain workflow."""
@@ -28278,6 +28630,10 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             pass
         try:
             self._refresh_ltx23_clip_length_slider()
+        except Exception:
+            pass
+        try:
+            self._sync_lipsync_ui()
         except Exception:
             pass
         try:
@@ -30088,6 +30444,33 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         if bool(narration_enabled) and narration_mode == "clone" and not narration_sample_path:
             raise ValueError("Narration is set to 'add your own…' but no voice sample file was provided.")
 
+        lipsync_enabled = False
+        lipsync_source = "generated"
+        lipsync_transcript_path = ""
+        try:
+            lipsync_enabled = bool(
+                narration_enabled
+                and self.chk_ltx_lipsync.isChecked()
+                and self._is_ltx23_video_model_selected()
+            )
+        except Exception:
+            lipsync_enabled = False
+        try:
+            lipsync_source = str(self.cmb_lipsync_source.currentData() or "generated").strip().lower()
+        except Exception:
+            lipsync_source = "generated"
+        if lipsync_source not in ("generated", "uploaded"):
+            lipsync_source = "generated"
+        try:
+            lipsync_transcript_path = str(self.lipsync_transcript_path_edit.text() or '').strip()
+        except Exception:
+            lipsync_transcript_path = ""
+        if lipsync_enabled and lipsync_source == "uploaded":
+            if not lipsync_transcript_path:
+                raise ValueError("LTX lip-sync is set to Uploaded transcript, but no transcript file was selected.")
+            if not os.path.isfile(lipsync_transcript_path):
+                raise ValueError(f"LTX lip-sync transcript file was not found:\n{lipsync_transcript_path}")
+
         # Final polish: bake subtitles only when narration and/or lyrics is enabled.
         bake_subtitles = False
         try:
@@ -30434,6 +30817,9 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             extra_info=(self.extra_info.toPlainText() or '').strip(),
             attachments=attachments,
             encoding=enc,
+            lipsync_enabled=bool(lipsync_enabled),
+            lipsync_source=str(lipsync_source),
+            lipsync_transcript_path=str(lipsync_transcript_path),
         )
         return job
 
