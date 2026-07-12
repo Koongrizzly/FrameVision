@@ -813,25 +813,23 @@ class HiDreamUI(QMainWindow):
         box = QGroupBox("Offloading / memory options")
         layout = QVBoxLayout(box)
         note = QLabel(
-            "Experimental. Leave this off for normal CUDA-only loading. "
-            "When enabled, the UI will pass device_map=auto only if the runner supports it."
+            "Keeps HiDream closer to 12 GB VRAM by using a capped GPU budget and CPU RAM offloading. "
+            "Leave this off for the fastest normal CUDA-only loading on higher-VRAM cards."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #9ca3af;")
         layout.addWidget(note)
 
-        self.auto_offload_check = QCheckBox("Try automatic CPU offload")
+        self.auto_offload_check = QCheckBox("Low VRAM")
         self.auto_offload_check.setChecked(False)
+        self.auto_offload_check.setToolTip("for use with 12 gigabyte vram cards")
         layout.addWidget(self.auto_offload_check)
 
-        folder_row = QHBoxLayout()
+        # Keep the offload folder setting internally for backward compatibility and
+        # emergency fallback, but do not surface it in the normal UI. Low-VRAM mode
+        # is designed to prefer CPU RAM offload, not disk-heavy offload.
         self.offload_folder_edit = QLineEdit(str(DEFAULT_OFFLOAD_FOLDER))
-        browse = QPushButton("Browse")
-        browse.clicked.connect(self.browse_offload_folder)
-        folder_row.addWidget(self.offload_folder_edit, 1)
-        folder_row.addWidget(browse)
-        layout.addWidget(QLabel("Offload folder"))
-        layout.addLayout(folder_row)
+        self.offload_folder_edit.setVisible(False)
 
         return box
 
@@ -1495,8 +1493,11 @@ class HiDreamUI(QMainWindow):
         }
 
     def current_offload_settings(self) -> dict:
+        low_vram = self.auto_offload_check.isChecked()
         return {
-            "try_auto_cpu_offload": self.auto_offload_check.isChecked(),
+            "low_vram": low_vram,
+            # Keep the legacy key so older queue/settings readers keep working.
+            "try_auto_cpu_offload": low_vram,
             "offload_folder": self.offload_folder_edit.text().strip() or str(DEFAULT_OFFLOAD_FOLDER),
         }
 
@@ -1898,8 +1899,8 @@ class HiDreamUI(QMainWindow):
 
             offload = data.get("offload_settings", {}) if isinstance(data.get("offload_settings"), dict) else {}
             # Backward-compatible import from the previous placeholder offload UI.
-            try_auto = bool(offload.get("try_auto_cpu_offload", offload.get("offload_model_to_cpu", False)))
-            self.auto_offload_check.setChecked(try_auto)
+            low_vram = bool(offload.get("low_vram", offload.get("try_auto_cpu_offload", offload.get("offload_model_to_cpu", False))))
+            self.auto_offload_check.setChecked(low_vram)
             self.offload_folder_edit.setText(str(offload.get("offload_folder", DEFAULT_OFFLOAD_FOLDER)))
 
             self._active_model_key = self.current_model_key()
@@ -2048,16 +2049,22 @@ class HiDreamUI(QMainWindow):
             "--resolution_mode", "framevision",
         ]
         offload = settings.get("offload_settings", {}) if isinstance(settings.get("offload_settings"), dict) else {}
-        try_auto_offload = bool(offload.get("try_auto_cpu_offload", False))
-        if self.cli_supports_option("--device_map"):
-            if try_auto_offload:
-                offload_folder = Path(str(offload.get("offload_folder") or DEFAULT_OFFLOAD_FOLDER)).expanduser()
+        low_vram = bool(offload.get("low_vram", offload.get("try_auto_cpu_offload", False)))
+        offload_folder = Path(str(offload.get("offload_folder") or DEFAULT_OFFLOAD_FOLDER)).expanduser()
+        if low_vram:
+            offload_folder.mkdir(parents=True, exist_ok=True)
+        if self.cli_supports_option("--low_vram") and low_vram:
+            args.append("--low_vram")
+            if self.cli_supports_option("--offload_folder"):
+                args.extend(["--offload_folder", str(offload_folder)])
+        elif self.cli_supports_option("--device_map"):
+            if low_vram:
                 offload_folder.mkdir(parents=True, exist_ok=True)
                 args.extend(["--device_map", "auto", "--offload_folder", str(offload_folder)])
             else:
                 args.extend(["--device_map", "cuda"])
-        elif try_auto_offload:
-            self.log("Auto offload selected, but this runner does not support --device_map yet; running CUDA-only.")
+        elif low_vram:
+            self.log("Low VRAM selected, but this runner does not support it yet; running CUDA-only.")
 
         negative_prompt = str(settings.get("negative_prompt", "")).strip()
         if self.is_full_variant(str(job.get("model_key") or "base")) and negative_prompt:

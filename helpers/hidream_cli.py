@@ -591,6 +591,119 @@ def _recast_float8_prefixes(model: torch.nn.Module, prefixes: list[str], compute
     return recast
 
 
+
+def _format_gib(value_gb: float) -> str:
+    mib = max(256, int(round(float(value_gb) * 1024.0)))
+    return f"{mib}MiB"
+
+
+def _is_low_vram_workflow(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "low_vram", False))
+
+
+def _build_low_vram_profile(args: argparse.Namespace, weight_dtype: torch.dtype, width: int, height: int, ref_count: int) -> dict:
+    """Choose a practical GPU budget that aims to keep total process VRAM below ~12 GB.
+
+    The model-weight budget must stay lower than the desired process peak to leave
+    room for activations, latents, attention workspaces, and reference tensors.
+    """
+    fp8 = is_float8_dtype(weight_dtype)
+    area = max(1, int(width) * int(height))
+    baseline_area = 1280 * 704
+
+    if ref_count <= 0:
+        gpu_budget_gb = 8.0 if fp8 else 7.25
+    elif ref_count == 1:
+        gpu_budget_gb = 7.5 if fp8 else 6.9
+    else:
+        gpu_budget_gb = 7.0 if fp8 else 6.5
+
+    if area > int(baseline_area * 1.55):
+        gpu_budget_gb -= 0.35
+    if area > int(baseline_area * 2.10):
+        gpu_budget_gb -= 0.45
+    if area > int(baseline_area * 3.00):
+        gpu_budget_gb -= 0.40
+
+    gpu_budget_gb = max(5.5, min(gpu_budget_gb, 8.25))
+    target_process_peak_gb = 11.5
+    hard_process_cap_gb = 12.0
+
+    cpu_budget_gb = 48
+    if ref_count >= 2:
+        cpu_budget_gb = 64
+
+    return {
+        "gpu_budget_gb": gpu_budget_gb,
+        "cpu_budget_gb": cpu_budget_gb,
+        "target_process_peak_gb": target_process_peak_gb,
+        "hard_process_cap_gb": hard_process_cap_gb,
+        "offload_state_dict": True,
+        "offload_buffers": True,
+        "low_cpu_mem_usage": True,
+    }
+
+
+def _apply_cuda_allocator_cap(target_process_peak_gb: float) -> None:
+    try:
+        if not torch.cuda.is_available():
+            return
+        props = torch.cuda.get_device_properties(0)
+        total_gb = float(props.total_memory) / (1024.0 ** 3)
+        fraction = max(0.10, min(0.98, float(target_process_peak_gb) / max(0.01, total_gb)))
+        torch.cuda.set_per_process_memory_fraction(fraction, device=0)
+        print(f"[HiDream CLI] CUDA allocator cap: {fraction:.3f} of GPU0 (~{target_process_peak_gb:.2f} GB target, total {total_gb:.2f} GB)")
+    except Exception as exc:
+        print(f"[HiDream CLI] Warning: could not apply CUDA allocator cap: {exc}")
+
+
+def _force_execution_device_property(model: torch.nn.Module, device: torch.device) -> None:
+    """Ensure pipeline code uses CUDA as the execution device even with CPU offload."""
+    try:
+        setattr(model, "_framevision_execution_device", torch.device(device))
+    except Exception:
+        return
+
+    cls = type(model)
+    if getattr(cls, "_framevision_device_patched", False):
+        return
+
+    orig_prop = getattr(cls, "device", None)
+    if isinstance(orig_prop, property):
+        def _patched_device(self):
+            forced = getattr(self, "_framevision_execution_device", None)
+            if forced is not None:
+                return forced
+            try:
+                return orig_prop.fget(self)
+            except Exception:
+                return torch.device("cuda:0")
+        cls.device = property(_patched_device)
+    else:
+        def _patched_device(self):
+            forced = getattr(self, "_framevision_execution_device", None)
+            if forced is not None:
+                return forced
+            return torch.device("cuda:0")
+        cls.device = property(_patched_device)
+    setattr(cls, "_framevision_device_patched", True)
+
+
+def _load_hidream_model(model_cls, model_dir: Path, load_kwargs: dict):
+    try:
+        return model_cls.from_pretrained(str(model_dir), **load_kwargs).eval()
+    except TypeError as exc:
+        stripped = dict(load_kwargs)
+        removed = []
+        for key in ["offload_state_dict", "offload_buffers", "low_cpu_mem_usage", "max_memory"]:
+            if key in stripped:
+                removed.append(key)
+                stripped.pop(key, None)
+        if removed:
+            print(f"[HiDream CLI] Retry model load without unsupported options {removed}: {exc}")
+            return model_cls.from_pretrained(str(model_dir), **stripped).eval()
+        raise
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("FrameVision HiDream CLI")
     parser.add_argument("--model_key", choices=list(MODEL_MAP.keys()), default="base")
@@ -611,6 +724,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--noise_clip_std", type=float, default=2.5)
     parser.add_argument("--device_map", type=str, default="cuda", choices=["cuda", "auto"])
     parser.add_argument("--offload_folder", type=str, default=str(APP_ROOT / "temp" / "hidream_offload"))
+    parser.add_argument("--low_vram", action="store_true", help="Keep HiDream closer to 12 GB VRAM by using a capped GPU budget and CPU RAM offload.")
     parser.add_argument("--negative_prompt", type=str, default="")
     parser.add_argument("--resolution_mode", choices=["native", "framevision"], default="framevision")
     parser.add_argument("--disable_ref_safe_resolution", action="store_true", help="Disable FrameVision reference/edit safe bucket override.")
@@ -661,6 +775,13 @@ def main() -> None:
 
     output_path = Path(args.output_image).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
 
     ref_count = len([p for p in (args.ref_images or []) if str(p).strip()])
     reference_safe_active = bool(ref_count and args.resolution_mode == "framevision" and not args.disable_ref_safe_resolution)
@@ -720,6 +841,16 @@ def main() -> None:
     print(f"[HiDream CLI] Weight dtype: {dtype_label(weight_dtype)}")
     print(f"[HiDream CLI] Compute dtype: {dtype_label(compute_dtype)}")
 
+    low_vram_profile = None
+    if _is_low_vram_workflow(args):
+        low_vram_profile = _build_low_vram_profile(args, weight_dtype, selected_w, selected_h, ref_count)
+        print("[HiDream CLI] Low VRAM mode: enabled")
+        print(f"[HiDream CLI] Low VRAM target process peak: ~{low_vram_profile['target_process_peak_gb']:.2f} GB (hard ceiling goal {low_vram_profile['hard_process_cap_gb']:.2f} GB)")
+        print(f"[HiDream CLI] Low VRAM model GPU budget: ~{low_vram_profile['gpu_budget_gb']:.2f} GB; CPU offload budget: {low_vram_profile['cpu_budget_gb']} GB")
+        _apply_cuda_allocator_cap(low_vram_profile['target_process_peak_gb'])
+    else:
+        print("[HiDream CLI] Low VRAM mode: disabled")
+
     print(f"[HiDream CLI] Loading processor and model ({dtype_label(weight_dtype)} weights)...")
     processor = AutoProcessor.from_pretrained(str(model_dir))
     tokenizer = ensure_processor_chat_template(processor, model_dir, get_tokenizer)
@@ -727,7 +858,20 @@ def main() -> None:
 
     load_dtype = compute_dtype if is_float8_dtype(weight_dtype) else weight_dtype
     load_kwargs = {"dtype": load_dtype}
-    if args.device_map == "auto":
+    if _is_low_vram_workflow(args):
+        offload_folder = Path(args.offload_folder).expanduser()
+        offload_folder.mkdir(parents=True, exist_ok=True)
+        load_kwargs["device_map"] = "auto"
+        load_kwargs["offload_folder"] = str(offload_folder)
+        if low_vram_profile is not None:
+            load_kwargs["max_memory"] = {0: _format_gib(low_vram_profile["gpu_budget_gb"]), "cpu": f"{int(low_vram_profile['cpu_budget_gb'])}GiB"}
+            load_kwargs["offload_state_dict"] = bool(low_vram_profile.get("offload_state_dict", True))
+            load_kwargs["offload_buffers"] = bool(low_vram_profile.get("offload_buffers", True))
+            load_kwargs["low_cpu_mem_usage"] = bool(low_vram_profile.get("low_cpu_mem_usage", True))
+        print(f"[HiDream CLI] Low VRAM load kwargs: device_map=auto, max_memory={load_kwargs.get('max_memory')}, offload_folder={offload_folder}")
+        if is_float8_dtype(weight_dtype):
+            print("[HiDream CLI] Note: FP8 model selected with low-VRAM offload; initial load will use the FP8-safe compute dtype, then recast large tensors.")
+    elif args.device_map == "auto":
         offload_folder = Path(args.offload_folder).expanduser()
         offload_folder.mkdir(parents=True, exist_ok=True)
         load_kwargs["device_map"] = "auto"
@@ -745,11 +889,18 @@ def main() -> None:
         original_nn = qwen3_vl_transformers.nn
         try:
             qwen3_vl_transformers.nn = nn_proxy
-            model = Qwen3VLForConditionalGeneration.from_pretrained(str(model_dir), **load_kwargs).eval()
+            model = _load_hidream_model(Qwen3VLForConditionalGeneration, model_dir, load_kwargs)
         finally:
             qwen3_vl_transformers.nn = original_nn
     else:
-        model = Qwen3VLForConditionalGeneration.from_pretrained(str(model_dir), **load_kwargs).eval()
+        model = _load_hidream_model(Qwen3VLForConditionalGeneration, model_dir, load_kwargs)
+
+    if _is_low_vram_workflow(args) or args.device_map == "auto":
+        _force_execution_device_property(model, torch.device("cuda:0"))
+        try:
+            print(f"[HiDream CLI] Model execution device forced to: {model.device}")
+        except Exception:
+            pass
 
     if is_float8_dtype(weight_dtype):
         if fp8_ops is not None:
@@ -797,9 +948,17 @@ def main() -> None:
     image.save(output_path)
     dt = time.time() - t0
     try:
+        peak_gb = None
+        if torch.cuda.is_available():
+            try:
+                peak_gb = torch.cuda.max_memory_allocated() / (1024.0 ** 3)
+            except Exception:
+                peak_gb = None
         print(f"[HiDream CLI] Saved: {output_path}")
         print(f"[HiDream CLI] Final image size: {image.size[0]}x{image.size[1]}")
         print(f"[HiDream CLI] Generation time: {dt:.1f}s")
+        if peak_gb is not None:
+            print(f"[HiDream CLI] Peak CUDA allocated: {peak_gb:.2f} GB")
     except Exception:
         pass
 

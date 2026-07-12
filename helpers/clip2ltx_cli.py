@@ -9112,6 +9112,21 @@ def _hidream_cli_path(root: Path) -> str:
     return ""
 
 
+def _hidream_batch_cli_path(root: Path) -> str:
+    root = Path(root).resolve()
+    candidates = [
+        (root / "helpers" / "hidream_batch_cli.py").resolve(),
+        (root / "hidream_batch_cli.py").resolve(),
+    ]
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return str(cand)
+        except Exception:
+            continue
+    return ""
+
+
 def _hidream_python_path(root: Path) -> str:
     root = Path(root).resolve()
     candidates = [
@@ -9439,6 +9454,106 @@ def _run_hidream_start_image(root: Path, *, prompt: str, negative: str, output_p
     }
 
 
+def _run_hidream_batch_start_images(root: Path, *, jobs: List[Dict[str, Any]], progress_callback: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    def _emit(text: str) -> None:
+        if callable(progress_callback):
+            try:
+                progress_callback(str(text or ""))
+            except Exception:
+                pass
+
+    if not jobs:
+        return {"ok": True, "jobs": [], "job_count": 0}
+    root = Path(root).resolve()
+    model_key = _pick_hidream_model_key(root)
+    if not model_key:
+        raise RuntimeError(_hidream_missing_message(root))
+    cli = _hidream_batch_cli_path(root)
+    if not cli or not os.path.isfile(cli):
+        raise RuntimeError("HiDream batch selected but helpers/hidream_batch_cli.py was not found.")
+    py = _hidream_python_path(root)
+
+    first_job = jobs[0] if isinstance(jobs[0], dict) else {}
+    batch_root = Path(_safe_str(first_job.get("output_dir") or Path(_safe_str(first_job.get("start_image_path"))).parent or root)).expanduser().resolve()
+    batch_dir = (batch_root / "_hidream_batch").resolve()
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = batch_dir / "hidream_batch_manifest.json"
+    results_path = batch_dir / "hidream_batch_results.json"
+
+    manifest_jobs: List[Dict[str, Any]] = []
+    for job in jobs:
+        manifest_jobs.append({
+            "shot_id": _safe_str(job.get("shot_id")),
+            "prompt": _safe_str(job.get("prompt")),
+            "negative_prompt": _safe_str(job.get("negative_prompt")),
+            "output_image": _safe_str(job.get("start_image_path")),
+            "payload_json_path": _safe_str(job.get("payload_path")),
+            "log_path": _safe_str(job.get("log_path")),
+            "width": _safe_int(job.get("width"), 1280),
+            "height": _safe_int(job.get("height"), 720),
+            "seed": _safe_int(job.get("seed"), -1),
+            "steps": _safe_int(job.get("steps"), 28),
+            "guidance_scale": _safe_float(job.get("guidance_scale"), 0.0),
+            "shift": _safe_float(job.get("shift"), 1.0),
+            "scheduler_name": _safe_str(job.get("scheduler_name"), "flash"),
+            "timesteps": _safe_str(job.get("timesteps"), "none"),
+            "noise_scale_start": _safe_float(job.get("noise_scale_start"), 7.5),
+            "noise_scale_end": _safe_float(job.get("noise_scale_end"), 7.5),
+            "noise_clip_std": _safe_float(job.get("noise_clip_std"), 2.5),
+            "keep_original_aspect": _safe_bool(job.get("keep_original_aspect"), False),
+            "reference_paths": list(job.get("reference_paths") or []),
+            "debug_payload_base": dict(job.get("debug_payload_base") or {}),
+        })
+    _write_json_file(manifest_path, {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "model_key": model_key,
+        "jobs": manifest_jobs,
+    })
+
+    cmd = [
+        py,
+        cli,
+        "--manifest_json", str(manifest_path),
+        "--results_json", str(results_path),
+        "--resolution_mode", "framevision",
+    ]
+    _emit(f"Loading HiDream once for a warm batch of {len(manifest_jobs)} image(s)...")
+    env = os.environ.copy()
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        env=env,
+    )
+    if proc.stdout:
+        for raw in proc.stdout:
+            try:
+                line = raw.decode("utf-8", errors="replace").rstrip() if isinstance(raw, bytes) else str(raw).rstrip()
+            except Exception:
+                line = str(raw).rstrip()
+            if line:
+                _emit(line[:240])
+    rc = int(proc.wait() or 0)
+    results: Dict[str, Any] = {}
+    if results_path.is_file():
+        try:
+            results = _read_json_file(str(results_path))
+        except Exception:
+            results = {}
+    if rc != 0 and not isinstance(results, dict):
+        raise RuntimeError(f"HiDream batch CLI failed (exit code {rc}).")
+    if not isinstance(results, dict):
+        raise RuntimeError("HiDream batch CLI did not return a readable results JSON.")
+    results.setdefault("rc", rc)
+    results.setdefault("manifest_json", str(manifest_path))
+    results.setdefault("results_json", str(results_path))
+    return results
+
+
+
+
 def generate_ltx_start_image_for_shot(payload: dict) -> dict:
     """Generate one start image for one selected LTX director shot.
 
@@ -9561,6 +9676,8 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
         else:
             seed = _safe_int(seed_raw, int(time.time() * 1000) % 2147483647)
 
+        prepare_only = _safe_bool(payload.get("prepare_only"), False)
+
         selected_reference_paths, selected_reference_paths_source = _selected_reference_paths_for_start_image_handoff(shot, character_reference, payload, director_plan, limit=5)
         available_reference_sheet_paths = _reference_available_paths_from_normalized(character_reference, limit=5)
         loaded_reference_count = len(available_reference_sheet_paths)
@@ -9593,6 +9710,115 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
         reference_paths_to_pass = selected_reference_paths if image_model == "hidream" else []
         character_reference_passed = False
         image_model_reference_mode = "direct_reference_image_pending" if reference_paths_to_pass else ("environment_only" if shot_subject_mode == "environment_only" else (_safe_str(shot.get("image_model_reference_mode")) or "text_only"))
+
+        debug_payload_base: Dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "shot_id": shot_id,
+            "source_director_plan_path": str(plan_path),
+            "selected_shot": shot,
+            "image_model": image_model,
+            "image_model_forced_to_hidream_for_reference": bool(image_model_forced_to_hidream_for_reference),
+            "image_model_reference_resolution_override": _safe_str(shot.get("image_model_reference_resolution_override")),
+            "selected_prompt_source": selected_prompt_source,
+            "raw_selected_image_prompt": raw_prompt,
+            "sanitized_image_prompt_used": prompt,
+            "image_prompt_word_count": _director_word_count(prompt),
+            "removed_duplicate_phrases": prompt_removed_phrases,
+            "director_raw_llm_output": shot.get("director_raw_llm_output") if isinstance(shot.get("director_raw_llm_output"), dict) and shot.get("director_raw_llm_output") else {},
+            "fallback_reason": _safe_str(shot.get("fallback_reason") or ("director_raw_llm_output_empty" if not shot.get("director_raw_llm_output") else "")),
+            "negative_prompt_used": negative,
+            "seed": seed,
+            "resolution": resolution,
+            "width": width,
+            "height": height,
+            "output_path": str(start_path),
+            "command_summary": {"type": "pending_prepare_only"} if prepare_only else {},
+            "model_files_used": {},
+            "shot_subject_mode": shot_subject_mode,
+            "visible_subject_detected": bool(shot.get("visible_subject_detected")),
+            "reference_eligible": bool(shot.get("reference_eligible")),
+            "reference_routing_reason": _safe_str(shot.get("reference_routing_reason")),
+            "available_reference_sheet_paths": available_reference_sheet_paths,
+            "loaded_reference_count": loaded_reference_count,
+            "wanted_reference_count": wanted_reference_count,
+            "selected_reference_sheet_paths": selected_reference_paths,
+            "selected_reference_sheet_paths_source": selected_reference_paths_source,
+            "selection_reason": selection_reason,
+            "source_had_full_character_reference_sheets": source_had_full_character_reference_sheets,
+            "collapsed_to_single_ref_warning": collapsed_to_single_ref_warning,
+            "reference_paths_requested_for_handoff": reference_paths_to_pass,
+            "character_reference_passed_to_image_model": False,
+            "image_model_reference_mode": image_model_reference_mode,
+            "actual_image_model_reference_paths_passed": [],
+            "reference_handoff": {
+                "reference_paths_requested": reference_paths_to_pass,
+                "reference_paths_passed": [],
+                "reference_arg_name": "pending",
+                "reference_arg_source": "prepare_only",
+                "reference_handoff_supported": bool(reference_paths_to_pass),
+                "reference_handoff_reason": "prepare_only_pending_generation",
+            },
+            "skipped_reference_reason": _safe_str("selected_reference_paths_not_added_to_hidream_command" if selected_reference_paths and image_model == "hidream" else "image_model_has_no_direct_reference_input" if selected_reference_paths and image_model != "hidream" else shot.get("skipped_reference_reason") or ""),
+            "environment_prompt_omitted_subjects": bool(shot.get("environment_prompt_omitted_subjects")),
+            "character_reference": {
+                "enabled": bool(_safe_bool(character_reference.get("enabled"), False)),
+                "global_reference_sheet_path": _safe_str(character_reference.get("global_reference_sheet_path")),
+                "global_reference_direct_model_use": False,
+                "global_reference_usage": "metadata_text_context_only",
+                "reference_sheet_path": selected_reference_paths[0] if selected_reference_paths else "",
+                "character_reference_sheets": character_reference.get("character_reference_sheets") if isinstance(character_reference.get("character_reference_sheets"), dict) else {},
+                "available_reference_sheet_paths": available_reference_sheet_paths,
+                "loaded_reference_count": loaded_reference_count,
+                "wanted_reference_count": wanted_reference_count,
+                "selected_reference_sheet_paths": selected_reference_paths,
+                "selected_reference_sheet_paths_source": selected_reference_paths_source,
+                "selection_reason": selection_reason,
+                "source_had_full_character_reference_sheets": source_had_full_character_reference_sheets,
+                "collapsed_to_single_ref_warning": collapsed_to_single_ref_warning,
+                "actual_image_model_reference_paths_passed": [],
+                "passed_to_model": False,
+                "global_reference_passed_to_model": False,
+                "model_reference_mode": image_model_reference_mode,
+                "hidream_multi_reference_policy": "per_character_sheets_only",
+                "mode": "reference_sheet",
+                "shot_subject_mode": shot_subject_mode,
+                "visible_subject_detected": bool(shot.get("visible_subject_detected")),
+                "reference_eligible": bool(shot.get("reference_eligible")),
+                "reference_routing_reason": _safe_str(shot.get("reference_routing_reason")),
+                "skipped_reference_reason": _safe_str(shot.get("skipped_reference_reason")),
+                "environment_prompt_omitted_subjects": bool(shot.get("environment_prompt_omitted_subjects")),
+            },
+            "character_reference_warnings": _plan_character_reference_warnings(character_reference, passed_to_model=False),
+        }
+        if prepare_only:
+            return {
+                "ok": True,
+                "prepared": True,
+                "shot_id": shot_id,
+                "image_model": image_model,
+                "output_dir": str(test_dir),
+                "start_image_path": str(start_path),
+                "payload_path": str(payload_path),
+                "log_path": str(log_path),
+                "prompt": prompt,
+                "negative_prompt": negative,
+                "seed": seed,
+                "resolution": resolution,
+                "width": width,
+                "height": height,
+                "steps": _safe_int(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("steps"), 28) if image_model == "hidream" else 0,
+                "guidance_scale": _safe_float(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("guidance_scale"), 0.0) if image_model == "hidream" else 0.0,
+                "shift": _safe_float(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("shift"), 1.0) if image_model == "hidream" else 1.0,
+                "scheduler_name": _safe_str(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("scheduler_name"), "flash") if image_model == "hidream" else "",
+                "timesteps": _safe_str(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("timesteps"), "none") if image_model == "hidream" else "",
+                "noise_scale_start": 7.5,
+                "noise_scale_end": 7.5,
+                "noise_clip_std": 2.5,
+                "keep_original_aspect": False,
+                "reference_paths": list(reference_paths_to_pass),
+                "debug_payload_base": debug_payload_base,
+                "message": "Start image prepared.",
+            }
 
         command_summary: Dict[str, Any] = {}
         model_files: Dict[str, Any] = {}
@@ -11411,10 +11637,10 @@ def _write_full_run_text_report(path: Path, report: Dict[str, Any]) -> None:
 
 
 def run_all_ltx_director_shots(payload: dict) -> dict:
-    """Generate all LTX director shots one-by-one.
+    """Generate a complete LTX director run in two strict phases.
 
-    Uses the already-working single-shot path for each shot:
-    start image -> LTX image-to-video with WAV audio guide -> duration correction.
+    Phase 1 prepares every required start image (including HiDream reference
+    workflows). Phase 2 converts those prepared images to LTX clips.
     """
     try:
         if not isinstance(payload, dict):
@@ -11504,11 +11730,211 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
             except Exception:
                 pass
 
-        _emit(f"Starting full LTX run: {len(shots)} shots")
+        # Full music-clip runs are intentionally split into two strict phases.
+        # This keeps large image models loaded long enough to finish the complete
+        # start-image batch and prevents reference/HiDream workflows from falling
+        # back to image 1 -> video 1 -> image 2 -> video 2 scheduling.
+        prepared_start_images: Dict[str, str] = {}
+        image_phase_failures: Dict[str, str] = {}
+        image_phase_generated = 0
+        image_phase_reused = 0
+        image_phase_skipped_for_ready_clip = 0
+        report["execution_order"] = "all_start_images_then_all_ltx_videos"
+        hidream_batch_prepared_jobs: List[Dict[str, Any]] = []
+        report["image_phase"] = {
+            "status": "running",
+            "generated_count": 0,
+            "reused_count": 0,
+            "skipped_for_ready_clip_count": 0,
+            "failed_count": 0,
+            "prepared_start_images": {},
+            "failures": {},
+        }
+        _save_report()
+
+        _emit(f"Phase 1/2 - preparing all start images: {len(shots)} shots")
+        for image_idx, image_shot in enumerate(shots, start=1):
+            image_sid = _safe_str(image_shot.get("id")) or f"LTX{image_idx:02d}"
+            image_stem = _safe_stem(image_sid)
+            try:
+                if callable(payload.get("cancel_check")) and bool(payload.get("cancel_check")()):
+                    report["cancelled"] = True
+                    report["image_phase"]["status"] = "cancelled"
+                    _emit("Cancelled while preparing start images.")
+                    break
+
+                image_review_item = ((review_state.get("shots") or {}).get(image_sid) if isinstance(review_state.get("shots"), dict) else {}) or {}
+                image_review_start = _safe_str(image_review_item.get("current_start_image_path"))
+                image_review_clip = _safe_str(image_review_item.get("current_clip_path"))
+                image_review_clip_ready = bool(image_review_clip and os.path.isfile(image_review_clip))
+                image_force_review_clip = bool(
+                    use_review_current_images
+                    and image_review_start
+                    and os.path.isfile(image_review_start)
+                    and not image_review_clip_ready
+                    and _safe_bool(image_review_item.get("clip_invalidated_by_new_image"), False)
+                )
+                image_trimmed = run_dir / f"{image_stem}_ltx_trimmed.mp4"
+
+                # A ready clip needs no new image. This mirrors the video phase's
+                # skip rules so resuming a run does not waste image generations.
+                if review_continue_missing_only and image_review_clip_ready:
+                    image_phase_skipped_for_ready_clip += 1
+                    continue
+                if skip_completed and (not image_force_review_clip) and _valid_nonempty_file(image_trimmed):
+                    image_phase_skipped_for_ready_clip += 1
+                    continue
+
+                if image_force_review_clip:
+                    prepared_start_images[image_sid] = image_review_start
+                    image_phase_reused += 1
+                    _emit(f"Phase 1/2 image {image_idx}/{len(shots)}: using reviewed start image for {image_sid}")
+                    continue
+
+                if image_mode == "existing":
+                    existing_image = _shot_existing_start_image_path(image_shot)
+                    if not existing_image or not os.path.isfile(existing_image):
+                        raise RuntimeError("Use existing start image is selected, but this shot has no valid existing start image path assigned.")
+                    prepared_start_images[image_sid] = existing_image
+                    image_phase_reused += 1
+                    _emit(f"Phase 1/2 image {image_idx}/{len(shots)}: registered existing start image for {image_sid}")
+                    continue
+
+                generated_image_path = (run_dir / f"{image_stem}_start.png").resolve()
+                if skip_completed and _valid_nonempty_file(generated_image_path):
+                    prepared_start_images[image_sid] = str(generated_image_path)
+                    image_phase_reused += 1
+                    _emit(f"Phase 1/2 image {image_idx}/{len(shots)}: reusing completed start image for {image_sid}")
+                    continue
+
+                _emit(f"Phase 1/2 image {image_idx}/{len(shots)}: preparing {image_sid} with {image_mode.replace('_', ' ')}")
+                image_payload: Dict[str, Any] = {
+                    "root_dir": str(root),
+                    "ltx_director_plan_path": str(plan_path),
+                    "shot_id": image_sid,
+                    "image_model": image_mode,
+                    "seed": payload.get("seed"),
+                    "resolution": resolution,
+                    "output_dir": str(run_dir),
+                    "start_image_name": f"{image_stem}_start.png",
+                    "start_image_payload_name": f"{image_stem}_start_image_payload.json",
+                    "start_image_log_name": f"{image_stem}_imagegen.log.txt",
+                    "progress_callback": lambda msg, _sid=image_sid: _emit(f"{_sid}: {msg}"),
+                }
+                if "character_reference" in payload:
+                    image_payload["character_reference"] = payload.get("character_reference")
+                prepared = generate_ltx_start_image_for_shot(dict(image_payload, prepare_only=True))
+                if not isinstance(prepared, dict) or not bool(prepared.get("ok")):
+                    raise RuntimeError(_safe_str(prepared.get("message") if isinstance(prepared, dict) else "", "Start image preparation failed.") or "Start image preparation failed.")
+                prepared_model = _safe_str(prepared.get("image_model"), image_mode)
+                if prepared_model == "hidream":
+                    hidream_batch_prepared_jobs.append(prepared)
+                    _emit(f"Phase 1/2 image {image_idx}/{len(shots)}: queued {image_sid} for warm HiDream batch")
+                else:
+                    image_result = generate_ltx_start_image_for_shot(image_payload)
+                    if not isinstance(image_result, dict) or not bool(image_result.get("ok")):
+                        raise RuntimeError(_safe_str(image_result.get("message") if isinstance(image_result, dict) else "", "Start image generation failed.") or "Start image generation failed.")
+                    final_image_path = _safe_str(image_result.get("start_image_path"))
+                    if not final_image_path or not os.path.isfile(final_image_path):
+                        raise RuntimeError("Start image generation reported success, but no start image file was found.")
+                    prepared_start_images[image_sid] = final_image_path
+                    image_phase_generated += 1
+            except Exception as image_exc:
+                image_phase_failures[image_sid] = str(image_exc)
+                _emit(f"Start image failed for {image_sid}: {image_exc}")
+
+            report["image_phase"].update({
+                "generated_count": image_phase_generated,
+                "reused_count": image_phase_reused,
+                "skipped_for_ready_clip_count": image_phase_skipped_for_ready_clip,
+                "failed_count": len(image_phase_failures),
+                "prepared_start_images": dict(prepared_start_images),
+                "failures": dict(image_phase_failures),
+            })
+            _save_report()
+
+        if hidream_batch_prepared_jobs and not _safe_bool(report.get("cancelled"), False):
+            try:
+                _emit(f"Phase 1/2 - running warm HiDream batch for {len(hidream_batch_prepared_jobs)} queued image(s)")
+                batch_results = _run_hidream_batch_start_images(
+                    root,
+                    jobs=hidream_batch_prepared_jobs,
+                    progress_callback=lambda msg: _emit(f"HiDream batch: {msg}"),
+                )
+                result_map = {}
+                if isinstance(batch_results.get("jobs"), list):
+                    for item in batch_results.get("jobs") or []:
+                        if isinstance(item, dict):
+                            result_map[_safe_str(item.get("shot_id"))] = item
+                for prepared in hidream_batch_prepared_jobs:
+                    sid = _safe_str(prepared.get("shot_id"))
+                    res = result_map.get(sid) or {}
+                    final_image_path = _safe_str(res.get("output_image") or prepared.get("start_image_path"))
+                    if bool(res.get("ok")) and final_image_path and os.path.isfile(final_image_path):
+                        prepared_start_images[sid] = final_image_path
+                        image_phase_generated += 1
+                    else:
+                        image_phase_failures[sid] = _safe_str(res.get("error") or batch_results.get("message") or "HiDream batch generation failed.")
+                        _emit(f"Start image failed for {sid}: {image_phase_failures[sid]}")
+                    report["image_phase"].update({
+                        "generated_count": image_phase_generated,
+                        "reused_count": image_phase_reused,
+                        "skipped_for_ready_clip_count": image_phase_skipped_for_ready_clip,
+                        "failed_count": len(image_phase_failures),
+                        "prepared_start_images": dict(prepared_start_images),
+                        "failures": dict(image_phase_failures),
+                    })
+                    _save_report()
+            except Exception as batch_exc:
+                batch_msg = str(batch_exc)
+                for prepared in hidream_batch_prepared_jobs:
+                    sid = _safe_str(prepared.get("shot_id"))
+                    if sid not in prepared_start_images and sid not in image_phase_failures:
+                        image_phase_failures[sid] = batch_msg
+                _emit(f"HiDream warm batch failed: {batch_msg}")
+                report["image_phase"].update({
+                    "generated_count": image_phase_generated,
+                    "reused_count": image_phase_reused,
+                    "skipped_for_ready_clip_count": image_phase_skipped_for_ready_clip,
+                    "failed_count": len(image_phase_failures),
+                    "prepared_start_images": dict(prepared_start_images),
+                    "failures": dict(image_phase_failures),
+                })
+                _save_report()
+
+        report["image_phase"].update({
+            "status": "cancelled" if _safe_bool(report.get("cancelled"), False) else "finished",
+            "generated_count": image_phase_generated,
+            "reused_count": image_phase_reused,
+            "skipped_for_ready_clip_count": image_phase_skipped_for_ready_clip,
+            "failed_count": len(image_phase_failures),
+            "prepared_start_images": dict(prepared_start_images),
+            "failures": dict(image_phase_failures),
+        })
+        _save_report()
+
+        if _safe_bool(report.get("cancelled"), False):
+            msg = (
+                f"Full LTX run cancelled during start-image preparation. "
+                f"Images ready: {len(prepared_start_images)} | Image failures: {len(image_phase_failures)} | Output: {run_dir}"
+            )
+            report["message"] = msg
+            report["report_json"] = str(report_json)
+            report["report_txt"] = str(report_txt)
+            _save_report()
+            return report
+
+        _emit(
+            f"Phase 1/2 complete - start images ready: {len(prepared_start_images)} | "
+            f"failed: {len(image_phase_failures)}. Phase 2/2 - generating all LTX videos."
+        )
+
+        _emit(f"Starting Phase 2/2 LTX video run: {len(shots)} shots")
         for idx, shot in enumerate(shots, start=1):
             sid = _safe_str(shot.get("id")) or f"LTX{idx:02d}"
             stem = _safe_stem(sid)
             item: Dict[str, Any] = {"shot_id": sid, "index": idx, "status": "pending"}
+            prepared_start = _safe_str(prepared_start_images.get(sid))
             review_item = ((review_state.get("shots") or {}).get(sid) if isinstance(review_state.get("shots"), dict) else {}) or {}
             review_start = _safe_str(review_item.get("current_start_image_path"))
             review_clip = _safe_str(review_item.get("current_clip_path"))
@@ -11528,6 +11954,21 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
                     report["shots"].append(item)
                     _save_report()
                     break
+
+                if sid in image_phase_failures:
+                    item.update({
+                        "status": "failed",
+                        "stage": "start_image",
+                        "error": image_phase_failures[sid],
+                        "message": "Video generation was skipped because the start image failed in Phase 1/2.",
+                        "audio_path": _safe_str(shot.get("audio_clip_path")),
+                        "can_recreate_later": True,
+                    })
+                    report["failed_count"] = _safe_int(report.get("failed_count"), 0) + 1
+                    report["shots"].append(item)
+                    _emit(f"Skipped video for {sid}: start image failed in Phase 1/2")
+                    _save_report()
+                    continue
 
                 trimmed = run_dir / f"{stem}_ltx_trimmed.mp4"
                 if review_continue_missing_only and review_clip_ready:
@@ -11574,6 +12015,12 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
                     test_payload_name = f"{stem}_review_payload.json"
                     log_name = f"{stem}_review_ltx23.log.txt"
                     duration_report_name = f"{stem}_review_duration_report.json"
+                elif prepared_start:
+                    # Phase 1 already generated or registered this image. Force the
+                    # single-shot runner into clip-only mode so no image model can
+                    # re-enter between LTX video generations.
+                    run_image_mode = "existing"
+                    existing_start = prepared_start
                 elif run_image_mode == "existing":
                     existing_start = _shot_existing_start_image_path(shot)
                     if not existing_start:
