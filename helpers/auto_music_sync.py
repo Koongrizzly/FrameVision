@@ -600,6 +600,26 @@ def _musicclip_prepare_krea2_single_payload(payload: dict) -> dict:
 
 # ---------------------------- LTX hard duration guard -----------------------
 
+# All Music Clip Creator LTX paths use the same minimum timing contract.
+# At the normal 24 fps this is 3.0 seconds / 73 inclusive frames.
+_MUSICCLIP_LTX_MIN_SHOT_SECONDS = 3.0
+_MUSICCLIP_LTX_MIN_SHOT_FRAMES = 73
+
+def _musicclip_ltx_frames_for_duration(seconds: float, fps: int = 24) -> int:
+    """Return the smallest valid LTX 8n+1 frame count covering the duration."""
+    try:
+        seconds = max(0.0, float(seconds))
+    except Exception:
+        seconds = 0.0
+    try:
+        fps = max(1, min(120, int(fps)))
+    except Exception:
+        fps = 24
+    frames = int(math.ceil((seconds * fps) / 8.0 - 1e-9)) * 8 + 1
+    if seconds >= _MUSICCLIP_LTX_MIN_SHOT_SECONDS - 0.055:
+        frames = max(_MUSICCLIP_LTX_MIN_SHOT_FRAMES, frames)
+    return max(1, int(frames))
+
 def _musicclip_ltx_hard_cap_seconds_from_payload(payload: dict) -> float:
     """Return the effective hard max shot duration for LTX-VRAMLab plans.
 
@@ -698,6 +718,16 @@ def _musicclip_ltx_write_timing(shot: dict, start: float, end: float) -> None:
     if not any(k in shot for k in ("duration", "duration_seconds", "clip_duration", "shot_duration", "length_seconds")):
         shot["duration"] = float(dur)
 
+    # LTX frame counts are inclusive: 3.0 seconds at 24 fps is 73 frames.
+    # Keep this metadata synchronized whenever a shot is merged or retimed.
+    try:
+        target_fps = int(shot.get("target_fps") or shot.get("fps") or 24)
+    except Exception:
+        target_fps = 24
+    target_fps = max(1, min(120, target_fps))
+    target_frames = _musicclip_ltx_frames_for_duration(dur, target_fps)
+    shot["target_fps"] = int(target_fps)
+    shot["target_frames"] = int(target_frames)
 
 
 def _musicclip_ltx_raw_padding_settings_from_payload(payload: dict) -> tuple[float, int, float]:
@@ -831,90 +861,537 @@ def _musicclip_ltx_apply_raw_padding_to_plan_file(plan_path: str, payload: dict,
         return {"changed": False, "message": str(exc)}
 
 
-def _musicclip_ltx_sanitize_plan_file(plan_path: str, payload: dict, label: str = "LTX plan") -> dict:
-    """Split over-cap LTX shots in an already-written JSON plan.
+def _musicclip_ltx_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    txt = str(value).strip().lower()
+    if txt in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if txt in {"0", "false", "no", "off", "disabled", ""}:
+        return False
+    return bool(default)
 
-    Returns a small report. It is intentionally conservative: it only runs when
-    the payload/settings indicate the LTX-VRAMLab 241-frame limit. It rewrites the
-    same JSON file atomically and keeps all creative prompt fields from the source
-    shot on each split segment.
+
+def _musicclip_ltx_duration_bounds_from_payload(payload: dict) -> tuple[bool, float, float, float, str]:
+    """Resolve the authoritative LTX shot range.
+
+    Every Music Clip Creator LTX workflow has a hard 3.0 second / 73 frame
+    minimum. When the visible Duration Guard is enabled, a larger selected
+    minimum overrides that floor. The backend hard maximum still wins when it
+    is lower than the selected manual/auto maximum.
     """
-    cap = _musicclip_ltx_hard_cap_seconds_from_payload(payload)
-    if cap <= 0.05:
-        return {"changed": False, "split_count": 0, "cap_seconds": 0.0, "message": "no hard cap active"}
+    try:
+        payload = dict(payload or {})
+    except Exception:
+        payload = {}
+    settings = payload.get("bridge_generation_settings")
+    if not isinstance(settings, dict):
+        settings = {}
+
+    enabled = _musicclip_ltx_bool(
+        settings.get("smart_scene_duration_guard", payload.get("smart_scene_duration_guard", False)),
+        False,
+    )
+    mode = _normalize_smart_scene_max_mode(
+        str(settings.get("smart_max_scene_mode") or payload.get("smart_max_scene_mode") or "Auto (source-aware)")
+    )
+
+    try:
+        selected_min = float(
+            settings.get("smart_resolved_min_scene_len")
+            or settings.get("smart_min_scene_len")
+            or settings.get("manual_min_clip_seconds")
+            or settings.get("min_ltx_shot_seconds")
+            or payload.get("smart_min_scene_len")
+            or payload.get("min_ltx_shot_seconds")
+            or 0.0
+        )
+    except Exception:
+        selected_min = 0.0
+    if enabled and selected_min > 0.0:
+        min_len = max(_MUSICCLIP_LTX_MIN_SHOT_SECONDS, min(30.0, selected_min))
+    else:
+        min_len = _MUSICCLIP_LTX_MIN_SHOT_SECONDS
+
+    user_max = 0.0
+    if enabled and mode == "Manual":
+        for key in (
+            "smart_resolved_max_scene_len",
+            "smart_max_scene_len",
+            "manual_max_clip_seconds",
+            "max_ltx_shot_seconds",
+        ):
+            try:
+                value = float(settings.get(key) or payload.get(key) or 0.0)
+            except Exception:
+                value = 0.0
+            if value > 0.05:
+                user_max = value
+                break
+    elif enabled and mode == "Auto (source-aware)":
+        for key in (
+            "smart_resolved_max_scene_len",
+            "resolved_smart_max_scene_len",
+            "max_ltx_shot_seconds",
+        ):
+            try:
+                value = float(settings.get(key) or payload.get(key) or 0.0)
+            except Exception:
+                value = 0.0
+            if value > 0.05:
+                user_max = value
+                break
+    # "Off" deliberately leaves user_max at zero; only the backend cap applies.
+
+    hard_cap = _musicclip_ltx_hard_cap_seconds_from_payload(payload)
+    effective_max = user_max
+    if hard_cap > 0.05:
+        effective_max = min(effective_max, hard_cap) if effective_max > 0.05 else hard_cap
+    if effective_max > 0.05:
+        effective_max = max(_MUSICCLIP_LTX_MIN_SHOT_SECONDS, min(30.0, effective_max))
+    else:
+        effective_max = 0.0
+
+    if min_len > 0.0 and effective_max > 0.0 and min_len > effective_max:
+        # The backend hard cap may lower an unusually high user-selected minimum,
+        # but a manual maximum is never allowed to reintroduce sub-3-second LTX shots.
+        if hard_cap > 0.05 and effective_max >= hard_cap - 0.001:
+            min_len = effective_max
+        else:
+            effective_max = min_len
+
+    return bool(enabled), float(min_len), float(effective_max), float(hard_cap), mode
+
+
+def _musicclip_ltx_choose_partition_count(total: float, original_count: int, min_len: float, max_len: float) -> int:
+    total = max(0.0, float(total))
+    original_count = max(1, int(original_count or 1))
+    if total <= 0.05:
+        return 1
+
+    lower_count = 1
+    upper_count = max(1, original_count)
+    if max_len > 0.05:
+        lower_count = max(1, int(math.ceil((total - 1e-9) / max_len)))
+    if min_len > 0.05:
+        upper_count = max(1, int(math.floor((total + 1e-9) / min_len)))
+    else:
+        upper_count = max(lower_count, original_count)
+
+    if lower_count <= upper_count:
+        return max(lower_count, min(original_count, upper_count))
+
+    # Very short isolated blocks can make the requested range mathematically
+    # impossible. Pick the count with the smallest total bound violation.
+    candidates = sorted({1, lower_count, upper_count, max(1, lower_count - 1), upper_count + 1})
+    best_n = 1
+    best_score = float("inf")
+    for n in candidates:
+        if n <= 0:
+            continue
+        avg = total / float(n)
+        under = max(0.0, min_len - avg) if min_len > 0.05 else 0.0
+        over = max(0.0, avg - max_len) if max_len > 0.05 else 0.0
+        score = under + over + abs(n - original_count) * 0.0001
+        if score < best_score:
+            best_score = score
+            best_n = n
+    return max(1, int(best_n))
+
+
+def _musicclip_ltx_partition_boundaries(
+    block_start: float,
+    block_end: float,
+    count: int,
+    min_len: float,
+    max_len: float,
+    original_boundaries: list[float],
+) -> list[float]:
+    """Create legal boundaries while preserving existing cut points when possible."""
+    block_start = float(block_start)
+    block_end = max(block_start, float(block_end))
+    count = max(1, int(count or 1))
+    if count <= 1 or block_end - block_start <= 0.05:
+        return [block_start, block_end]
+
+    total = block_end - block_start
+    originals = sorted({round(float(v), 6) for v in (original_boundaries or []) if block_start + 0.03 < float(v) < block_end - 0.03})
+    bounds = [block_start]
+    prev = block_start
+
+    for idx in range(1, count):
+        remaining = count - idx
+        target = block_start + total * (idx / float(count))
+
+        lower = prev + (min_len if min_len > 0.05 else 0.05)
+        upper = block_end - remaining * (min_len if min_len > 0.05 else 0.05)
+        if max_len > 0.05:
+            upper = min(upper, prev + max_len)
+            lower = max(lower, block_end - remaining * max_len)
+        lower = max(prev + 0.03, lower)
+        upper = min(block_end - 0.03, upper)
+
+        if upper < lower:
+            cut = max(prev + 0.03, min(block_end - 0.03, target))
+        else:
+            legal_originals = [v for v in originals if lower - 1e-6 <= v <= upper + 1e-6]
+            cut = min(legal_originals, key=lambda v: abs(v - target)) if legal_originals else max(lower, min(upper, target))
+        bounds.append(float(cut))
+        prev = float(cut)
+
+    bounds.append(block_end)
+    return bounds
+
+
+def _musicclip_ltx_representative_shot(block: list[tuple[dict, float, float, float]], start: float, end: float) -> tuple[dict, list[str]]:
+    overlaps: list[tuple[float, dict, str]] = []
+    source_ids: list[str] = []
+    for shot, s, e, _d in block:
+        overlap = max(0.0, min(end, e) - max(start, s))
+        if overlap <= 0.001:
+            continue
+        sid = str(shot.get("id") or shot.get("shot_id") or "").strip()
+        if sid and sid not in source_ids:
+            source_ids.append(sid)
+        overlaps.append((overlap, shot, sid))
+    if overlaps:
+        overlaps.sort(key=lambda item: item[0], reverse=True)
+        return copy.deepcopy(overlaps[0][1]), source_ids
+    return copy.deepcopy(block[0][0]), source_ids
+
+
+def _musicclip_ltx_sanitize_plan_file(plan_path: str, payload: dict, label: str = "LTX plan") -> dict:
+    """Enforce final minimum/maximum timing on every written LTX plan.
+
+    The global LTX floor is always 3.0 seconds / 73 frames. The visible Smart
+    Scene Duration Guard may raise that minimum and supply a stricter maximum.
+    The existing Grouping control remains the planning preference, but the final
+    LTX safety pass still removes sub-3-second render shots in every workflow.
+    """
+    guard_enabled, min_len, max_len, hard_cap, max_mode = _musicclip_ltx_duration_bounds_from_payload(payload)
+    if max_len <= 0.05 and min_len <= 0.05:
+        return {
+            "changed": False,
+            "split_count": 0,
+            "merge_count": 0,
+            "cap_seconds": 0.0,
+            "message": "no LTX duration limit active",
+        }
+
     try:
         path = str(plan_path or "").strip()
         if not path or not os.path.isfile(path):
-            return {"changed": False, "split_count": 0, "cap_seconds": cap, "message": "plan not found"}
+            return {"changed": False, "split_count": 0, "merge_count": 0, "cap_seconds": max_len, "message": "plan not found"}
         with open(path, "r", encoding="utf-8") as f:
             plan = json.load(f)
         if not isinstance(plan, dict):
-            return {"changed": False, "split_count": 0, "cap_seconds": cap, "message": "plan is not an object"}
+            return {"changed": False, "split_count": 0, "merge_count": 0, "cap_seconds": max_len, "message": "plan is not an object"}
         shots, key = _musicclip_ltx_shot_list_ref(plan)
         if not isinstance(shots, list) or not shots:
-            return {"changed": False, "split_count": 0, "cap_seconds": cap, "message": "no shots"}
+            return {"changed": False, "split_count": 0, "merge_count": 0, "cap_seconds": max_len, "message": "no shots"}
 
-        new_shots = []
-        split_count = 0
-        max_seen = 0.0
-        eps = 0.035
+        timed: list[tuple[dict, float, float, float]] = []
         for shot in shots:
             if not isinstance(shot, dict):
-                new_shots.append(shot)
                 continue
             start, end, dur = _musicclip_ltx_read_timing(shot)
-            if dur <= 0.0 and end > start:
-                dur = end - start
-            max_seen = max(max_seen, dur)
-            if dur <= cap + eps:
-                new_shots.append(shot)
+            if dur <= 0.03 or end <= start + 0.03:
                 continue
-            pieces = max(2, int(math.ceil(dur / cap)))
-            piece_len = dur / float(pieces)
-            # Keep every part at or below the hard cap even with rounding.
-            if piece_len > cap:
-                pieces += 1
-                piece_len = dur / float(pieces)
-            original_id = str(shot.get("id") or shot.get("shot_id") or "LTX").strip() or "LTX"
-            for pi in range(pieces):
-                a = start + (dur * pi / float(pieces))
-                b = start + (dur * (pi + 1) / float(pieces))
-                part = copy.deepcopy(shot)
-                _musicclip_ltx_write_timing(part, a, b)
-                part["source_ltx_shot_id"] = original_id
-                part["split_from_overlong_ltx_shot"] = True
-                part["split_part"] = int(pi + 1)
-                part["split_parts"] = int(pieces)
-                new_shots.append(part)
-            split_count += 1
+            timed.append((shot, float(start), float(end), float(dur)))
+        if not timed:
+            return {"changed": False, "split_count": 0, "merge_count": 0, "cap_seconds": max_len, "message": "no timed shots"}
 
-        if split_count <= 0:
-            return {"changed": False, "split_count": 0, "cap_seconds": cap, "max_seen_seconds": max_seen, "message": "already within cap"}
+        eps = 0.055
+        # The 3-second LTX minimum is global, not conditional on the visible guard.
+        range_active = bool(min_len > 0.05)
+        already_legal = True
+        frame_metadata_changed = False
+        for _shot, _start, _end, dur in timed:
+            if range_active and dur < min_len - eps:
+                already_legal = False
+                break
+            if max_len > 0.05 and dur > max_len + eps:
+                already_legal = False
+                break
+            try:
+                target_fps = int(_shot.get("target_fps") or _shot.get("fps") or plan.get("fps") or (payload or {}).get("fps") or 24)
+            except Exception:
+                target_fps = 24
+            target_fps = max(1, min(120, target_fps))
+            wanted_frames = _musicclip_ltx_frames_for_duration(dur, target_fps)
+            try:
+                current_frames = int(_shot.get("target_frames") or 0)
+            except Exception:
+                current_frames = 0
+            try:
+                current_fps = int(_shot.get("target_fps") or 0)
+            except Exception:
+                current_fps = 0
+            if current_frames != wanted_frames or current_fps != target_fps:
+                _shot["target_fps"] = int(target_fps)
+                _shot["target_frames"] = int(wanted_frames)
+                frame_metadata_changed = True
+        if already_legal:
+            if range_active and max_len > 0.05:
+                msg = f"already within {min_len:.1f}-{max_len:.1f}s"
+            elif range_active:
+                msg = f"already above the {min_len:.1f}s LTX minimum"
+            elif max_len > 0.05:
+                msg = f"already within {max_len:.1f}s maximum"
+            else:
+                msg = "already within duration guard"
+            if frame_metadata_changed:
+                plan["ltx_minimum_shot_contract"] = {
+                    "minimum_seconds": float(_MUSICCLIP_LTX_MIN_SHOT_SECONDS),
+                    "minimum_frames": int(_MUSICCLIP_LTX_MIN_SHOT_FRAMES),
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(plan, f, indent=2, ensure_ascii=False)
+                os.replace(tmp, path)
+                msg += "; synchronized LTX frame counts"
+            return {
+                "changed": bool(frame_metadata_changed),
+                "timing_changed": False,
+                "frame_metadata_changed": bool(frame_metadata_changed),
+                "split_count": 0,
+                "merge_count": 0,
+                "cap_seconds": max_len,
+                "min_seconds": min_len,
+                "min_frames": int(_MUSICCLIP_LTX_MIN_SHOT_FRAMES),
+                "max_seconds": max_len,
+                "shot_count": len(timed),
+                "message": msg,
+            }
 
-        # Renumber LTX ids after splitting, so UI labels, output stems and review
-        # state stay unique and ordered.
-        for idx, shot in enumerate(new_shots, start=1):
-            if isinstance(shot, dict):
+        # With only the backend hard maximum active, retain the proven legacy
+        # behaviour: split only the individual overlong shot and leave every
+        # other cut/prompt untouched.
+        if not range_active and max_len > 0.05:
+            new_shots: list[Any] = []
+            split_source_count = 0
+            for shot in shots:
+                if not isinstance(shot, dict):
+                    new_shots.append(shot)
+                    continue
+                start, end, dur = _musicclip_ltx_read_timing(shot)
+                if dur <= max_len + eps:
+                    new_shots.append(shot)
+                    continue
+                pieces = max(2, int(math.ceil(dur / max_len)))
+                while pieces > 1 and (dur / float(pieces)) > max_len + 1e-6:
+                    pieces += 1
+                original_id = str(shot.get("id") or shot.get("shot_id") or "LTX").strip() or "LTX"
+                for part_index in range(pieces):
+                    a = start + dur * (part_index / float(pieces))
+                    b = start + dur * ((part_index + 1) / float(pieces))
+                    part = copy.deepcopy(shot)
+                    _musicclip_ltx_write_timing(part, a, b)
+                    part["source_ltx_shot_id"] = original_id
+                    part["split_from_overlong_ltx_shot"] = True
+                    part["split_part"] = int(part_index + 1)
+                    part["split_parts"] = int(pieces)
+                    part["duration_guard_applied"] = True
+                    part["duration_guard_max_seconds"] = round(float(max_len), 6)
+                    new_shots.append(part)
+                split_source_count += 1
+
+            for idx, shot in enumerate(new_shots, start=1):
+                if not isinstance(shot, dict):
+                    continue
                 sid = f"LTX{idx:02d}"
                 shot["id"] = sid
                 if "shot_id" in shot:
                     shot["shot_id"] = sid
+            plan[key] = new_shots
+            for count_key in ("ltx_shot_count", "shot_count", "director_shot_count"):
+                if count_key in plan:
+                    plan[count_key] = int(len([s for s in new_shots if isinstance(s, dict)]))
+            msg = f"enforced {max_len:.1f}s LTX maximum (split {split_source_count} over-cap shot(s))"
+            notes = plan.get("warnings")
+            if not isinstance(notes, list):
+                notes = []
+            notes.append(f"{label}: {msg}.")
+            plan["warnings"] = notes
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(plan, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, path)
+            return {
+                "changed": True,
+                "split_count": int(split_source_count),
+                "merge_count": 0,
+                "cap_seconds": max_len,
+                "min_seconds": 0.0,
+                "max_seconds": max_len,
+                "shot_count": len([s for s in new_shots if isinstance(s, dict)]),
+                "old_shot_count": len(timed),
+                "message": msg,
+            }
+
+        # Keep distinct timeline islands separate. Normal music plans are one
+        # contiguous block, but this avoids filling deliberate gaps in custom plans.
+        blocks: list[list[tuple[dict, float, float, float]]] = []
+        current: list[tuple[dict, float, float, float]] = []
+        current_end = 0.0
+        for item in timed:
+            _shot, start, end, _dur = item
+            if current and start > current_end + 0.15:
+                blocks.append(current)
+                current = []
+            current.append(item)
+            current_end = max(current_end, end) if current else end
+        if current:
+            blocks.append(current)
+
+        new_shots: list[dict] = []
+        impossible_blocks = 0
+        for block in blocks:
+            block_start = float(block[0][1])
+            block_end = max(float(item[2]) for item in block)
+            total = max(0.0, block_end - block_start)
+            if total <= 0.03:
+                continue
+
+            if range_active:
+                count = _musicclip_ltx_choose_partition_count(total, len(block), min_len, max_len)
+                if total < min_len - eps or (max_len > 0.05 and count * min_len > total + eps):
+                    impossible_blocks += 1
+            else:
+                # Preserve old max-only behaviour: only add enough parts for the cap.
+                count = max(len(block), int(math.ceil(total / max_len))) if max_len > 0.05 else len(block)
+
+            original_boundaries = [float(item[2]) for item in block[:-1]]
+            bounds = _musicclip_ltx_partition_boundaries(
+                block_start,
+                block_end,
+                count,
+                min_len if range_active else 0.0,
+                max_len,
+                original_boundaries,
+            )
+            for idx in range(len(bounds) - 1):
+                start_t = float(bounds[idx])
+                end_t = float(bounds[idx + 1])
+                if end_t <= start_t + 0.03:
+                    continue
+                part, source_ids = _musicclip_ltx_representative_shot(block, start_t, end_t)
+                old_start, old_end, _old_dur = _musicclip_ltx_read_timing(part)
+                _musicclip_ltx_write_timing(part, start_t, end_t)
+                part["duration_guard_applied"] = True
+                part["ltx_minimum_duration_applied"] = True
+                part["duration_guard_min_seconds"] = round(float(min_len), 6) if range_active else 0.0
+                part["ltx_minimum_frames"] = int(_MUSICCLIP_LTX_MIN_SHOT_FRAMES)
+                part["duration_guard_max_seconds"] = round(float(max_len), 6) if max_len > 0.05 else 0.0
+                if source_ids:
+                    part["duration_guard_source_shot_ids"] = source_ids
+                if len(source_ids) > 1:
+                    part["merged_by_smart_scene_duration_guard"] = True
+                if abs(old_start - start_t) > 0.02 or abs(old_end - end_t) > 0.02:
+                    part["retimed_by_smart_scene_duration_guard"] = True
+                new_shots.append(part)
+
+        if not new_shots:
+            return {"changed": False, "split_count": 0, "merge_count": 0, "cap_seconds": max_len, "message": "duration guard could not build legal shots"}
+
+        old_count = len(timed)
+        new_count = len(new_shots)
+        split_count = max(0, new_count - old_count)
+        merge_count = max(0, old_count - new_count)
+
+        # Renumber ids after merging/splitting so output stems and review state are unique.
+        for idx, shot in enumerate(new_shots, start=1):
+            sid = f"LTX{idx:02d}"
+            shot["id"] = sid
+            if "shot_id" in shot:
+                shot["shot_id"] = sid
         plan[key] = new_shots
         for count_key in ("ltx_shot_count", "shot_count", "director_shot_count"):
             if count_key in plan:
-                plan[count_key] = int(len(new_shots))
+                plan[count_key] = int(new_count)
+
+        guard_meta = plan.get("smart_scene_duration_guard")
+        if not isinstance(guard_meta, dict):
+            guard_meta = {}
+        guard_meta.update({
+            "enabled": bool(guard_enabled),
+            "minimum_seconds": float(min_len) if range_active else 0.0,
+            "minimum_frames": int(_MUSICCLIP_LTX_MIN_SHOT_FRAMES),
+            "global_ltx_minimum_seconds": float(_MUSICCLIP_LTX_MIN_SHOT_SECONDS),
+            "global_ltx_minimum_active": True,
+            "minimum_source": "smart_scene_duration_guard" if guard_enabled and min_len > _MUSICCLIP_LTX_MIN_SHOT_SECONDS + 0.001 else "global_ltx_floor",
+            "maximum_seconds": float(max_len) if max_len > 0.05 else 0.0,
+            "maximum_mode": max_mode,
+            "backend_hard_cap_seconds": float(hard_cap),
+            "authoritative_for_ltx_plan": bool(range_active),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        plan["smart_scene_duration_guard"] = guard_meta
+        plan["ltx_minimum_shot_contract"] = {
+            "minimum_seconds": float(_MUSICCLIP_LTX_MIN_SHOT_SECONDS),
+            "minimum_frames": int(_MUSICCLIP_LTX_MIN_SHOT_FRAMES),
+            "selected_effective_minimum_seconds": float(min_len),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+        if range_active and max_len > 0.05:
+            msg = f"enforced {min_len:.1f}-{max_len:.1f}s LTX shot range"
+        elif max_len > 0.05:
+            msg = f"enforced {max_len:.1f}s LTX maximum"
+        else:
+            msg = f"enforced {min_len:.1f}s LTX minimum"
+        details = []
+        if merge_count:
+            details.append(f"merged {merge_count}")
+        if split_count:
+            details.append(f"added {split_count} split shot(s)")
+        if new_count == old_count:
+            details.append("retimed boundaries")
+        if impossible_blocks:
+            details.append(f"{impossible_blocks} short edge block(s) could not meet the minimum exactly")
+        if details:
+            msg += " (" + ", ".join(details) + ")"
+
         notes = plan.get("warnings")
         if not isinstance(notes, list):
             notes = []
-        notes.append(f"{label}: split {split_count} over-10s LTX shot(s) for LTX-VRAMLab 241-frame limit.")
+        notes.append(f"{label}: {msg}.")
         plan["warnings"] = notes
+
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(plan, f, indent=2, ensure_ascii=False)
         os.replace(tmp, path)
-        return {"changed": True, "split_count": split_count, "cap_seconds": cap, "shot_count": len(new_shots), "message": f"split {split_count} over-cap shot(s)"}
+        return {
+            "changed": True,
+            "timing_changed": True,
+            "frame_metadata_changed": True,
+            "split_count": split_count,
+            "merge_count": merge_count,
+            "retimed_count": new_count if new_count == old_count else 0,
+            "cap_seconds": max_len,
+            "min_seconds": min_len,
+            "min_frames": int(_MUSICCLIP_LTX_MIN_SHOT_FRAMES),
+            "max_seconds": max_len,
+            "shot_count": new_count,
+            "old_shot_count": old_count,
+            "message": msg,
+        }
     except Exception as exc:
-        return {"changed": False, "split_count": 0, "cap_seconds": cap, "message": str(exc)}
+        return {
+            "changed": False,
+            "split_count": 0,
+            "merge_count": 0,
+            "cap_seconds": max_len,
+            "min_seconds": min_len,
+            "max_seconds": max_len,
+            "message": str(exc),
+        }
 
 
 
@@ -1126,12 +1603,13 @@ def _musicclip_ltx_apply_sanitize_result(result: dict, payload: dict, path_keys:
             if not isinstance(warnings, list):
                 warnings = []
             warnings.append(str(report.get("message") or "LTX plan duration guard applied."))
-            audio_report = _musicclip_ltx_regenerate_audio_chunks_for_plan(path, payload, label)
-            result["ltx_audio_chunk_guard_report"] = audio_report
-            if audio_report.get("changed"):
-                warnings.append(str(audio_report.get("message") or "LTX audio chunks regenerated after duration split."))
-            elif not audio_report.get("ok", True):
-                warnings.append("LTX plan was split, but audio chunks could not be regenerated: " + str(audio_report.get("message") or "unknown error"))
+            if bool(report.get("timing_changed", True)):
+                audio_report = _musicclip_ltx_regenerate_audio_chunks_for_plan(path, payload, label)
+                result["ltx_audio_chunk_guard_report"] = audio_report
+                if audio_report.get("changed"):
+                    warnings.append(str(audio_report.get("message") or "LTX audio chunks regenerated after duration split."))
+                elif not audio_report.get("ok", True):
+                    warnings.append("LTX plan timing changed, but audio chunks could not be regenerated: " + str(audio_report.get("message") or "unknown error"))
             result["warnings"] = warnings
             result["ltx_duration_guard_report"] = report
         raw_report = _musicclip_ltx_apply_raw_padding_to_plan_file(path, payload, label)
@@ -11441,7 +11919,7 @@ class AutoMusicSyncWidget(QWidget):
             self.ltx_section_music_track, ltx_music_lay = _make_ltx_section("Music track", expanded=True)
             self.ltx_section_idea, ltx_idea_lay = _make_ltx_section("Idea / project setup", expanded=True)
             self.ltx_section_reference_images, ltx_ref_lay = _make_ltx_section("Reference image section", expanded=False)
-            self.ltx_section_videoclip_settings, ltx_video_lay = _make_ltx_section("Videoclip settings / LTX backend", expanded=True)
+            self.ltx_section_videoclip_settings, ltx_video_lay = _make_ltx_section("Effects and Loras", expanded=False)
             self.ltx_section_lyrics_lipsync, ltx_lipsync_lay = _make_ltx_section("Lyrics / lipsync", expanded=False)
             self.ltx_section_shot_list, ltx_shot_list_lay = _make_ltx_section("LTX Shot list", expanded=False)
             self.ltx_section_settings_advanced, ltx_advanced_lay = _make_ltx_section("Settings and advanced features", expanded=False)
@@ -11818,8 +12296,8 @@ class AutoMusicSyncWidget(QWidget):
             self.combo_bridge_ltx_grouping_mode = QComboBox(ltx_box)
             self.combo_bridge_ltx_grouping_mode.addItems(["Auto", "No grouping"])
             self.combo_bridge_ltx_grouping_mode.setToolTip(
-                "Auto merges short Music Clip Creator scenes into fewer 6-10 second LTX test shots. "
-                "No grouping keeps one LTX shot per source scene."
+                "Auto may combine short source scenes into fewer LTX shots. "
+                "No grouping prefers one LTX shot per source scene. In both modes, final LTX render shots are kept at least 3.0 seconds / 73 frames."
             )
             ltx_form.addRow("Grouping:", self.combo_bridge_ltx_grouping_mode)
 
@@ -11882,6 +12360,21 @@ class AutoMusicSyncWidget(QWidget):
             self.edit_ltx_generated_start_image.setReadOnly(True)
             self.edit_ltx_generated_start_image.setPlaceholderText("Generated start image path appears here")
             ltx_single_form.addRow("Generated start image:", self.edit_ltx_generated_start_image)
+
+            # Keep the start-image widgets available for the existing internal/test
+            # code paths, but remove these old debugging rows from the visible UI.
+            self.row_ltx_single_start_image.hide()
+            self.edit_ltx_generated_start_image.hide()
+            try:
+                _existing_start_label = ltx_single_form.labelForField(self.row_ltx_single_start_image)
+                if _existing_start_label is not None:
+                    _existing_start_label.hide()
+                _generated_start_label = ltx_single_form.labelForField(self.edit_ltx_generated_start_image)
+                if _generated_start_label is not None:
+                    _generated_start_label.hide()
+            except Exception:
+                pass
+
             ltx_single_lay.addLayout(ltx_single_form)
 
             row_ltx_start_gen = QHBoxLayout()
@@ -11956,11 +12449,16 @@ class AutoMusicSyncWidget(QWidget):
                 "Creates final assembly from an existing ltx_full_run folder. "
                 "Each generated LTX video is retimed to its song timeline duration, then the original full music track is used as master audio."
             )
+
+            # These were useful while developing/testing the LTX workflow, but the
+            # finished one-click action now lives in the footer. Keep the objects
+            # alive for compatibility with existing handlers and busy-state code.
+            self.btn_generate_all_ltx_shots.hide()
+            self.btn_cancel_all_ltx_shots.hide()
+            self.btn_assemble_ltx_music_video.hide()
+
             row_ltx_single_actions.addWidget(self.btn_refresh_ltx_single_shots)
             row_ltx_single_actions.addWidget(self.btn_test_ltx_single_shot)
-            row_ltx_single_actions.addWidget(self.btn_generate_all_ltx_shots)
-            row_ltx_single_actions.addWidget(self.btn_cancel_all_ltx_shots)
-            row_ltx_single_actions.addWidget(self.btn_assemble_ltx_music_video)
             row_ltx_single_actions.addStretch(1)
             shot_tools_hint = QLabel("The shot list auto-refreshes after creating the LTX Director Plan.", self.ltx_section_settings_advanced)
             shot_tools_hint.setWordWrap(True)
@@ -13469,6 +13967,10 @@ class AutoMusicSyncWidget(QWidget):
                 "It stops at the next safe stage and does not delete generated files."
             )
             self.btn_footer_cancel_ltx_generation.setEnabled(False)
+            # Queue mode is the default, and cancellation then belongs in the
+            # FrameVision Queue tab. The toggle/update method reveals this only
+            # for direct in-UI LTX generation.
+            self.btn_footer_cancel_ltx_generation.hide()
 
         
         self.btn_presets.setToolTip(
@@ -14926,17 +15428,45 @@ class AutoMusicSyncWidget(QWidget):
         preset = _combo("combo_director_preset", "Balanced")
         scene_cut_style = _combo("combo_scene_cut_style", "Auto")
         max_scene_mode = _combo("combo_smart_max_scene_mode", "Auto (source-aware)")
+        manual_min = _spin("spin_smart_min_scene_len", 1.5)
         manual_max = _spin("spin_smart_max_scene_len", 5.0)
         try:
             duration_guard = bool(getattr(self, "check_smart_scene_duration_guard", None) and self.check_smart_scene_duration_guard.isChecked())
         except Exception:
             duration_guard = True
 
+        try:
+            source_durations = _source_durations_from_sources(list(getattr(self, "clip_sources", []) or []))
+        except Exception:
+            source_durations = []
+        resolved_guard = _resolve_smart_scene_duration_guard(
+            enabled=duration_guard,
+            min_scene_len=manual_min,
+            max_scene_len=manual_max,
+            max_scene_mode=max_scene_mode,
+            source_clip_durations=source_durations,
+        )
+        resolved_min = float(resolved_guard.get("min_len") or 0.0) if duration_guard else 0.0
+        resolved_max = float(resolved_guard.get("max_len") or 0.0) if duration_guard else 0.0
+        # LTX never receives a shot shorter than 3.0 seconds / 73 frames.
+        resolved_ltx_min = max(_MUSICCLIP_LTX_MIN_SHOT_SECONDS, resolved_min)
+        try:
+            grouping_mode = _combo("combo_bridge_ltx_grouping_mode", "Auto")
+        except Exception:
+            grouping_mode = "Auto"
+        grouping_enabled = str(grouping_mode or "Auto").strip().lower() not in {"no grouping", "off", "disabled", "false", "0"}
+
         low = f"{max_scene_mode} {scene_cut_style}".lower()
-        if duration_guard and "manual" in low and manual_max > 0.0:
+        if duration_guard:
+            # Duration Guard is the timing authority. The director preset/cut style
+            # may still choose *where* a legal cut lands, but not a different length.
             clip_length_mode = "manual"
-            target_clip_seconds = float(manual_max)
-            max_ltx = float(manual_max)
+            if resolved_max > 0.0:
+                target_clip_seconds = (resolved_ltx_min + resolved_max) * 0.5 if resolved_ltx_min > 0.0 else resolved_max
+                max_ltx = resolved_max
+            else:
+                target_clip_seconds = max(resolved_ltx_min, 0.0)
+                max_ltx = 0.0
         elif "short" in low or "busy" in low:
             clip_length_mode = "short"
             target_clip_seconds = 4.0
@@ -14961,10 +15491,22 @@ class AutoMusicSyncWidget(QWidget):
             # trimming/lipsync breathing room.
             planned_ltx_cap = 9.9
             manual_max = min(float(manual_max), planned_ltx_cap)
+            if resolved_max > 0.0:
+                resolved_max = min(float(resolved_max), planned_ltx_cap)
+            resolved_ltx_min = min(float(resolved_ltx_min), planned_ltx_cap)
+            if resolved_max > 0.0 and resolved_max < resolved_ltx_min:
+                resolved_max = resolved_ltx_min
             if target_clip_seconds > 0.0:
                 target_clip_seconds = min(float(target_clip_seconds), planned_ltx_cap)
             if max_ltx > 0.0:
                 max_ltx = min(float(max_ltx), planned_ltx_cap)
+
+        if resolved_max > 0.0 and resolved_max < resolved_ltx_min:
+            resolved_max = resolved_ltx_min
+        if max_ltx > 0.0 and max_ltx < resolved_ltx_min:
+            max_ltx = resolved_ltx_min
+        if target_clip_seconds > 0.0:
+            target_clip_seconds = max(resolved_ltx_min, target_clip_seconds)
 
         output_resolution = self._planner_bridge_normal_output_resolution_text()
         ltx_resolution = self._planner_bridge_ltx_resolution()
@@ -14980,14 +15522,24 @@ class AutoMusicSyncWidget(QWidget):
             "preset": preset,
             "director_preset": preset,
             "clip_length_mode": clip_length_mode,
-            "manual_max_clip_seconds": float(manual_max) if duration_guard and "manual" in str(max_scene_mode).lower() else None,
+            "duration_guard_overrides_pacing": bool(duration_guard),
+            "manual_min_clip_seconds": float(resolved_min) if duration_guard and resolved_min > 0.0 else None,
+            "manual_max_clip_seconds": float(resolved_max) if duration_guard and resolved_max > 0.0 else None,
+            "min_ltx_shot_seconds": float(resolved_ltx_min),
+            "min_ltx_shot_frames": int(_MUSICCLIP_LTX_MIN_SHOT_FRAMES),
+            "ltx_minimum_duration_enforced": True,
+            "grouping_mode": str(grouping_mode or "Auto"),
+            "ltx_grouping_enabled": bool(grouping_enabled),
+            "max_ltx_shot_seconds": float(resolved_max) if duration_guard and resolved_max > 0.0 else (float(max_ltx) if max_ltx > 0.0 else None),
             "target_clip_seconds": float(target_clip_seconds) if target_clip_seconds > 0.0 else None,
-            "max_ltx_shot_seconds": float(max_ltx) if max_ltx > 0.0 else None,
             "scene_cut_style": scene_cut_style,
             "beat_style": scene_cut_style,
             "smart_scene_duration_guard": bool(duration_guard),
+            "smart_min_scene_len": float(manual_min),
             "smart_max_scene_mode": max_scene_mode,
             "smart_max_scene_len": float(manual_max),
+            "smart_resolved_min_scene_len": float(resolved_min) if duration_guard else 0.0,
+            "smart_resolved_max_scene_len": float(resolved_max) if duration_guard else 0.0,
             "ltx_backend": str(backend or ""),
             "output_resolution": output_resolution,
             "output_resolution_label": str(self.combo_res.currentText() or "") if getattr(self, "combo_res", None) is not None else "",
@@ -15333,6 +15885,10 @@ class AutoMusicSyncWidget(QWidget):
                 "cut_style": str(self.combo_scene_cut_style.currentText()) if hasattr(self, "combo_scene_cut_style") else "",
                 "scene_cut_style": str(self.combo_scene_cut_style.currentText()) if hasattr(self, "combo_scene_cut_style") else "",
                 "cut_timing_offset": float(self.spin_smart_cut_timing_offset.value()) if hasattr(self, "spin_smart_cut_timing_offset") else 0.0,
+                "smart_scene_duration_guard": bool(self.check_smart_scene_duration_guard.isChecked()) if hasattr(self, "check_smart_scene_duration_guard") else True,
+                "smart_min_scene_len": float(self.spin_smart_min_scene_len.value()) if hasattr(self, "spin_smart_min_scene_len") else 1.5,
+                "smart_max_scene_mode": str(self.combo_smart_max_scene_mode.currentText()) if hasattr(self, "combo_smart_max_scene_mode") else "Auto (source-aware)",
+                "smart_max_scene_len": float(self.spin_smart_max_scene_len.value()) if hasattr(self, "spin_smart_max_scene_len") else 5.0,
                 "creative_brief": self._planner_bridge_creative_brief(),
                 "smart_scene_map": _scene_map_to_list(scenes),
                 "lyric_segments": _lyric_segments_to_list(self._current_lyric_segments_for_bridge()),
@@ -16052,19 +16608,26 @@ class AutoMusicSyncWidget(QWidget):
 
     def _update_ltx_footer_action_text(self) -> None:
         try:
+            use_queue = self._ltx_use_framevision_queue_enabled()
+
             btn = getattr(self, "btn_footer_queue_ltx_videoclip", None)
-            if btn is None:
-                return
-            if self._ltx_use_framevision_queue_enabled():
-                btn.setText("Queue LTX Video")
-                btn.setToolTip(
-                    "Prepare prompt plan, LTX shot plan and LTX director plan in a background worker, then add the heavy LTX render/assembly to FrameVision Queue."
-                )
-            else:
-                btn.setText("Generate LTX Video")
-                btn.setToolTip(
-                    "Prepare prompt plan, LTX shot plan and LTX director plan in a background worker, then run the LTX render/assembly directly in this UI."
-                )
+            if btn is not None:
+                if use_queue:
+                    btn.setText("Queue LTX Video")
+                    btn.setToolTip(
+                        "Prepare prompt plan, LTX shot plan and LTX director plan in a background worker, then add the heavy LTX render/assembly to FrameVision Queue."
+                    )
+                else:
+                    btn.setText("Generate LTX Video")
+                    btn.setToolTip(
+                        "Prepare prompt plan, LTX shot plan and LTX director plan in a background worker, then run the LTX render/assembly directly in this UI."
+                    )
+
+            # A queued job is cancelled from FrameVision Queue. This footer button
+            # only controls the direct in-UI worker, so do not show it in queue mode.
+            cancel_btn = getattr(self, "btn_footer_cancel_ltx_generation", None)
+            if cancel_btn is not None:
+                cancel_btn.setVisible(not use_queue)
         except Exception:
             pass
 
@@ -16544,7 +17107,9 @@ class AutoMusicSyncWidget(QWidget):
                     sh["song_end"] = round(end, 3)
                     sh["duration"] = round(max(0.05, end - start), 3)
                     sh["target_fps"] = int(sh.get("target_fps") or fps or 24)
-                    sh["target_frames"] = max(1, int(round(float(sh["duration"]) * int(sh["target_fps"]))))
+                    sh["target_frames"] = _musicclip_ltx_frames_for_duration(
+                        float(sh["duration"]), int(sh["target_fps"])
+                    )
                     sh["duration_safety_changed"] = True
                     cursor = end
                 data["shots"] = shots
@@ -16981,7 +17546,7 @@ class AutoMusicSyncWidget(QWidget):
         """Split overlong LTX shots and immediately rebuild only per-shot audio chunks."""
         payload = self._ltx_duration_guard_payload()
         report = _musicclip_ltx_sanitize_plan_file(plan_path, payload, label)
-        if isinstance(report, dict) and report.get("changed"):
+        if isinstance(report, dict) and report.get("changed") and bool(report.get("timing_changed", True)):
             audio_report = _musicclip_ltx_regenerate_audio_chunks_for_plan(plan_path, payload, label)
             report["audio_chunk_report"] = audio_report
         return report
@@ -17001,7 +17566,7 @@ class AutoMusicSyncWidget(QWidget):
                 if isinstance(report, dict) and report.get("changed"):
                     audio_report = report.get("audio_chunk_report") if isinstance(report.get("audio_chunk_report"), dict) else {}
                     audio_note = " Audio chunks rebuilt." if audio_report.get("changed") else ""
-                    self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s).{audio_note}")
+                    self._set_planner_bridge_status(f"Planner Bridge: {str(report.get('message') or 'Duration guard applied.')}.{audio_note}")
             except Exception:
                 pass
             with open(path, "r", encoding="utf-8") as f:
@@ -17149,7 +17714,7 @@ class AutoMusicSyncWidget(QWidget):
             if isinstance(report, dict) and report.get("changed"):
                 audio_report = report.get("audio_chunk_report") if isinstance(report.get("audio_chunk_report"), dict) else {}
                 audio_note = " Audio chunks rebuilt." if audio_report.get("changed") else ""
-                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before start-image generation.{audio_note}")
+                self._set_planner_bridge_status(f"Planner Bridge: {str(report.get('message') or 'Duration guard applied')} before start-image generation.{audio_note}")
                 self._refresh_ltx_single_shots()
         except Exception:
             pass
@@ -17453,7 +18018,7 @@ class AutoMusicSyncWidget(QWidget):
             if isinstance(report, dict) and report.get("changed"):
                 audio_report = report.get("audio_chunk_report") if isinstance(report.get("audio_chunk_report"), dict) else {}
                 audio_note = " Audio chunks rebuilt." if audio_report.get("changed") else ""
-                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before generation.{audio_note}")
+                self._set_planner_bridge_status(f"Planner Bridge: {str(report.get('message') or 'Duration guard applied')} before generation.{audio_note}")
                 self._refresh_ltx_single_shots()
         except Exception:
             pass
@@ -17829,9 +18394,11 @@ class AutoMusicSyncWidget(QWidget):
             return
 
         try:
-            report = _musicclip_ltx_sanitize_plan_file(plan_path, {"ltx_backend": self._current_ltx_generation_backend()}, "LTX director plan")
+            report = self._apply_ltx_duration_guard_for_plan(plan_path, "LTX director plan")
             if isinstance(report, dict) and report.get("changed"):
-                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before assembly.")
+                audio_report = report.get("audio_chunk_report") if isinstance(report.get("audio_chunk_report"), dict) else {}
+                audio_note = " Audio chunks rebuilt." if audio_report.get("changed") else ""
+                self._set_planner_bridge_status(f"Planner Bridge: {str(report.get('message') or 'Duration guard applied')} before assembly.{audio_note}")
                 self._refresh_ltx_single_shots()
         except Exception:
             pass
@@ -18067,7 +18634,7 @@ class AutoMusicSyncWidget(QWidget):
             if isinstance(report, dict) and report.get("changed"):
                 audio_report = report.get("audio_chunk_report") if isinstance(report.get("audio_chunk_report"), dict) else {}
                 audio_note = " Audio chunks rebuilt." if audio_report.get("changed") else ""
-                self._set_planner_bridge_status(f"Planner Bridge: Duration guard split {int(report.get('split_count') or 0)} over-10s LTX shot(s) before testing.{audio_note}")
+                self._set_planner_bridge_status(f"Planner Bridge: {str(report.get('message') or 'Duration guard applied')} before testing.{audio_note}")
                 self._refresh_ltx_single_shots()
         except Exception:
             pass
@@ -19376,14 +19943,19 @@ class AutoMusicSyncWidget(QWidget):
             raw_smart_on = True
             guard_checked = False
 
-        # UI-only lock: when Duration Guard is active, the Smart Scene Map toggle
-        # stays visually checked/unchanged but cannot be toggled until the guard is off.
+        # Duration Guard depends on Smart Scene Map timing. Enabling the guard
+        # therefore turns Smart Scene Map on and locks it until the guard is off.
         try:
             if smart_cb is not None:
+                if guard_checked and not raw_smart_on:
+                    smart_cb.blockSignals(True)
+                    smart_cb.setChecked(True)
+                    smart_cb.blockSignals(False)
+                    raw_smart_on = True
                 smart_cb.setEnabled(not guard_checked)
                 if guard_checked:
                     smart_cb.setToolTip(
-                        "Duration Guard is active — Smart Scene Map toggle is locked because duration guard controls scene timing."
+                        "Duration Guard is active — Smart Scene Map is locked on because the selected minimum/maximum controls scene timing."
                     )
                 else:
                     smart_cb.setToolTip(

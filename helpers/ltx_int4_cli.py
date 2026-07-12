@@ -135,7 +135,7 @@ def _int_option(extra: Iterable[str], names: Tuple[str, ...], default: int) -> i
         return int(default)
 
 
-_SAFE_GROUP_BLOCKS = (1, 2, 3, 4, 6, 8, 12, 14, 16, 24, 48)
+_SAFE_GROUP_BLOCKS = (1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 24, 32, 48)
 _BASELINE_WORK_UNITS = float(832 * 448 * 241)
 
 
@@ -178,14 +178,15 @@ def _select_sdnq_offload_policy(
     move with resolution instead of treating frame count as the only source of
     pressure.
 
-    The 24 GB two-stage I2V path preserves the measured fast 121-frame route
-    and the proven guarded 217/241-frame route.  The 16 GB and 12 GB planners
-    start with smaller resident transformer groups and step down earlier:
+    The 24 GB two-stage I2V path preserves the measured fast 121-frame route,
+    then uses progressively smaller Stage 2 groups as full-resolution temporal
+    pressure rises.  Music-synchronised 704p jobs around 225-241 aligned frames
+    use a 4-block Stage 2 group so refinement steps 2 and 3 retain real driver
+    headroom instead of touching the WDDM shared-memory floor.
 
-    * 16 GB: Stage 1 gets an extra guard near the 180-frame/704p workload;
-      Stage 2 reduces from 16 to 12 resident blocks at the same boundary.
-    * 12 GB: Stage 1 starts reducing around the 121-frame/704p workload;
-      Stage 2 is already strongly grouped by that point.
+    The 16 GB, 12 GB, and 8 GB Stage 2 plans step down even earlier.  Stage 1
+    remains on the already-proven faster policies; this calibration is focused
+    specifically on full-resolution Stage 2 residency.
 
     Manual mode/group overrides still win.  Disabling the automatic planner
     selects a fixed per-card fallback instead of applying workload thresholds.
@@ -259,25 +260,26 @@ def _select_sdnq_offload_policy(
         use_stream = False
         reason = "manual group offload override; prefetch disabled for predictable VRAM"
     elif variant == "int4" and not bool(automation_enabled):
-        # VRAM Lab OFF in the UI: keep a deterministic fixed policy.  The
-        # temporal VAE decoder remains spill-safe because that is part of the
-        # correct INT4 pipeline, not an optional tuning experiment.
+        # VRAM Lab OFF in the UI: keep a deterministic fixed policy.  Stage 1
+        # retains its established profile while Stage 2 still receives a safe
+        # per-card residency ceiling; disabling automation must not turn a
+        # 16/24 GB selection into an accidental full-resolution spill path.
         if profile_bucket == 24:
-            desired = blocks
-            mode = "model_cpu_offload"
+            desired = blocks if stage == "stage1" else 4
         elif profile_bucket == 16:
-            desired = 16 if stage == "stage1" else 12
-            mode = "group_cpu_offload"
+            desired = 16 if stage == "stage1" else 3
         elif profile_bucket == 12:
-            desired = 8 if stage == "stage1" else 4
-            mode = "group_cpu_offload"
+            desired = 8 if stage == "stage1" else 2
         else:
-            desired = 4 if stage == "stage1" else 2
-            mode = "group_cpu_offload"
+            desired = 4 if stage == "stage1" else 1
+        if stage == "stage1" and profile_bucket == 24:
+            mode = "model_cpu_offload"
+        else:
+            mode = "group_cpu_offload" if desired > 1 else "sequential_cpu_offload"
         use_stream = False
         reason = (
-            f"INT4 automatic VRAM planner disabled; fixed {profile_bucket}GB "
-            f"{stage} policy"
+            f"INT4 automatic VRAM planner disabled; fixed conservative "
+            f"{profile_bucket}GB {stage} policy"
         )
     elif (
         variant == "int4"
@@ -300,11 +302,15 @@ def _select_sdnq_offload_policy(
             first_group_limit = 0.80 if is_i2v else 2.00
             second_group_limit = 1.20 if is_i2v else 2.75
             if work_factor <= first_group_limit:
-                desired = 24
+                # The music route normally runs Stage 1 without CFG and the
+                # measured 24-block path used only ~11.7 GB at 241 model
+                # frames.  A 32-block group uses the available 24 GB card more
+                # productively while retaining a large activation reserve.
+                desired = 32
             elif work_factor <= second_group_limit:
-                desired = 16
+                desired = 24
             else:
-                desired = 12
+                desired = 16
             mode = "group_cpu_offload"
             use_stream = False
             reason = (
@@ -335,13 +341,20 @@ def _select_sdnq_offload_policy(
                 desired = _select_stepped_group(
                     work_factor,
                     (
-                        (1.85, 24),
-                        (2.55, 14),
-                        (2.80, 12),
-                        (3.40, 6),
-                        (4.25, 4),
+                        (1.55, 24),
+                        (1.85, 14),
+                        # Full-resolution refinement grows substantially after
+                        # the first step.  Reduce residency before the 201-217f
+                        # band, then use four blocks for the common 225-241f
+                        # Music Creator route.  The measured 8-block route hit
+                        # 24.59 GB reserved / 0.00 GB driver-free on step 2/3.
+                        (2.05, 8),
+                        (2.25, 6),
+                        (2.80, 4),
+                        (3.40, 3),
+                        (4.25, 2),
                     ),
-                    3,
+                    1,
                 )
             else:
                 desired = _select_stepped_group(
@@ -349,7 +362,7 @@ def _select_sdnq_offload_policy(
                     ((5.50, 12), (6.50, 8)),
                     6,
                 )
-            mode = "group_cpu_offload"
+            mode = "group_cpu_offload" if desired > 1 else "sequential_cpu_offload"
             use_stream = False
             reason = (
                 f"INT4 24GB {'I2V' if is_i2v else 'T2V'} Stage 2 boundary guard; "
@@ -381,16 +394,23 @@ def _select_sdnq_offload_policy(
         if stage == "stage1":
             desired = _select_stepped_group(
                 work_factor,
-                ((0.45, 24), (0.75, 16), (1.10, 12)),
+                # The measured 24-block Stage 1 route stayed around 11.7 GB
+                # for 241 model frames at 704p, so it is also the useful fast
+                # tier for a real 16 GB card.  Step down only as the quarter-
+                # resolution activation load grows beyond that range.
+                ((0.75, 24), (1.00, 16), (1.30, 12)),
                 8,
             )
         else:
             desired = _select_stepped_group(
                 work_factor,
-                ((1.75, 16), (2.30, 12), (2.75, 8), (3.40, 6), (4.25, 4)),
-                3,
+                # Stage 2 is activation-heavy and cannot reuse the Stage 1
+                # residency assumptions.  A 241f/704p job now resolves to
+                # three blocks instead of eight/twelve.
+                ((1.10, 8), (1.55, 6), (1.95, 4), (2.75, 3), (3.40, 2)),
+                1,
             )
-        mode = "group_cpu_offload"
+        mode = "group_cpu_offload" if desired > 1 else "sequential_cpu_offload"
         use_stream = False
         reason = (
             f"INT4 automatic 16GB {stage} planner; resolution/frame-aware "
@@ -409,10 +429,10 @@ def _select_sdnq_offload_policy(
         else:
             desired = _select_stepped_group(
                 work_factor,
-                ((0.65, 8), (1.10, 6), (1.80, 4), (2.75, 3)),
-                2,
+                ((0.65, 6), (1.10, 4), (1.80, 3), (2.75, 2)),
+                1,
             )
-        mode = "group_cpu_offload"
+        mode = "group_cpu_offload" if desired > 1 else "sequential_cpu_offload"
         use_stream = False
         reason = (
             f"INT4 automatic 12GB {stage} planner; resolution/frame-aware "
@@ -430,7 +450,7 @@ def _select_sdnq_offload_policy(
         else:
             desired = _select_stepped_group(
                 work_factor,
-                ((0.55, 4), (1.10, 3), (2.00, 2)),
+                ((0.55, 3), (1.10, 2)),
                 1,
             )
         mode = "group_cpu_offload" if desired > 1 else "sequential_cpu_offload"
@@ -501,6 +521,109 @@ def _select_sdnq_offload_policy(
             else "heavy"
         ),
     }
+
+
+def _configure_attention_backend(pipe: Any, requested: str, ctx: Dict[str, Any]) -> str:
+    """Select a bounded-memory Diffusers attention backend for LTX INT4.
+
+    Native SDPA can choose a math fallback for some long cross-attention
+    shapes.  That fallback materialises much larger temporary tensors and is a
+    poor match for the 704p Stage 2 sequence.  ``_native_efficient`` is part of
+    PyTorch/Diffusers and does not require another downloaded package.
+    """
+    requested_text = str(requested or "auto").strip().lower().replace("-", "_")
+    backend_map = {
+        "auto": "_native_efficient",
+        "efficient": "_native_efficient",
+        "native_efficient": "_native_efficient",
+        "native": "native",
+        "flash": "_native_flash",
+        "native_flash": "_native_flash",
+        "sage": "sage",
+    }
+    selected = backend_map.get(requested_text, "_native_efficient")
+    transformer = getattr(pipe, "transformer", None)
+    setter = getattr(transformer, "set_attention_backend", None)
+    if not callable(setter):
+        ctx["ltx_sdnq_attention_backend"] = (
+            "default: transformer does not expose set_attention_backend"
+        )
+        return "default"
+    try:
+        setter(selected)
+        ctx["ltx_sdnq_attention_backend"] = (
+            f"{selected}: explicit bounded-memory attention dispatcher"
+        )
+        print(
+            f"[ltx-status] SDNQ attention backend: {selected}",
+            flush=True,
+        )
+        return selected
+    except Exception as exc:
+        # The PyTorch native default remains a correct fallback.  Do not abort
+        # model loading merely because an optional dispatcher backend is absent.
+        try:
+            resetter = getattr(transformer, "reset_attention_backend", None)
+            if callable(resetter):
+                resetter()
+        except Exception:
+            pass
+        ctx["ltx_sdnq_attention_backend"] = (
+            f"default fallback; {selected} unavailable: {type(exc).__name__}: {exc}"
+        )
+        print(
+            "[ltx-warning] Bounded-memory attention backend unavailable; "
+            f"using Diffusers default: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return "default"
+
+
+def _resolve_prompt_sequence_length(
+    tokenizer: Any,
+    prompt: str,
+    negative_prompt: Optional[str],
+    do_cfg: bool,
+    *,
+    hard_max: int = 1024,
+) -> Tuple[int, int]:
+    """Return a connector-compatible padded length for the prompt batch.
+
+    Diffusers defaults LTX-2 to 1024 text tokens even for a short prompt.  The
+    resulting all-padding cross-attention mask scales with the video token
+    count and becomes expensive around 9-10 seconds at 704p.  LTX-2's video
+    connector groups text states around 128 learnable registers, so the cached
+    sequence length must remain divisible by 128.  Probe token lengths on CPU
+    and round up to the next 128-token block without removing any real token.
+    """
+    maximum = max(128, int(hard_max))
+    values = [str(prompt or "")]
+    if bool(do_cfg):
+        values.append(str(negative_prompt or ""))
+    try:
+        encoded = tokenizer(
+            values,
+            padding=False,
+            truncation=True,
+            max_length=maximum,
+            add_special_tokens=True,
+        )
+        ids = encoded.get("input_ids") if hasattr(encoded, "get") else None
+        lengths = []
+        if ids is not None:
+            if ids and isinstance(ids[0], int):
+                lengths = [len(ids)]
+            else:
+                lengths = [len(row) for row in ids]
+        actual = max(lengths) if lengths else maximum
+    except Exception:
+        actual = maximum
+    register_block = 128
+    effective = min(
+        maximum,
+        max(register_block, ((int(actual) + register_block - 1) // register_block) * register_block),
+    )
+    return int(effective), int(actual)
 
 
 def _driver_free_bytes(torch_module: Any) -> Optional[int]:
@@ -1109,6 +1232,7 @@ def _extract_audio_latents(
     ctx: Dict[str, Any],
     num_frames: int,
     frame_rate: float,
+    output_num_frames: Optional[int] = None,
 ) -> Tuple[Any, Any, Optional[int]]:
     """Decode the selected soundtrack and encode it with the split model audio VAE.
 
@@ -1139,7 +1263,11 @@ def _extract_audio_latents(
             f"{type(exc).__name__}: {exc}"
         ) from exc
 
-    duration = float(num_frames) / float(frame_rate)
+    # Keep the user-visible waveform at the exact requested output duration,
+    # while the encoded/padded conditioning latent below follows the aligned
+    # 8n+1 model length used by the transformer.
+    waveform_frames = int(output_num_frames) if output_num_frames is not None else int(num_frames)
+    duration = float(waveform_frames) / float(frame_rate)
     requested_max = getattr(args, "audio_max_duration", None)
     if requested_max is not None and float(requested_max) > 0:
         duration = min(duration, float(requested_max))
@@ -1377,8 +1505,42 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
 
     target_width = int(getattr(args, "width", 768))
     target_height = int(getattr(args, "height", 512))
-    num_frames = int(getattr(args, "num_frames", 121))
+    requested_num_frames = max(1, int(getattr(args, "num_frames", 121)))
     frame_rate = float(getattr(args, "frame_rate", 24))
+
+    # LTX-2's video VAE represents F output frames as
+    # ``(latent_frames - 1) * 8 + 1``. Passing an arbitrary count such as 228
+    # directly therefore creates only 225 decodable frames while other parts
+    # of the pipeline still receive 228. Besides shortening the clip, those
+    # mismatched temporal shapes produced a repeatable Stage 2 allocator spike
+    # on the Music Creator route. Generate the next valid 8n+1 model length and
+    # trim the streamed VAE output back to the exact requested frame count.
+    vae_scale_factors = info.get("transformer_config", {}).get("vae_scale_factors", (8, 32, 32))
+    try:
+        temporal_ratio = max(1, int(vae_scale_factors[0]))
+    except Exception:
+        temporal_ratio = 8
+    model_num_frames = (
+        ((requested_num_frames - 1 + temporal_ratio - 1) // temporal_ratio)
+        * temporal_ratio
+        + 1
+    )
+    num_frames = int(model_num_frames)
+    ctx["ltx_sdnq_requested_num_frames"] = str(requested_num_frames)
+    ctx["ltx_sdnq_model_num_frames"] = str(model_num_frames)
+    if model_num_frames == requested_num_frames:
+        ctx["ltx_sdnq_frame_alignment"] = "already valid 8n+1 model length"
+    else:
+        ctx["ltx_sdnq_frame_alignment"] = (
+            f"model generation padded {requested_num_frames}->{model_num_frames} frames; "
+            f"final decode trimmed back to {requested_num_frames}"
+        )
+        print(
+            "[ltx-status] Aligning requested frame count for LTX temporal VAE: "
+            f"{requested_num_frames} -> {model_num_frames}; output will be trimmed back",
+            flush=True,
+        )
+
     if workflow == "two_stages":
         if target_width % 64 != 0 or target_height % 64 != 0:
             raise RuntimeError(
@@ -1507,6 +1669,12 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
     ctx["ltx_sdnq_quantized_matmul"] = "; ".join(quantized_matmul_status) or "not found"
     print(f"[ltx-status] SDNQ quantized matmul: {ctx['ltx_sdnq_quantized_matmul']}", flush=True)
 
+    _configure_attention_backend(
+        pipe,
+        str(getattr(args, "attention_backend", "auto") or "auto"),
+        ctx,
+    )
+
     try:
         pipe.vae.enable_tiling()
         ctx["ltx_sdnq_vae_tiling"] = "enabled"
@@ -1520,6 +1688,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         ctx=ctx,
         num_frames=num_frames,
         frame_rate=frame_rate,
+        output_num_frames=requested_num_frames,
     )
     freeze_reference_audio = reference_audio_latents is not None
 
@@ -1631,26 +1800,26 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
     if workflow != "two_stages":
         stage2_policy = dict(stage1_policy)
 
-    # Long Stage 2 jobs can leave a large amount of inactive allocator cache
-    # reserved after each refinement step. On Windows that reservation can push
-    # otherwise-dead memory into WDDM shared GPU memory for the remaining steps.
-    # Use the same workload boundaries that motivate stronger offload on 12/16GB
-    # cards, while leaving the proven 121/217/241-frame 24GB paths untouched.
-    stage2_allocator_trim_threshold = {24: 2.80, 16: 1.75, 12: 1.10, 8: 0.0}.get(
-        int(stage2_policy.get("profile_bucket", 24)),
-        2.80,
-    )
+    # Every grouped Stage 2 route can accumulate inactive CUDA allocator
+    # blocks between its three refinement steps.  The residency planner above
+    # now leaves additional live-tensor headroom; this cache guard complements
+    # it by returning stale allocator blocks after steps 1 and 2.  Live tensors
+    # are untouched and the proven short full-transformer fast path is unchanged.
     stage2_allocator_trim = bool(
         workflow == "two_stages"
-        and str(stage2_policy.get("mode", "")) in {"group_cpu_offload", "sequential_cpu_offload"}
-        and float(stage2_policy.get("work_factor", 0.0)) > float(stage2_allocator_trim_threshold)
+        and str(stage2_policy.get("mode", ""))
+        in {"group_cpu_offload", "sequential_cpu_offload"}
     )
     ctx["ltx_sdnq_stage2_allocator_guard"] = (
-        "enabled: release inactive CUDA allocator cache after refinement steps "
-        f"1-2 (work={float(stage2_policy.get('work_factor', 0.0)):.3f} > "
-        f"{stage2_allocator_trim_threshold:.3f})"
+        "enabled: collect Python garbage and release inactive CUDA allocator "
+        "cache after grouped refinement steps 1-2"
         if stage2_allocator_trim
-        else "not needed for this workload/profile"
+        else "not needed: Stage 2 uses the full-transformer fast path"
+    )
+    ctx["ltx_sdnq_stage2_conservative_policy"] = (
+        f"profile={stage2_policy['profile_bucket']}GB; "
+        f"group={stage2_policy['group_blocks']}/{stage2_policy['block_count']}; "
+        f"mode={stage2_policy['mode']}; work={stage2_policy['work_factor']:.3f}"
     )
     ctx["ltx_sdnq_stage2_allocator_trim_count"] = "0"
 
@@ -2067,7 +2236,24 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
 
     prompt = str(getattr(args, "prompt", ""))
     do_cfg = bool(guidance_scale > 1.0 or audio_guidance_scale > 1.0)
-    print("[ltx-status] Encoding SDNQ prompt once for all stages", flush=True)
+    prompt_sequence_length, prompt_token_count = _resolve_prompt_sequence_length(
+        getattr(pipe, "tokenizer", None),
+        prompt,
+        negative_prompt,
+        do_cfg,
+        hard_max=1024,
+    )
+    ctx["ltx_sdnq_prompt_sequence_length_requested"] = "1024"
+    ctx["ltx_sdnq_prompt_token_count"] = str(prompt_token_count)
+    ctx["ltx_sdnq_prompt_sequence_length"] = str(prompt_sequence_length)
+    ctx["ltx_sdnq_prompt_padding_tokens_removed"] = str(
+        max(0, 1024 - int(prompt_sequence_length))
+    )
+    print(
+        "[ltx-status] Encoding SDNQ prompt once for all stages "
+        f"({prompt_sequence_length} tokens instead of fixed 1024 padding)",
+        flush=True,
+    )
     try:
         torch_module.cuda.reset_peak_memory_stats()
     except Exception:
@@ -2084,7 +2270,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
             prompt,
             negative_prompt,
             do_classifier_free_guidance=do_cfg,
-            max_sequence_length=1024,
+            max_sequence_length=prompt_sequence_length,
         )
     else:
         (
@@ -2097,7 +2283,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
             negative_prompt=negative_prompt,
             do_classifier_free_guidance=do_cfg,
             num_videos_per_prompt=1,
-            max_sequence_length=1024,
+            max_sequence_length=prompt_sequence_length,
             device=pipe._execution_device,
             dtype=torch_module.bfloat16,
         )
@@ -2224,6 +2410,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
     ):
         previous = time.perf_counter()
         trim_count = 0
+        memory_events = []
 
         def _callback(
             _pipe: Any,
@@ -2239,6 +2426,19 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
             _sample_driver_free(phase_name)
             print(f"[ltx-step-time] {event}", flush=True)
 
+            if str(phase_name) == "stage2":
+                try:
+                    allocated = float(torch_module.cuda.memory_allocated()) / (1024 ** 3)
+                    reserved = float(torch_module.cuda.memory_reserved()) / (1024 ** 3)
+                    driver_free = float(torch_module.cuda.mem_get_info()[0]) / (1024 ** 3)
+                    memory_events.append(
+                        f"step {int(step)+1}/{expected_steps}: allocated={allocated:.2f} GB, "
+                        f"reserved={reserved:.2f} GB, driver_free={driver_free:.2f} GB"
+                    )
+                    ctx["ltx_sdnq_stage2_step_memory"] = " | ".join(memory_events)
+                except Exception:
+                    pass
+
             # Do this only between Stage 2 refinement steps. ``empty_cache``
             # never frees live tensors; it returns unused allocator blocks to
             # the CUDA driver so WDDM does not keep paging a stale 20+ GB cache
@@ -2248,6 +2448,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
                     _sync_cuda()
                     before_reserved = float(torch_module.cuda.memory_reserved()) / (1024 ** 3)
                     before_free = float(torch_module.cuda.mem_get_info()[0]) / (1024 ** 3)
+                    gc.collect()
                     torch_module.cuda.empty_cache()
                     _sync_cuda()
                     after_reserved = float(torch_module.cuda.memory_reserved()) / (1024 ** 3)
@@ -2304,7 +2505,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         "audio_guidance_rescale": audio_guidance_rescale,
         "generator": generator,
         "callback_on_step_end_tensor_inputs": ["latents"],
-        "max_sequence_length": 1024,
+        "max_sequence_length": prompt_sequence_length,
     }
     if stg_scale > 0.0 or audio_stg_scale > 0.0:
         common_kwargs["spatio_temporal_guidance_blocks"] = [28]
@@ -2516,7 +2717,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
                 trim_cuda_cache=stage2_allocator_trim,
             ),
             "callback_on_step_end_tensor_inputs": ["latents"],
-            "max_sequence_length": 1024,
+            "max_sequence_length": prompt_sequence_length,
         }
         if loaded_image is not None:
             stage2_kwargs["image"] = loaded_image
@@ -2688,7 +2889,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
                 vae=video_vae,
                 latents=video_latents_final,
                 torch_module=torch_module,
-                target_num_frames=num_frames,
+                target_num_frames=requested_num_frames,
                 window_frames=int(decode_plan["window_frames"]),
                 stride_frames=int(decode_plan["stride_frames"]),
                 spatial_tiling=bool(decode_plan["spatial_tiling"]),
@@ -2698,6 +2899,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
             ctx["ltx_sdnq_video_decode_window_frames"] = str(decode_stats["window_frames"])
             ctx["ltx_sdnq_video_decode_stride_frames"] = str(decode_stats["stride_frames"])
             ctx["ltx_sdnq_video_decode_overlap_frames"] = str(decode_stats["overlap_frames"])
+            ctx["ltx_sdnq_video_decode_output_frames"] = str(decode_stats["decoded_frames"])
             ctx["ltx_sdnq_video_decode_spatial_tiling"] = (
                 "enabled" if decode_stats["spatial_tiling"] else "disabled"
             )
@@ -3005,11 +3207,17 @@ def _write_report(path: Path, ctx: Dict[str, Any], exception_text: str = "") -> 
         "ltx_sdnq_input_mode", "ltx_sdnq_pipeline_class", "ltx_sdnq_model_root",
         "ltx_sdnq_workflow", "ltx_sdnq_weight_dtype", "ltx_sdnq_offload_policy",
         "ltx_sdnq_memory_policy_input_mode", "ltx_sdnq_stage1_policy_tier",
-        "ltx_sdnq_stage2_policy_tier", "ltx_sdnq_stage1_equivalent_704_frames",
+        "ltx_sdnq_stage2_policy_tier", "ltx_sdnq_requested_num_frames",
+        "ltx_sdnq_model_num_frames", "ltx_sdnq_frame_alignment",
+        "ltx_sdnq_stage1_equivalent_704_frames",
         "ltx_sdnq_stage2_equivalent_704_frames", "ltx_sdnq_i2v_fast_path_limits",
-        "ltx_sdnq_stage2_allocator_guard", "ltx_sdnq_stage2_allocator_trim_count",
-        "ltx_sdnq_stage2_allocator_trim_last", "ltx_sdnq_stage2_allocator_trim_error",
+        "ltx_sdnq_stage2_allocator_guard", "ltx_sdnq_stage2_conservative_policy",
+        "ltx_sdnq_stage2_allocator_trim_count", "ltx_sdnq_stage2_allocator_trim_last",
+        "ltx_sdnq_stage2_allocator_trim_error", "ltx_sdnq_stage2_step_memory",
+        "ltx_sdnq_attention_backend",
         "ltx_sdnq_stage1_offload_policy", "ltx_sdnq_stage2_offload_policy",
+        "ltx_sdnq_prompt_sequence_length_requested", "ltx_sdnq_prompt_token_count",
+        "ltx_sdnq_prompt_sequence_length", "ltx_sdnq_prompt_padding_tokens_removed",
         "ltx_sdnq_prompt_peak_allocated_gb", "ltx_sdnq_prompt_peak_reserved_gb",
         "ltx_sdnq_stage1_peak_allocated_gb", "ltx_sdnq_stage1_peak_reserved_gb",
         "ltx_sdnq_stage1_min_driver_free_gb", "ltx_sdnq_stage2_peak_allocated_gb",
@@ -3018,7 +3226,8 @@ def _write_report(path: Path, ctx: Dict[str, Any], exception_text: str = "") -> 
         "ltx_sdnq_vram_safety_result", "ltx_sdnq_video_decode_plan",
         "ltx_sdnq_video_decode_chunks", "ltx_sdnq_video_decode_window_frames",
         "ltx_sdnq_video_decode_stride_frames", "ltx_sdnq_video_decode_overlap_frames",
-        "ltx_sdnq_video_decode_spatial_tiling", "ltx_sdnq_video_decode_time_s",
+        "ltx_sdnq_video_decode_output_frames", "ltx_sdnq_video_decode_spatial_tiling",
+        "ltx_sdnq_video_decode_time_s",
         "ltx_int4_conditioning_mask_guard", "ltx_int4_conditioning_mask_rewrites",
         "ltx_int4_conditioning_mask_last_move", "output_path",
     ]
@@ -3086,7 +3295,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deep-log-interval", type=float, default=1.0)
     parser.add_argument("--deep-log-max-events", type=int, default=4000)
     parser.add_argument("--deep-lifecycle-log", action="store_true")
-    parser.add_argument("--attention-backend", choices=["auto"], default="auto")
+    parser.add_argument(
+        "--attention-backend",
+        choices=["auto", "native", "efficient", "flash", "sage"],
+        default="auto",
+    )
     parser.add_argument("--no-boundary-echo", action="store_true")
     parser.add_argument("--extra", nargs=argparse.REMAINDER, default=[])
     return parser

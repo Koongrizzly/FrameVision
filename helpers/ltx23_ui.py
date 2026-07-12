@@ -3740,12 +3740,32 @@ class LTX23RunnerWidget(QWidget):
         finally:
             self.fast_iclora_route_check.blockSignals(False)
 
+    @staticmethod
+    def _timestamped_diagnostic_path(path_text: str, stamp: str) -> str:
+        """Return a per-run report/log path without changing the saved UI base path."""
+        raw = str(path_text or "").strip()
+        if not raw:
+            return raw
+        path = Path(raw)
+        suffix = path.suffix or ".txt"
+        stem = path.stem if path.suffix else path.name
+        return str(path.with_name(f"{stem}_{stamp}{suffix}"))
+
+    def _run_diagnostic_paths(self) -> Tuple[str, str]:
+        """Create matching timestamped summary and deep-lifecycle filenames."""
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        return (
+            self._timestamped_diagnostic_path(self.report_row.text(), stamp),
+            self._timestamped_diagnostic_path(self.deep_log_row.text(), stamp),
+        )
+
     def _build_int4_command(self, *, prepare_video_inputs: bool = False) -> Tuple[str, List[str], Path, List[str]]:
         """Build the isolated INT4 command with under-the-hood VRAM automation."""
         python_exe = self.python_row.text() or str(DEFAULT_PYTHON)
         cli_path = str(INT4_CLI_PATH)
         self._normalize_resolution_for_pipeline()
         output_path = self._make_output_path()
+        report_path, deep_log_path = self._run_diagnostic_paths()
         audio_mode = AUDIO_MODE_COMPAT_MAP.get(self.audio_mode_combo.currentText(), AUDIO_MODE_DISABLED)
         # Native FP16/FP8 keeps using a2vid_two_stage.  Isolated INT4 maps the
         # same UI mode onto its normal Euler two_stages backend.
@@ -3804,7 +3824,7 @@ class LTX23RunnerWidget(QWidget):
             "--seed", str(self.seed_spin.value()),
             "--shift", f"{self.shift_spin.value():g}",
             "--ltx-root", self.ltx_root_row.text(),
-            "--report-path", self.report_row.text(),
+            "--report-path", report_path,
             "--attention-backend", "auto",
         ]
         negative_prompt = self.negative_edit.toPlainText().strip()
@@ -3833,7 +3853,7 @@ class LTX23RunnerWidget(QWidget):
             args.extend([
                 "--deep-log-interval", str(self.deep_interval_spin.value()),
                 "--deep-log-max-events", str(self.deep_max_events_spin.value()),
-                "--deep-log-path", self.deep_log_row.text(),
+                "--deep-log-path", deep_log_path,
                 "--deep-lifecycle-log",
             ])
 
@@ -3871,6 +3891,7 @@ class LTX23RunnerWidget(QWidget):
         cli_path = self.cli_row.text() or str(DEFAULT_CLI_PATH)
         self._normalize_resolution_for_pipeline()
         output_path = self._make_output_path()
+        report_path, deep_log_path = self._run_diagnostic_paths()
         pipeline_name = self._effective_pipeline()
         audio_mode = AUDIO_MODE_COMPAT_MAP.get(self.audio_mode_combo.currentText(), AUDIO_MODE_DISABLED)
         extra: List[str] = []
@@ -3989,7 +4010,7 @@ class LTX23RunnerWidget(QWidget):
             "--seed", str(self.seed_spin.value()),
             "--shift", f"{self.shift_spin.value():g}",
             "--ltx-root", self.ltx_root_row.text(),
-            "--report-path", self.report_row.text(),
+            "--report-path", report_path,
         ]
         if extra_preview_args:
             args.extend(extra_preview_args)
@@ -4053,7 +4074,7 @@ class LTX23RunnerWidget(QWidget):
             args.extend([
                 "--deep-log-interval", str(self.deep_interval_spin.value()),
                 "--deep-log-max-events", str(self.deep_max_events_spin.value()),
-                "--deep-log-path", self.deep_log_row.text(),
+                "--deep-log-path", deep_log_path,
                 "--deep-lifecycle-log",
             ])
         if pipeline_name in ("two_stages", "two_stages_hq", "a2vid_two_stage"):
