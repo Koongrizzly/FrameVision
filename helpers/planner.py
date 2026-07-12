@@ -19739,6 +19739,9 @@ class PipelineWorker(QThread):
                     "voice": str(self.job.narration_voice or "ryan"),
                     "sample_path": str(self.job.narration_sample_path or ''),
                     "language": str(self.job.narration_language or "auto"),
+                    # Bump the audio fingerprint when the timed speech engine changes.
+                    "engine": "planner_speech_v2.1",
+                    "strategy": "shot_timed_segments",
                 })
             except Exception:
                 pass
@@ -19915,60 +19918,21 @@ class PipelineWorker(QThread):
                 narr_wav_ready = False
                 narr_text = ""
                 if bool(self.job.narration_enabled) and (not bool(self.job.silent)):
-                    # Generate narration script using Qwen JSON path
+                    # Generate a coherent shot-timed narration track.
+                    # The helper keeps all visible Planner controls/API stable, while it:
+                    # - builds fixed speech windows from the assembled timeline;
+                    # - asks Qwen3-VL or the selected own llama for one line per window;
+                    # - synthesizes/fits each line separately; and
+                    # - composes a full-duration narration.wav with the final line near the ending.
                     plan_obj = _safe_read_json(plan_path) if os.path.exists(plan_path) else {}
                     shots_obj = _safe_read_json(shots_path) if os.path.exists(shots_path) else {}
-                    sys_p = (
-                        "You are a helpful video narrator. Produce a short spoken narration script for the video. "
-                        "Return strict JSON only."
-                    )
-                    user_p = (
-                        "Create a narration script that matches the plan and shots.\n"
-                        "Constraints:\n"
-                        "- Keep it concise and natural spoken language.\n"
-                        "- No bullet points.\n"
-                        "- Avoid mentioning camera settings.\n"
-                        "- Target a spoken duration close to TARGET_SPOKEN_DURATION_SEC (±15%).\n"
-                        "- Keep it short: do not exceed MAX_WORDS words.\n"
-                        "- Output JSON with keys: narration_text.\n\n"
-                        f"LANGUAGE: {str(self.job.narration_language or 'auto')}\n\n"
-                        f"TARGET_SPOKEN_DURATION_SEC: {duration_sec:.1f}\n"
-                        f"MAX_WORDS: {max(10, int(round(duration_sec * 2.2)))}\n\n"
-                        f"PROMPT: {self.job.prompt}\n\n"
-                        f"EXTRA: {self.job.extra_info}\n\n"
-                        f"PLAN_JSON: {json.dumps(plan_obj, ensure_ascii=False)}\n\n"
-                        f"SHOTS_JSON: {json.dumps(shots_obj, ensure_ascii=False)}\n"
-                    )
-                    raw_path = os.path.join(prompts_dir, "narration_raw.txt")
-                    used_path = os.path.join(prompts_dir, "narration_prompts_used.txt")
-                    err_path = os.path.join(prompts_dir, "narration_error.txt")
-                    narr_json_obj, raw_text = _qwen_json_call(
-                        "Narration script",
-                        sys_p,
-                        user_p,
-                        raw_path,
-                        used_path,
-                        err_path,
-                        temperature=0.2,
-                        max_new_tokens=1024,
-                    )
-                    narration_text = ""
-                    try:
-                        if isinstance(narr_json_obj, dict):
-                            narration_text = str(narr_json_obj.get("narration_text") or '').strip()
-                    except Exception:
-                        narration_text = ""
-                    if not narration_text:
-                        # fallback: use raw text
-                        narration_text = (raw_text or '').strip()
-                    if not narration_text:
-                        raise RuntimeError("Narration script generation returned empty text.")
-                    _safe_write_text(narration_txt, narration_text)
-                    _safe_write_json(narration_json, {"narration_text": narration_text, "language": str(self.job.narration_language or "auto")})
-                    narr_text = narration_text
+                    timeline_obj = _safe_read_json(timeline_json) if os.path.exists(timeline_json) else {}
 
-                    # Generate narration audio via Qwen3 TTS worker (helpers/qwentts_ui.py)
-                    # Built-in voices use mode=custom + speaker token; clone uses mode=clone + ref audio
+                    try:
+                        from helpers import planner_speech as _planner_speech  # type: ignore
+                    except Exception:
+                        import planner_speech as _planner_speech  # type: ignore
+
                     root_dir = _root()
                     helpers_qwentts = root_dir / "helpers" / "qwentts_ui.py"
                     if not helpers_qwentts.exists():
@@ -19981,8 +19945,7 @@ class PipelineWorker(QThread):
                     if not env_py.exists():
                         raise RuntimeError("Qwen3 TTS environment not found. Install Qwen3 TTS via Optional Installs.")
 
-                    mode = "custom" if str(self.job.narration_mode or "builtin") != "clone" else "clone"
-                    # Clone mode uses Whisper transcript as ref_text (stored in manifest).
+                    mode = "clone" if str(self.job.narration_mode or "builtin") == "clone" else "custom"
                     ref_text = ""
                     if mode == "clone":
                         try:
@@ -19996,172 +19959,68 @@ class PipelineWorker(QThread):
                                     ref_text = (_safe_read_text(_tp) or '').strip()
                             except Exception:
                                 ref_text = ""
-                    payload = {
-                        "mode": mode,
-                        "payload": {
-                            "model_path": str(_qwen3tts_model_path_for_mode(mode)),
-                            "tokenizer_path": str(_qwen3tts_tokenizer_path()),
-                            "text": narr_text,
-                            "language": str(self.job.narration_language or "auto"),
-                            "speaker": str(self.job.narration_voice or "ryan"),
-                            "ref_audio_path": str(self.job.narration_sample_path or ''),
-                            "common": {
-                                "output_name": f"narration_{self.job.job_id}",
-                                "add_timestamp": False,
-                                "output_dir": str(audio_dir),
-                                "output_format": "wav",
-                            }
-                        }
-                    }
 
-                    if mode == "clone":
-                        payload["payload"]["ref_text"] = ref_text
-                        # Fallback supported by Qwen3 TTS clone if transcription is unavailable.
-                        payload["payload"]["x_vector_only_mode"] = (False if ref_text else True)
+                    speech_result = _planner_speech.create_story_narration(
+                        root_dir=str(root_dir),
+                        job_id=str(self.job.job_id),
+                        prompt=str(self.job.prompt or ''),
+                        extra_info=str(self.job.extra_info or ''),
+                        language=str(self.job.narration_language or "auto"),
+                        narration_mode=str(self.job.narration_mode or "builtin"),
+                        voice=str(self.job.narration_voice or "ryan"),
+                        voice_sample_path=str(self.job.narration_sample_path or ''),
+                        ref_text=str(ref_text or ''),
+                        plan_obj=plan_obj,
+                        shots_obj=shots_obj,
+                        timeline_obj=timeline_obj,
+                        target_duration_sec=float(duration_sec or 0.0),
+                        audio_dir=str(audio_dir),
+                        prompts_dir=str(prompts_dir),
+                        narration_wav=str(narration_wav),
+                        narration_txt=str(narration_txt),
+                        narration_json=str(narration_json),
+                        transcript_path=str(_transcript_txt or transcript_path or ''),
+                        ffmpeg_path=str(ffmpeg2),
+                        ffprobe_path=str(ffprobe2),
+                        qwentts_python=str(env_py),
+                        qwentts_script=str(helpers_qwentts.resolve()),
+                        tts_model_path=str(_qwen3tts_model_path_for_mode(mode)),
+                        tts_tokenizer_path=str(_qwen3tts_tokenizer_path()),
+                        llm_json_call=_qwen_json_call,
+                        llm_settings=(self.job.encoding if isinstance(self.job.encoding, dict) else None),
+                        log_path=str(tts_log),
+                        stop_requested=lambda: bool(self._stop_requested),
+                        log_callback=lambda msg: self.signals.log.emit(str(msg)),
+                    )
 
-                    cmd = [str(env_py), "-u", str(helpers_qwentts.resolve()), "--worker", "--task", "generate"]
-                    with open(tts_log, "a", encoding="utf-8", errors="replace") as lf:
-                        lf.write("[cmd] " + " ".join(cmd) + "\n")
-                        cp = subprocess.run(cmd, cwd=str(root_dir), input=json.dumps(payload), text=True, capture_output=True)
-                        lf.write(cp.stdout or '')
-                        if cp.stderr:
-                            lf.write("\n[stderr]\n" + cp.stderr + "\n")
-                    if cp.returncode != 0:
-                        raise RuntimeError(f"TTS failed (exit={cp.returncode}). See: {tts_log}")
-                                        # qwentts_ui returns JSON to stdout; extract out_path if present
-                    out_path = ""
-                    try:
-                        import re as _re
-                        stdout_text = (cp.stdout or '')
-                        # Look for the last __RESULT__{...} block in stdout (worker prints it on success).
-                        m_all = _re.findall(r"__RESULT__\s*(\{.*\})", stdout_text)
-                        if m_all:
-                            obj = json.loads(m_all[-1])
-                            if obj.get("ok") and obj.get("out_path"):
-                                out_path = str(obj.get("out_path"))
-                        if not out_path:
-                            # Fallback: try to locate any JSON with an out_path key.
-                            m2 = _re.findall(r"(\{[^\n\r]*\})", stdout_text)
-                            for raw in reversed(m2):
-                                try:
-                                    obj = json.loads(raw)
-                                    if isinstance(obj, dict) and obj.get("out_path"):
-                                        out_path = str(obj.get("out_path"))
-                                        break
-                                except Exception:
-                                    continue
-                    except Exception:
-                        out_path = ""
-                    def _force_local_wav(src_path: str, dst_wav: str) -> bool:
-                        """Ensure narration lands in this job's audio/ as narration.wav."""
-                        try:
-                            if not src_path or (not os.path.exists(src_path)):
-                                return False
-                            os.makedirs(os.path.dirname(dst_wav), exist_ok=True)
-                            # If already a wav, try a straight copy first
-                            try:
-                                import shutil as _shutil
-                                _shutil.copyfile(src_path, dst_wav)
-                                return os.path.exists(dst_wav)
-                            except Exception:
-                                pass
-                            # Fallback: transcode via ffmpeg (handles mp3/ogg/wav etc.)
-                            try:
-                                args = [
-                                    ffmpeg2, "-y",
-                                    "-i", str(src_path),
-                                    "-vn",
-                                    "-acodec", "pcm_s16le",
-                                    "-ar", "44100",
-                                    "-ac", "2",
-                                    str(dst_wav),
-                                ]
-                                cp2 = subprocess.run(args, cwd=str(root_dir), capture_output=True, text=True)
-                                if cp2.returncode == 0 and os.path.exists(dst_wav):
-                                    return True
-                                # log ffmpeg failure detail into tts_log
-                                try:
-                                    with open(tts_log, "a", encoding="utf-8", errors="replace") as lf:
-                                        lf.write("\n[ffmpeg] " + " ".join(args) + "\n")
-                                        if cp2.stdout:
-                                            lf.write(cp2.stdout + "\n")
-                                        if cp2.stderr:
-                                            lf.write("[ffmpeg_stderr]\n" + cp2.stderr + "\n")
-                                except Exception:
-                                    pass
-                            except Exception:
-                                pass
-                            return False
-                        except Exception:
-                            return False
-
-                    # Resolve the produced narration file and copy/transcode it into job/audio/narration.wav
-                    searched = []
-                    src_candidates = []
-
-                    if out_path and os.path.exists(out_path):
-                        src_candidates.append(out_path)
-
-                    # Common output folder used by qwentts_ui (and other helpers)
-                    try:
-                        out_dirs = [
-                            root_dir / "output" / "audio" / "qwen3tts",
-                            root_dir / "output" / "qwen3tts",
-                        ]
-                        for out_dir in out_dirs:
-                            if not out_dir.exists():
-                                continue
-                        for ext in (".wav", ".mp3", ".flac", ".ogg", ".m4a"):
-                                cands = sorted(
-                                    [p for p in out_dir.glob(f"narration*{ext}")],
-                                    key=lambda p: p.stat().st_mtime,
-                                    reverse=True
-                                )
-                                for p in cands:
-                                    src_candidates.append(str(p))
-                    except Exception:
-                        pass
-
-                    # Last resort: search job audio dir itself in case backend wrote there with a different name/ext
-                    try:
-                        for ext in (".wav", ".mp3", ".flac", ".ogg", ".m4a"):
-                            cands = sorted(
-                                [p for p in Path(audio_dir).glob(f"narration*{ext}")],
-                                key=lambda p: p.stat().st_mtime,
-                                reverse=True
-                            )
-                            for p in cands:
-                                src_candidates.append(str(p))
-                    except Exception:
-                        pass
-
-                    # Deduplicate candidates while preserving order
-                    _seen = set()
-                    src_candidates2 = []
-                    for p in src_candidates:
-                        if not p:
-                            continue
-                        if p in _seen:
-                            continue
-                        _seen.add(p)
-                        src_candidates2.append(p)
-                    src_candidates = src_candidates2
-
-                    for p in src_candidates:
-                        searched.append(p)
-                        if _force_local_wav(p, narration_wav):
-                            break
-
-                    if not os.path.exists(narration_wav):
-                        raise RuntimeError(
-                            "Narration WAV was not produced in the job folder (missing audio/narration.wav). "
-                            "TTS did run, but output could not be copied/transcoded. "
-                            f"Searched: {searched}. See: {tts_log}"
-                        )
+                    narr_text = str(_safe_read_text(narration_txt) or '').strip()
+                    if not narr_text:
+                        raise RuntimeError("Timed narration generated no transcript text.")
+                    if not _file_ok(narration_wav, 512):
+                        raise RuntimeError("Timed narration generated no usable narration.wav.")
 
                     narr_wav_ready = True
+                    manifest.setdefault("narration", {}).update({
+                        "engine": str(speech_result.get("engine") or "planner_speech_v2.1"),
+                        "strategy": "shot_timed_segments",
+                        "segment_count": int(speech_result.get("segment_count") or 0),
+                        "target_duration_sec": float(speech_result.get("target_duration_sec") or 0.0),
+                        "spoken_duration_sec": float(speech_result.get("spoken_duration_sec") or 0.0),
+                        "last_spoken_end_sec": float(speech_result.get("last_spoken_end_sec") or 0.0),
+                        "last_spoken_end_ratio": float(speech_result.get("last_spoken_end_ratio") or 0.0),
+                    })
                     manifest.setdefault("paths", {})["narration_wav"] = narration_wav
                     manifest.setdefault("paths", {})["narration_txt"] = narration_txt
+                    manifest.setdefault("paths", {})["narration_json"] = narration_json
+                    try:
+                        _speech_paths = speech_result.get("paths") or {}
+                        if isinstance(_speech_paths, dict):
+                            for _key in ("narration_timeline_json", "narration_srt", "segments_dir"):
+                                _value = str(_speech_paths.get(_key) or '').strip()
+                                if _value:
+                                    manifest["paths"][_key] = _value
+                    except Exception:
+                        pass
                     _safe_write_json(manifest_path, manifest)
 
                 # 2) Mix/mux audio into final_cut.mp4
@@ -22251,138 +22110,156 @@ class PipelineWorker(QThread):
                 except Exception as e:
                     raise RuntimeError(f"Bake subtitles: cannot import helpers/whisper.py: {e}")
 
-                env_py = None
-                try:
-                    env_py = _wh._whisper_env_python()
-                except Exception:
-                    env_py = None
-                if not env_py or not os.path.isfile(str(env_py)):
-                    raise RuntimeError(
-                        "Whisper environment not found. Expected: environments/.whisper. "
-                        "Install Whisper via Optional Installs."
-                    )
-
-                runner = _wh._ensure_whisper_runner_file()
-                model_dir = _find_whisper_model_dir()
-                if not model_dir:
-                    raise RuntimeError(
-                        "Whisper model folder not found. Expected /models/whisper/ (preferred) "
-                        "or /models/faster_whisper/medium/."
-                    )
-
-                try:
-                    device = _wh._guess_device()
-                except Exception:
-                    device = "cpu"
-                compute_type = "float16" if device == "cuda" else "int8"
-
-                ffprobe_path = None
-                try:
-                    ffprobe_path = _wh._find_binary("ffprobe")
-                except Exception:
-                    ffprobe_path = None
-
-                out_temp = os.path.join(str(_root()), "output", "_temp")
-                os.makedirs(out_temp, exist_ok=True)
-
-                payload = {
-                    "root": str(_root()),
-                    "media_path": str(src_video),
-                    "model_dir": str(model_dir),
-                    "device": device,
-                    "compute_type": compute_type,
-                    "language": "auto",
-                    "task": "transcribe",
-                    "ffprobe_path": str(ffprobe_path) if ffprobe_path else "",
-                }
-
-                payload_file = os.path.join(out_temp, f"_whisper_payload_subs_{int(time.time()*1000)}.json")
-                _safe_write_text(payload_file, json.dumps(payload, indent=2, ensure_ascii=False))
-
-                cmd = [str(env_py), str(runner), str(payload_file)]
-                self.signals.log.emit("[whisper] transcribing final video for subtitles")
-
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(_root()),
-                    text=True,
-                    bufsize=1,
-                )
-
-                last_result = None
-                if proc.stdout:
-                    for line in proc.stdout:
-                        if self._stop_requested:
-                            try:
-                                proc.terminate()
-                            except Exception:
-                                pass
-                            try:
-                                proc.kill()
-                            except Exception:
-                                pass
-                            raise RuntimeError("Cancelled by user.")
-                        line = (line or '').strip()
-                        if not line:
-                            continue
-                        if line.startswith("{") and line.endswith("}"):
-                            try:
-                                msg = json.loads(line)
-                                t = msg.get("type")
-                                if t == "result":
-                                    last_result = msg.get("data") or {}
-                                elif t == "error":
-                                    raise RuntimeError(str(msg.get("message", "")))
-                            except Exception:
-                                self.signals.log.emit(f"[whisper] {line}")
-                        else:
-                            self.signals.log.emit(f"[whisper] {line}")
-
-                rc = proc.wait()
-                if rc != 0:
-                    raise RuntimeError(f"Whisper runner failed (exit code {rc}).")
-                if not last_result:
-                    raise RuntimeError("Whisper runner returned no result.")
-
-                seg_json_tmp = str(last_result.get("segments_json") or '')
-                if not seg_json_tmp or not os.path.isfile(seg_json_tmp):
-                    raise RuntimeError(f"Whisper missing segments JSON: {seg_json_tmp}")
-
-                # Write SRT into final/ (stable, user-friendly)
                 srt_path = os.path.join(final_dir, "subtitles.srt")
                 try:
-                    seg_obj = _safe_read_json(seg_json_tmp) or {}
+                    _lyrics_active = bool(getattr(self.job, "ace15_lyrics_enabled", False)) or (str(_lyrics_mode or '').strip().lower() == "lyrics")
                 except Exception:
-                    seg_obj = {}
-                segs_in = seg_obj.get("segments") if isinstance(seg_obj, dict) else None
-                if not isinstance(segs_in, list):
-                    segs_in = []
-                segments = []
-                for s in segs_in:
-                    if not isinstance(s, dict):
-                        continue
+                    _lyrics_active = False
+                _timed_narration_srt = str((manifest.get("paths") or {}).get("narration_srt") or '')
+                _use_timed_narration_srt = (
+                    bool(getattr(self.job, "narration_enabled", False))
+                    and (not _lyrics_active)
+                    and _file_ok(_timed_narration_srt, 16)
+                )
+
+                if _use_timed_narration_srt:
                     try:
-                        segments.append(_wh.WhisperSegment(
-                            start=float(s.get("start", 0.0) or 0.0),
-                            end=float(s.get("end", 0.0) or 0.0),
-                            text=str(s.get("text", "") or '').strip(),
-                        ))
+                        shutil.copy2(_timed_narration_srt, srt_path)
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to copy timed narration subtitles: {e}")
+                    self.signals.log.emit("[subtitles] using exact timed narration transcript")
+                else:
+                    env_py = None
+                    try:
+                        env_py = _wh._whisper_env_python()
                     except Exception:
-                        continue
-                if not segments:
-                    raise RuntimeError("Whisper returned no segments for subtitles.")
-                try:
-                    _wh._write_srt(segments, srt_path)
-                except Exception as e:
-                    raise RuntimeError(f"Failed to write SRT: {e}")
+                        env_py = None
+                    if not env_py or not os.path.isfile(str(env_py)):
+                        raise RuntimeError(
+                            "Whisper environment not found. Expected: environments/.whisper. "
+                            "Install Whisper via Optional Installs."
+                        )
+
+                    runner = _wh._ensure_whisper_runner_file()
+                    model_dir = _find_whisper_model_dir()
+                    if not model_dir:
+                        raise RuntimeError(
+                            "Whisper model folder not found. Expected /models/whisper/ (preferred) "
+                            "or /models/faster_whisper/medium/."
+                        )
+
+                    try:
+                        device = _wh._guess_device()
+                    except Exception:
+                        device = "cpu"
+                    compute_type = "float16" if device == "cuda" else "int8"
+
+                    ffprobe_path = None
+                    try:
+                        ffprobe_path = _wh._find_binary("ffprobe")
+                    except Exception:
+                        ffprobe_path = None
+
+                    out_temp = os.path.join(str(_root()), "output", "_temp")
+                    os.makedirs(out_temp, exist_ok=True)
+
+                    payload = {
+                        "root": str(_root()),
+                        "media_path": str(src_video),
+                        "model_dir": str(model_dir),
+                        "device": device,
+                        "compute_type": compute_type,
+                        "language": "auto",
+                        "task": "transcribe",
+                        "ffprobe_path": str(ffprobe_path) if ffprobe_path else "",
+                    }
+
+                    payload_file = os.path.join(out_temp, f"_whisper_payload_subs_{int(time.time()*1000)}.json")
+                    _safe_write_text(payload_file, json.dumps(payload, indent=2, ensure_ascii=False))
+
+                    cmd = [str(env_py), str(runner), str(payload_file)]
+                    self.signals.log.emit("[whisper] transcribing final video for subtitles")
+
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        cwd=str(_root()),
+                        text=True,
+                        bufsize=1,
+                    )
+
+                    last_result = None
+                    if proc.stdout:
+                        for line in proc.stdout:
+                            if self._stop_requested:
+                                try:
+                                    proc.terminate()
+                                except Exception:
+                                    pass
+                                try:
+                                    proc.kill()
+                                except Exception:
+                                    pass
+                                raise RuntimeError("Cancelled by user.")
+                            line = (line or '').strip()
+                            if not line:
+                                continue
+                            if line.startswith("{") and line.endswith("}"):
+                                try:
+                                    msg = json.loads(line)
+                                    t = msg.get("type")
+                                    if t == "result":
+                                        last_result = msg.get("data") or {}
+                                    elif t == "error":
+                                        raise RuntimeError(str(msg.get("message", "")))
+                                except Exception:
+                                    self.signals.log.emit(f"[whisper] {line}")
+                            else:
+                                self.signals.log.emit(f"[whisper] {line}")
+
+                    rc = proc.wait()
+                    if rc != 0:
+                        raise RuntimeError(f"Whisper runner failed (exit code {rc}).")
+                    if not last_result:
+                        raise RuntimeError("Whisper runner returned no result.")
+
+                    seg_json_tmp = str(last_result.get("segments_json") or '')
+                    if not seg_json_tmp or not os.path.isfile(seg_json_tmp):
+                        raise RuntimeError(f"Whisper missing segments JSON: {seg_json_tmp}")
+
+                    # Write SRT into final/ (stable, user-friendly)
+                    try:
+                        seg_obj = _safe_read_json(seg_json_tmp) or {}
+                    except Exception:
+                        seg_obj = {}
+                    segs_in = seg_obj.get("segments") if isinstance(seg_obj, dict) else None
+                    if not isinstance(segs_in, list):
+                        segs_in = []
+                    segments = []
+                    for s in segs_in:
+                        if not isinstance(s, dict):
+                            continue
+                        try:
+                            segments.append(_wh.WhisperSegment(
+                                start=float(s.get("start", 0.0) or 0.0),
+                                end=float(s.get("end", 0.0) or 0.0),
+                                text=str(s.get("text", "") or '').strip(),
+                            ))
+                        except Exception:
+                            continue
+                    if not segments:
+                        raise RuntimeError("Whisper returned no segments for subtitles.")
+                    try:
+                        _wh._write_srt(segments, srt_path)
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to write SRT: {e}")
 
                 # Burn in subtitles with ffmpeg
                 try:
                     ffmpeg3 = _wh._find_binary("ffmpeg")
                 except Exception:
-                    ffmpeg3 = "ffmpeg"
+                    ffmpeg3 = str(ffmpeg2 or "ffmpeg")
 
                 base = os.path.splitext(os.path.basename(src_video))[0]
                 out_sub = os.path.join(final_dir, f"{base}_subtitled.mp4")
