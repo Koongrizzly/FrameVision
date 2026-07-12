@@ -12223,6 +12223,9 @@ class PipelineWorker(QThread):
                 "own_character_bible_enabled": self.job.encoding.get("own_character_bible_enabled"),
                 "own_character_1_prompt": self.job.encoding.get("own_character_1_prompt"),
                 "own_character_2_prompt": self.job.encoding.get("own_character_2_prompt"),
+                "ltx_lipsync_enabled": bool(getattr(self.job, "lipsync_enabled", False)),
+                "ltx_lipsync_source": str(getattr(self.job, "lipsync_source", "generated") or "generated"),
+                "ltx_lipsync_staging_version": "storyteller_stage_v1",
             }, sort_keys=True))
 
             def step_shots() -> None:
@@ -12865,6 +12868,43 @@ class PipelineWorker(QThread):
                         _safe_write_json(plan_path, plan_obj)
                 except Exception:
                     pass
+
+                # LTX lip-sync needs the still images to be staged for a real visible speaker.
+                # Generated narration remains one continuous storyteller monologue; selected
+                # shots show the speaker, while the remaining shots are deliberate voice-over B-roll.
+                try:
+                    _mk_for_lipsync = _video_model_key(self.job.encoding.get("video_model") or "")
+                except Exception:
+                    _mk_for_lipsync = ""
+                if _mk_for_lipsync == "ltx23" and bool(getattr(self.job, "lipsync_enabled", False)):
+                    try:
+                        from helpers import planner_lipsync as _planner_lipsync_stage  # type: ignore
+                    except Exception:
+                        import planner_lipsync as _planner_lipsync_stage  # type: ignore
+                    out_shots, _lipsync_stage_meta = _planner_lipsync_stage.stage_shots_for_lipsync(
+                        out_shots,
+                        plan_obj,
+                        prompt=str(self.job.prompt or ""),
+                        source_mode=str(getattr(self.job, "lipsync_source", "generated") or "generated"),
+                    )
+                    if not out_shots:
+                        raise RuntimeError("LTX lip-sync staging produced an empty shot list.")
+                    if isinstance(plan_obj, dict):
+                        plan_obj["lipsync_storyteller"] = dict(_lipsync_stage_meta or {})
+                        _safe_write_json(plan_path, plan_obj)
+                    try:
+                        _speaker = str((_lipsync_stage_meta or {}).get("speaker_name") or "the storyteller")
+                        _onscreen = list((_lipsync_stage_meta or {}).get("onscreen_shot_ids") or [])
+                        self.signals.log.emit(
+                            f"[lip-sync] staged {_speaker} on-screen in {len(_onscreen)} shot(s); "
+                            "other speech windows remain natural voice-over B-roll"
+                        )
+                    except Exception:
+                        pass
+                    shots_generation_note = (
+                        f"{shots_generation_note.rstrip('.')} Added on-screen storyteller staging for LTX lip-sync."
+                    ).strip()
+
                 _safe_write_json(shots_path, out_shots)
                 manifest["paths"]["shots_json"] = shots_path
                 manifest["paths"]["shots_raw_txt"] = shots_raw_path
@@ -17627,7 +17667,9 @@ class PipelineWorker(QThread):
                             pass
                     self.signals.log.emit(f"[ltx23] {sid}: start image -> {img_path}")
                     if clip_audio_path:
-                        self.signals.log.emit(f"[ltx23] {sid}: lip-sync audio -> {clip_audio_path}")
+                        self.signals.log.emit(f"[ltx23] {sid}: on-screen lip-sync audio -> {clip_audio_path}")
+                    elif bool((lipsync_item or {}).get("has_speech")):
+                        self.signals.log.emit(f"[ltx23] {sid}: narration continues as voice-over B-roll (no mouth animation requested)")
                     if end_image_path:
                         self.signals.log.emit(f"[ltx23] {sid}: end image -> {end_image_path}")
                     self.signals.progress.emit(min(99, 72 + int((i - 1) * (25 / max(1, len(shots))))))
