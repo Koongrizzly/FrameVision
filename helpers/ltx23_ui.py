@@ -1929,6 +1929,7 @@ class LTX23RunnerWidget(QWidget):
         self.refresh_lora_cache_btn = QPushButton()
 
         layout.addStretch(1)
+        self.vram_lab_tab = tab
         self.tabs.addTab(tab, "VRAM Lab")
 
     def _build_locations_section(self) -> None:
@@ -2641,6 +2642,8 @@ class LTX23RunnerWidget(QWidget):
         except Exception:
             is_extended = False
         auto_vram_enabled = self._is_auto_vram_profile_mode() if hasattr(self, "vram_profile_combo") else False
+        if self._selected_model_variant() == "INT4" and hasattr(self, "vram_lab_combo"):
+            auto_vram_enabled = self.vram_lab_combo.currentText().strip().upper() != "OFF"
         should_show_manual_warning = bool(is_extended and not auto_vram_enabled)
         self.extended_frames_warning_label.setVisible(should_show_manual_warning)
         if hasattr(self, "auto_vram_advice_label"):
@@ -3738,7 +3741,7 @@ class LTX23RunnerWidget(QWidget):
             self.fast_iclora_route_check.blockSignals(False)
 
     def _build_int4_command(self, *, prepare_video_inputs: bool = False) -> Tuple[str, List[str], Path, List[str]]:
-        """Build the isolated INT4 command without touching native VRAM Lab state."""
+        """Build the isolated INT4 command with under-the-hood VRAM automation."""
         python_exe = self.python_row.text() or str(DEFAULT_PYTHON)
         cli_path = str(INT4_CLI_PATH)
         self._normalize_resolution_for_pipeline()
@@ -3781,11 +3784,15 @@ class LTX23RunnerWidget(QWidget):
         if self._user_lora_cli_args():
             raise RuntimeError("INT4 LoRA loading is not connected yet. Disable LoRAs or use FP16/FP8.")
 
-        profile = self._effective_vram_profile_key(str(self.vram_profile_combo.currentText() or "24"))
+        # INT4 keeps its memory planner entirely under the hood. The visible
+        # VRAM Lab toggle only enables/disables that planner; the hidden native
+        # VRAM Lab profile controls are never forwarded to the quant CLI.
+        int4_auto_vram = self.vram_lab_combo.currentText().strip().upper() != "OFF"
         args = [
             cli_path,
             "--pipeline", pipeline_name,
-            "--vram-profile", profile,
+            "--vram-profile", "auto",
+            "--int4-auto-vram" if int4_auto_vram else "--no-int4-auto-vram",
             "--model-root", self.checkpoint_row.text().strip(),
             "--prompt", self.prompt_edit.toPlainText().strip(),
             "--output-path", str(output_path),
@@ -5070,6 +5077,28 @@ class LTX23RunnerWidget(QWidget):
                 return token
         return inferred
 
+    def _set_vram_lab_tab_visible(self, visible: bool) -> None:
+        """Show native VRAM Lab tuning only for FP16/FP8 models."""
+        if not hasattr(self, "tabs"):
+            return
+        target = getattr(self, "vram_lab_tab", None)
+        index = self.tabs.indexOf(target) if target is not None else -1
+        if index < 0:
+            for candidate in range(self.tabs.count()):
+                if self.tabs.tabText(candidate).strip().lower() == "vram lab":
+                    index = candidate
+                    break
+        if index < 0:
+            return
+        try:
+            self.tabs.setTabVisible(index, bool(visible))
+        except AttributeError:
+            # PySide6 builds used by FrameVision expose setTabVisible. Keep a
+            # harmless fallback for older Qt bindings.
+            self.tabs.setTabEnabled(index, bool(visible))
+        if not visible and self.tabs.currentIndex() == index:
+            self.tabs.setCurrentIndex(0)
+
     def _apply_model_variant_route(self, variant: str = "", *, update_checkpoint: bool = False) -> None:
         token = str(variant or self._selected_model_variant()).strip().upper() or "FP16"
         is_int4 = token == "INT4"
@@ -5088,13 +5117,20 @@ class LTX23RunnerWidget(QWidget):
                 root = self._portable_ltx_root_for_autofill()
                 self.checkpoint_row.setText(str(self._checkpoint_for_variant(root, token)))
         if hasattr(self, "vram_lab_combo"):
-            self.vram_lab_combo.setEnabled(not is_int4)
+            # Keep the simple ON/OFF control available for every model. For
+            # INT4, ON enables automatic card detection plus workload-aware
+            # Stage 1/Stage 2 residency in ltx_int4_cli.py. Native VRAM Lab
+            # tuning remains exclusive to FP16/FP8.
+            self.vram_lab_combo.setEnabled(True)
             self._set_tooltip(
                 self.vram_lab_combo,
-                "The native VRAM Lab toggle applies only to FP16/FP8. INT4 uses its isolated CLI and never imports ltx23_vram_lab_cli.py."
-                if is_int4 else
-                "Simple VRAM Lab toggle. ON uses the safe VRAM Lab mode. OFF disables VRAM Lab and runs without that protection layer.",
+                (
+                    "INT4 automatic VRAM planner. ON detects the installed GPU as a 12/16/24 GB profile and automatically scales Stage 1, Stage 2 and final decode from resolution and frame count. OFF uses a fixed per-card INT4 policy."
+                    if is_int4 else
+                    "Simple VRAM Lab toggle. ON uses the safe VRAM Lab mode. OFF disables VRAM Lab and runs without that protection layer."
+                ),
             )
+        self._set_vram_lab_tab_visible(not is_int4)
 
     def _sync_model_variant_from_checkpoint(self) -> None:
         if self._loading or not hasattr(self, "model_variant_combo"):
