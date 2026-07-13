@@ -9213,13 +9213,12 @@ class PipelineWorker(QThread):
                     _regen_ltx_backend = str(_selection.get("backend") or "native")
                     _regen_backend_reason = str(_selection.get("reason") or "")
                 except Exception as _select_exc:
-                    if _preferred_backend == "int4":
-                        raise RuntimeError(
-                            f"This clip was assigned to LTX INT4, but recreate could not prepare it: "
-                            f"{type(_select_exc).__name__}: {_select_exc}"
-                        ) from _select_exc
+                    # Resume/recreate must stay usable when INT4 was removed or
+                    # temporarily renamed. The already-built native command is
+                    # always the safe fallback, even when older metadata says
+                    # this clip previously used INT4.
                     _regen_ltx_backend = "native"
-                    _regen_backend_reason = f"INT4 selection failed; native fallback: {type(_select_exc).__name__}: {_select_exc}"
+                    _regen_backend_reason = f"INT4 selection failed; automatic native fallback: {type(_select_exc).__name__}: {_select_exc}"
 
                 log_file = os.path.join(clips_dir, f"{sid}.ltx23.log.txt")
                 Path(log_file).parent.mkdir(parents=True, exist_ok=True)
@@ -17382,16 +17381,12 @@ class PipelineWorker(QThread):
                     selected_backend = str(_selection.get("backend") or "native")
                     backend_reason = str(_selection.get("reason") or "")
                 except Exception as _select_exc:
-                    # Missing INT4 keeps the proven native route. Once this Planner
-                    # run explicitly selected INT4, however, do not silently mix a
-                    # native clip into the same resume/review job.
-                    if str(preferred_backend or "auto").strip().lower() == "int4":
-                        raise RuntimeError(
-                            f"Planner selected LTX INT4, but its command could not be prepared: "
-                            f"{type(_select_exc).__name__}: {_select_exc}"
-                        ) from _select_exc
+                    # The Planner's visible LTX choice is automatic. A stored
+                    # INT4 backend is only a preference; if INT4 is unavailable,
+                    # resume/recreate continues with the proven native FP16/FP8
+                    # command instead of hard-failing.
                     selected_backend = "native"
-                    backend_reason = f"INT4 selection failed; native fallback: {type(_select_exc).__name__}: {_select_exc}"
+                    backend_reason = f"INT4 selection failed; automatic native fallback: {type(_select_exc).__name__}: {_select_exc}"
                 try:
                     self.signals.log.emit(f"[ltx23] backend -> {selected_backend} ({backend_reason})")
                 except Exception:
@@ -17498,28 +17493,28 @@ class PipelineWorker(QThread):
                         import planner_ltx_int4 as _planner_ltx_int4  # type: ignore
                     _int4_status = _planner_ltx_int4.int4_install_status(_root())
                     _int4_ready = bool((_int4_status or {}).get("ok"))
-                    # Once a Planner job has actually recorded INT4, resume is
-                    # strict. Never downgrade its remaining/recreated clips to
-                    # FP16/FP8 just because the INT4 folder was moved or broken.
-                    if _stored_ltx23_backend == "int4":
-                        if not _int4_ready:
-                            raise RuntimeError(
-                                "This Planner job already uses LTX INT4, but the INT4 installation is no longer ready: "
-                                + str((_int4_status or {}).get("message") or "unknown INT4 installation error")
-                            )
+                    # Backend selection is automatic on every run. Existing
+                    # INT4 metadata is a preference only: when the INT4 install
+                    # is absent or incomplete, resume continues with native
+                    # FP16/FP8 and updates the job metadata after generation.
+                    if _int4_ready:
                         ltx23_backend = "int4"
-                        ltx23_backend_reason = "resume locked to the job's recorded INT4 backend"
-                    elif _int4_ready:
-                        ltx23_backend = "int4"
-                        ltx23_backend_reason = str((_int4_status or {}).get("message") or "complete INT4 install detected")
+                        if _stored_ltx23_backend == "int4":
+                            ltx23_backend_reason = "recorded INT4 backend is available"
+                        else:
+                            ltx23_backend_reason = str((_int4_status or {}).get("message") or "complete INT4 install detected")
                     else:
                         ltx23_backend = "native"
-                        ltx23_backend_reason = str((_int4_status or {}).get("message") or ltx23_backend_reason)
+                        if _stored_ltx23_backend == "int4":
+                            ltx23_backend_reason = (
+                                "recorded INT4 backend unavailable; automatic native FP16/FP8 fallback: "
+                                + str((_int4_status or {}).get("message") or "unknown INT4 installation error")
+                            )
+                        else:
+                            ltx23_backend_reason = str((_int4_status or {}).get("message") or ltx23_backend_reason)
                 except Exception as _backend_exc:
-                    if _stored_ltx23_backend == "int4":
-                        raise
                     ltx23_backend = "native"
-                    ltx23_backend_reason = f"INT4 detection failed: {type(_backend_exc).__name__}: {_backend_exc}"
+                    ltx23_backend_reason = f"INT4 detection failed; automatic native fallback: {type(_backend_exc).__name__}: {_backend_exc}"
                 self.signals.log.emit(
                     f"[ltx23] automatic backend -> {ltx23_backend} ({ltx23_backend_reason})"
                 )
@@ -17882,6 +17877,10 @@ class PipelineWorker(QThread):
                                 log_path=log_file,
                                 preferred_backend=ltx23_backend,
                             )
+                            # Keep subsequent clips and final resume metadata on
+                            # the backend that was actually selected. This also
+                            # clears stale INT4 locking after a native fallback.
+                            ltx23_backend = str(actual_backend or ltx23_backend)
                     except subprocess.CalledProcessError as e:
                         raise RuntimeError(f"LTX 2.3 failed for {sid}. See log: {log_file}\n{e}") from e
                     if not os.path.isfile(out_file) or os.path.getsize(out_file) < 1024:

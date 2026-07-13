@@ -11,7 +11,9 @@ one giant BF16 checkpoint.
 Current scope:
 - LTX 2.3 Distilled 1.1 SDNQ INT4 folder in Diffusers layout.
 - INT8 is intentionally not connected in this restart patch.
-- one-stage and Euler two-stage text-to-video / first-image-to-video.
+- one-stage and Euler two-stage text/image-to-video through official Diffusers LTX2 pipelines.
+- official-style repeated --image and --lora arguments used by the FrameVision LTX UI.
+- a2vid_two_stage is preserved as the public audio workflow name instead of being renamed by the UI.
 - synchronized generated audio, plus uploaded-audio A2V through normal two-stage with frozen audio latents.
 - workload-aware model/group/sequential CPU offload selected from the FrameVision VRAM profile.
 - latent-first Stage 2 teardown so VAE/vocoder decode never overlaps the quant transformer.
@@ -29,13 +31,14 @@ import importlib
 import importlib.metadata
 import json
 import os
+import re
 import sys
 import threading
 import time
 import traceback
 import types
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 _REQUIRED_DIRS = (
@@ -1144,16 +1147,67 @@ def _load_ltx23_spatial_upsampler(
 
 
 
-def _install_i2v_conditioning_mask_guard(pipe: Any, ctx: Dict[str, Any]) -> None:
-    """Keep the Diffusers 0.39 two-stage I2V conditioning mask with its latents.
+def _move_condition_payload_to_device(value: Any, target_device: Any, moved: List[str], label: str) -> Any:
+    """Recursively move condition inputs/outputs onto the pipeline execution device."""
+    current_device = getattr(value, "device", None)
+    mover = getattr(value, "to", None)
+    if current_device is not None and callable(mover):
+        if str(current_device) != str(target_device):
+            moved.append(f"{label}:{current_device}->{target_device}")
+            return mover(device=target_device)
+        return value
 
-    When Stage 2 receives CPU latents, Diffusers creates the conditioning mask on
-    CPU and only moves the latent tensor to CUDA. The first denoise operation then
-    mixes a CUDA timestep with a CPU mask. The guard is instance-local and exists
-    only in this isolated INT4 CLI; no installed package or native LTX file is
-    edited.
+    if isinstance(value, list):
+        changed = False
+        items = []
+        for index, item in enumerate(value):
+            new_item = _move_condition_payload_to_device(item, target_device, moved, f"{label}[{index}]")
+            changed = changed or (new_item is not item)
+            items.append(new_item)
+        return items if changed else value
+
+    if isinstance(value, tuple):
+        changed = False
+        items = []
+        for index, item in enumerate(value):
+            new_item = _move_condition_payload_to_device(item, target_device, moved, f"{label}[{index}]")
+            changed = changed or (new_item is not item)
+            items.append(new_item)
+        return tuple(items) if changed else value
+
+    if isinstance(value, dict):
+        changed = False
+        result: Dict[Any, Any] = {}
+        for key, item in value.items():
+            new_item = _move_condition_payload_to_device(item, target_device, moved, f"{label}.{key}")
+            changed = changed or (new_item is not item)
+            result[key] = new_item
+        return result if changed else value
+
+    for attr in ("frames", "latents", "conditioning_mask", "clean_latents", "keyframe_coords", "image"):
+        if hasattr(value, attr):
+            item = getattr(value, attr)
+            new_item = _move_condition_payload_to_device(item, target_device, moved, f"{label}.{attr}")
+            if new_item is not item:
+                try:
+                    setattr(value, attr, new_item)
+                except Exception:
+                    pass
+        
+    return value
+
+
+def _install_i2v_conditioning_mask_guard(pipe: Any, ctx: Dict[str, Any]) -> None:
+    """Keep supplied Stage 2 condition tensors on the pipeline execution device.
+
+    The Stage 1 -> Stage 2 handoff is kept in system RAM. Diffusers can accept
+    image/keyframe conditions on CPU while the Stage 2 scheduler/model runs on
+    CUDA. The old guard only moved returned tensors after ``prepare_latents``
+    finished, but multi-image runs can already fail *inside* ``prepare_latents``
+    when CUDA latents are concatenated with CPU keyframe tensors. Align both the
+    incoming condition payloads and the returned tensors.
     """
-    if pipe.__class__.__name__ != "LTX2ImageToVideoPipeline":
+    if pipe.__class__.__name__ not in {"LTX2ImageToVideoPipeline", "LTX2ConditionPipeline"}:
         ctx["ltx_int4_conditioning_mask_guard"] = "not needed: text-to-video"
         ctx["ltx_int4_conditioning_mask_rewrites"] = "0"
         return
@@ -1165,37 +1219,56 @@ def _install_i2v_conditioning_mask_guard(pipe: Any, ctx: Dict[str, Any]) -> None
         return
 
     state = {"rewrites": 0, "last": "none"}
+    tensor_names = ("latents", "conditioning_mask", "clean_latents", "keyframe_coords")
 
     def guarded(_self: Any, *args: Any, **kwargs: Any) -> Any:
+        target_device = getattr(_self, "_execution_device", None) or kwargs.get("device")
+        if target_device is not None:
+            pre_moved: List[str] = []
+            try:
+                for key in ("latents", "conditions", "conditioning_mask", "clean_latents", "keyframe_coords", "image"):
+                    if key not in kwargs:
+                        continue
+                    updated = _move_condition_payload_to_device(kwargs[key], target_device, pre_moved, key)
+                    if updated is not kwargs[key]:
+                        kwargs[key] = updated
+                if pre_moved:
+                    state["rewrites"] += 1
+                    state["last"] = "; ".join(pre_moved)
+                    ctx["ltx_int4_conditioning_mask_rewrites"] = str(state["rewrites"])
+                    ctx["ltx_int4_conditioning_mask_last_move"] = state["last"]
+                    print("[ltx-status] Prepared INT4 condition inputs on the execution device: " + state["last"], flush=True)
+            except Exception as exc:
+                ctx["ltx_int4_conditioning_mask_guard_error"] = f"{type(exc).__name__}: {exc}"
+                raise
+
         result = original(*args, **kwargs)
-        if not isinstance(result, tuple) or len(result) < 2:
+        if not isinstance(result, tuple) or not result:
             return result
-        latents, conditioning_mask, *rest = result
+        if target_device is None:
+            return result
+        items = list(result)
+        moved: List[str] = []
         try:
-            latent_device = getattr(latents, "device", None)
-            mask_device = getattr(conditioning_mask, "device", None)
-            if latent_device is not None and mask_device is not None and latent_device != mask_device:
-                before = str(mask_device)
-                conditioning_mask = conditioning_mask.to(device=latent_device)
+            for index, value in enumerate(items):
+                updated = _move_condition_payload_to_device(value, target_device, moved, tensor_names[index] if index < len(tensor_names) else f"tensor_{index}")
+                if updated is not value:
+                    items[index] = updated
+            if moved:
                 state["rewrites"] += 1
-                state["last"] = f"{before} -> {latent_device}; dtype={getattr(conditioning_mask, 'dtype', 'unknown')}"
+                state["last"] = "; ".join(moved)
                 ctx["ltx_int4_conditioning_mask_rewrites"] = str(state["rewrites"])
                 ctx["ltx_int4_conditioning_mask_last_move"] = state["last"]
-                print(
-                    "[ltx-status] Aligned INT4 I2V conditioning mask with video latents: "
-                    + state["last"],
-                    flush=True,
-                )
+                print("[ltx-status] Aligned INT4 condition tensors with the execution device: " + state["last"], flush=True)
         except Exception as exc:
             ctx["ltx_int4_conditioning_mask_guard_error"] = f"{type(exc).__name__}: {exc}"
             raise
-        return (latents, conditioning_mask, *rest)
+        return tuple(items)
 
     pipe.prepare_latents = types.MethodType(guarded, pipe)
-    ctx["ltx_int4_conditioning_mask_guard"] = "installed: instance-local Diffusers I2V alignment"
+    ctx["ltx_int4_conditioning_mask_guard"] = "installed: instance-local Stage 2 condition input/output device alignment"
     ctx["ltx_int4_conditioning_mask_rewrites"] = "0"
     ctx["ltx_int4_conditioning_mask_last_move"] = "none"
-
 
 def _add_ltx_source_paths(ltx_root: Path, ctx: Dict[str, Any]) -> None:
     """Expose the installed official LTX audio preprocessing helpers.
@@ -1249,8 +1322,14 @@ def _extract_audio_latents(
     audio_path = Path(audio_text).expanduser().resolve()
     if not audio_path.is_file():
         raise FileNotFoundError(f"INT4 reference audio not found: {audio_path}")
-    if str(getattr(args, "pipeline", "")) != "two_stages":
-        raise RuntimeError("INT4 reference-audio generation requires the normal two_stages workflow.")
+    public_pipeline = str(getattr(args, "pipeline", "") or "").strip()
+    if public_pipeline not in {"two_stages", "a2vid_two_stage"}:
+        raise RuntimeError(
+            "INT4 reference-audio generation requires a2vid_two_stage "
+            "(or legacy two_stages)."
+        )
+    ctx["ltx_int4_reference_audio_public_pipeline"] = public_pipeline
+    ctx["ltx_int4_reference_audio_runtime_layout"] = "two_stages"
 
     _add_ltx_source_paths(Path(str(getattr(args, "ltx_root", Path.cwd()))), ctx)
     try:
@@ -1490,18 +1569,141 @@ def _call_ltx2_pipe(pipe: Any, kwargs: Dict[str, Any], *, freeze_audio: bool, ct
         return pipe(**kwargs)
 
 
+def _lora_requests(args: Any) -> List[Tuple[Path, float]]:
+    requests: List[Tuple[Path, float]] = []
+    for raw in list(getattr(args, "loras", []) or []):
+        if len(raw) != 2:
+            raise RuntimeError(f"Invalid --lora entry {raw!r}; expected PATH STRENGTH.")
+        path = Path(str(raw[0])).expanduser().resolve()
+        strength = float(raw[1])
+        if not path.is_file():
+            raise FileNotFoundError(f"LTX INT4 LoRA not found: {path}")
+        if not (-4.0 <= strength <= 4.0):
+            raise RuntimeError(f"LTX INT4 LoRA strength must be between -4 and 4: {strength}")
+        requests.append((path, strength))
+    return requests
+
+
+def _enable_diffusers_peft_backend(ctx: Dict[str, Any]) -> Tuple[bool, str]:
+    """Try to enable Diffusers PEFT-backed LoRA loading for the isolated INT4 CLI."""
+    try:
+        import peft  # type: ignore
+    except Exception as exc:
+        detail = f"missing: {type(exc).__name__}: {exc}"
+        ctx["ltx_int4_peft_backend"] = detail
+        return False, detail
+
+    detail_bits = [f"peft={getattr(peft, '__version__', 'unknown')}"]
+    try:
+        import diffusers  # type: ignore
+        from diffusers import loaders as _diffusers_loaders  # type: ignore
+        from diffusers.utils import import_utils as _diffusers_import_utils  # type: ignore
+        try:
+            import diffusers.utils as _diffusers_utils  # type: ignore
+        except Exception:
+            _diffusers_utils = None
+
+        # Diffusers snapshots the backend flag in several modules. Refresh the
+        # relevant copies for this process after confirming that PEFT imports.
+        try:
+            _diffusers_import_utils.USE_PEFT_BACKEND = True
+        except Exception:
+            pass
+        if _diffusers_utils is not None:
+            try:
+                _diffusers_utils.USE_PEFT_BACKEND = True
+            except Exception:
+                pass
+        try:
+            import diffusers.loaders.lora_pipeline as _lora_pipeline  # type: ignore
+            _lora_pipeline.USE_PEFT_BACKEND = True
+        except Exception:
+            pass
+        detail_bits.append(f"diffusers={getattr(diffusers, '__version__', 'unknown')}")
+        detail_bits.append("enabled")
+    except Exception as exc:
+        detail = f"present but could not enable: {type(exc).__name__}: {exc}"
+        ctx["ltx_int4_peft_backend"] = detail
+        return False, detail
+
+    detail = "; ".join(detail_bits)
+    ctx["ltx_int4_peft_backend"] = detail
+    return True, detail
+
+
+def _load_requested_loras(pipe: Any, args: Any, ctx: Dict[str, Any]) -> None:
+    requests = _lora_requests(args)
+    if not requests:
+        ctx["ltx_int4_loras"] = "none"
+        ctx["ltx_int4_peft_backend"] = ctx.get("ltx_int4_peft_backend", "not needed: no LoRAs requested")
+        return
+    loader = getattr(pipe, "load_lora_weights", None)
+    setter = getattr(pipe, "set_adapters", None)
+    if not callable(loader) or not callable(setter):
+        raise RuntimeError(f"{pipe.__class__.__name__} does not expose Diffusers LoRA loading.")
+
+    peft_ready, peft_detail = _enable_diffusers_peft_backend(ctx)
+    if not peft_ready:
+        raise RuntimeError(
+            "INT4 LoRA loading needs the PEFT backend in the .ltx23 environment. "
+            f"Detected state: {peft_detail}. Install/repair PEFT for that environment, "
+            "then retry the INT4 LoRA run."
+        )
+
+    names: List[str] = []
+    weights: List[float] = []
+    rendered: List[str] = []
+    for index, (path, strength) in enumerate(requests, start=1):
+        # PEFT stores adapter names as keys in torch.nn.ModuleDict, so names
+        # may not contain dots (or other punctuation from filenames such as
+        # "LTX-2.3-fightV3.0.safetensors"). Build a stable, module-safe name.
+        safe_stem = re.sub(r"[^0-9A-Za-z_]+", "_", path.stem).strip("_")
+        if not safe_stem:
+            safe_stem = "lora"
+        adapter_name = f"framevision_ltx23_{index}_{safe_stem[:48]}"
+        try:
+            loader(str(path.parent), weight_name=path.name, adapter_name=adapter_name, local_files_only=True, low_cpu_mem_usage=True)
+        except TypeError:
+            loader(str(path.parent), weight_name=path.name, adapter_name=adapter_name)
+        except ValueError as exc:
+            # Diffusers reports PEFT backend problems through ValueError. Surface
+            # a direct repair hint instead of the generic upstream message.
+            raise RuntimeError(
+                "INT4 LoRA loading could not start because Diffusers still reported a PEFT backend problem. "
+                f"Backend state: {ctx.get('ltx_int4_peft_backend', peft_detail)}. Original error: {exc}"
+            ) from exc
+        names.append(adapter_name)
+        weights.append(float(strength))
+        rendered.append(f"{path.name}@{strength:g}")
+        print(f"[ltx-status] Loaded INT4 LoRA: {path.name} @ {strength:g}", flush=True)
+    setter(names, adapter_weights=weights)
+    ctx["ltx_int4_loras"] = "; ".join(rendered)
+    ctx["ltx_int4_lora_adapter_names"] = "; ".join(names)
+
+
+def _frame_to_latent_index(frame: int, num_frames: int, temporal_ratio: int) -> int:
+    frame = int(frame)
+    if frame < 0 or frame >= max(1, int(num_frames)) - 1:
+        return -1
+    if frame <= 0:
+        return 0
+    return ((frame - 1) // max(1, int(temporal_ratio))) + 1
+
+
 def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dict[str, Any]:
     info = validate_sdnq_model_root(Path(str(args.sdnq_model_root)))
     root: Path = info["root"]
-    workflow = str(getattr(args, "pipeline", "one_stage") or "one_stage").strip()
-
-    if workflow == "two_stages_hq":
+    requested_pipeline = str(getattr(args, "pipeline", "one_stage") or "one_stage").strip()
+    if requested_pipeline == "two_stages_hq":
         raise RuntimeError(
-            "SDNQ two_stages_hq is not connected yet. That workflow uses the official res_2s sampler, "
-            "while the current SDNQ bridge implements the proven Euler two_stages path. Select two_stages."
+            "INT4 two_stages_hq is not connected yet because the split SDNQ package does not expose the official res_2s sampler. "
+            "Use one_stage, two_stages, or a2vid_two_stage."
         )
-    if workflow not in {"one_stage", "two_stages"}:
-        raise RuntimeError(f"Unsupported SDNQ workflow: {workflow!r}")
+    if requested_pipeline not in {"one_stage", "two_stages", "a2vid_two_stage"}:
+        raise RuntimeError(f"Unsupported INT4 workflow: {requested_pipeline!r}")
+    workflow = "two_stages" if requested_pipeline == "a2vid_two_stage" else requested_pipeline
+    ctx["ltx_int4_public_pipeline"] = requested_pipeline
+    ctx["ltx_int4_runtime_stage_layout"] = workflow
 
     target_width = int(getattr(args, "width", 768))
     target_height = int(getattr(args, "height", 512))
@@ -1607,10 +1809,12 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         import diffusers  # type: ignore
         from diffusers import (  # type: ignore
             FlowMatchEulerDiscreteScheduler,
+            LTX2ConditionPipeline,
             LTX2ImageToVideoPipeline,
             LTX2Pipeline,
         )
         from diffusers.pipelines.ltx2 import LTX2LatentUpsamplePipeline  # type: ignore
+        from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition  # type: ignore
         from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel  # type: ignore
         from diffusers.pipelines.ltx2.utils import (  # type: ignore
             DISTILLED_SIGMA_VALUES,
@@ -1638,8 +1842,23 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         )
     ctx["ltx_sdnq_cuda_before_load"] = _cuda_text(torch_module)
 
-    image_path = str(getattr(args, "i2v_image", "") or "").strip()
-    pipeline_cls = LTX2ImageToVideoPipeline if image_path else LTX2Pipeline
+    condition_specs = list(getattr(args, "_visual_conditions", []) or [])
+    simple_i2v = bool(
+        len(condition_specs) == 1
+        and int(condition_specs[0].get("frame", 0)) == 0
+        and abs(float(condition_specs[0].get("strength", 1.0)) - 1.0) < 1e-6
+        and int(condition_specs[0].get("crf", 0)) == 0
+    )
+    image_path = str(condition_specs[0].get("path", "") if simple_i2v else "").strip()
+    if simple_i2v:
+        pipeline_cls = LTX2ImageToVideoPipeline
+        ctx["ltx_int4_condition_route"] = "dedicated LTX2ImageToVideoPipeline"
+    elif condition_specs:
+        pipeline_cls = LTX2ConditionPipeline
+        ctx["ltx_int4_condition_route"] = "LTX2ConditionPipeline for positioned/multiple images"
+    else:
+        pipeline_cls = LTX2Pipeline
+        ctx["ltx_int4_condition_route"] = "text-to-video"
     ctx["ltx_sdnq_pipeline_class"] = pipeline_cls.__name__
 
     load_t0 = time.perf_counter()
@@ -1655,6 +1874,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
     ctx["ltx_sdnq_cuda_after_load"] = _cuda_text(torch_module)
     print(f"[ltx-status] SDNQ model loaded in {load_s:.2f}s", flush=True)
     _install_i2v_conditioning_mask_guard(pipe, ctx)
+    _load_requested_loras(pipe, args, ctx)
 
     quantized_matmul_status = []
     for component_name in ("transformer", "text_encoder"):
@@ -1774,7 +1994,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         override_mode=offload_override,
         workflow=workflow,
         stage="stage1",
-        input_mode="image-to-video" if image_path else "text-to-video",
+        input_mode="image-to-video" if condition_specs else "text-to-video",
         automation_enabled=auto_vram_enabled,
         int4_24_stage2_full_max_work=int4_24_stage2_full_max_work,
         int4_24_i2v_stage1_full_max_work=int4_24_i2v_stage1_full_max_work,
@@ -1791,7 +2011,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         override_mode=offload_override,
         workflow=workflow,
         stage="stage2",
-        input_mode="image-to-video" if image_path else "text-to-video",
+        input_mode="image-to-video" if condition_specs else "text-to-video",
         automation_enabled=auto_vram_enabled,
         int4_24_stage2_full_max_work=int4_24_stage2_full_max_work,
         int4_24_i2v_stage1_full_max_work=int4_24_i2v_stage1_full_max_work,
@@ -1841,7 +2061,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
     ctx["ltx_sdnq_stage2_group_blocks"] = str(stage2_policy["group_blocks"])
     ctx["ltx_sdnq_stage2_group_estimated_gb"] = f"{stage2_group_gb:.2f}"
     ctx["ltx_sdnq_memory_policy_input_mode"] = (
-        "image-to-video" if image_path else "text-to-video"
+        "image-to-video" if condition_specs else "text-to-video"
     )
     ctx["ltx_sdnq_stage1_policy_tier"] = str(stage1_policy["policy_tier"])
     ctx["ltx_sdnq_stage2_policy_tier"] = str(stage2_policy["policy_tier"])
@@ -2477,12 +2697,28 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         return _callback
 
     loaded_image = None
-    if image_path:
+    loaded_conditions: List[Any] = []
+    if simple_i2v:
         image_file = Path(image_path).expanduser()
         if not image_file.is_file():
             raise FileNotFoundError(f"SDNQ I2V image not found: {image_file}")
         loaded_image = load_image(str(image_file))
         ctx["ltx_sdnq_input_mode"] = "image-to-video"
+        ctx["ltx_int4_visual_conditions"] = f"{image_file.name}:frame=0:dedicated-i2v"
+    elif condition_specs:
+        rendered: List[str] = []
+        for spec in condition_specs:
+            path_text = str(spec.get("path") or "").strip()
+            raw_frame = int(spec.get("frame") or 0)
+            strength = float(spec.get("strength") if spec.get("strength") is not None else 1.0)
+            image_file = Path(path_text).expanduser()
+            if not image_file.is_file():
+                raise FileNotFoundError(f"SDNQ visual condition not found: {image_file}")
+            latent_index = _frame_to_latent_index(raw_frame, requested_num_frames, temporal_ratio)
+            loaded_conditions.append(LTX2VideoCondition(frames=load_image(str(image_file)), index=latent_index, strength=strength))
+            rendered.append(f"{image_file.name}:frame={raw_frame}:latent={latent_index}:strength={strength:g}")
+        ctx["ltx_sdnq_input_mode"] = "image-conditioned-video"
+        ctx["ltx_int4_visual_conditions"] = "; ".join(rendered)
     else:
         ctx["ltx_sdnq_input_mode"] = "text-to-video"
 
@@ -2511,12 +2747,10 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         common_kwargs["spatio_temporal_guidance_blocks"] = [28]
     if loaded_image is not None:
         common_kwargs["image"] = loaded_image
+    if loaded_conditions:
+        common_kwargs["conditions"] = loaded_conditions
     if reference_audio_latents is not None:
-        # Stage 1 uses a CUDA generator, so supplied latents must enter on CUDA.
-        # They are small and frozen; the video transformer can still attend to them.
-        common_kwargs["audio_latents"] = reference_audio_latents.to(
-            device="cuda", dtype=torch_module.float32
-        )
+        common_kwargs["audio_latents"] = reference_audio_latents.to(device="cuda", dtype=torch_module.float32)
         common_kwargs["noise_scale"] = 0.0
 
     try:
@@ -2719,8 +2953,18 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
             "callback_on_step_end_tensor_inputs": ["latents"],
             "max_sequence_length": prompt_sequence_length,
         }
+        # Preserve the same image/keyframe conditions through refinement.
+        # The previous UI bridge dropped them at the Stage 1 -> Stage 2 boundary,
+        # allowing the three refinement steps to repaint the conditioned clip.
         if loaded_image is not None:
             stage2_kwargs["image"] = loaded_image
+        if loaded_conditions:
+            stage2_kwargs["conditions"] = loaded_conditions
+        ctx["ltx_int4_stage2_visual_conditioning"] = (
+            "dedicated start image reapplied" if loaded_image is not None
+            else f"{len(loaded_conditions)} positioned condition(s) reapplied" if loaded_conditions
+            else "none"
+        )
 
         policy_changed = bool(
             stage2_policy["mode"] != stage1_policy["mode"]
@@ -3105,49 +3349,62 @@ def _detect_vram_profile(torch_module: Any) -> int:
 
 
 def _normalize_input_image(args: Any, ctx: Dict[str, Any]) -> None:
-    image_text = str(getattr(args, "i2v_image", "") or "").strip()
-    if not image_text:
+    """Normalize official-style image conditions without changing their frame positions."""
+    raw_conditions: List[Tuple[str, int, float, int]] = []
+    legacy_path = str(getattr(args, "i2v_image", "") or "").strip()
+    if legacy_path:
+        raw_conditions.append((legacy_path, int(getattr(args, "i2v_image_frame", 0) or 0), float(getattr(args, "i2v_image_strength", 1.0) or 1.0), int(getattr(args, "i2v_image_crf", 0) or 0)))
+    for raw in list(getattr(args, "image_conditions", []) or []):
+        if len(raw) not in {3, 4}:
+            raise RuntimeError(f"Invalid --image entry {raw!r}; expected PATH FRAME STRENGTH [CRF].")
+        path_text, frame_text, strength_text = raw[:3]
+        crf_text = raw[3] if len(raw) == 4 else 0
+        raw_conditions.append((str(path_text).strip(), int(frame_text), float(strength_text), int(crf_text)))
+
+    if not raw_conditions:
+        args._visual_conditions = []
         ctx["ltx_int4_input_mode_requested"] = "text-to-video"
+        ctx["ltx_int4_visual_condition_count"] = "0"
         return
-
-    if int(getattr(args, "i2v_image_frame", 0) or 0) != 0:
-        raise RuntimeError("INT4 currently supports the start image only at frame 0.")
-    if abs(float(getattr(args, "i2v_image_strength", 1.0) or 1.0) - 1.0) > 1e-6:
-        raise RuntimeError("INT4 currently supports start-image strength 1.0 only.")
-    if int(getattr(args, "i2v_image_crf", 0) or 0) != 0:
-        raise RuntimeError("INT4 image CRF is not implemented in the isolated runner; keep it at 0.")
-
-    source = Path(image_text).expanduser().resolve()
-    if not source.is_file():
-        raise FileNotFoundError(f"INT4 start image not found: {source}")
-    ctx["ltx_int4_input_mode_requested"] = "image-to-video"
-    ctx["ltx_int4_original_image"] = str(source)
-
-    if not bool(getattr(args, "normalize_input_image", True)):
-        args.i2v_image = str(source)
-        ctx["ltx_int4_image_normalization"] = "disabled"
-        return
-
-    try:
-        from PIL import Image
-    except Exception as exc:
-        raise RuntimeError(f"Pillow is required to normalize the INT4 input image: {type(exc).__name__}: {exc}") from exc
 
     root = Path(str(getattr(args, "ltx_root", "") or Path(__file__).resolve().parent.parent)).expanduser().resolve()
+    normalize_images = bool(getattr(args, "normalize_input_image", True))
     temp_dir = root / "temp" / "ltx_int4"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    digest = __import__("hashlib").sha1(str(source).encode("utf-8", "ignore")).hexdigest()[:12]
-    target = temp_dir / f"clean_{source.stem}_{digest}.png"
-    with Image.open(source) as image:
-        original_mode = image.mode
-        original_size = image.size
-        clean = image.convert("RGB")
-        clean.save(target, format="PNG", optimize=False)
-    args.i2v_image = str(target)
-    ctx["ltx_int4_image_normalization"] = "enabled"
-    ctx["ltx_int4_original_image_mode"] = str(original_mode)
-    ctx["ltx_int4_original_image_size"] = f"{original_size[0]}x{original_size[1]}"
-    ctx["ltx_int4_clean_image"] = str(target)
+    if normalize_images:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            from PIL import Image
+        except Exception as exc:
+            raise RuntimeError(f"Pillow is required to normalize INT4 condition images: {type(exc).__name__}: {exc}") from exc
+
+    normalized: List[Dict[str, Any]] = []
+    rendered: List[str] = []
+    for path_text, frame, strength, crf in raw_conditions:
+        source = Path(path_text).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"INT4 condition image not found: {source}")
+        if int(crf) != 0:
+            raise RuntimeError("The split INT4 Diffusers loader does not use image CRF; keep the official CRF field at 0.")
+        final_path = source
+        original_mode = "unchanged"
+        original_size = "unknown"
+        if normalize_images:
+            digest = __import__("hashlib").sha1(str(source).encode("utf-8", "ignore")).hexdigest()[:12]
+            target = temp_dir / f"clean_{source.stem}_{digest}.png"
+            with Image.open(source) as image:
+                original_mode = str(image.mode)
+                original_size = f"{image.size[0]}x{image.size[1]}"
+                image.convert("RGB").save(target, format="PNG", optimize=False)
+            final_path = target
+        normalized.append({"path": str(final_path), "frame": int(frame), "strength": float(strength), "crf": int(crf)})
+        rendered.append(f"{source.name}:frame={int(frame)}:strength={float(strength):g}:crf={int(crf)}:mode={original_mode}:size={original_size}")
+
+    args._visual_conditions = normalized
+    args.i2v_image = str(normalized[0]["path"])
+    ctx["ltx_int4_input_mode_requested"] = "image-conditioned-video"
+    ctx["ltx_int4_visual_condition_count"] = str(len(normalized))
+    ctx["ltx_int4_image_normalization"] = "enabled" if normalize_images else "disabled"
+    ctx["ltx_int4_visual_condition_inputs"] = "; ".join(rendered)
 
 
 class _CudaMonitor:
@@ -3193,7 +3450,7 @@ def _write_report(path: Path, ctx: Dict[str, Any], exception_text: str = "") -> 
         "=" * 78,
         f"Updated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"Python: {sys.executable}",
-        "Native ltx23_vram_lab_cli.py used: NO",
+        "Native ltx23_vram_lab_cli.py modified: NO",
         "INT8 enabled: NO",
         "",
         "INT4 run",
@@ -3252,7 +3509,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Isolated FrameVision LTX 2.3 INT4 runner. It does not import or modify the native VRAM Lab CLI."
     )
-    parser.add_argument("--pipeline", choices=["one_stage", "two_stages"], default="two_stages")
+    parser.add_argument("--pipeline", choices=["one_stage", "two_stages", "two_stages_hq", "a2vid_two_stage"], default="two_stages")
     parser.add_argument("--model-root", "--sdnq-model-root", dest="sdnq_model_root", required=True)
     parser.add_argument("--vram-profile", choices=["auto", "24", "16", "12", "8"], default="auto")
     planner = parser.add_mutually_exclusive_group()
@@ -3283,6 +3540,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--i2v-image-frame", type=int, default=0)
     parser.add_argument("--i2v-image-strength", type=float, default=1.0)
     parser.add_argument("--i2v-image-crf", type=int, default=0)
+    parser.add_argument(
+        "--image", dest="image_conditions", action="append", nargs="+", default=[],
+        metavar="IMAGE_ARG",
+        help="Official LTX-style image condition: --image PATH FRAME STRENGTH [CRF]. Repeat for start/end/reference images.",
+    )
+    parser.add_argument(
+        "--lora", dest="loras", action="append", nargs=2, default=[], metavar=("PATH", "STRENGTH"),
+        help="Official LTX-style local LoRA argument. Repeat to combine adapters.",
+    )
     parser.add_argument("--normalize-input-image", dest="normalize_input_image", action="store_true", default=True)
     parser.add_argument("--no-normalize-input-image", dest="normalize_input_image", action="store_false")
     parser.add_argument("--spatial-upsampler-path", default="")
@@ -3337,9 +3603,11 @@ def main() -> int:
     try:
         if abs(float(args.shift) - 5.0) > 1e-6:
             raise RuntimeError("The isolated INT4 runner currently uses the distilled sigma schedule; keep Shift at 5.0.")
-        if str(args.audio_path or "").strip() and args.pipeline != "two_stages":
-            raise RuntimeError("INT4 uploaded reference audio must use the normal two_stages workflow.")
-        if args.pipeline == "two_stages" and not str(args.spatial_upsampler_path or "").strip():
+        if args.pipeline == "a2vid_two_stage" and not str(args.audio_path or "").strip():
+            raise RuntimeError("a2vid_two_stage requires --audio-path.")
+        if str(args.audio_path or "").strip() and args.pipeline not in {"a2vid_two_stage", "two_stages"}:
+            raise RuntimeError("Uploaded reference audio requires a2vid_two_stage (or legacy two_stages).")
+        if args.pipeline in {"two_stages", "a2vid_two_stage", "two_stages_hq"} and not str(args.spatial_upsampler_path or "").strip():
             default_up = Path(args.ltx_root).expanduser() / "models" / "ltx23" / "spatial_upsampler" / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
             args.spatial_upsampler_path = str(default_up)
 

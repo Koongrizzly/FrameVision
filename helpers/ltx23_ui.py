@@ -8,7 +8,7 @@ Drop this file in:
 
 Expected companion files:
     FrameVision/helpers/ltx23_vram_lab_cli.py  (FP16/FP8 only)
-    FrameVision/helpers/planner_ltx_int4.py     (INT4 + conditions/LoRA)
+    FrameVision/helpers/ltx_int4_cli.py         (isolated INT4 backend)
 
 The widget keeps the proven FP16/FP8 CLI untouched and routes INT4 to a
 separate helper instead of mixing quant code into native VRAM Lab / LTX logic. It can be imported into FrameVision or launched directly
@@ -67,7 +67,7 @@ from PySide6.QtCore import QUrl
 HERE = Path(__file__).resolve().parent
 APP_ROOT = HERE.parent if HERE.name.lower() == "helpers" else HERE
 DEFAULT_CLI_PATH = APP_ROOT / "helpers" / "ltx23_vram_lab_cli.py"
-INT4_CLI_PATH = APP_ROOT / "helpers" / "planner_ltx_int4.py"
+INT4_CLI_PATH = APP_ROOT / "helpers" / "ltx_int4_cli.py"
 INT4_MODEL_RELATIVE = Path("models") / "ltx23_int4"
 DEFAULT_LTX_ROOT = APP_ROOT
 OLD_DEFAULT_LTX_ROOTS = {str(Path(r"C:\ltx23")).lower(), str(Path(r"C:\ltx")).lower()}
@@ -1684,9 +1684,8 @@ class LTX23RunnerWidget(QWidget):
                     pass
                 if is_int4:
                     self.audio_hint_label.setText(
-                        "INT4 uses the normal two-stage workflow. The selected audio is encoded once, kept frozen "
-                        "through both stages to drive the video, and the original waveform is baked into the output. "
-                        "This does not use two_stages_hq or the native VRAM Lab CLI."
+                        "INT4 uses the same a2vid_two_stage selection and audio arguments as the FP16/FP8 UI. "
+                        "Only the isolated INT4 model loader and VRAM policy differ."
                     )
                 else:
                     self.audio_hint_label.setText(
@@ -1962,12 +1961,12 @@ class LTX23RunnerWidget(QWidget):
         self.quantization_combo = WheelGuardComboBox()
         self.quantization_combo.addItems(QUANTIZATION_MODE_CHOICES)
         self._set_combo(self.quantization_combo, QUANTIZATION_MODE_NONE)
-        self._set_tooltip(self.model_variant_combo, "Choose FP16/FP8 on the untouched native VRAM Lab CLI, or INT4 on the isolated planner_ltx_int4.py route.")
+        self._set_tooltip(self.model_variant_combo, "Choose FP16/FP8 on the untouched native VRAM Lab CLI, or INT4 on the isolated ltx_int4_cli.py route.")
         self._set_tooltip(self.auto_fill_model_paths_btn, "Auto-fill LTX root, env, checkpoint, Gemma, output and tool paths for the selected model.")
         self._set_tooltip(self.quantization_combo, "Quantization is off by default. FP8 modes are experimental and must be selected manually.")
         self._set_tooltip(self.ltx_root_row, "Portable LTX root folder. Default is the FrameVision install root; models, outputs and portable settings stay under this root.")
         self._set_tooltip(self.python_row, "Python executable from the LTX environment, usually under the FrameVision install root: environments\\.ltx23\\python.exe.")
-        self._set_tooltip(self.cli_row, "FP16/FP8 use helpers\\ltx23_vram_lab_cli.py. INT4 uses helpers\\planner_ltx_int4.py. The UI switches this path automatically.")
+        self._set_tooltip(self.cli_row, "FP16/FP8 use helpers\\ltx23_vram_lab_cli.py. INT4 uses helpers\\ltx_int4_cli.py. The UI switches this path automatically.")
         self._set_tooltip(self.checkpoint_row, "Main LTX 2.3 checkpoint / safetensors file. This is the large model file.")
         self._set_tooltip(self.gemma_row, "Gemma text encoder folder. Usually leave this unchanged once it works.")
         self._set_tooltip(self.output_dir_row, "Folder where generated videos are saved. Default is under the LTX root output folder.")
@@ -3767,11 +3766,12 @@ class LTX23RunnerWidget(QWidget):
         output_path = self._make_output_path()
         report_path, deep_log_path = self._run_diagnostic_paths()
         audio_mode = AUDIO_MODE_COMPAT_MAP.get(self.audio_mode_combo.currentText(), AUDIO_MODE_DISABLED)
-        # Native FP16/FP8 keeps using a2vid_two_stage.  Isolated INT4 maps the
-        # same UI mode onto its normal Euler two_stages backend.
-        pipeline_name = "two_stages" if audio_mode == AUDIO_MODE_A2V else self._effective_pipeline()
-        if pipeline_name not in {"one_stage", "two_stages"}:
-            raise RuntimeError("INT4 currently supports one_stage and normal two_stages only. two_stages_hq remains on FP16/FP8.")
+        # Keep the exact same public workflow selection used by FP16/FP8.
+        # The INT4 CLI decides only how the split SDNQ weights are loaded; it
+        # must not rename a2vid_two_stage into an unrelated workflow.
+        pipeline_name = self._effective_pipeline()
+        if pipeline_name not in {"one_stage", "two_stages", "two_stages_hq", "a2vid_two_stage"}:
+            raise RuntimeError(f"Unsupported LTX workflow: {pipeline_name}")
         if audio_mode == AUDIO_MODE_A2V:
             audio_path = self.audio_row.text().strip()
             if not audio_path:
@@ -3824,28 +3824,50 @@ class LTX23RunnerWidget(QWidget):
         negative_prompt = self.negative_edit.toPlainText().strip()
         if negative_prompt:
             args.extend(["--negative-prompt", negative_prompt])
-        if start_image:
+        # A normal start-image-only job uses the dedicated INT4 I2V pipeline.
+        # Start+end/middle/reference jobs use repeated official-style --image
+        # conditions. This prevents ordinary I2V from being routed through the
+        # general condition path unnecessarily.
+        simple_start_i2v = (
+            bool(start_image)
+            and not end_image
+            and not references
+            and int(self.start_image_frame_spin.value()) == 0
+            and abs(float(self.start_image_strength_spin.value()) - 1.0) < 1e-6
+        )
+        if simple_start_i2v:
             args.extend([
-                "--image", start_image,
-                str(self.start_image_frame_spin.value()),
-                f"{self.start_image_strength_spin.value():g}",
+                "--i2v-image", start_image,
+                "--i2v-image-frame", str(self.start_image_frame_spin.value()),
+                "--i2v-image-strength", f"{self.start_image_strength_spin.value():g}",
+                "--i2v-image-crf", "0",
             ])
-        if end_image:
-            args.extend([
-                "--image", end_image,
-                str(max(0, self.frames_spin.value() - 1)),
-                f"{self.end_image_strength_spin.value():g}",
-            ])
-        for ref_path in references:
-            args.extend([
-                "--image", ref_path,
-                "0",
-                f"{self.reference_image_strength_spin.value():g}",
-            ])
+        else:
+            if start_image:
+                args.extend([
+                    "--image", start_image,
+                    str(self.start_image_frame_spin.value()),
+                    f"{self.start_image_strength_spin.value():g}",
+                    "0",
+                ])
+            if end_image:
+                args.extend([
+                    "--image", end_image,
+                    str(max(0, self.frames_spin.value() - 1)),
+                    f"{self.end_image_strength_spin.value():g}",
+                    "0",
+                ])
+            for ref_path in references:
+                args.extend([
+                    "--image", ref_path,
+                    "0",
+                    f"{self.reference_image_strength_spin.value():g}",
+                    "0",
+                ])
         args.extend(self._user_lora_cli_args())
         if hasattr(self, "normalize_input_image_check") and not self.normalize_input_image_check.isChecked():
             args.append("--no-normalize-input-image")
-        if pipeline_name == "two_stages" and self.spatial_upsampler_row.text().strip():
+        if pipeline_name in {"two_stages", "two_stages_hq", "a2vid_two_stage"} and self.spatial_upsampler_row.text().strip():
             args.extend(["--spatial-upsampler-path", self.spatial_upsampler_row.text().strip()])
         if audio_mode == AUDIO_MODE_A2V:
             args.extend([
@@ -5091,7 +5113,7 @@ class LTX23RunnerWidget(QWidget):
 
     def _selected_model_variant(self) -> str:
         # Safety first: a recognized INT4 split-model folder must always use the
-        # isolated planner_ltx_int4.py, even when an older settings file restored the
+        # isolated ltx_int4_cli.py, even when an older settings file restored the
         # combo as FP16. This prevents the native VRAM Lab CLI from ever receiving
         # the INT4 directory as --checkpoint-path.
         inferred = self._infer_model_variant_from_checkpoint(
@@ -5147,7 +5169,7 @@ class LTX23RunnerWidget(QWidget):
         if hasattr(self, "vram_lab_combo"):
             # Keep the simple ON/OFF control available for every model. For
             # INT4, ON enables automatic card detection plus workload-aware
-            # Stage 1/Stage 2 residency in planner_ltx_int4.py. Native VRAM Lab
+            # Stage 1/Stage 2 residency in ltx_int4_cli.py. Native VRAM Lab
             # tuning remains exclusive to FP16/FP8.
             self.vram_lab_combo.setEnabled(True)
             self._set_tooltip(
@@ -5206,7 +5228,7 @@ class LTX23RunnerWidget(QWidget):
                 self.quantization_combo.setEnabled(False)
                 self._set_tooltip(
                     self.quantization_combo,
-                    "INT4 is already pre-quantized and runs only through the isolated planner_ltx_int4.py.",
+                    "INT4 is already pre-quantized and runs only through the isolated ltx_int4_cli.py.",
                 )
             elif not is_fp8:
                 self._set_combo(self.quantization_combo, QUANTIZATION_MODE_NONE)

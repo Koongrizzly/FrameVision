@@ -153,26 +153,30 @@ def build_auto_planner_command(
     """Choose INT4 when available and otherwise return the untouched native command.
 
     ``preferred_backend`` may be ``auto``, ``int4`` or ``native``. ``auto``
-    falls back to the untouched native command when INT4 is unavailable. An
-    explicit ``int4`` assignment is strict so resume/recreate cannot silently
-    mix a native FP16/FP8 clip into an INT4 Planner job.
+    and ``int4`` both fall back to the untouched native command when INT4 is
+    unavailable. The stored backend is a preference, not a hard dependency;
+    this keeps Planner resume/recreate usable when the INT4 folder is moved,
+    renamed, uninstalled, or temporarily incomplete.
     """
     root = _framevision_root(app_root)
     preference = str(preferred_backend or "auto").strip().lower().replace("-", "_")
     status = int4_install_status(root)
     native_requested = preference in {"native", "fp16", "fp8", "fp16_fp8"}
-    if preference == "int4" and not bool(status.get("ok")):
-        raise RuntimeError(
-            "This Planner job is assigned to LTX INT4, but the INT4 installation is not ready: "
-            + str(status.get("message") or "unknown INT4 installation error")
-        )
     use_int4 = not native_requested and bool(status.get("ok"))
     if not use_int4:
+        if native_requested:
+            reason = "native explicitly requested"
+        elif preference == "int4":
+            reason = "recorded INT4 backend unavailable; automatic native fallback: " + str(
+                status.get("message") or "INT4 unavailable"
+            )
+        else:
+            reason = str(status.get("message") or "INT4 unavailable")
         return {
             "backend": "native",
             "command": list(native_command),
             "status": status,
-            "reason": "native explicitly requested" if native_requested else str(status.get("message") or "INT4 unavailable"),
+            "reason": reason,
         }
 
     frames = max(1, int(num_frames))
@@ -1355,13 +1359,19 @@ def _load_ltx23_spatial_upsampler(
 
 
 def _install_i2v_conditioning_mask_guard(pipe: Any, ctx: Dict[str, Any]) -> None:
-    """Keep the Diffusers 0.39 two-stage I2V conditioning mask with its latents.
+    """Keep supplied Stage 2 condition tensors on the pipeline execution device.
 
-    When Stage 2 receives CPU latents, Diffusers creates the conditioning mask on
-    CPU and only moves the latent tensor to CUDA. The first denoise operation then
-    mixes a CUDA timestep with a CPU mask. The guard is instance-local and exists
-    only in this isolated INT4 CLI; no installed package or native LTX file is
-    edited.
+    Diffusers 0.39 keeps caller-supplied video latents on their incoming device
+    inside ``LTX2ConditionPipeline.prepare_latents``.  FrameVision deliberately
+    stores the Stage 1 -> Stage 2 handoff in system RAM, so the returned video
+    latents, conditioning mask, and clean conditioning latents can all remain on
+    CPU while the scheduler timesteps are created on CUDA.  Aligning only the
+    mask is not enough: the denoising loop later combines CUDA model output with
+    both ``latents`` and ``clean_latents``.
+
+    This instance-local wrapper moves every tensor returned by ``prepare_latents``
+    to the pipeline execution device.  It changes neither Diffusers nor the
+    existing native/standalone LTX CLIs.
     """
     if pipe.__class__.__name__ not in {"LTX2ImageToVideoPipeline", "LTX2ConditionPipeline"}:
         ctx["ltx_int4_conditioning_mask_guard"] = "not needed: text-to-video"
@@ -1375,34 +1385,53 @@ def _install_i2v_conditioning_mask_guard(pipe: Any, ctx: Dict[str, Any]) -> None
         return
 
     state = {"rewrites": 0, "last": "none"}
+    tensor_names = ("latents", "conditioning_mask", "clean_latents", "keyframe_coords")
 
     def guarded(_self: Any, *args: Any, **kwargs: Any) -> Any:
         result = original(*args, **kwargs)
-        if not isinstance(result, tuple) or len(result) < 2:
+        if not isinstance(result, tuple) or not result:
             return result
-        latents, conditioning_mask, *rest = result
+
+        # ``device`` is explicitly supplied by the Diffusers pipeline.  Prefer
+        # the resolved execution-device property because it includes the CUDA
+        # index selected by Accelerate/group offload.
+        target_device = getattr(_self, "_execution_device", None) or kwargs.get("device")
+        if target_device is None:
+            return result
+
+        items = list(result)
+        moved: List[str] = []
         try:
-            latent_device = getattr(latents, "device", None)
-            mask_device = getattr(conditioning_mask, "device", None)
-            if latent_device is not None and mask_device is not None and latent_device != mask_device:
-                before = str(mask_device)
-                conditioning_mask = conditioning_mask.to(device=latent_device)
+            for index, value in enumerate(items):
+                current_device = getattr(value, "device", None)
+                mover = getattr(value, "to", None)
+                if current_device is None or not callable(mover):
+                    continue
+                if str(current_device) == str(target_device):
+                    continue
+                items[index] = mover(device=target_device)
+                label = tensor_names[index] if index < len(tensor_names) else f"tensor_{index}"
+                moved.append(f"{label}:{current_device}->{target_device}")
+
+            if moved:
                 state["rewrites"] += 1
-                state["last"] = f"{before} -> {latent_device}; dtype={getattr(conditioning_mask, 'dtype', 'unknown')}"
+                state["last"] = "; ".join(moved)
                 ctx["ltx_int4_conditioning_mask_rewrites"] = str(state["rewrites"])
                 ctx["ltx_int4_conditioning_mask_last_move"] = state["last"]
                 print(
-                    "[ltx-status] Aligned INT4 I2V conditioning mask with video latents: "
+                    "[ltx-status] Aligned INT4 condition tensors with the execution device: "
                     + state["last"],
                     flush=True,
                 )
         except Exception as exc:
             ctx["ltx_int4_conditioning_mask_guard_error"] = f"{type(exc).__name__}: {exc}"
             raise
-        return (latents, conditioning_mask, *rest)
+        return tuple(items)
 
     pipe.prepare_latents = types.MethodType(guarded, pipe)
-    ctx["ltx_int4_conditioning_mask_guard"] = "installed: instance-local Diffusers I2V alignment"
+    ctx["ltx_int4_conditioning_mask_guard"] = (
+        "installed: instance-local Diffusers Stage 2 condition-tensor alignment"
+    )
     ctx["ltx_int4_conditioning_mask_rewrites"] = "0"
     ctx["ltx_int4_conditioning_mask_last_move"] = "none"
 
