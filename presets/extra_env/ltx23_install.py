@@ -7,7 +7,7 @@ Safe defaults:
 - Creates/repairs env at <root>/environments/.ltx23.
 - Keeps official LTX repo at <root>/models/ltx23/repos/LTX-2.
 - Keeps models at <root>/models/ltx23.
-- Installs/repairs SDNQ support on every normal installer/repair run.
+- Installs/repairs SDNQ and PEFT LoRA support on every normal installer/repair run.
 - Can download complete OzzyGT SDNQ INT8/INT4 split-model repositories.
 - Keeps FFmpeg at <root>/presets/bin.
 - Uses <root>/temp and local HF/Torch caches only.
@@ -56,6 +56,8 @@ TRITON_WINDOWS_PIN = "triton-windows==3.4.0.post21"
 TRITON_REQUIRED_VERSION = "3.4.0.post21"
 SDNQ_PACKAGE = "sdnq==0.2.1"
 DIFFUSERS_SDNQ_PACKAGE = "diffusers==0.39.0"
+PEFT_PACKAGE = "peft==0.19.1"
+PEFT_REQUIRED_VERSION = "0.19.1"
 SPLIT_PART_FILENAMES: Sequence[str] = (
     "vocoder.safetensors",
     "audio_vae.safetensors",
@@ -281,6 +283,62 @@ print(
         )
     status("OK", f"Exact SDNQ/LTX2 compiled runtime: {out}")
     return True
+
+def ensure_peft_runtime(py: Path, root: Path, *, install: bool) -> bool:
+    """Install and verify Diffusers PEFT support used by LTX user LoRAs.
+
+    This repair runs independently from the general requirements install so an
+    existing .ltx23 environment also gains LoRA support on a normal installer
+    repair pass. ``--no-deps`` protects the already-tested Torch, Diffusers,
+    Transformers, Accelerate, Triton and SDNQ package tuple.
+    """
+
+    probe = rf"""
+import diffusers
+import peft
+import transformers
+import accelerate
+from diffusers.loaders import PeftAdapterMixin
+from diffusers.utils.import_utils import is_peft_available
+assert peft.__version__ == "{PEFT_REQUIRED_VERSION}", peft.__version__
+assert bool(is_peft_available()), "Diffusers does not see the PEFT backend"
+print(
+    "peft", peft.__version__,
+    "diffusers", diffusers.__version__,
+    "transformers", transformers.__version__,
+    "accelerate", accelerate.__version__,
+    "backend", bool(is_peft_available()),
+    "mixin", PeftAdapterMixin.__name__,
+)
+"""
+    rc, out, err = run_python_capture(py, probe, root)
+    if rc == 0:
+        status("FOUND", f"PEFT LoRA runtime: {out}")
+        status("SKIPPED", "PEFT LoRA runtime repair install skipped")
+        return True
+
+    detail = (err or out or "import failed").splitlines()[-1]
+    status("MISSING", f"PEFT LoRA runtime is incomplete: {detail}")
+    if not install:
+        return False
+
+    pip_install(
+        py,
+        [PEFT_PACKAGE],
+        root,
+        label=f"PEFT LoRA runtime ({PEFT_PACKAGE})",
+        extra_args=["--upgrade", "--force-reinstall", "--no-deps"],
+    )
+
+    rc, out, err = run_python_capture(py, probe, root)
+    if rc != 0:
+        raise RuntimeError(
+            "PEFT install/repair finished, but Diffusers LoRA support still fails: "
+            + ((err or out or "unknown import failure").splitlines()[-1])
+        )
+    status("OK", f"PEFT LoRA runtime: {out}")
+    return True
+
 
 def install_deps(py: Path, root: Path) -> None:
     script_dir = Path(__file__).resolve().parent
@@ -928,6 +986,13 @@ def main() -> int:
         # SDNQ support is checked and repaired on every installer/repair run.
         if not ensure_sdnq_runtime(py, root, install=not args.verify_only):
             raise RuntimeError("SDNQ/LTX2 runtime verification failed")
+
+        # User LoRA loading in Diffusers LTX2 uses the PEFT adapter backend.
+        # Check and repair it on every normal installer/repair run, including
+        # existing environments created before INT4 LoRA support was wired.
+        if not ensure_peft_runtime(py, root, install=not args.verify_only):
+            raise RuntimeError("PEFT/Diffusers LoRA runtime verification failed")
+
         # Optional acceleration kernels are now attempted by default during a normal install/repair.
         # Use --skip-flash-attn / --skip-triton / --skip-sage-attn to disable them.
         # Keep --install-* as legacy no-op flags.
