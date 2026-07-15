@@ -17158,6 +17158,21 @@ class PipelineWorker(QThread):
                     target_duration_early = float(getattr(self.job, "approx_duration_sec", 0) or 0.0)
 
                 tts_mode = "clone" if str(self.job.narration_mode or "builtin") == "clone" else "custom"
+                _requested_lipsync_source = str(
+                    getattr(self.job, "lipsync_source", "generated") or "generated"
+                ).strip().lower()
+                if _requested_lipsync_source not in ("generated", "uploaded"):
+                    _requested_lipsync_source = "generated"
+                _requested_transcript_path = str(
+                    getattr(self.job, "lipsync_transcript_path", "") or ""
+                ).strip()
+                if _requested_lipsync_source == "uploaded":
+                    self.signals.log.emit(
+                        f"[lip-sync] exact uploaded transcript source -> {_requested_transcript_path or '<missing>'}"
+                    )
+                else:
+                    self.signals.log.emit("[lip-sync] text source -> Planner-created narration")
+
                 result = _planner_lipsync.prepare_lipsync_assets(
                     root_dir=str(root_dir),
                     job_id=str(self.job.job_id),
@@ -17176,8 +17191,8 @@ class PipelineWorker(QThread):
                     narration_txt=str(narration_txt_early),
                     narration_json=str(narration_json_early),
                     transcript_path=str(transcript_path),
-                    source_mode=str(getattr(self.job, "lipsync_source", "generated") or "generated"),
-                    uploaded_transcript_path=str(getattr(self.job, "lipsync_transcript_path", "") or ""),
+                    source_mode=_requested_lipsync_source,
+                    uploaded_transcript_path=_requested_transcript_path,
                     ffmpeg_path=str(_planner_lipsync_tool("ffmpeg")),
                     ffprobe_path=str(_planner_lipsync_tool("ffprobe")),
                     qwentts_python=str(qwentts_python),
@@ -17195,6 +17210,22 @@ class PipelineWorker(QThread):
                     log_callback=lambda msg: self.signals.log.emit(str(msg)),
                 )
 
+                _prepared_source_mode = str((result or {}).get("source_mode") or "").strip().lower()
+                if _prepared_source_mode != _requested_lipsync_source:
+                    raise RuntimeError(
+                        "Planner prepared the wrong lip-sync text source: "
+                        f"requested {_requested_lipsync_source}, prepared {_prepared_source_mode or 'unknown'}."
+                    )
+                if _requested_lipsync_source == "uploaded":
+                    _prepared_signature = str((result or {}).get("source_spoken_word_signature") or "").strip()
+                    if not _prepared_signature:
+                        raise RuntimeError(
+                            "Uploaded transcript narration was prepared without an exact-source verification signature."
+                        )
+                    self.signals.log.emit(
+                        "[lip-sync] uploaded transcript verified; generated prompt/story text was not used as narration"
+                    )
+
                 try:
                     stable_sample = str(result.get("voice_sample_path") or '').strip()
                     if stable_sample:
@@ -17208,6 +17239,8 @@ class PipelineWorker(QThread):
                     "lipsync_enabled": True,
                     "lipsync_source": str(result.get("source_mode") or getattr(self.job, "lipsync_source", "generated")),
                     "lipsync_fingerprint": str(result.get("fingerprint") or ''),
+                    "lipsync_source_transcript_path": str(result.get("source_transcript_path") or ''),
+                    "lipsync_source_spoken_signature": str(result.get("source_spoken_word_signature") or ''),
                     "voice": str(self.job.narration_voice or "ryan"),
                     "mode": str(self.job.narration_mode or "builtin"),
                     "language": str(self.job.narration_language or "auto"),
@@ -17538,6 +17571,23 @@ class PipelineWorker(QThread):
                     lipsync_plan_fp = str((lipsync_plan_obj or {}).get("fingerprint") or '')
                     if not lipsync_shot_map:
                         raise RuntimeError("LTX lip-sync was enabled, but no prepared per-shot audio map was found.")
+                    _job_lipsync_source = str(
+                        getattr(self.job, "lipsync_source", "generated") or "generated"
+                    ).strip().lower()
+                    _plan_lipsync_source = str((lipsync_plan_obj or {}).get("source_mode") or "").strip().lower()
+                    if _plan_lipsync_source != _job_lipsync_source:
+                        raise RuntimeError(
+                            "The prepared lip-sync audio belongs to a different text source "
+                            f"({_plan_lipsync_source or 'unknown'} instead of {_job_lipsync_source}). "
+                            "Narration must be rebuilt before video generation."
+                        )
+                    if _job_lipsync_source == "uploaded" and not str(
+                        (lipsync_plan_obj or {}).get("source_spoken_word_signature") or ""
+                    ).strip():
+                        raise RuntimeError(
+                            "The uploaded transcript audio plan has no exact-source verification. "
+                            "Rebuild narration before generating clips."
+                        )
                 _vram_release("before ltx23")
 
                 id_to_img: Dict[str, str] = {}
@@ -17714,10 +17764,34 @@ class PipelineWorker(QThread):
                     clip_audio_path = str((lipsync_item or {}).get("audio_file") or '').strip()
                     if clip_audio_path and not os.path.isfile(clip_audio_path):
                         raise RuntimeError(f"[ltx23] Missing prepared lip-sync WAV for shot {sid}: {clip_audio_path}")
+                    if (
+                        bool(getattr(self.job, "lipsync_enabled", False))
+                        and str(getattr(self.job, "lipsync_source", "generated") or "generated").strip().lower() == "uploaded"
+                        and bool((lipsync_item or {}).get("has_speech"))
+                        and not clip_audio_path
+                    ):
+                        raise RuntimeError(
+                            f"[ltx23] Uploaded transcript contains speech for {sid}, but no per-shot WAV was assigned. "
+                            "Planner will not silently generate ordinary LTX audio instead."
+                        )
                     if clip_audio_path:
-                        lipsync_suffix = str((lipsync_item or {}).get("prompt_suffix") or '').strip()
-                        if lipsync_suffix:
-                            prompt = (prompt.rstrip() + " " + lipsync_suffix).strip()
+                        # Audio-conditioned lip-sync must not inherit a contradictory
+                        # storyline/image prompt. The direct LTX UI works because the
+                        # motion prompt stays compatible with the supplied start image.
+                        # Lock identity, clothes, setting and framing to that image and
+                        # let the supplied WAV drive only speech/facial motion.
+                        _speaker_label = str((lipsync_item or {}).get("speaker_visual_label") or "The person").strip()
+                        prompt = (
+                            f"{_speaker_label} is exactly the same person shown in the supplied start image. "
+                            "Keep the same face, identity, age, hairstyle, clothing, body, background, lighting, "
+                            "camera position, composition and framing for the entire clip. "
+                            "The person speaks the supplied audio naturally with accurate lip and jaw movement, "
+                            "subtle facial expression and minimal head motion. "
+                            "Follow the timing, pauses and silence in the supplied audio exactly. "
+                            "When the audio is silent, the mouth stays closed and relaxed. "
+                            "Do not introduce another person, replace the subject, change clothes, change location, "
+                            "cut to another scene, perform a transition, or invent extra speech."
+                        )
 
                     # Duration → frames (same idea as the other video engines).
                     try:

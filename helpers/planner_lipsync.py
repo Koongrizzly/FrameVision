@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
-LIPSYNC_ENGINE_VERSION = "planner_lipsync_v1.2"
+LIPSYNC_ENGINE_VERSION = "planner_lipsync_v1.4_identity_locked"
 _MAX_TEMPO = 1.28
 _BASE_WORDS_PER_SEC = 1.55
 # Use the same practical headroom as the real audio fitter.  The old planner
@@ -142,6 +142,34 @@ def _read_json(path: str) -> Any:
         return json.loads(_read_text(path))
     except Exception:
         return {}
+
+
+def _transcript_spoken_text(raw_text: str) -> str:
+    """Return only the spoken words from TXT/SRT/VTT input, without timestamps."""
+    cues = _parse_timed_transcript(str(raw_text or ""))
+    if cues:
+        return _collapse(" ".join(str(item.get("text") or "") for item in cues))
+    return _collapse(" ".join(_sentence_units(str(raw_text or ""))))
+
+
+def _spoken_word_signature(text: str) -> str:
+    """Stable word-only signature used to prove uploaded text was not rewritten."""
+    words = re.findall(r"[^\W_]+(?:['’-][^\W_]+)?", str(text or "").lower(), flags=re.UNICODE)
+    return _sha1_text(" ".join(words))
+
+
+def _find_stable_uploaded_transcript(audio_dir: str) -> str:
+    """Recover the project-local uploaded transcript during Resume."""
+    try:
+        for name in sorted(os.listdir(audio_dir)):
+            low = str(name).lower()
+            if low.startswith("lipsync_transcript_original") and low.endswith((".txt", ".srt", ".vtt")):
+                candidate = os.path.join(audio_dir, name)
+                if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                    return candidate
+    except Exception:
+        pass
+    return ""
 
 
 def _sha1_text(text: str) -> str:
@@ -496,57 +524,69 @@ def _even_window_subset(windows: Sequence[Dict[str, Any]], count: int) -> List[D
     return [dict(windows[idx]) for idx in indices]
 
 
+def _uploaded_plain_lines(text: str) -> List[str]:
+    """Return physical non-empty TXT lines as hard speech units.
+
+    Uploaded plain-text transcripts are user-authored shot scripts. A newline is
+    therefore an explicit boundary, not a suggestion. Never merge adjacent lines
+    and never move overflow words into the next line/shot.
+    """
+    clean = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    clean = clean.lstrip("\ufeff")
+    lines: List[str] = []
+    for raw_line in clean.split("\n"):
+        line = _collapse(raw_line)
+        if not line:
+            continue
+        if line.upper() == "WEBVTT" or "-->" in line:
+            continue
+        # Ignore standalone subtitle cue numbers without discarding ordinary
+        # lines that begin with a number.
+        if re.fullmatch(r"\d+", line):
+            continue
+        lines.append(line)
+    return lines
+
+
 def _allocate_plain_text_to_windows(text: str, windows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    tokens = _collapse(text).split()
-    if not tokens or not windows:
+    """Bind each uploaded TXT line to one Planner shot, in order.
+
+    Older builds collapsed the whole transcript into one token stream and then
+    redistributed words according to shot capacity. That merged neighbouring
+    lines and could start a new shot with words stolen from the previous line.
+    This function deliberately treats every non-empty physical line as atomic.
+    """
+    lines = _uploaded_plain_lines(text)
+    if not lines or not windows:
         return []
-    units = _sentence_units(text)
-    desired_segments = max(1, min(len(windows), max(len(units), int(math.ceil(len(tokens) / 7.0)))))
-    selected = _even_window_subset(windows, desired_segments)
-    capacity = sum(int(item.get("max_words") or 0) for item in selected)
-    # A sentence-count-based subset can be too small for a perfectly usable
-    # transcript.  Expand across every planned shot before declaring failure.
-    if len(tokens) > capacity and len(selected) < len(windows):
-        selected = [dict(item) for item in windows]
-        capacity = sum(int(item.get("max_words") or 0) for item in selected)
-    if len(tokens) > capacity:
-        approximate = len(tokens) / _BASE_WORDS_PER_SEC
-        minimum = len(tokens) / max(0.1, _ALLOCATION_WORDS_PER_SEC)
-        available = sum(_safe_float(item.get("available_sec")) for item in selected)
+    if len(lines) > len(windows):
         raise RuntimeError(
-            f"The transcript still cannot fit the completed shot timeline: {len(tokens)} words need at least about "
-            f"{minimum:.1f}s after gentle fitting, while {available:.1f}s is available. "
-            "This should normally be caught before generation; increase the Planner duration and resume. "
-            "No words were removed."
+            f"The uploaded transcript has {len(lines)} non-empty lines but the Planner created only "
+            f"{len(windows)} usable video shots. Each line is locked to one shot, so add more shots/images "
+            "or remove transcript lines. No lines were merged or split."
         )
+
+    selected = [dict(item) for item in windows[: len(lines)]]
     segments: List[Dict[str, Any]] = []
-    cursor = 0
-    remaining_words = len(tokens)
-    remaining_capacity = capacity
-    for index, window in enumerate(selected, start=1):
-        if cursor >= len(tokens):
-            break
-        cap = max(1, int(window.get("max_words") or 1))
-        windows_left = len(selected) - index
-        if windows_left <= 0:
-            take = remaining_words
-        else:
-            proportional = int(round(remaining_words * cap / float(max(1, remaining_capacity))))
-            minimum_left = windows_left
-            take = max(1, min(cap, proportional, remaining_words - minimum_left if remaining_words > minimum_left else 1))
-        take = _choose_word_boundary(tokens, cursor, take, min(cap, remaining_words))
-        chunk = _collapse(" ".join(tokens[cursor : cursor + take]))
-        cursor += take
-        remaining_words = len(tokens) - cursor
-        remaining_capacity -= cap
-        segments.append({**window, "beat_id": f"U{index:02d}", "index": index, "text": chunk, "word_count": len(chunk.split())})
-    if cursor < len(tokens) and segments:
-        tail = _collapse(" ".join(tokens[cursor:]))
-        segments[-1]["text"] = _collapse(str(segments[-1].get("text") or "") + " " + tail)
-        segments[-1]["word_count"] = len(str(segments[-1]["text"]).split())
-    for index, segment in enumerate(segments, start=1):
-        segment["is_first"] = index == 1
-        segment["is_final"] = index == len(segments)
+    for index, (line, window) in enumerate(zip(lines, selected), start=1):
+        word_count = len(line.split())
+        # Do not redistribute or reject a user-authored line based on a rough
+        # words-per-second estimate. The real TTS result is measured below and
+        # the existing strict audio fitter decides whether that exact line can
+        # fit the shot. If it cannot, the run stops with the line/shot intact.
+        segments.append(
+            {
+                **window,
+                "beat_id": f"U{index:02d}",
+                "index": index,
+                "text": line,
+                "word_count": word_count,
+                "source_line_index": index,
+                "line_locked": True,
+                "is_first": index == 1,
+                "is_final": index == len(lines),
+            }
+        )
     return segments
 
 
@@ -1281,7 +1321,13 @@ def prepare_lipsync_assets(
     speaker_name = _infer_speaker_name(plan_obj, prompt)
     uploaded = str(uploaded_transcript_path or "").strip()
     if source_mode == "uploaded" and (not uploaded or not os.path.isfile(uploaded)):
-        raise RuntimeError("LTX lip-sync is set to Uploaded transcript, but no transcript file was selected.")
+        recovered_transcript = _find_stable_uploaded_transcript(audio_dir)
+        if recovered_transcript:
+            uploaded = recovered_transcript
+            if log_callback:
+                log_callback(f"[lip-sync] recovered project-local uploaded transcript: {uploaded}")
+        else:
+            raise RuntimeError("LTX lip-sync is set to Uploaded transcript, but no transcript file was selected or recovered.")
 
     ref_text = ""
     stable_voice_sample = str(voice_sample_path or "")
@@ -1296,11 +1342,23 @@ def prepare_lipsync_assets(
         stable_voice_sample = clone_info.get("voice_sample_path") or stable_voice_sample
         ref_text = clone_info.get("ref_text") or ""
 
-    source_fp: Any = _file_fingerprint(uploaded) if source_mode == "uploaded" else {
-        "prompt": str(prompt or ""),
-        "extra_info": str(extra_info or ""),
-        "plan": plan_obj if isinstance(plan_obj, dict) else {},
-    }
+    uploaded_spoken_text = ""
+    uploaded_spoken_signature = ""
+    if source_mode == "uploaded":
+        uploaded_spoken_text = _transcript_spoken_text(_read_text(uploaded))
+        if not uploaded_spoken_text:
+            raise RuntimeError("The uploaded lip-sync transcript contains no readable spoken text.")
+        uploaded_spoken_signature = _spoken_word_signature(uploaded_spoken_text)
+        source_fp: Any = {
+            **_file_fingerprint(uploaded),
+            "spoken_word_signature": uploaded_spoken_signature,
+        }
+    else:
+        source_fp = {
+            "prompt": str(prompt or ""),
+            "extra_info": str(extra_info or ""),
+            "plan": plan_obj if isinstance(plan_obj, dict) else {},
+        }
     fingerprint = _sha1_text(
         json.dumps(
             {
@@ -1328,15 +1386,14 @@ def prepare_lipsync_assets(
     if _prepared_plan_assets_ok(prior, narration_wav):
         if prior.get("fingerprint") == fingerprint:
             if log_callback:
-                log_callback("[lip-sync] reusing prepared narration and per-shot audio")
+                log_callback("[lip-sync] reusing prepared narration and per-shot audio (exact source match)")
             return prior
-        if bool(resume_existing):
-            # Compatibility path for jobs created before resume flags were removed
-            # from the fingerprint. Preserve the old plan fingerprint so already
-            # rendered LTX clips keep their matching intent fingerprints.
-            if log_callback:
-                log_callback("[lip-sync] resume: reusing existing narration/audio; transient Planner flags were ignored")
-            return prior
+        if log_callback:
+            prior_mode = str((prior or {}).get("source_mode") or "unknown")
+            log_callback(
+                f"[lip-sync] prepared audio does not match the current source "
+                f"({prior_mode} -> {source_mode}); rebuilding narration and shot WAV files"
+            )
 
     try:
         from helpers import planner_speech  # type: ignore
@@ -1380,6 +1437,17 @@ def prepare_lipsync_assets(
             stop_requested=stop_requested,
             log_callback=log_callback,
         )
+        rendered_spoken_text = _collapse(_read_text(narration_txt)) if os.path.isfile(narration_txt) else ""
+        rendered_signature = _spoken_word_signature(rendered_spoken_text)
+        if rendered_signature != uploaded_spoken_signature:
+            raise RuntimeError(
+                "Planner narration text no longer matches the uploaded transcript. "
+                "Generation was stopped before LTX clips so prompt/story text cannot be used by mistake."
+            )
+        if log_callback:
+            log_callback(
+                f"[lip-sync] verified uploaded transcript text exactly ({len(uploaded_spoken_text.split())} words)"
+            )
     else:
         windows = _build_lipsync_windows(shots, timeline)
         if not windows:
@@ -1442,6 +1510,18 @@ def prepare_lipsync_assets(
         delivery = _collapse(shot.get("lipsync_delivery")).lower()
         if delivery not in ("onscreen", "voiceover_broll"):
             delivery = "onscreen" if _speaker_ready_from_existing_shot(shot) else "voiceover_broll"
+
+        # Uploaded-transcript mode is an explicit request to drive speaking
+        # shots from the supplied words.  Older/resumed projects can still have
+        # shot metadata created while "Created narration" was selected, leaving
+        # those shots marked as voice-over B-roll.  That produced has_speech=True
+        # but no per-shot WAV, then the video step correctly refused to fall back
+        # to ordinary LTX audio.  For uploaded transcript mode, every shot that
+        # overlaps actual transcript speech must therefore receive a WAV and use
+        # the audio-conditioned route, regardless of stale delivery metadata.
+        if source_mode == "uploaded" and has_speech:
+            delivery = "onscreen"
+
         shot_speaker = _collapse(shot.get("lipsync_speaker_name") or speaker_name) or "the storyteller"
         shot_speaker_visual = _collapse(shot.get("lipsync_speaker_visual_label") or _speaker_visual_label(shot_speaker))
         audio_conditioned = bool(has_speech and delivery == "onscreen")
@@ -1457,20 +1537,15 @@ def prepare_lipsync_assets(
         prompt_suffix = ""
         audio_condition_duration = 0.0
         if audio_conditioned:
-            try:
-                last_spoken_end = max(
-                    _safe_float(segment.get("scheduled_end_sec"), _safe_float(segment.get("end_sec")))
-                    for segment in overlapping
-                )
-                audio_condition_duration = max(0.1, min(duration, (last_spoken_end - start) + 0.20))
-            except Exception:
-                audio_condition_duration = duration
+            # Keep the complete per-shot WAV as conditioning, including any
+            # silence after the spoken words. Truncating conditioning at the
+            # last word removed the silence cue and encouraged continued mouth
+            # motion until the video ended.
+            audio_condition_duration = duration
             prompt_suffix = (
-                f"{shot_speaker_visual} is the only speaking subject and visibly says the supplied words with natural articulation. "
-                f"Keep {shot_speaker_visual}'s face in a frontal or natural three-quarter readable view with the mouth unobstructed. "
-                "Follow the supplied speech timing, but when the supplied speech ends, immediately close the mouth and return to a relaxed neutral expression; "
-                "do not continue speaking, mouthing words, or inventing extra dialogue. Other people, animals, and background subjects remain silent. "
-                "Preserve the planned action, setting, and camera movement without turning away from the speaking face."
+                f"{shot_speaker_visual} speaks the supplied audio with natural articulation. "
+                "Keep the same identity and visual appearance as the start image. "
+                "Follow all pauses and silence exactly; keep the mouth closed during silence."
             )
         shot_items.append(
             {
@@ -1482,6 +1557,7 @@ def prepare_lipsync_assets(
                 "audio_conditioned": audio_conditioned,
                 "speech_delivery": delivery,
                 "speaker_name": shot_speaker,
+                "speaker_visual_label": shot_speaker_visual,
                 "audio_file": chunk_path,
                 "audio_condition_duration_sec": round(audio_condition_duration, 3) if audio_conditioned else 0.0,
                 "text": _collapse(" ".join(str(segment.get("text") or "") for segment in overlapping)),
@@ -1495,6 +1571,9 @@ def prepare_lipsync_assets(
         "engine": LIPSYNC_ENGINE_VERSION,
         "fingerprint": fingerprint,
         "source_mode": source_mode,
+        "source_transcript_path": uploaded if source_mode == "uploaded" else "",
+        "source_fingerprint": source_fp,
+        "source_spoken_word_signature": uploaded_spoken_signature if source_mode == "uploaded" else "",
         "speaker_name": speaker_name,
         "target_duration_sec": round(total_duration, 3),
         "voice_sample_path": stable_voice_sample,

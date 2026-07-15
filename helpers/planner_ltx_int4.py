@@ -174,6 +174,8 @@ def build_auto_planner_command(
     frames = max(1, int(num_frames))
     fps = max(1.0, float(frame_rate))
     audio_text = str(audio_path or "").strip()
+    if audio_text and not os.path.isfile(audio_text):
+        raise RuntimeError(f"Planner lip-sync audio file was not found: {audio_text}")
     pipeline_name = "a2vid_two_stage" if audio_text else "two_stages"
 
     command: List[str] = [
@@ -269,31 +271,6 @@ def build_auto_planner_command(
 
     forwarded_extra = [str(x) for x in list(extra_args or []) if str(x).strip()]
 
-    if audio_text:
-        # Moderate lip-sync profile. Keep enough audio influence for visible
-        # articulation without forcing continued mouth motion after speech ends.
-        strong_guidance = {
-            "--video-cfg-guidance-scale": "3",
-            "--video-stg-guidance-scale": "0",
-            "--video-rescale-scale": "0.7",
-            "--audio-cfg-guidance-scale": "3",
-            "--audio-stg-guidance-scale": "0",
-            "--audio-rescale-scale": "0",
-            "--a2v-guidance-scale": "1.5",
-            "--v2a-guidance-scale": "1.5",
-        }
-        cleaned: List[str] = []
-        i = 0
-        while i < len(forwarded_extra):
-            token = forwarded_extra[i]
-            if token in strong_guidance:
-                i += 2 if (i + 1) < len(forwarded_extra) else 1
-                continue
-            cleaned.append(token)
-            i += 1
-        forwarded_extra = cleaned
-        for option, value in strong_guidance.items():
-            forwarded_extra.extend([option, value])
 
     if forwarded_extra:
         command.append("--extra")
