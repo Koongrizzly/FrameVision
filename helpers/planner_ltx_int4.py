@@ -7,6 +7,7 @@ INT4 install and translates Planner clip settings into the same public command
 surface used by the working LTX UI and helpers/ltx_int4_cli.py.
 """
 
+import json
 import os
 import time
 from pathlib import Path
@@ -119,6 +120,82 @@ def _timestamped_report(root: Path, prefix: str = "ltx_int4_planner_report") -> 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     return str(root / "tools" / "vram_lab" / f"{prefix}_{stamp}.txt")
 
+def _load_ltx_ui_runtime_settings(root: Path) -> Dict[str, Any]:
+    """Read the settings used by the working helpers/ltx23_ui.py direct route.
+
+    Planner is an automation client, not a second LTX tuning surface.  Missing or
+    malformed settings fall back to the last proven direct-run values instead of
+    the old experimental Planner overrides.
+    """
+    defaults: Dict[str, Any] = {
+        "vram_lab": "OFF",
+        "video_cfg_guidance_scale": 2.0,
+        "video_stg_guidance_scale": 0.0,
+        "video_rescale_scale": 0.7,
+        "audio_cfg_guidance_scale": 1.0,
+        "audio_stg_guidance_scale": 0.0,
+        "audio_rescale_scale": 0.0,
+        "a2v_guidance_scale": 1.1,
+        "v2a_guidance_scale": 1.0,
+        "video_skip_step": 0,
+        "audio_skip_step": 0,
+        "max_batch_size": 2,
+        "ltx_normalize_input_image": False,
+    }
+    path = root / "presets" / "setsave" / "ltx23_ui.json"
+    loaded: Dict[str, Any] = {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            loaded = raw
+    except Exception:
+        loaded = {}
+    merged = dict(defaults)
+    for key in defaults:
+        if key in loaded:
+            merged[key] = loaded[key]
+    merged["settings_path"] = str(path)
+    merged["settings_loaded"] = bool(loaded)
+    return merged
+
+
+_UI_EXTRA_FLAGS = {
+    "--video-cfg-guidance-scale": "video_cfg_guidance_scale",
+    "--video-stg-guidance-scale": "video_stg_guidance_scale",
+    "--video-rescale-scale": "video_rescale_scale",
+    "--audio-cfg-guidance-scale": "audio_cfg_guidance_scale",
+    "--audio-stg-guidance-scale": "audio_stg_guidance_scale",
+    "--audio-rescale-scale": "audio_rescale_scale",
+    "--a2v-guidance-scale": "a2v_guidance_scale",
+    "--v2a-guidance-scale": "v2a_guidance_scale",
+    "--video-skip-step": "video_skip_step",
+    "--audio-skip-step": "audio_skip_step",
+    "--max-batch-size": "max_batch_size",
+}
+
+
+def _ui_mirrored_extra_args(extra_args: Optional[List[str]], settings: Dict[str, Any]) -> List[str]:
+    """Preserve unrelated extras while replacing all LTX guidance/runtime pairs."""
+    original = [str(value) for value in list(extra_args or []) if str(value).strip()]
+    kept: List[str] = []
+    index = 0
+    while index < len(original):
+        token = original[index]
+        if token in _UI_EXTRA_FLAGS:
+            index += 2  # known flags always take one value
+            continue
+        kept.append(token)
+        index += 1
+    for flag, key in _UI_EXTRA_FLAGS.items():
+        value = settings.get(key)
+        if key in {"video_skip_step", "audio_skip_step", "max_batch_size"}:
+            value_text = str(int(float(value)))
+        else:
+            value_text = f"{float(value):g}"
+        kept.extend([flag, value_text])
+    return kept
+
+
 
 def build_auto_planner_command(
     *,
@@ -177,6 +254,9 @@ def build_auto_planner_command(
     if audio_text and not os.path.isfile(audio_text):
         raise RuntimeError(f"Planner lip-sync audio file was not found: {audio_text}")
     pipeline_name = "a2vid_two_stage" if audio_text else "two_stages"
+    ui_settings = _load_ltx_ui_runtime_settings(root)
+    ui_vram_lab = str(ui_settings.get("vram_lab") or "OFF").strip().upper()
+    int4_vram_flag = "--no-int4-auto-vram" if ui_vram_lab == "OFF" else "--int4-auto-vram"
 
     command: List[str] = [
         str(status["python_exe"]),
@@ -184,7 +264,6 @@ def build_auto_planner_command(
         "--pipeline", pipeline_name,
         "--model-root", str(status["model_root"]),
         "--vram-profile", "auto",
-        "--int4-auto-vram",
         "--prompt", str(prompt or ""),
         "--output-path", str(output_path),
         "--height", str(int(height)),
@@ -199,6 +278,11 @@ def build_auto_planner_command(
         "--attention-backend", "auto",
         "--no-boundary-echo",
     ]
+    # Keep the exact same INT4 VRAM toggle as the user's direct LTX UI.
+    command.insert(command.index("--prompt"), int4_vram_flag)
+
+    if not bool(ui_settings.get("ltx_normalize_input_image", False)):
+        command.append("--no-normalize-input-image")
 
     if str(negative_prompt or "").strip():
         command += ["--negative-prompt", str(negative_prompt).strip()]
@@ -269,8 +353,7 @@ def build_auto_planner_command(
         if float(audio_max_duration or 0.0) > 0.0:
             command += ["--audio-max-duration", f"{float(audio_max_duration):.6f}"]
 
-    forwarded_extra = [str(x) for x in list(extra_args or []) if str(x).strip()]
-
+    forwarded_extra = _ui_mirrored_extra_args(extra_args, ui_settings)
 
     if forwarded_extra:
         command.append("--extra")
@@ -282,6 +365,9 @@ def build_auto_planner_command(
         "status": status,
         "reason": (
             f"complete INT4 install detected; pipeline={pipeline_name}; "
-            f"condition_route={'dedicated_i2v' if simple_start_i2v else 'positioned_images'}"
+            f"condition_route={'dedicated_i2v' if simple_start_i2v else 'positioned_images'}; "
+            f"ltx_ui_settings={'loaded' if ui_settings.get('settings_loaded') else 'proven defaults'}; "
+            f"int4_vram={int4_vram_flag}"
         ),
+        "ltx_ui_runtime_settings": ui_settings,
     }

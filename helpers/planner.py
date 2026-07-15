@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import shutil
 import json
+import math
 import importlib.util
 import time
 import datetime
@@ -7391,6 +7392,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QComboBox,
     QSpinBox,
+    QDoubleSpinBox,
     QFileDialog,
     QListWidget,
     QListWidgetItem,
@@ -7706,6 +7708,7 @@ class PlannerJob:
     lipsync_enabled: bool = False
     lipsync_source: str = "generated"  # generated | uploaded
     lipsync_transcript_path: str = ""
+    lipsync_tail_sec: float = 0.30
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False)
@@ -8892,9 +8895,15 @@ class PipelineWorker(QThread):
                     _regen_lipsync_item = _planner_lipsync.load_shot_map(_lip_plan_path).get(sid, {})
                     _regen_lipsync_audio = str((_regen_lipsync_item or {}).get("audio_file") or '').strip()
                     if _regen_lipsync_audio and os.path.isfile(_regen_lipsync_audio):
-                        _lip_suffix = str((_regen_lipsync_item or {}).get("prompt_suffix") or '').strip()
-                        if _lip_suffix and _lip_suffix not in str(prompt or ''):
-                            prompt = (str(prompt or '').rstrip() + " " + _lip_suffix).strip()
+                        try:
+                            _regen_audio_duration = float((_regen_lipsync_item or {}).get("duration_sec") or (_regen_lipsync_item or {}).get("audio_condition_duration_sec") or 0.0)
+                        except Exception:
+                            _regen_audio_duration = 0.0
+                        if _regen_audio_duration > 0.05:
+                            frames = _ltx23_planner_frame_count(
+                                max(12, min(int(max_frames or 241), int(round(_regen_audio_duration * float(max(1, fps)))))),
+                                int(max_frames or 241),
+                            )
                         # Hidden Wan2GP recreation does not expose the proven audio-conditioned CLI route.
                         # Use the same native FrameVision VRAM-Lab path as the original lip-sync run.
                         _hidden_wangp_ltx = False
@@ -9163,7 +9172,7 @@ class PipelineWorker(QThread):
                     "--audio-cfg-guidance-scale", "1",
                     "--audio-stg-guidance-scale", "0",
                     "--audio-rescale-scale", "0",
-                    "--a2v-guidance-scale", "1",
+                    "--a2v-guidance-scale", "1.1",
                     "--v2a-guidance-scale", "1",
                     "--video-skip-step", "0",
                     "--audio-skip-step", "0",
@@ -12300,6 +12309,12 @@ class PipelineWorker(QThread):
                 min_sec = float(gen_profile.get("min_sec", 2.5))
                 max_sec = float(gen_profile.get("max_sec", 5.0))
                 target_total = float(max(1.0, float(getattr(self.job, "approx_duration_sec", 0) or 0.0)))
+                _uploaded_lipsync_count = 0
+                try:
+                    if bool(getattr(self.job, "lipsync_enabled", False)) and str(getattr(self.job, "lipsync_source", "generated") or "generated").lower() == "uploaded":
+                        _uploaded_lipsync_count = int((self.job.encoding or {}).get("ltx_lipsync_line_count") or 0)
+                except Exception:
+                    _uploaded_lipsync_count = 0
 
                                 # Own storyline: build a minimal seeded shot list directly from the user's prompt blocks.
                 if bool(_own_storyline_enabled):
@@ -12373,6 +12388,13 @@ class PipelineWorker(QThread):
 
                     if not clean_prompts:
                         raise RuntimeError("Own storyline is enabled but no usable prompts were found.")
+                    if _uploaded_lipsync_count:
+                        if len(clean_prompts) != _uploaded_lipsync_count:
+                            raise RuntimeError(
+                                f"Uploaded transcript has {_uploaded_lipsync_count} lines, but Own Storyline provides {len(clean_prompts)} image/video prompts. "
+                                "Use exactly one prompt/image for each transcript line. Planner will not skip, duplicate, merge, or split them."
+                            )
+                        _needs_time_fit = False
 
                     # Duration constraints for videoclip generation (min/max per image clip)
                     try:
@@ -12630,6 +12652,8 @@ class PipelineWorker(QThread):
                     n_shots = max(lo, min(80, min(hi, max(1, n_guess))))
                 except Exception:
                     n_shots = max(1, min(80, int(target_total / max(1.5, avg_sec))))
+                if _uploaded_lipsync_count:
+                    n_shots = max(1, min(80, int(_uploaded_lipsync_count)))
 
                 plan_obj = _normalize_story_arc(plan_obj, float(target_total), int(n_shots))
                 try:
@@ -12730,6 +12754,14 @@ class PipelineWorker(QThread):
                     else:
                         # try treat dict itself as shot map (unlikely)
                         pass
+
+                if _uploaded_lipsync_count and shots_list and len(shots_list) != int(_uploaded_lipsync_count):
+                    # Keep only exact, ordered one-to-one rows when the model returned extras;
+                    # missing rows use the existing deterministic fallback below.
+                    if len(shots_list) > int(_uploaded_lipsync_count):
+                        shots_list = shots_list[: int(_uploaded_lipsync_count)]
+                    else:
+                        shots_list = []
 
                 shots_generation_note = "Generated with Qwen (JSON enforced)."
                 shots_used_fallback = False
@@ -17208,7 +17240,27 @@ class PipelineWorker(QThread):
                     log_path=str(tts_log_early),
                     stop_requested=lambda: bool(self._stop_requested),
                     log_callback=lambda msg: self.signals.log.emit(str(msg)),
+                    uploaded_tail_sec=float(getattr(self.job, "lipsync_tail_sec", 0.30) or 0.30),
+                    uploaded_min_clip_sec=3.0,
+                    uploaded_max_clip_sec=max(3.0, float(min(241, int((self.job.encoding or {}).get("generation_profile", {}).get("max_frames") or 241))) / max(1.0, float((self.job.encoding or {}).get("generation_profile", {}).get("fps") or 24))),
                 )
+
+                _updated_lipsync_shots = list((result or {}).get("updated_shots") or [])
+                if _updated_lipsync_shots:
+                    _safe_write_json(shots_path, _updated_lipsync_shots)
+                    shots_list = _updated_lipsync_shots
+                    try:
+                        _actual_total = float((result or {}).get("target_duration_sec") or 0.0)
+                        self.job.approx_duration_sec = int(math.ceil(_actual_total))
+                        if isinstance(self.job.encoding, dict):
+                            self.job.encoding["ltx_lipsync_actual_total_duration_sec"] = _actual_total
+                        manifest.setdefault("settings", {})["audio_driven_duration_sec"] = round(_actual_total, 3)
+                        manifest["settings"]["n_shots"] = len(_updated_lipsync_shots)
+                        self.signals.log.emit(
+                            f"[lip-sync] audio-driven plan locked: {len(_updated_lipsync_shots)} clips, {_actual_total:.3f}s total"
+                        )
+                    except Exception:
+                        pass
 
                 _prepared_source_mode = str((result or {}).get("source_mode") or "").strip().lower()
                 if _prepared_source_mode != _requested_lipsync_source:
@@ -17774,24 +17826,11 @@ class PipelineWorker(QThread):
                             f"[ltx23] Uploaded transcript contains speech for {sid}, but no per-shot WAV was assigned. "
                             "Planner will not silently generate ordinary LTX audio instead."
                         )
-                    if clip_audio_path:
-                        # Audio-conditioned lip-sync must not inherit a contradictory
-                        # storyline/image prompt. The direct LTX UI works because the
-                        # motion prompt stays compatible with the supplied start image.
-                        # Lock identity, clothes, setting and framing to that image and
-                        # let the supplied WAV drive only speech/facial motion.
-                        _speaker_label = str((lipsync_item or {}).get("speaker_visual_label") or "The person").strip()
-                        prompt = (
-                            f"{_speaker_label} is exactly the same person shown in the supplied start image. "
-                            "Keep the same face, identity, age, hairstyle, clothing, body, background, lighting, "
-                            "camera position, composition and framing for the entire clip. "
-                            "The person speaks the supplied audio naturally with accurate lip and jaw movement, "
-                            "subtle facial expression and minimal head motion. "
-                            "Follow the timing, pauses and silence in the supplied audio exactly. "
-                            "When the audio is silent, the mouth stays closed and relaxed. "
-                            "Do not introduce another person, replace the subject, change clothes, change location, "
-                            "cut to another scene, perform a transition, or invent extra speech."
-                        )
+                    if clip_audio_path and not prompt:
+                        # Match the direct LTX UI: keep the normal shot prompt and use only
+                        # a minimal fallback when the shot has no I2V prompt at all.
+                        prompt = "The person is talking."
+
 
                     # Duration → frames (same idea as the other video engines).
                     try:
@@ -24005,6 +24044,17 @@ class PlannerPane(QWidget):
         self.cmb_lipsync_source.currentIndexChanged.connect(self._sync_lipsync_ui)
         self.cmb_lipsync_source.currentIndexChanged.connect(self._save_lipsync_ui_settings)
         lsr.addWidget(self.cmb_lipsync_source, 1)
+        self.lbl_lipsync_tail = QLabel("End tail")
+        self.spin_lipsync_tail = QDoubleSpinBox()
+        self.spin_lipsync_tail.setRange(0.0, 1.5)
+        self.spin_lipsync_tail.setSingleStep(0.05)
+        self.spin_lipsync_tail.setDecimals(2)
+        self.spin_lipsync_tail.setSuffix(" s")
+        self.spin_lipsync_tail.setValue(0.30)
+        self.spin_lipsync_tail.setToolTip("Extra quiet hold after each spoken line. The WAV duration itself decides the clip length.")
+        self.spin_lipsync_tail.valueChanged.connect(self._save_lipsync_ui_settings)
+        lsr.addWidget(self.lbl_lipsync_tail)
+        lsr.addWidget(self.spin_lipsync_tail)
 
         self.lipsync_transcript_row = QWidget()
         ltr = QHBoxLayout(self.lipsync_transcript_row)
@@ -24027,6 +24077,7 @@ class PlannerPane(QWidget):
             if _source_idx >= 0:
                 self.cmb_lipsync_source.setCurrentIndex(_source_idx)
             self.lipsync_transcript_path_edit.setText(str(_lipsync_saved.get("ltx_lipsync_transcript_path") or ""))
+            self.spin_lipsync_tail.setValue(float(_lipsync_saved.get("ltx_lipsync_tail_sec", 0.30) or 0.30))
         except Exception:
             pass
 
@@ -24038,11 +24089,12 @@ class PlannerPane(QWidget):
         lay.addWidget(self.music_vol_row)
 
         # Duration slider + manual number box
-        duration_row = QWidget()
-        dr = QHBoxLayout(duration_row)
+        self.duration_row = QWidget()
+        dr = QHBoxLayout(self.duration_row)
         dr.setContentsMargins(0, 0, 0, 0)
         dr.setSpacing(10)
-        dr.addWidget(QLabel("Approx duration"))
+        self.lbl_duration_title = QLabel("Approx duration")
+        dr.addWidget(self.lbl_duration_title)
 
         self.sld_duration = QSlider(Qt.Horizontal)
         self.sld_duration.setRange(5, 1800)
@@ -24068,7 +24120,7 @@ class PlannerPane(QWidget):
         dr.addWidget(self.sld_duration, 1)
         dr.addWidget(self.spin_duration)
         dr.addWidget(self.lbl_duration)
-        lay.addWidget(duration_row)
+        lay.addWidget(self.duration_row)
 
 
         try:
@@ -28258,6 +28310,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
                 "ltx_lipsync_enabled": enabled,
                 "ltx_lipsync_source": source,
                 "ltx_lipsync_transcript_path": path,
+                "ltx_lipsync_tail_sec": float(self.spin_lipsync_tail.value()) if hasattr(self, "spin_lipsync_tail") else 0.30,
             })
         except Exception:
             pass
@@ -28287,7 +28340,20 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         except Exception:
             pass
         try:
-            self.lipsync_transcript_row.setVisible(visible and enabled and source == "uploaded")
+            uploaded_audio_driven = bool(visible and enabled and source == "uploaded")
+            self.lipsync_transcript_row.setVisible(uploaded_audio_driven)
+            if hasattr(self, "spin_lipsync_tail"):
+                self.spin_lipsync_tail.setEnabled(uploaded_audio_driven)
+            if hasattr(self, "lbl_lipsync_tail"):
+                self.lbl_lipsync_tail.setEnabled(uploaded_audio_driven)
+            if hasattr(self, "sld_duration"):
+                self.sld_duration.setEnabled(not uploaded_audio_driven)
+            if hasattr(self, "spin_duration"):
+                self.spin_duration.setEnabled(not uploaded_audio_driven)
+            if hasattr(self, "lbl_duration_title"):
+                self.lbl_duration_title.setText("Duration (audio-driven)" if uploaded_audio_driven else "Approx duration")
+            if hasattr(self, "lbl_duration"):
+                self.lbl_duration.setText("WAV + tail" if uploaded_audio_driven else _duration_label(int(self._current_duration_seconds())))
         except Exception:
             pass
 
@@ -30732,32 +30798,26 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         return out
 
     def _preflight_lipsync_before_generate(self, job: PlannerJob) -> bool:
-        """Reject impossible uploaded lip-sync transcripts before expensive work starts."""
+        """Validate uploaded source only; speech itself owns the final duration."""
         try:
             if not bool(getattr(job, "lipsync_enabled", False)):
                 return True
             if str(getattr(job, "lipsync_source", "generated") or "generated").strip().lower() != "uploaded":
                 return True
-            transcript_path = str(getattr(job, "lipsync_transcript_path", "") or "").strip()
-            target_duration = float(getattr(job, "approx_duration_sec", 0) or 0.0)
             try:
                 from helpers import planner_lipsync as _planner_lipsync_preflight  # type: ignore
             except Exception:
                 import planner_lipsync as _planner_lipsync_preflight  # type: ignore
-            result = _planner_lipsync_preflight.preflight_uploaded_transcript(
-                transcript_path, target_duration
+            result = _planner_lipsync_preflight.inspect_uploaded_transcript(
+                str(getattr(job, "lipsync_transcript_path", "") or ""),
+                tail_sec=float(getattr(job, "lipsync_tail_sec", 0.30) or 0.30),
             )
             if bool((result or {}).get("ok", False)):
                 return True
-            message = str((result or {}).get("message") or "The uploaded lip-sync transcript cannot fit the selected duration.")
-            QMessageBox.warning(self, "Lip-sync transcript does not fit", message)
+            QMessageBox.warning(self, "Cannot use lip-sync transcript", str((result or {}).get("message") or "The transcript is invalid."))
             return False
         except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "Cannot check lip-sync transcript",
-                f"The transcript could not be checked before generation:\n{exc}",
-            )
+            QMessageBox.warning(self, "Cannot check lip-sync transcript", f"The transcript could not be checked before generation:\n{exc}")
             return False
 
     def _build_job(self) -> PlannerJob:
@@ -30898,11 +30958,26 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             lipsync_transcript_path = str(self.lipsync_transcript_path_edit.text() or '').strip()
         except Exception:
             lipsync_transcript_path = ""
+        lipsync_tail_sec = 0.30
+        try:
+            lipsync_tail_sec = float(self.spin_lipsync_tail.value())
+        except Exception:
+            lipsync_tail_sec = 0.30
+        lipsync_inspection: Dict[str, Any] = {}
         if lipsync_enabled and lipsync_source == "uploaded":
             if not lipsync_transcript_path:
                 raise ValueError("LTX lip-sync is set to Uploaded transcript, but no transcript file was selected.")
             if not os.path.isfile(lipsync_transcript_path):
                 raise ValueError(f"LTX lip-sync transcript file was not found:\n{lipsync_transcript_path}")
+            try:
+                from helpers import planner_lipsync as _planner_lipsync_job  # type: ignore
+            except Exception:
+                import planner_lipsync as _planner_lipsync_job  # type: ignore
+            lipsync_inspection = _planner_lipsync_job.inspect_uploaded_transcript(
+                lipsync_transcript_path, tail_sec=lipsync_tail_sec
+            )
+            if not bool(lipsync_inspection.get("ok")):
+                raise ValueError(str(lipsync_inspection.get("message") or "The uploaded transcript is invalid."))
 
         # Final polish: bake subtitles only when narration and/or lyrics is enabled.
         bake_subtitles = False
@@ -31101,6 +31176,12 @@ These prompts override the normal reused Own Storymode prompts for the video sta
                     except Exception:
                         _own_storyline_i2v_mismatch_accepted = True
 
+        enc["ltx_lipsync_audio_driven"] = bool(lipsync_enabled and lipsync_source == "uploaded")
+        enc["ltx_lipsync_tail_sec"] = float(lipsync_tail_sec)
+        enc["ltx_lipsync_line_count"] = int(lipsync_inspection.get("line_count") or 0)
+        enc["ltx_lipsync_estimated_clip_durations_sec"] = list(lipsync_inspection.get("estimated_clip_durations_sec") or [])
+        enc["ltx_lipsync_estimated_total_duration_sec"] = float(lipsync_inspection.get("estimated_total_duration_sec") or 0.0)
+
         enc["own_storyline_text"] = str(_own_storyline_text or '')
         enc["own_storyline_prompts"] = _own_storyline_prompts if isinstance(_own_storyline_prompts, list) else []
         enc["own_storyline_parser_mode"] = str(_own_storyline_mode or "paragraph")
@@ -31244,7 +31325,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             narration_sample_path=str(narration_sample_path),
             narration_language=str(narration_language),
             bake_subtitles=bool(bake_subtitles),
-            approx_duration_sec=int(self._current_duration_seconds()),
+            approx_duration_sec=int(math.ceil(float(lipsync_inspection.get("estimated_total_duration_sec") or self._current_duration_seconds()))) if (lipsync_enabled and lipsync_source == "uploaded") else int(self._current_duration_seconds()),
             resolution_preset=str(aspect_label),
             quality_preset=f"{int(upscale_factor)}×",
             extra_info=(self.extra_info.toPlainText() or '').strip(),
@@ -31253,6 +31334,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             lipsync_enabled=bool(lipsync_enabled),
             lipsync_source=str(lipsync_source),
             lipsync_transcript_path=str(lipsync_transcript_path),
+            lipsync_tail_sec=float(lipsync_tail_sec),
         )
         return job
 

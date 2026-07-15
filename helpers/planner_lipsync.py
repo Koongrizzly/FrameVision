@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
-LIPSYNC_ENGINE_VERSION = "planner_lipsync_v1.4_identity_locked"
+LIPSYNC_ENGINE_VERSION = "planner_lipsync_v2.0_audio_driven_ui_mirror"
 _MAX_TEMPO = 1.28
 _BASE_WORDS_PER_SEC = 1.55
 # Use the same practical headroom as the real audio fitter.  The old planner
@@ -57,85 +57,50 @@ def _write_json(path: str, obj: Any) -> None:
     _write_text(path, json.dumps(obj, indent=2, ensure_ascii=False))
 
 
-def preflight_uploaded_transcript(transcript_path: str, target_duration_sec: float) -> Dict[str, Any]:
-    """Cheap Generate-click validation before story planning or model loading.
-
-    This deliberately blocks only transcripts that cannot fit even with the same
-    gentle tempo allowance used by the real fitter.  Borderline-but-feasible text
-    is allowed through; exact per-shot fitting still happens later after the shot
-    list exists.
-    """
+def inspect_uploaded_transcript(
+    transcript_path: str,
+    *,
+    tail_sec: float = 0.30,
+    min_clip_sec: float = 3.0,
+    max_clip_sec: float = 10.041667,
+) -> Dict[str, Any]:
+    """Inspect source text without forcing it into a user-selected project length."""
     path = str(transcript_path or "").strip()
-    target = max(0.0, _safe_float(target_duration_sec))
     if not path or not os.path.isfile(path):
-        return {
-            "ok": False,
-            "reason": "missing",
-            "message": "The selected lip-sync transcript file could not be found.",
-            "word_count": 0,
-            "target_duration_sec": target,
-        }
-
+        return {"ok": False, "reason": "missing", "message": "The selected lip-sync transcript file could not be found.", "line_count": 0}
     raw = _read_text(path)
     cues = _parse_timed_transcript(raw)
-    if cues:
-        spoken_text = _collapse(" ".join(str(item.get("text") or "") for item in cues))
-        timed_end = max((_safe_float(item.get("end_sec")) for item in cues), default=0.0)
-    else:
-        spoken_text = _collapse(" ".join(_sentence_units(raw)))
-        timed_end = 0.0
-    words = len(spoken_text.split())
-    if words <= 0:
-        return {
-            "ok": False,
-            "reason": "empty",
-            "message": "The selected lip-sync transcript contains no readable spoken text.",
-            "word_count": 0,
-            "target_duration_sec": target,
-        }
-
-    normal_seconds = words / _BASE_WORDS_PER_SEC
-    minimum_text_seconds = words / max(0.1, _ALLOCATION_WORDS_PER_SEC)
-    minimum_project_seconds = minimum_text_seconds / _PREFLIGHT_USABLE_RATIO
-    if timed_end > 0.0:
-        minimum_project_seconds = max(minimum_project_seconds, timed_end)
-
-    # Round the useful recommendation up to the Planner's normal 5-second step.
-    recommended = int(math.ceil(max(5.0, minimum_project_seconds) / 5.0) * 5)
-    too_long = target <= 0.0 or minimum_project_seconds > target + 0.25
-
-    if too_long:
-        if timed_end > target + 0.25:
-            detail = (
-                f"Its last timed subtitle ends at {timed_end:.1f}s, but the selected project duration is "
-                f"{target:.1f}s."
-            )
-        else:
-            detail = (
-                f"It has {words} words and needs at least about {minimum_project_seconds:.1f}s, even with "
-                f"the allowed gentle speech fitting. The selected project duration is {target:.1f}s."
-            )
-        message = (
-            detail
-            + f"\n\nSet the Planner duration to at least {recommended} seconds, or shorten the transcript, "
-              "before starting. Nothing has been generated yet."
-        )
-    else:
-        message = ""
-
+    units = [_collapse(item.get("text")) for item in cues] if cues else _uploaded_plain_lines(raw)
+    units = [unit for unit in units if unit]
+    if not units:
+        return {"ok": False, "reason": "empty", "message": "The selected lip-sync transcript contains no readable spoken lines.", "line_count": 0}
+    tail = max(0.0, min(2.0, _safe_float(tail_sec, 0.30)))
+    minimum = max(0.1, _safe_float(min_clip_sec, 3.0))
+    maximum = max(minimum, _safe_float(max_clip_sec, 10.041667))
+    estimates: List[float] = []
+    for unit in units:
+        words = max(1, len(unit.split()))
+        speech = max(0.65, words / _BASE_WORDS_PER_SEC)
+        estimates.append(round(min(maximum, max(minimum, speech + tail)), 3))
     return {
-        "ok": not too_long,
-        "reason": "too_long" if too_long else "ok",
-        "message": message,
-        "word_count": words,
-        "target_duration_sec": round(target, 3),
-        "estimated_normal_speech_sec": round(normal_seconds, 3),
-        "minimum_project_duration_sec": round(minimum_project_seconds, 3),
-        "recommended_duration_sec": recommended,
-        "timed_end_sec": round(timed_end, 3),
+        "ok": True,
+        "reason": "ok",
+        "message": "",
+        "line_count": len(units),
+        "lines": units,
         "has_timing": bool(cues),
+        "tail_sec": round(tail, 3),
+        "min_clip_sec": round(minimum, 3),
+        "max_clip_sec": round(maximum, 3),
+        "estimated_clip_durations_sec": estimates,
+        "estimated_total_duration_sec": round(sum(estimates), 3),
+        "word_count": sum(len(unit.split()) for unit in units),
     }
 
+
+def preflight_uploaded_transcript(transcript_path: str, target_duration_sec: float = 0.0) -> Dict[str, Any]:
+    """Compatibility wrapper: validate the file, never compare it with a slider."""
+    return inspect_uploaded_transcript(transcript_path)
 
 def _read_json(path: str) -> Any:
     try:
@@ -324,68 +289,46 @@ def stage_shots_for_lipsync(
     prompt: str = "",
     source_mode: str = "generated",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Stage selected shots as visible storyteller shots before images are generated."""
+    """Mark speaking shots without rewriting user-authored uploaded-transcript visuals."""
     shots = _normalise_shots(shots_obj)
     if not shots:
         return [], {"speaker_name": "", "onscreen_shot_ids": []}
     speaker = _infer_speaker_name(plan_obj, prompt)
     speaker_visual = _speaker_visual_label(speaker)
-    setting = _collapse((plan_obj or {}).get("setting") if isinstance(plan_obj, dict) else "")
-    setting = re.sub(r"^outdoors\s*,?\s*", "", setting, flags=re.IGNORECASE).strip()
-    selected = set(_onscreen_storyteller_indices(len(shots), source_mode))
+    uploaded_mode = str(source_mode or "").strip().lower().startswith("upload")
+    selected = set(range(len(shots))) if uploaded_mode else set(_onscreen_storyteller_indices(len(shots), source_mode))
     onscreen_ids: List[str] = []
     for index, shot in enumerate(shots):
-        original = _clean_visual_text(
-            shot.get("lipsync_original_visual")
-            or shot.get("visual_description")
-            or shot.get("seed")
-            or shot.get("prompt")
-        )
+        sid = _collapse(shot.get("id") or f"S{index + 1:02d}")
+        original = _clean_visual_text(shot.get("lipsync_original_visual") or shot.get("visual_description") or shot.get("seed") or shot.get("prompt"))
         shot["lipsync_original_visual"] = original
         shot["lipsync_speaker_name"] = speaker
         shot["lipsync_speaker_visual_label"] = speaker_visual
         if index in selected:
-            sid = _collapse(shot.get("id") or f"S{index + 1:02d}")
             onscreen_ids.append(sid)
-            if setting:
-                location = f" {setting}" if re.match(r"^(?:in|at|near|by|beside|on|inside|outside)\b", setting, flags=re.IGNORECASE) else f" in {setting}"
-            else:
-                location = " in the established location"
-            context = original or "the story setting and its important visual details"
-            staged = (
-                f"Medium close-up of {speaker_visual}{location}, facing the camera in a natural three-quarter view with a clear, "
-                f"unobstructed face and fully visible mouth, speaking as the on-screen storyteller. "
-                f"The surrounding story context remains visible behind the speaker: {context}. "
-                "One speaking character only; do not duplicate the speaker or cover the mouth."
-            )
             shot["lipsync_delivery"] = "onscreen"
-            shot["visual_description"] = staged
-            shot["seed"] = staged
-            shot["camera"] = "medium close-up"
-            stage = shot.get("stage_directions") if isinstance(shot.get("stage_directions"), dict) else {}
-            stage = dict(stage)
-            stage["camera"] = "medium close-up"
-            stage["lipsync_delivery"] = "onscreen storyteller"
-            shot["stage_directions"] = stage
-            note = _collapse(shot.get("notes"))
-            shot["notes"] = _collapse(
-                (note + " " if note else "")
-                + f"On-screen storyteller: {speaker} speaks with a readable face and visible mouth; preserve the story context as background detail."
-            )
+            if not uploaded_mode:
+                # Planner-created narration can still stage a readable storyteller.
+                setting = _collapse((plan_obj or {}).get("setting") if isinstance(plan_obj, dict) else "")
+                setting = re.sub(r"^outdoors\s*,?\s*", "", setting, flags=re.IGNORECASE).strip()
+                location = (f" in {setting}" if setting else " in the established location")
+                context = original or "the story setting and its important visual details"
+                staged = (
+                    f"Medium close-up of {speaker_visual}{location}, facing the camera in a natural three-quarter view with a clear, "
+                    f"unobstructed face and fully visible mouth, speaking as the on-screen storyteller. "
+                    f"The surrounding story context remains visible behind the speaker: {context}. One speaking character only."
+                )
+                shot["visual_description"] = staged
+                shot["seed"] = staged
+                shot["camera"] = "medium close-up"
         else:
             shot["lipsync_delivery"] = "voiceover_broll"
-            note = _collapse(shot.get("notes"))
-            shot["notes"] = _collapse(
-                (note + " " if note else "")
-                + f"Voice-over B-roll for {speaker}; no visible character should appear to speak in this shot."
-            )
     return shots, {
         "speaker_name": speaker,
         "onscreen_shot_ids": onscreen_ids,
         "voiceover_shot_ids": [str(item.get("id") or "") for item in shots if item.get("lipsync_delivery") == "voiceover_broll"],
-        "source_mode": "uploaded" if str(source_mode or "").lower().startswith("upload") else "generated",
+        "source_mode": "uploaded" if uploaded_mode else "generated",
     }
-
 
 def _normalise_shots(shots_obj: Any, fallback_duration: float = 5.0) -> List[Dict[str, Any]]:
     if isinstance(shots_obj, dict):
@@ -819,9 +762,8 @@ def _strict_fit_audio(
     if tempo > _MAX_TEMPO:
         minimum = source_duration / (_MAX_TEMPO * 0.99)
         raise RuntimeError(
-            f"Speech section {label} needs about {minimum:.1f}s including the lip-sync safety margin, "
-            f"but its video window is only {available:.1f}s. Increase the Planner duration or shorten "
-            "that transcript section; words were not cut."
+            f"Speech section {label} needs about {minimum:.1f}s, but one LTX clip can provide only "
+            f"{available:.1f}s for speech. Shorten that single line; words were not cut or moved."
         )
     filters: List[str] = []
     if abs(tempo - 1.0) > 0.005:
@@ -1131,6 +1073,170 @@ def _synthesise_uploaded_transcript(
     )
 
 
+def _convert_audio_without_tempo(source: str, destination: str, ffmpeg_path: str, log_handle: Any) -> None:
+    command = [
+        ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error", "-i", source,
+        "-af", "aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo",
+        "-c:a", "pcm_s16le", destination,
+    ]
+    log_handle.write("[convert] " + " ".join(command) + "\n")
+    cp = subprocess.run(command, capture_output=True, text=True)
+    if cp.stderr:
+        log_handle.write(cp.stderr + "\n")
+    if cp.returncode != 0 or not _file_ok(destination):
+        raise RuntimeError(f"Could not convert narration audio: {source}")
+
+
+def _pad_audio_to_duration(source: str, destination: str, duration_sec: float, ffmpeg_path: str, log_handle: Any) -> None:
+    duration = max(0.1, float(duration_sec))
+    command = [
+        ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error", "-i", source,
+        "-af", f"apad=pad_dur={duration:.6f},atrim=0:{duration:.6f},aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo",
+        "-t", f"{duration:.6f}", "-c:a", "pcm_s16le", destination,
+    ]
+    log_handle.write("[shot-pad] " + " ".join(command) + "\n")
+    cp = subprocess.run(command, capture_output=True, text=True)
+    if cp.stderr:
+        log_handle.write(cp.stderr + "\n")
+    if cp.returncode != 0 or not _file_ok(destination):
+        raise RuntimeError(f"Could not create audio-driven shot WAV: {destination}")
+
+
+def _synthesise_uploaded_audio_driven(
+    *, planner_speech: Any, transcript_path: str, shots_obj: Any, job_id: str,
+    language: str, narration_mode: str, voice: str, voice_sample_path: str,
+    ref_text: str, model_path: str, tokenizer_path: str, qwentts_python: str,
+    qwentts_script: str, audio_dir: str, narration_wav: str, narration_txt: str,
+    narration_json: str, ffmpeg_path: str, ffprobe_path: str, log_path: str,
+    tail_sec: float, min_clip_sec: float, max_clip_sec: float,
+    stop_requested: Optional[Callable[[], bool]], log_callback: Optional[Callable[[str], None]],
+) -> Dict[str, Any]:
+    inspection = inspect_uploaded_transcript(
+        transcript_path, tail_sec=tail_sec, min_clip_sec=min_clip_sec, max_clip_sec=max_clip_sec
+    )
+    if not inspection.get("ok"):
+        raise RuntimeError(str(inspection.get("message") or "The uploaded transcript is invalid."))
+    lines = list(inspection.get("lines") or [])
+    shots = _normalise_shots(shots_obj)
+    if len(lines) != len(shots):
+        raise RuntimeError(
+            f"Uploaded transcript has {len(lines)} non-empty lines, but the Planner has {len(shots)} shots/images. "
+            "Uploaded lip-sync is one line = one image = one video clip. Make the counts equal; no line will be split, merged, or moved."
+        )
+    tail = float(inspection["tail_sec"])
+    minimum = float(inspection["min_clip_sec"])
+    maximum = float(inspection["max_clip_sec"])
+    segments_dir = os.path.join(audio_dir, "narration_segments")
+    chunks_dir = os.path.join(audio_dir, "lipsync_shots")
+    os.makedirs(segments_dir, exist_ok=True)
+    os.makedirs(chunks_dir, exist_ok=True)
+    fitted: List[Dict[str, Any]] = []
+    updated_shots: List[Dict[str, Any]] = []
+    cursor = 0.0
+    with open(log_path, "a", encoding="utf-8", errors="replace") as log_handle:
+        log_handle.write(f"\n=== {LIPSYNC_ENGINE_VERSION} uploaded_audio_driven ===\n")
+        for index, (line, shot_raw) in enumerate(zip(lines, shots), start=1):
+            if stop_requested and stop_requested():
+                raise RuntimeError("Cancelled by user.")
+            sid = str(shot_raw.get("id") or f"S{index:02d}")
+            beat_id = f"U{index:02d}"
+            segment = {"beat_id": beat_id, "index": index, "text": line, "shot_ids": [sid]}
+            if log_callback:
+                log_callback(f"[lip-sync] TTS {sid} line {index}/{len(lines)}")
+            raw_wav = planner_speech._run_tts_segment(
+                segment=segment, job_id=job_id, language=language, narration_mode=narration_mode,
+                voice=voice, voice_sample_path=voice_sample_path, ref_text=ref_text,
+                model_path=model_path, tokenizer_path=tokenizer_path, qwentts_python=qwentts_python,
+                qwentts_script=qwentts_script, segments_dir=segments_dir, ffmpeg_path=ffmpeg_path,
+                log_handle=log_handle, stop_requested=stop_requested,
+            )
+            raw_duration = float(planner_speech._probe_duration(raw_wav, ffprobe_path) or 0.0)
+            if raw_duration <= 0.01:
+                raise RuntimeError(f"Could not measure TTS duration for transcript line {index} ({sid}).")
+            max_speech = max(0.45, maximum - tail)
+            fitted_wav = os.path.join(segments_dir, f"{beat_id}_fitted.wav")
+            if raw_duration > max_speech:
+                try:
+                    speech_duration, tempo = _strict_fit_audio(
+                        source=raw_wav, destination=fitted_wav, source_duration=raw_duration,
+                        available=max_speech, ffmpeg_path=ffmpeg_path, log_handle=log_handle, label=sid,
+                    )
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"Transcript line {index} ({sid}) produces {raw_duration:.2f}s of speech, longer than one LTX clip can hold. "
+                        f"Shorten only that line; the Planner did not split or cut it. Details: {exc}"
+                    ) from exc
+            else:
+                _convert_audio_without_tempo(raw_wav, fitted_wav, ffmpeg_path, log_handle)
+                speech_duration, tempo = raw_duration, 1.0
+            clip_duration = min(maximum, max(minimum, speech_duration + tail))
+            shot_wav = os.path.join(chunks_dir, f"{sid}.wav")
+            _pad_audio_to_duration(fitted_wav, shot_wav, clip_duration, ffmpeg_path, log_handle)
+            scheduled_start = cursor
+            scheduled_end = cursor + speech_duration
+            clip_end = cursor + clip_duration
+            fitted.append({
+                **segment,
+                "audio_file": fitted_wav,
+                "shot_audio_file": shot_wav,
+                "raw_audio_file": raw_wav,
+                "raw_duration_sec": round(raw_duration, 3),
+                "audio_duration_sec": round(speech_duration, 3),
+                "clip_duration_sec": round(clip_duration, 3),
+                "tail_sec": round(max(0.0, clip_duration - speech_duration), 3),
+                "tempo": round(float(tempo), 4),
+                "scheduled_start_sec": round(scheduled_start, 3),
+                "scheduled_end_sec": round(scheduled_end, 3),
+                "clip_start_sec": round(cursor, 3),
+                "clip_end_sec": round(clip_end, 3),
+            })
+            shot = dict(shot_raw)
+            shot["duration_sec"] = round(clip_duration, 3)
+            shot["lipsync_audio_duration_sec"] = round(speech_duration, 3)
+            shot["lipsync_tail_sec"] = round(max(0.0, clip_duration - speech_duration), 3)
+            shot["lipsync_delivery"] = "onscreen"
+            updated_shots.append(shot)
+            if log_callback:
+                log_callback(
+                    f"[lip-sync] {sid}: speech {speech_duration:.3f}s -> video {clip_duration:.3f}s "
+                    f"({int(round(clip_duration * 24.0))} frames at 24 fps before model alignment)"
+                )
+            cursor = clip_end
+        planner_speech._compose_track(
+            segments=fitted, target_duration=cursor, destination=narration_wav,
+            ffmpeg_path=ffmpeg_path, log_handle=log_handle,
+        )
+    _write_text(narration_txt, "\n".join(lines).strip() + "\n")
+    srt_path = os.path.join(audio_dir, "narration.srt")
+    timeline_path = os.path.join(audio_dir, "narration_timeline.json")
+    planner_speech._write_srt(srt_path, fitted)
+    timeline = [
+        {"index": i, "shot_id": str(shot.get("id") or f"S{i:02d}"), "start_sec": round(float(seg["clip_start_sec"]), 3),
+         "duration_sec": round(float(seg["clip_duration_sec"]), 3), "end_sec": round(float(seg["clip_end_sec"]), 3)}
+        for i, (shot, seg) in enumerate(zip(updated_shots, fitted), start=1)
+    ]
+    result = {
+        "engine": LIPSYNC_ENGINE_VERSION,
+        "strategy": "uploaded_audio_driven_one_line_per_shot",
+        "target_duration_sec": round(cursor, 3),
+        "spoken_duration_sec": round(sum(float(item["audio_duration_sec"]) for item in fitted), 3),
+        "segment_count": len(fitted),
+        "segments": fitted,
+        "timeline": timeline,
+        "updated_shots": updated_shots,
+        "inspection": inspection,
+        "paths": {
+            "narration_wav": narration_wav, "narration_txt": narration_txt,
+            "narration_json": narration_json, "narration_timeline_json": timeline_path,
+            "narration_srt": srt_path, "segments_dir": segments_dir,
+            "lipsync_shots_dir": chunks_dir, "tts_log": log_path,
+        },
+    }
+    _write_json(timeline_path, result)
+    _write_json(narration_json, result)
+    return result
+
+
 def ensure_clone_reference_text(
     *,
     root_dir: str,
@@ -1276,133 +1382,89 @@ def _segments_for_shot(segments: Sequence[Dict[str, Any]], start: float, end: fl
 
 
 def prepare_lipsync_assets(
-    *,
-    root_dir: str,
-    job_id: str,
-    prompt: str,
-    extra_info: str,
-    language: str,
-    narration_mode: str,
-    voice: str,
-    voice_sample_path: str,
-    plan_obj: Any,
-    shots_obj: Any,
-    target_duration_sec: float,
-    audio_dir: str,
-    prompts_dir: str,
-    narration_wav: str,
-    narration_txt: str,
-    narration_json: str,
-    transcript_path: str,
-    source_mode: str,
-    uploaded_transcript_path: str,
-    ffmpeg_path: str,
-    ffprobe_path: str,
-    qwentts_python: str,
-    qwentts_script: str,
-    tts_model_path: str,
-    tts_tokenizer_path: str,
-    llm_json_call: Callable[..., Tuple[Optional[Any], str]],
-    llm_settings: Optional[Dict[str, Any]] = None,
-    resume_existing: bool = False,
-    log_path: str = "",
-    stop_requested: Optional[Callable[[], bool]] = None,
-    log_callback: Optional[Callable[[str], None]] = None,
+    *, root_dir: str, job_id: str, prompt: str, extra_info: str, language: str,
+    narration_mode: str, voice: str, voice_sample_path: str, plan_obj: Any,
+    shots_obj: Any, target_duration_sec: float, audio_dir: str, prompts_dir: str,
+    narration_wav: str, narration_txt: str, narration_json: str, transcript_path: str,
+    source_mode: str, uploaded_transcript_path: str, ffmpeg_path: str, ffprobe_path: str,
+    qwentts_python: str, qwentts_script: str, tts_model_path: str, tts_tokenizer_path: str,
+    llm_json_call: Callable[..., Tuple[Optional[Any], str]], llm_settings: Optional[Dict[str, Any]] = None,
+    resume_existing: bool = False, log_path: str = "", stop_requested: Optional[Callable[[], bool]] = None,
+    log_callback: Optional[Callable[[str], None]] = None, uploaded_tail_sec: float = 0.30,
+    uploaded_min_clip_sec: float = 3.0, uploaded_max_clip_sec: float = 10.041667,
 ) -> Dict[str, Any]:
     os.makedirs(audio_dir, exist_ok=True)
     os.makedirs(prompts_dir, exist_ok=True)
     log_path = log_path or os.path.join(audio_dir, "tts_log.txt")
     shots = _normalise_shots(shots_obj)
-    timeline = build_shot_timeline(shots, target_duration_sec)
-    if not timeline:
+    if not shots:
         raise RuntimeError("LTX lip-sync cannot start because the Planner shot list is empty.")
-    total_duration = max(_safe_float(item.get("end_sec")) for item in timeline)
     source_mode = "uploaded" if str(source_mode or "").strip().lower().startswith("upload") else "generated"
+    # Uploaded speech is not scaled to the old duration slider. Generated narration keeps its legacy timeline.
+    timeline = build_shot_timeline(shots, 0.0 if source_mode == "uploaded" else target_duration_sec)
+    total_duration = max(_safe_float(item.get("end_sec")) for item in timeline)
     speaker_name = _infer_speaker_name(plan_obj, prompt)
     uploaded = str(uploaded_transcript_path or "").strip()
     if source_mode == "uploaded" and (not uploaded or not os.path.isfile(uploaded)):
-        recovered_transcript = _find_stable_uploaded_transcript(audio_dir)
-        if recovered_transcript:
-            uploaded = recovered_transcript
-            if log_callback:
-                log_callback(f"[lip-sync] recovered project-local uploaded transcript: {uploaded}")
-        else:
+        uploaded = _find_stable_uploaded_transcript(audio_dir)
+        if not uploaded:
             raise RuntimeError("LTX lip-sync is set to Uploaded transcript, but no transcript file was selected or recovered.")
+        if log_callback:
+            log_callback(f"[lip-sync] recovered project-local uploaded transcript: {uploaded}")
 
     ref_text = ""
     stable_voice_sample = str(voice_sample_path or "")
     clone_info: Dict[str, str] = {}
     if str(narration_mode or "").strip().lower() == "clone":
-        clone_info = ensure_clone_reference_text(
-            root_dir=root_dir,
-            voice_sample_path=stable_voice_sample,
-            audio_dir=audio_dir,
-            log_path=log_path,
-        )
+        clone_info = ensure_clone_reference_text(root_dir=root_dir, voice_sample_path=stable_voice_sample, audio_dir=audio_dir, log_path=log_path)
         stable_voice_sample = clone_info.get("voice_sample_path") or stable_voice_sample
         ref_text = clone_info.get("ref_text") or ""
 
     uploaded_spoken_text = ""
     uploaded_spoken_signature = ""
     if source_mode == "uploaded":
-        uploaded_spoken_text = _transcript_spoken_text(_read_text(uploaded))
-        if not uploaded_spoken_text:
-            raise RuntimeError("The uploaded lip-sync transcript contains no readable spoken text.")
-        uploaded_spoken_signature = _spoken_word_signature(uploaded_spoken_text)
-        source_fp: Any = {
-            **_file_fingerprint(uploaded),
-            "spoken_word_signature": uploaded_spoken_signature,
-        }
-    else:
-        source_fp = {
-            "prompt": str(prompt or ""),
-            "extra_info": str(extra_info or ""),
-            "plan": plan_obj if isinstance(plan_obj, dict) else {},
-        }
-    fingerprint = _sha1_text(
-        json.dumps(
-            {
-                "engine": LIPSYNC_ENGINE_VERSION,
-                "source_mode": source_mode,
-                "source": source_fp,
-                "speaker_name": speaker_name,
-                "staging_version": "storyteller_stage_v1",
-                "shots": shots,
-                "timeline": timeline,
-                "language": language,
-                "narration_mode": narration_mode,
-                "voice": voice,
-                "voice_sample": _file_fingerprint(stable_voice_sample) if stable_voice_sample else {},
-                "tts_model": _file_fingerprint(tts_model_path),
-                "tts_tokenizer": _file_fingerprint(tts_tokenizer_path),
-                "llm_settings": _stable_llm_settings(llm_settings) if source_mode == "generated" else {},
-            },
-            sort_keys=True,
-            ensure_ascii=False,
+        inspection = inspect_uploaded_transcript(
+            uploaded, tail_sec=uploaded_tail_sec, min_clip_sec=uploaded_min_clip_sec,
+            max_clip_sec=uploaded_max_clip_sec,
         )
-    )
+        if not inspection.get("ok"):
+            raise RuntimeError(str(inspection.get("message") or "The uploaded transcript is invalid."))
+        if int(inspection.get("line_count") or 0) != len(shots):
+            raise RuntimeError(
+                f"Uploaded transcript has {int(inspection.get('line_count') or 0)} lines, but the Planner has {len(shots)} shots/images. "
+                "Uploaded lip-sync requires an exact one-to-one count."
+            )
+        uploaded_spoken_text = _transcript_spoken_text(_read_text(uploaded))
+        uploaded_spoken_signature = _spoken_word_signature(uploaded_spoken_text)
+        source_fp: Any = {**_file_fingerprint(uploaded), "spoken_word_signature": uploaded_spoken_signature}
+    else:
+        inspection = {}
+        source_fp = {"prompt": str(prompt or ""), "extra_info": str(extra_info or ""), "plan": plan_obj if isinstance(plan_obj, dict) else {}}
+
+    fingerprint = _sha1_text(json.dumps({
+        "engine": LIPSYNC_ENGINE_VERSION, "source_mode": source_mode, "source": source_fp,
+        "speaker_name": speaker_name, "shots": shots,
+        "language": language, "narration_mode": narration_mode, "voice": voice,
+        "voice_sample": _file_fingerprint(stable_voice_sample) if stable_voice_sample else {},
+        "tts_model": _file_fingerprint(tts_model_path), "tts_tokenizer": _file_fingerprint(tts_tokenizer_path),
+        "uploaded_tail_sec": round(float(uploaded_tail_sec), 3) if source_mode == "uploaded" else None,
+        "uploaded_min_clip_sec": round(float(uploaded_min_clip_sec), 3) if source_mode == "uploaded" else None,
+        "uploaded_max_clip_sec": round(float(uploaded_max_clip_sec), 3) if source_mode == "uploaded" else None,
+        "llm_settings": _stable_llm_settings(llm_settings) if source_mode == "generated" else {},
+    }, sort_keys=True, ensure_ascii=False))
     plan_path = os.path.join(audio_dir, "lipsync_plan.json")
     prior = _read_json(plan_path) if os.path.isfile(plan_path) else {}
-    if _prepared_plan_assets_ok(prior, narration_wav):
-        if prior.get("fingerprint") == fingerprint:
-            if log_callback:
-                log_callback("[lip-sync] reusing prepared narration and per-shot audio (exact source match)")
-            return prior
+    if _prepared_plan_assets_ok(prior, narration_wav) and prior.get("fingerprint") == fingerprint:
         if log_callback:
-            prior_mode = str((prior or {}).get("source_mode") or "unknown")
-            log_callback(
-                f"[lip-sync] prepared audio does not match the current source "
-                f"({prior_mode} -> {source_mode}); rebuilding narration and shot WAV files"
-            )
+            log_callback("[lip-sync] reusing prepared narration and per-shot audio (exact source match)")
+        return prior
 
     try:
         from helpers import planner_speech  # type: ignore
     except Exception:
         import planner_speech  # type: ignore
-
     if log_callback:
-        label = "uploaded transcript" if source_mode == "uploaded" else "Planner narration"
-        log_callback(f"[lip-sync] preparing {label} before LTX clips")
+        log_callback(f"[lip-sync] preparing {'uploaded transcript' if source_mode == 'uploaded' else 'Planner narration'} before LTX clips")
 
     if source_mode == "uploaded":
         ext = os.path.splitext(uploaded)[1] or ".txt"
@@ -1411,182 +1473,103 @@ def prepare_lipsync_assets(
             shutil.copy2(uploaded, stable_transcript)
         except Exception:
             stable_transcript = uploaded
-        speech_result = _synthesise_uploaded_transcript(
-            planner_speech=planner_speech,
-            transcript_path=stable_transcript,
-            shots_obj=shots,
-            timeline=timeline,
-            target_duration=total_duration,
-            job_id=job_id,
-            language=language,
-            narration_mode=narration_mode,
-            voice=voice,
-            voice_sample_path=stable_voice_sample,
-            ref_text=ref_text,
-            model_path=tts_model_path,
-            tokenizer_path=tts_tokenizer_path,
-            qwentts_python=qwentts_python,
-            qwentts_script=qwentts_script,
-            audio_dir=audio_dir,
-            narration_wav=narration_wav,
-            narration_txt=narration_txt,
-            narration_json=narration_json,
-            ffmpeg_path=ffmpeg_path,
-            ffprobe_path=ffprobe_path,
-            log_path=log_path,
-            stop_requested=stop_requested,
-            log_callback=log_callback,
+        speech_result = _synthesise_uploaded_audio_driven(
+            planner_speech=planner_speech, transcript_path=stable_transcript, shots_obj=shots,
+            job_id=job_id, language=language, narration_mode=narration_mode, voice=voice,
+            voice_sample_path=stable_voice_sample, ref_text=ref_text, model_path=tts_model_path,
+            tokenizer_path=tts_tokenizer_path, qwentts_python=qwentts_python, qwentts_script=qwentts_script,
+            audio_dir=audio_dir, narration_wav=narration_wav, narration_txt=narration_txt,
+            narration_json=narration_json, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
+            log_path=log_path, tail_sec=uploaded_tail_sec, min_clip_sec=uploaded_min_clip_sec,
+            max_clip_sec=uploaded_max_clip_sec, stop_requested=stop_requested, log_callback=log_callback,
         )
         rendered_spoken_text = _collapse(_read_text(narration_txt)) if os.path.isfile(narration_txt) else ""
-        rendered_signature = _spoken_word_signature(rendered_spoken_text)
-        if rendered_signature != uploaded_spoken_signature:
-            raise RuntimeError(
-                "Planner narration text no longer matches the uploaded transcript. "
-                "Generation was stopped before LTX clips so prompt/story text cannot be used by mistake."
-            )
-        if log_callback:
-            log_callback(
-                f"[lip-sync] verified uploaded transcript text exactly ({len(uploaded_spoken_text.split())} words)"
-            )
+        if _spoken_word_signature(rendered_spoken_text) != uploaded_spoken_signature:
+            raise RuntimeError("Planner narration text no longer matches the uploaded transcript. Generation stopped before LTX clips.")
+        shots = list(speech_result.get("updated_shots") or shots)
+        timeline = list(speech_result.get("timeline") or build_shot_timeline(shots, 0.0))
+        total_duration = float(speech_result.get("target_duration_sec") or sum(_safe_float(x.get("duration_sec")) for x in shots))
+        segments = list(speech_result.get("segments") or [])
+        shot_items: List[Dict[str, Any]] = []
+        for shot, segment in zip(shots, segments):
+            sid = str(shot.get("id") or "")
+            shot_wav = str(segment.get("shot_audio_file") or "")
+            if not _file_ok(shot_wav):
+                raise RuntimeError(f"Missing audio-driven per-shot WAV for {sid}: {shot_wav}")
+            duration = float(segment.get("clip_duration_sec") or shot.get("duration_sec") or 0.0)
+            shot_items.append({
+                "shot_id": sid, "start_sec": float(segment.get("clip_start_sec") or 0.0),
+                "end_sec": float(segment.get("clip_end_sec") or duration), "duration_sec": round(duration, 3),
+                "has_speech": True, "audio_conditioned": True, "speech_delivery": "onscreen",
+                "speaker_name": _collapse(shot.get("lipsync_speaker_name") or speaker_name) or "the storyteller",
+                "speaker_visual_label": _collapse(shot.get("lipsync_speaker_visual_label") or _speaker_visual_label(speaker_name)),
+                "audio_file": shot_wav, "audio_condition_duration_sec": round(duration, 3),
+                "speech_duration_sec": round(float(segment.get("audio_duration_sec") or 0.0), 3),
+                "text": str(segment.get("text") or ""), "prompt_suffix": "",
+                "audio_fingerprint": _file_fingerprint(shot_wav),
+            })
     else:
         windows = _build_lipsync_windows(shots, timeline)
         if not windows:
             raise RuntimeError("The Planner has no video shot long enough to hold lip-sync speech.")
         speech_result = _synthesise_generated_narration(
-            planner_speech=planner_speech,
-            windows=windows,
-            plan_obj=plan_obj,
-            prompt=prompt,
-            extra_info=extra_info,
-            language=language,
-            llm_json_call=llm_json_call,
-            llm_settings=llm_settings,
-            prompts_dir=prompts_dir,
-            speaker_name=speaker_name,
-            target_duration=total_duration,
-            job_id=job_id,
-            narration_mode=narration_mode,
-            voice=voice,
-            voice_sample_path=stable_voice_sample,
-            ref_text=ref_text,
-            model_path=tts_model_path,
-            tokenizer_path=tts_tokenizer_path,
-            qwentts_python=qwentts_python,
-            qwentts_script=qwentts_script,
-            audio_dir=audio_dir,
-            narration_wav=narration_wav,
-            narration_txt=narration_txt,
-            narration_json=narration_json,
-            ffmpeg_path=ffmpeg_path,
-            ffprobe_path=ffprobe_path,
-            log_path=log_path,
-            stop_requested=stop_requested,
-            log_callback=log_callback,
+            planner_speech=planner_speech, windows=windows, plan_obj=plan_obj, prompt=prompt,
+            extra_info=extra_info, language=language, llm_json_call=llm_json_call,
+            llm_settings=llm_settings, prompts_dir=prompts_dir, speaker_name=speaker_name,
+            target_duration=total_duration, job_id=job_id, narration_mode=narration_mode,
+            voice=voice, voice_sample_path=stable_voice_sample, ref_text=ref_text,
+            model_path=tts_model_path, tokenizer_path=tts_tokenizer_path,
+            qwentts_python=qwentts_python, qwentts_script=qwentts_script, audio_dir=audio_dir,
+            narration_wav=narration_wav, narration_txt=narration_txt, narration_json=narration_json,
+            ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, log_path=log_path,
+            stop_requested=stop_requested, log_callback=log_callback,
         )
+        segments = speech_result.get("segments") if isinstance(speech_result, dict) and isinstance(speech_result.get("segments"), list) else []
+        chunks_dir = os.path.join(audio_dir, "lipsync_shots")
+        os.makedirs(chunks_dir, exist_ok=True)
+        shot_items = []
+        shot_lookup = _shot_lookup(shots)
+        for item in timeline:
+            sid = str(item.get("shot_id") or "")
+            start = _safe_float(item.get("start_sec")); end = _safe_float(item.get("end_sec")); duration = max(0.1, end-start)
+            overlapping = _segments_for_shot(segments, start, end)
+            shot = shot_lookup.get(sid, {})
+            delivery = _collapse(shot.get("lipsync_delivery")).lower() or ("onscreen" if _speaker_ready_from_existing_shot(shot) else "voiceover_broll")
+            audio_conditioned = bool(overlapping and delivery == "onscreen")
+            chunk_path = os.path.join(chunks_dir, f"{sid}.wav") if audio_conditioned else ""
+            if audio_conditioned:
+                _cut_shot_audio(source=narration_wav, destination=chunk_path, start_sec=start, duration_sec=duration, ffmpeg_path=ffmpeg_path)
+            shot_items.append({
+                "shot_id": sid, "start_sec": round(start,3), "end_sec": round(end,3), "duration_sec": round(duration,3),
+                "has_speech": bool(overlapping), "audio_conditioned": audio_conditioned, "speech_delivery": delivery,
+                "speaker_name": _collapse(shot.get("lipsync_speaker_name") or speaker_name) or "the storyteller",
+                "speaker_visual_label": _collapse(shot.get("lipsync_speaker_visual_label") or _speaker_visual_label(speaker_name)),
+                "audio_file": chunk_path, "audio_condition_duration_sec": round(duration,3) if audio_conditioned else 0.0,
+                "text": _collapse(" ".join(str(segment.get("text") or "") for segment in overlapping)),
+                "prompt_suffix": "", "audio_fingerprint": _file_fingerprint(chunk_path) if chunk_path else {},
+            })
 
     try:
-        current_transcript = _read_text(transcript_path) if transcript_path and os.path.isfile(transcript_path) else ""
-        placeholder = not _collapse(current_transcript) or "will be generated" in current_transcript.lower() or "generated later" in current_transcript.lower()
-        if transcript_path and (source_mode == "uploaded" or placeholder):
+        if transcript_path and (source_mode == "uploaded" or not _collapse(_read_text(transcript_path) if os.path.isfile(transcript_path) else "")):
             _write_text(transcript_path, _read_text(narration_txt))
     except Exception:
         pass
-
     if not _file_ok(narration_wav, 512):
         raise RuntimeError("LTX lip-sync narration preparation produced no usable master WAV.")
-    segments = speech_result.get("segments") if isinstance(speech_result, dict) and isinstance(speech_result.get("segments"), list) else []
     chunks_dir = os.path.join(audio_dir, "lipsync_shots")
-    os.makedirs(chunks_dir, exist_ok=True)
-    shot_items: List[Dict[str, Any]] = []
-    shot_lookup = _shot_lookup(shots)
-    for item in timeline:
-        sid = str(item.get("shot_id") or "")
-        start = _safe_float(item.get("start_sec"))
-        end = _safe_float(item.get("end_sec"))
-        duration = max(0.1, end - start)
-        overlapping = _segments_for_shot(segments, start, end)
-        has_speech = bool(overlapping)
-        shot = shot_lookup.get(sid, {})
-        delivery = _collapse(shot.get("lipsync_delivery")).lower()
-        if delivery not in ("onscreen", "voiceover_broll"):
-            delivery = "onscreen" if _speaker_ready_from_existing_shot(shot) else "voiceover_broll"
-
-        # Uploaded-transcript mode is an explicit request to drive speaking
-        # shots from the supplied words.  Older/resumed projects can still have
-        # shot metadata created while "Created narration" was selected, leaving
-        # those shots marked as voice-over B-roll.  That produced has_speech=True
-        # but no per-shot WAV, then the video step correctly refused to fall back
-        # to ordinary LTX audio.  For uploaded transcript mode, every shot that
-        # overlaps actual transcript speech must therefore receive a WAV and use
-        # the audio-conditioned route, regardless of stale delivery metadata.
-        if source_mode == "uploaded" and has_speech:
-            delivery = "onscreen"
-
-        shot_speaker = _collapse(shot.get("lipsync_speaker_name") or speaker_name) or "the storyteller"
-        shot_speaker_visual = _collapse(shot.get("lipsync_speaker_visual_label") or _speaker_visual_label(shot_speaker))
-        audio_conditioned = bool(has_speech and delivery == "onscreen")
-        chunk_path = os.path.join(chunks_dir, f"{sid}.wav") if audio_conditioned else ""
-        if audio_conditioned:
-            _cut_shot_audio(
-                source=narration_wav,
-                destination=chunk_path,
-                start_sec=start,
-                duration_sec=duration,
-                ffmpeg_path=ffmpeg_path,
-            )
-        prompt_suffix = ""
-        audio_condition_duration = 0.0
-        if audio_conditioned:
-            # Keep the complete per-shot WAV as conditioning, including any
-            # silence after the spoken words. Truncating conditioning at the
-            # last word removed the silence cue and encouraged continued mouth
-            # motion until the video ended.
-            audio_condition_duration = duration
-            prompt_suffix = (
-                f"{shot_speaker_visual} speaks the supplied audio with natural articulation. "
-                "Keep the same identity and visual appearance as the start image. "
-                "Follow all pauses and silence exactly; keep the mouth closed during silence."
-            )
-        shot_items.append(
-            {
-                "shot_id": sid,
-                "start_sec": round(start, 3),
-                "end_sec": round(end, 3),
-                "duration_sec": round(duration, 3),
-                "has_speech": has_speech,
-                "audio_conditioned": audio_conditioned,
-                "speech_delivery": delivery,
-                "speaker_name": shot_speaker,
-                "speaker_visual_label": shot_speaker_visual,
-                "audio_file": chunk_path,
-                "audio_condition_duration_sec": round(audio_condition_duration, 3) if audio_conditioned else 0.0,
-                "text": _collapse(" ".join(str(segment.get("text") or "") for segment in overlapping)),
-                "prompt_suffix": prompt_suffix,
-                "audio_fingerprint": _file_fingerprint(chunk_path) if chunk_path else {},
-            }
-        )
-
-
     result = {
-        "engine": LIPSYNC_ENGINE_VERSION,
-        "fingerprint": fingerprint,
-        "source_mode": source_mode,
-        "source_transcript_path": uploaded if source_mode == "uploaded" else "",
-        "source_fingerprint": source_fp,
+        "engine": LIPSYNC_ENGINE_VERSION, "fingerprint": fingerprint, "source_mode": source_mode,
+        "source_transcript_path": uploaded if source_mode == "uploaded" else "", "source_fingerprint": source_fp,
         "source_spoken_word_signature": uploaded_spoken_signature if source_mode == "uploaded" else "",
-        "speaker_name": speaker_name,
-        "target_duration_sec": round(total_duration, 3),
-        "voice_sample_path": stable_voice_sample,
-        "ref_text": ref_text,
+        "speaker_name": speaker_name, "target_duration_sec": round(total_duration, 3),
+        "audio_driven_duration": bool(source_mode == "uploaded"),
+        "voice_sample_path": stable_voice_sample, "ref_text": ref_text,
         "voice_sample_transcript_path": clone_info.get("transcript_path", ""),
-        "speech": speech_result,
-        "timeline": timeline,
-        "shots": shot_items,
+        "speech": speech_result, "timeline": timeline, "shots": shot_items,
+        "updated_shots": shots if source_mode == "uploaded" else [],
         "paths": {
-            "lipsync_plan_json": plan_path,
-            "narration_wav": narration_wav,
-            "narration_txt": narration_txt,
-            "narration_json": narration_json,
+            "lipsync_plan_json": plan_path, "narration_wav": narration_wav,
+            "narration_txt": narration_txt, "narration_json": narration_json,
             "narration_srt": str((speech_result.get("paths") or {}).get("narration_srt") or "") if isinstance(speech_result, dict) else "",
             "narration_timeline_json": str((speech_result.get("paths") or {}).get("narration_timeline_json") or "") if isinstance(speech_result, dict) else "",
             "lipsync_shots_dir": chunks_dir,
@@ -1594,7 +1577,6 @@ def prepare_lipsync_assets(
     }
     _write_json(plan_path, result)
     return result
-
 
 def load_shot_map(plan_or_path: Any) -> Dict[str, Dict[str, Any]]:
     obj = _read_json(str(plan_or_path)) if isinstance(plan_or_path, (str, os.PathLike)) else plan_or_path
