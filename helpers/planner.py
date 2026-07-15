@@ -9136,7 +9136,12 @@ class PipelineWorker(QThread):
                     "--i2v-image-crf", "0",
                 ]
                 if use_audio_conditioning:
-                    _regen_audio_max_duration = float(frames) / float(max(1, int(fps)))
+                    try:
+                        _regen_audio_max_duration = float((_regen_lipsync_item or {}).get("audio_condition_duration_sec") or 0.0)
+                    except Exception:
+                        _regen_audio_max_duration = 0.0
+                    if _regen_audio_max_duration <= 0.0:
+                        _regen_audio_max_duration = float(frames) / float(max(1, int(fps)))
                     args += [
                         "--audio-path", _regen_lipsync_audio,
                         "--audio-start-time", "0",
@@ -9204,7 +9209,7 @@ class PipelineWorker(QThread):
                         loras=[],
                         audio_path=_regen_lipsync_audio if use_audio_conditioning else "",
                         audio_start_time=0.0,
-                        audio_max_duration=(float(frames) / float(max(1, int(fps)))) if use_audio_conditioning else 0.0,
+                        audio_max_duration=_regen_audio_max_duration if use_audio_conditioning else 0.0,
                         spatial_upsampler_path=str(spatial_upsampler),
                         extra_args=int4_extra_args,
                         preferred_backend=_preferred_backend,
@@ -17873,7 +17878,10 @@ class PipelineWorker(QThread):
                                 extra_loras=extra_loras,
                                 image_end_path=end_image_path,
                                 audio_path=clip_audio_path,
-                                audio_max_duration=float(dsec),
+                                audio_max_duration=(
+                                    float((lipsync_item or {}).get("audio_condition_duration_sec") or 0.0)
+                                    if clip_audio_path else 0.0
+                                ) or float(dsec),
                                 log_path=log_file,
                                 preferred_backend=ltx23_backend,
                             )
@@ -27038,6 +27046,97 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             manifest = _safe_read_json(manifest_path) or {} if (manifest_path and os.path.exists(manifest_path)) else {}
         except Exception:
             manifest = {}
+
+        # Resume repair for cloned/custom narration voices.
+        #
+        # During the first run the selected external voice sample is copied into
+        # <job>/audio/voice_sample.<ext> and that stable path is written to the
+        # manifest. Older job.json files can still contain the original external
+        # path (or an empty value), so Resume used to complain that no reference
+        # voice was selected even though the project already contained it.
+        try:
+            if str(getattr(job, "narration_mode", "") or "").strip().lower() == "clone":
+                current_sample = str(getattr(job, "narration_sample_path", "") or "").strip()
+                candidates: List[str] = []
+
+                narr_obj = manifest.get("narration") if isinstance(manifest, dict) else {}
+                if isinstance(narr_obj, dict):
+                    candidates.append(str(narr_obj.get("sample_path") or "").strip())
+
+                paths_obj = manifest.get("paths") if isinstance(manifest, dict) else {}
+                if isinstance(paths_obj, dict):
+                    for key in (
+                        "voice_sample_path",
+                        "voice_sample",
+                        "narration_voice_sample",
+                        "reference_voice",
+                        "reference_audio",
+                    ):
+                        candidates.append(str(paths_obj.get(key) or "").strip())
+
+                narration_json_path = ""
+                if isinstance(paths_obj, dict):
+                    narration_json_path = str(paths_obj.get("narration_json") or "").strip()
+                if not narration_json_path:
+                    narration_json_path = os.path.join(str(job_dir), "audio", "narration.json")
+                if narration_json_path and os.path.isfile(narration_json_path):
+                    try:
+                        narration_meta = _safe_read_json(narration_json_path) or {}
+                    except Exception:
+                        narration_meta = {}
+                    if isinstance(narration_meta, dict):
+                        for key in ("voice_sample_path", "sample_path", "reference_voice_path"):
+                            candidates.append(str(narration_meta.get(key) or "").strip())
+
+                audio_dir_resume = os.path.join(str(job_dir), "audio")
+                try:
+                    if os.path.isdir(audio_dir_resume):
+                        for name in os.listdir(audio_dir_resume):
+                            low = str(name).lower()
+                            if low.startswith("voice_sample.") and not low.endswith((".txt", ".json")):
+                                candidates.append(os.path.join(audio_dir_resume, name))
+                except Exception:
+                    pass
+
+                # Keep the original path first when it still exists; otherwise
+                # recover the stable project-local copy.
+                ordered = [current_sample] + candidates
+                recovered = ""
+                for candidate in ordered:
+                    candidate = str(candidate or "").strip()
+                    if not candidate:
+                        continue
+                    try:
+                        if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                            recovered = os.path.abspath(candidate)
+                            break
+                    except Exception:
+                        continue
+
+                if recovered:
+                    job.narration_sample_path = recovered
+                    try:
+                        manifest.setdefault("narration", {})["sample_path"] = recovered
+                        _safe_write_json(manifest_path, manifest)
+                    except Exception:
+                        pass
+                    try:
+                        data["narration_sample_path"] = recovered
+                        _safe_write_json(job_json, data)
+                    except Exception:
+                        pass
+                elif bool(getattr(job, "narration_enabled", False)):
+                    raise RuntimeError(
+                        "The cloned reference voice could not be recovered. "
+                        "Expected a saved project copy in the job's audio folder."
+                    )
+        except RuntimeError as e:
+            QMessageBox.warning(self, "Cannot resume", str(e))
+            return
+        except Exception:
+            # Do not block non-clone/legacy jobs because optional metadata was malformed.
+            pass
+
         try:
             status = str(self._derive_job_status(str(job_dir), manifest) or '').strip().lower()
         except Exception:

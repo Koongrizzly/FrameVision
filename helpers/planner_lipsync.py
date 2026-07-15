@@ -1455,11 +1455,21 @@ def prepare_lipsync_assets(
                 ffmpeg_path=ffmpeg_path,
             )
         prompt_suffix = ""
+        audio_condition_duration = 0.0
         if audio_conditioned:
+            try:
+                last_spoken_end = max(
+                    _safe_float(segment.get("scheduled_end_sec"), _safe_float(segment.get("end_sec")))
+                    for segment in overlapping
+                )
+                audio_condition_duration = max(0.1, min(duration, (last_spoken_end - start) + 0.20))
+            except Exception:
+                audio_condition_duration = duration
             prompt_suffix = (
-                f"{shot_speaker_visual} is the only speaking subject and is visibly saying the supplied words. "
-                f"Keep {shot_speaker_visual}'s face in a frontal or natural three-quarter readable view with the mouth unobstructed; "
-                "animate accurate speech articulation and realistic lip synchronization. Other people, animals, and background subjects do not speak. "
+                f"{shot_speaker_visual} is the only speaking subject and visibly says the supplied words with natural articulation. "
+                f"Keep {shot_speaker_visual}'s face in a frontal or natural three-quarter readable view with the mouth unobstructed. "
+                "Follow the supplied speech timing, but when the supplied speech ends, immediately close the mouth and return to a relaxed neutral expression; "
+                "do not continue speaking, mouthing words, or inventing extra dialogue. Other people, animals, and background subjects remain silent. "
                 "Preserve the planned action, setting, and camera movement without turning away from the speaking face."
             )
         shot_items.append(
@@ -1473,6 +1483,7 @@ def prepare_lipsync_assets(
                 "speech_delivery": delivery,
                 "speaker_name": shot_speaker,
                 "audio_file": chunk_path,
+                "audio_condition_duration_sec": round(audio_condition_duration, 3) if audio_conditioned else 0.0,
                 "text": _collapse(" ".join(str(segment.get("text") or "") for segment in overlapping)),
                 "prompt_suffix": prompt_suffix,
                 "audio_fingerprint": _file_fingerprint(chunk_path) if chunk_path else {},

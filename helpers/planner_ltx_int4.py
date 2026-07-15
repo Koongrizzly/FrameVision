@@ -269,34 +269,31 @@ def build_auto_planner_command(
 
     forwarded_extra = [str(x) for x in list(extra_args or []) if str(x).strip()]
 
-    # Planner uses reference audio only when its Lip Sync path is active.  The
-    # ordinary Planner defaults are deliberately gentle and are not strong
-    # enough to make the generated face follow speech reliably.  Replace only
-    # the audio/video guidance entries for audio-conditioned runs, while
-    # leaving all non-lipsync clips untouched.
     if audio_text:
-        strong_lipsync = {
+        # Moderate lip-sync profile. Keep enough audio influence for visible
+        # articulation without forcing continued mouth motion after speech ends.
+        strong_guidance = {
             "--video-cfg-guidance-scale": "3",
-            "--video-stg-guidance-scale": "1",
+            "--video-stg-guidance-scale": "0",
             "--video-rescale-scale": "0.7",
-            "--audio-cfg-guidance-scale": "7",
-            "--audio-stg-guidance-scale": "1",
-            "--audio-rescale-scale": "0.7",
-            "--a2v-guidance-scale": "3",
-            "--v2a-guidance-scale": "3",
+            "--audio-cfg-guidance-scale": "3",
+            "--audio-stg-guidance-scale": "0",
+            "--audio-rescale-scale": "0",
+            "--a2v-guidance-scale": "1.5",
+            "--v2a-guidance-scale": "1.5",
         }
         cleaned: List[str] = []
-        index = 0
-        while index < len(forwarded_extra):
-            token = forwarded_extra[index]
-            if token in strong_lipsync:
-                index += 2 if index + 1 < len(forwarded_extra) else 1
+        i = 0
+        while i < len(forwarded_extra):
+            token = forwarded_extra[i]
+            if token in strong_guidance:
+                i += 2 if (i + 1) < len(forwarded_extra) else 1
                 continue
             cleaned.append(token)
-            index += 1
+            i += 1
         forwarded_extra = cleaned
-        for flag, value in strong_lipsync.items():
-            forwarded_extra.extend([flag, value])
+        for option, value in strong_guidance.items():
+            forwarded_extra.extend([option, value])
 
     if forwarded_extra:
         command.append("--extra")
@@ -308,7 +305,6 @@ def build_auto_planner_command(
         "status": status,
         "reason": (
             f"complete INT4 install detected; pipeline={pipeline_name}; "
-            f"condition_route={'dedicated_i2v' if simple_start_i2v else 'positioned_images'}; "
-            f"lipsync_profile={'strong' if audio_text else 'normal'}"
+            f"condition_route={'dedicated_i2v' if simple_start_i2v else 'positioned_images'}"
         ),
     }
