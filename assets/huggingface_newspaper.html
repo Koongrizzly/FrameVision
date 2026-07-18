@@ -1,0 +1,1708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark">
+<title>Hugging Face Newspaper</title>
+<style>
+  :root{
+    --bg:#071011;
+    --bg-2:#0b1718;
+    --paper:#102022;
+    --paper-2:#12272a;
+    --paper-3:#173033;
+    --ink:#ecf7f3;
+    --muted:#91aaa5;
+    --faint:#607773;
+    --line:rgba(202,255,243,.13);
+    --line-strong:rgba(202,255,243,.24);
+    --cyan:#4ee7d3;
+    --lime:#b9f263;
+    --amber:#ffc766;
+    --violet:#a995ff;
+    --red:#ff7c6e;
+    --shadow:0 24px 80px rgba(0,0,0,.35);
+    --radius:20px;
+    --ease:cubic-bezier(.2,.8,.2,1);
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;
+    min-height:100vh;
+    color:var(--ink);
+    background:
+      radial-gradient(circle at 15% 10%, rgba(78,231,211,.10), transparent 28rem),
+      radial-gradient(circle at 90% 18%, rgba(185,242,99,.07), transparent 30rem),
+      radial-gradient(circle at 65% 90%, rgba(169,149,255,.08), transparent 34rem),
+      linear-gradient(145deg,var(--bg),#071314 48%,#061011);
+    font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    overflow-x:hidden;
+  }
+
+  body::before{
+    content:"";
+    position:fixed;
+    inset:0;
+    pointer-events:none;
+    opacity:.18;
+    z-index:-1;
+    background-image:
+      linear-gradient(rgba(255,255,255,.02) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(255,255,255,.016) 1px,transparent 1px);
+    background-size:42px 42px;
+    mask-image:linear-gradient(to bottom,black,transparent 80%);
+  }
+
+  .orb{
+    position:fixed;
+    width:36rem;
+    height:36rem;
+    border-radius:50%;
+    filter:blur(90px);
+    opacity:.10;
+    pointer-events:none;
+    z-index:-2;
+    animation:floatOrb 18s ease-in-out infinite alternate;
+  }
+  .orb.one{left:-12rem;top:10rem;background:var(--cyan)}
+  .orb.two{right:-15rem;top:25rem;background:var(--violet);animation-delay:-6s}
+  .orb.three{left:35%;bottom:-24rem;background:var(--lime);animation-delay:-11s}
+  @keyframes floatOrb{to{transform:translate3d(4rem,-2rem,0) scale(1.12)}}
+
+  button,input,select{font:inherit}
+  button{color:inherit}
+  a{color:inherit}
+  .shell{width:min(1520px,calc(100% - 32px));margin:0 auto;padding:20px 0 70px}
+
+  .topline{
+    display:flex;align-items:center;justify-content:space-between;gap:14px;
+    color:var(--muted);font-size:.78rem;letter-spacing:.12em;text-transform:uppercase;
+    padding:8px 4px 13px;border-bottom:1px solid var(--line);
+  }
+  .live-dot{
+    display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--lime);
+    box-shadow:0 0 14px rgba(185,242,99,.75);margin-right:8px;
+  }
+  .masthead{
+    position:relative;
+    display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:20px;
+    padding:26px 0 22px;border-bottom:3px double var(--line-strong);
+  }
+  .masthead-side{color:var(--muted);font-size:.86rem;line-height:1.5}
+  .masthead-side.right{text-align:right}
+  .brand{text-align:center}
+  .brand-kicker{
+    color:var(--cyan);font-weight:800;letter-spacing:.35em;text-transform:uppercase;
+    font-size:.72rem;margin-bottom:6px;
+  }
+  .brand h1{
+    margin:0;font-family:Georgia,"Times New Roman",serif;font-weight:700;
+    font-size:clamp(2.4rem,6vw,5.9rem);letter-spacing:-.075em;line-height:.88;
+    text-shadow:0 8px 30px rgba(0,0,0,.38);
+  }
+  .brand h1 span{color:var(--cyan);font-style:italic}
+  .brand p{margin:12px 0 0;color:var(--muted);font-size:.9rem;letter-spacing:.08em}
+
+  .hero{
+    display:grid;grid-template-columns:minmax(0,1.7fr) minmax(310px,.8fr);gap:18px;
+    padding:20px 0 18px;
+  }
+  .hero-main,.briefing{
+    position:relative;overflow:hidden;
+    border:1px solid var(--line);border-radius:var(--radius);
+    background:linear-gradient(145deg,rgba(18,39,42,.92),rgba(10,24,26,.92));
+    box-shadow:var(--shadow);
+  }
+  .hero-main{padding:clamp(24px,5vw,58px)}
+  .hero-main::after{
+    content:"HF";position:absolute;right:-.06em;bottom:-.28em;
+    font:900 15rem/1 Georgia,serif;color:rgba(78,231,211,.035);transform:rotate(-7deg);
+  }
+  .eyebrow{
+    display:inline-flex;align-items:center;gap:9px;color:var(--lime);
+    font-size:.76rem;font-weight:850;letter-spacing:.18em;text-transform:uppercase;
+  }
+  .hero h2{
+    position:relative;z-index:1;
+    margin:14px 0 13px;max-width:900px;
+    font:700 clamp(2rem,4.5vw,4.8rem)/.98 Georgia,"Times New Roman",serif;
+    letter-spacing:-.045em;
+  }
+  .hero-copy{position:relative;z-index:1;max-width:790px;color:#bed1cd;font-size:1.02rem;line-height:1.72}
+  .hero-actions{position:relative;z-index:1;display:flex;flex-wrap:wrap;gap:10px;margin-top:24px}
+  .primary-btn,.secondary-btn,.icon-btn,.filter-btn,.small-btn{
+    border:1px solid var(--line-strong);border-radius:12px;cursor:pointer;
+    transition:transform .22s var(--ease),border-color .22s,background .22s,box-shadow .22s,opacity .22s;
+  }
+  .primary-btn{
+    display:inline-flex;align-items:center;justify-content:center;gap:10px;
+    padding:13px 18px;background:linear-gradient(135deg,var(--cyan),#86f6d8);
+    border-color:transparent;color:#061313;font-weight:900;box-shadow:0 10px 30px rgba(78,231,211,.18);
+  }
+  .primary-btn:hover{transform:translateY(-2px);box-shadow:0 14px 36px rgba(78,231,211,.28)}
+  .primary-btn:disabled{opacity:.6;cursor:wait;transform:none}
+  .secondary-btn{
+    padding:12px 15px;background:rgba(255,255,255,.035);font-weight:760;
+  }
+  .secondary-btn:hover,.icon-btn:hover,.small-btn:hover{transform:translateY(-2px);background:rgba(255,255,255,.07);border-color:rgba(78,231,211,.45)}
+  .spin{display:inline-block;animation:spin 1s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  .briefing{padding:22px}
+  .briefing h3{
+    margin:0 0 18px;font:700 1.55rem/1.1 Georgia,serif;
+  }
+  .stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .stat{
+    min-height:92px;padding:14px;border:1px solid var(--line);border-radius:15px;
+    background:rgba(255,255,255,.025);
+  }
+  .stat strong{display:block;font-size:1.85rem;line-height:1;color:var(--cyan)}
+  .stat span{display:block;margin-top:8px;color:var(--muted);font-size:.76rem;text-transform:uppercase;letter-spacing:.1em}
+  .last-check{margin-top:14px;padding-top:14px;border-top:1px solid var(--line);color:var(--muted);font-size:.83rem;line-height:1.55}
+
+  .progress-wrap{
+    display:none;margin:0 0 18px;border:1px solid var(--line);border-radius:15px;
+    background:rgba(13,29,31,.86);padding:14px 16px;
+  }
+  .progress-wrap.active{display:block;animation:fadeUp .35s var(--ease)}
+  .progress-row{display:flex;justify-content:space-between;gap:15px;color:var(--muted);font-size:.82rem}
+  .progress-track{height:7px;margin-top:10px;border-radius:99px;background:#071213;overflow:hidden}
+  .progress-bar{height:100%;width:0;background:linear-gradient(90deg,var(--cyan),var(--lime));transition:width .35s var(--ease)}
+
+  .toolbar{
+    position:sticky;top:10px;z-index:30;
+    display:grid;grid-template-columns:minmax(250px,1fr) auto auto;gap:11px;
+    align-items:center;margin:0 0 18px;padding:11px;
+    border:1px solid var(--line);border-radius:17px;
+    background:rgba(7,18,19,.83);backdrop-filter:blur(20px);box-shadow:0 14px 45px rgba(0,0,0,.25);
+  }
+  .search{
+    display:flex;align-items:center;gap:10px;padding:0 13px;height:44px;
+    border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.035);
+  }
+  .search input{width:100%;background:none;border:0;outline:0;color:var(--ink)}
+  .search input::placeholder{color:var(--faint)}
+  .select{
+    height:44px;border:1px solid var(--line);border-radius:12px;
+    color:var(--ink);background:#102123;padding:0 12px;outline:0;
+  }
+  .icon-btn{
+    width:44px;height:44px;display:grid;place-items:center;
+    background:rgba(255,255,255,.035);
+  }
+
+  .filter-strip{
+    display:flex;gap:8px;overflow-x:auto;padding:1px 1px 14px;
+    scrollbar-width:thin;scrollbar-color:var(--line-strong) transparent;
+  }
+  .filter-btn{
+    white-space:nowrap;padding:9px 13px;background:rgba(255,255,255,.025);
+    color:var(--muted);font-size:.82rem;font-weight:780;
+  }
+  .filter-btn:hover{color:var(--ink);border-color:rgba(78,231,211,.35)}
+  .filter-btn.active{
+    color:#071313;background:var(--cyan);border-color:var(--cyan);
+    box-shadow:0 8px 24px rgba(78,231,211,.16);
+  }
+  .filter-count{opacity:.7;margin-left:5px}
+
+  .section-heading{
+    display:flex;align-items:end;justify-content:space-between;gap:18px;
+    margin:20px 0 12px;padding-bottom:11px;border-bottom:1px solid var(--line-strong);
+  }
+  .section-heading h2{margin:0;font:700 clamp(1.65rem,3vw,2.6rem)/1 Georgia,serif}
+  .section-heading p{margin:0;color:var(--muted);font-size:.86rem}
+
+  .headlines{
+    display:grid;grid-template-columns:1.4fr repeat(2,minmax(230px,.8fr));gap:14px;margin-bottom:24px;
+  }
+  .headline{
+    position:relative;overflow:hidden;min-height:240px;padding:22px;
+    border:1px solid var(--line);border-radius:18px;
+    background:linear-gradient(145deg,rgba(23,48,51,.96),rgba(12,27,29,.96));
+    cursor:pointer;transition:transform .35s var(--ease),border-color .35s,box-shadow .35s;
+  }
+  .headline:first-child{min-height:310px}
+  .headline:hover{transform:translateY(-5px);border-color:rgba(78,231,211,.4);box-shadow:0 22px 55px rgba(0,0,0,.32)}
+  .headline::before{
+    content:"";position:absolute;inset:auto -30% -55% 15%;height:110%;
+    background:radial-gradient(circle,rgba(78,231,211,.13),transparent 62%);
+    transform:rotate(-15deg);transition:transform .5s var(--ease);
+  }
+  .headline:hover::before{transform:rotate(-8deg) scale(1.14)}
+  .headline-number{
+    position:absolute;right:16px;top:10px;font:800 5rem/1 Georgia,serif;
+    color:rgba(255,255,255,.035);
+  }
+  .headline h3{position:relative;margin:38px 0 10px;font:700 1.45rem/1.08 Georgia,serif;word-break:break-word}
+  .headline:first-child h3{font-size:clamp(1.8rem,3.5vw,3.15rem);max-width:850px}
+  .headline p{position:relative;color:var(--muted);line-height:1.55;font-size:.88rem}
+  .headline-meta{position:absolute;left:22px;right:22px;bottom:20px;display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:.74rem}
+
+  .feed{
+    display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:13px;
+  }
+  .card{
+    position:relative;display:flex;flex-direction:column;min-height:290px;
+    border:1px solid var(--line);border-radius:17px;padding:17px;
+    background:linear-gradient(155deg,rgba(18,39,42,.92),rgba(10,24,26,.95));
+    box-shadow:0 8px 25px rgba(0,0,0,.14);
+    transition:transform .3s var(--ease),border-color .3s,box-shadow .3s;
+    animation:fadeUp .5s var(--ease) both;
+  }
+  .card:hover{transform:translateY(-4px);border-color:rgba(78,231,211,.34);box-shadow:0 18px 40px rgba(0,0,0,.28)}
+  @keyframes fadeUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+  .card-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+  .avatar{
+    flex:0 0 auto;width:44px;height:44px;border-radius:13px;display:grid;place-items:center;
+    color:#071313;font-weight:950;background:linear-gradient(135deg,var(--cyan),var(--lime));
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.25);
+  }
+  .status{
+    display:inline-flex;align-items:center;gap:6px;border-radius:99px;padding:6px 9px;
+    font-size:.67rem;font-weight:900;letter-spacing:.09em;text-transform:uppercase;
+    border:1px solid var(--line);
+  }
+  .status.new{color:var(--lime);background:rgba(185,242,99,.08);border-color:rgba(185,242,99,.25)}
+  .status.updated{color:var(--amber);background:rgba(255,199,102,.08);border-color:rgba(255,199,102,.25)}
+  .status.latest{color:var(--cyan);background:rgba(78,231,211,.08);border-color:rgba(78,231,211,.22)}
+  .card h3{margin:15px 0 4px;font:700 1.25rem/1.14 Georgia,serif;word-break:break-word}
+  .author{color:var(--muted);font-size:.8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .digest{margin:13px 0;color:#b8cbc7;font-size:.86rem;line-height:1.55}
+  .badges{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:15px}
+  .badge{
+    padding:5px 8px;border:1px solid var(--line);border-radius:8px;
+    color:var(--muted);font-size:.68rem;font-weight:750;background:rgba(255,255,255,.025);
+  }
+  .badge.quant{color:var(--violet);border-color:rgba(169,149,255,.28);background:rgba(169,149,255,.07)}
+  .badge.task{color:var(--cyan);border-color:rgba(78,231,211,.24);background:rgba(78,231,211,.055)}
+  .metrics{
+    display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:auto;padding-top:13px;border-top:1px solid var(--line);
+  }
+  .metric{font-size:.72rem;color:var(--muted)}
+  .metric strong{display:block;color:var(--ink);font-size:.86rem;margin-bottom:2px}
+  .card-actions{display:flex;gap:7px;margin-top:13px}
+  .small-btn{
+    flex:1;padding:9px 10px;background:rgba(255,255,255,.035);font-size:.76rem;font-weight:800;
+  }
+  .small-btn.saved{color:#071313;background:var(--lime);border-color:var(--lime)}
+  .small-btn.danger:hover{border-color:rgba(255,124,110,.5);color:var(--red)}
+
+  .empty{
+    grid-column:1/-1;text-align:center;padding:70px 25px;border:1px dashed var(--line-strong);
+    border-radius:20px;background:rgba(255,255,255,.018);color:var(--muted);
+  }
+  .empty .symbol{font-size:3rem;margin-bottom:14px}
+  .empty h3{margin:0 0 8px;color:var(--ink);font:700 1.65rem Georgia,serif}
+
+  .notice{
+    margin:14px 0;padding:14px 16px;border-radius:14px;border:1px solid rgba(255,199,102,.28);
+    background:rgba(255,199,102,.07);color:#eed6a8;font-size:.86rem;line-height:1.55;
+  }
+  .notice.error{border-color:rgba(255,124,110,.32);background:rgba(255,124,110,.07);color:#ffc1b8}
+  .hidden{display:none!important}
+
+  .drawer-backdrop,.modal-backdrop{
+    position:fixed;inset:0;z-index:80;background:rgba(1,8,9,.72);
+    backdrop-filter:blur(8px);opacity:0;pointer-events:none;transition:opacity .25s;
+  }
+  .drawer-backdrop.open,.modal-backdrop.open{opacity:1;pointer-events:auto}
+  .drawer{
+    position:absolute;right:0;top:0;width:min(520px,100%);height:100%;overflow:auto;
+    padding:24px;background:#0d1c1e;border-left:1px solid var(--line-strong);
+    transform:translateX(100%);transition:transform .38s var(--ease);
+  }
+  .drawer-backdrop.open .drawer{transform:none}
+  .drawer-head,.modal-head{display:flex;justify-content:space-between;gap:15px;align-items:center}
+  .drawer h2,.modal h2{margin:0;font:700 2rem Georgia,serif}
+  .setting-group{margin-top:23px;padding-top:20px;border-top:1px solid var(--line)}
+  .setting-group h3{margin:0 0 12px;font-size:.83rem;text-transform:uppercase;letter-spacing:.12em;color:var(--cyan)}
+  .field{display:grid;gap:7px;margin:12px 0}
+  .field label{font-size:.83rem;color:var(--muted)}
+  .field input,.field select,.field textarea{
+    width:100%;border:1px solid var(--line);border-radius:11px;background:#102426;color:var(--ink);
+    padding:11px 12px;outline:0;resize:vertical;
+  }
+  .toggle-row{display:flex;justify-content:space-between;gap:18px;align-items:center;padding:10px 0}
+  .toggle-row div strong{display:block;font-size:.88rem}
+  .toggle-row div span{display:block;color:var(--muted);font-size:.75rem;margin-top:3px}
+  .switch{position:relative;width:48px;height:27px;flex:0 0 auto}
+  .switch input{opacity:0;width:0;height:0}
+  .slider{position:absolute;inset:0;border-radius:99px;background:#263b3d;border:1px solid var(--line);cursor:pointer;transition:.25s}
+  .slider::after{content:"";position:absolute;width:19px;height:19px;left:3px;top:3px;border-radius:50%;background:#96aaa6;transition:.25s}
+  .switch input:checked + .slider{background:rgba(78,231,211,.28);border-color:var(--cyan)}
+  .switch input:checked + .slider::after{transform:translateX(21px);background:var(--cyan)}
+
+  .modal{
+    position:absolute;left:50%;top:50%;width:min(920px,calc(100% - 26px));max-height:88vh;overflow:auto;
+    transform:translate(-50%,-46%) scale(.97);opacity:0;
+    background:#0d1d1f;border:1px solid var(--line-strong);border-radius:22px;padding:24px;
+    box-shadow:0 35px 100px rgba(0,0,0,.55);transition:transform .3s var(--ease),opacity .3s;
+  }
+  .modal-backdrop.open .modal{transform:translate(-50%,-50%) scale(1);opacity:1}
+  .modal-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px}
+  .detail-box{padding:14px;border:1px solid var(--line);border-radius:14px;background:rgba(255,255,255,.022)}
+  .detail-box b{display:block;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.1em;margin-bottom:7px}
+  .detail-box span{word-break:break-word}
+  .file-list{margin-top:18px;border-top:1px solid var(--line);padding-top:16px}
+  .file{
+    display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.055);
+    font-size:.8rem;color:var(--muted);
+  }
+  .file code{color:#c9d9d5;white-space:normal;word-break:break-all}
+  .modal-head{
+    position:sticky;top:-24px;z-index:8;margin:-24px -24px 18px;padding:24px;
+    background:linear-gradient(180deg,#0d1d1f 74%,rgba(13,29,31,.94));
+    border-bottom:1px solid var(--line);backdrop-filter:blur(18px);
+  }
+  .detail-lead{margin:5px 0 0;color:var(--muted);font-size:.82rem;line-height:1.5}
+  .detail-actions{display:flex;flex-wrap:wrap;gap:9px;margin-top:18px}
+  .load-detail-note{
+    margin-top:13px;padding:12px 14px;border:1px dashed rgba(78,231,211,.28);border-radius:13px;
+    color:var(--muted);background:rgba(78,231,211,.035);font-size:.8rem;line-height:1.55;
+  }
+  .size-pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:15px}
+  .size-pill{
+    padding:9px 11px;border-radius:11px;border:1px solid var(--line);background:rgba(255,255,255,.025);
+    color:var(--muted);font-size:.76rem;
+  }
+  .size-pill strong{color:var(--ink);margin-left:5px}
+  .readme-card{margin-top:20px;border:1px solid var(--line);border-radius:17px;overflow:hidden;background:rgba(255,255,255,.018)}
+  .readme-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 17px;border-bottom:1px solid var(--line)}
+  .readme-head h3{margin:0;font:700 1.35rem Georgia,serif}
+  .readme-head span{color:var(--muted);font-size:.74rem}
+  .readme-content{padding:18px;line-height:1.65;color:#c9d9d5;overflow-wrap:anywhere}
+  .readme-content h1,.readme-content h2,.readme-content h3,.readme-content h4{
+    color:var(--ink);font-family:Georgia,serif;line-height:1.15;margin:1.35em 0 .55em;
+  }
+  .readme-content h1{font-size:2rem}.readme-content h2{font-size:1.55rem}.readme-content h3{font-size:1.25rem}
+  .readme-content p{margin:.72em 0}.readme-content ul,.readme-content ol{padding-left:1.45rem}
+  .readme-content code{padding:.12em .38em;border-radius:6px;background:#071415;color:#aef5e8;font-size:.88em}
+  .readme-content pre{overflow:auto;padding:14px;border-radius:12px;background:#071415;border:1px solid var(--line)}
+  .readme-content pre code{padding:0;background:none;color:#d8e6e2}
+  .readme-content blockquote{margin:1em 0;padding:.2em 1em;border-left:3px solid var(--cyan);color:var(--muted)}
+  .readme-content a{color:var(--cyan);text-decoration:none}.readme-content a:hover{text-decoration:underline}
+  .readme-content img{display:block;max-width:100%;height:auto;margin:16px auto;border-radius:12px;border:1px solid var(--line)}
+  .loader{padding:55px;text-align:center;color:var(--muted)}
+  .loader-ring{width:34px;height:34px;margin:0 auto 14px;border:3px solid var(--line);border-top-color:var(--cyan);border-radius:50%;animation:spin 1s linear infinite}
+
+  .toast-stack{position:fixed;right:18px;bottom:18px;z-index:120;display:grid;gap:9px}
+  .toast{
+    min-width:260px;max-width:390px;padding:13px 15px;border:1px solid var(--line-strong);
+    border-radius:13px;background:rgba(13,29,31,.96);box-shadow:0 18px 48px rgba(0,0,0,.35);
+    animation:toastIn .35s var(--ease);font-size:.84rem;
+  }
+  .toast.error{border-color:rgba(255,124,110,.35)}
+  @keyframes toastIn{from{opacity:0;transform:translateX(18px)}}
+
+  footer{
+    display:flex;justify-content:space-between;gap:20px;align-items:center;
+    margin-top:34px;padding-top:20px;border-top:1px solid var(--line);
+    color:var(--muted);font-size:.78rem;
+  }
+
+  @media(max-width:1050px){
+    .hero{grid-template-columns:1fr}
+    .headlines{grid-template-columns:1fr 1fr}
+    .headline:first-child{grid-column:1/-1}
+    .feed{grid-template-columns:repeat(2,minmax(0,1fr))}
+  }
+  @media(max-width:760px){
+    .shell{width:min(100% - 20px,1520px)}
+    .masthead{grid-template-columns:1fr}
+    .masthead-side{display:none}
+    .hero-main{padding:28px 22px}
+    .toolbar{grid-template-columns:1fr auto}
+    .toolbar .select{grid-column:1/-1;grid-row:2}
+    .headlines,.feed{grid-template-columns:1fr}
+    .headline:first-child{grid-column:auto}
+    .modal-grid{grid-template-columns:1fr}
+    footer{display:block}
+    footer div+div{margin-top:8px}
+  }
+  @media(max-width:480px){
+    .topline{font-size:.65rem}
+    .hero-actions>*{width:100%}
+    .stat-grid{grid-template-columns:1fr 1fr}
+    .card-actions{flex-wrap:wrap}
+    .small-btn{min-width:42%}
+  }
+
+  @media(prefers-reduced-motion:reduce){
+    *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.001ms!important}
+  }
+  body.no-motion *,body.no-motion *::before,body.no-motion *::after{
+    animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important;
+  }
+
+  @media print{
+    body{background:white;color:#111}
+    body::before,.orb,.hero-actions,.toolbar,.filter-strip,.card-actions,.topline .right,.briefing,.progress-wrap,.notice,footer{display:none!important}
+    .shell{width:100%;padding:0}
+    .masthead,.section-heading{border-color:#bbb}
+    .brand h1,.hero h2,.section-heading h2,.card h3{color:#111;text-shadow:none}
+    .masthead-side,.brand p,.hero-copy,.author,.digest,.metric,.metric strong,.badge{color:#333}
+    .hero{display:block}
+    .hero-main,.headline,.card{background:white;border-color:#bbb;box-shadow:none;break-inside:avoid}
+    .headlines,.feed{grid-template-columns:repeat(2,1fr)}
+  }
+</style>
+</head>
+<body>
+<div class="orb one"></div><div class="orb two"></div><div class="orb three"></div>
+
+<div class="shell">
+  <div class="topline">
+    <div><span class="live-dot"></span>Live from the Hugging Face Hub</div>
+    <div class="right" id="clock">Loading local time…</div>
+  </div>
+
+  <header class="masthead">
+    <div class="masthead-side">
+      Independent model discovery<br>
+      No account or installation required
+    </div>
+    <div class="brand">
+      <div class="brand-kicker">The daily model edition</div>
+      <h1>Hugging Face <span>Newspaper</span></h1>
+      <p>IMAGE &amp; VIDEO GENERATION • NEW RELEASES • MODEL UPDATES</p>
+    </div>
+    <div class="masthead-side right">
+      Standalone browser edition<br>
+      Data stays in this browser
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="hero-main">
+        <div class="eyebrow">◈ Your personal model desk</div>
+        <h2>Find the releases worth opening before the feed buries them.</h2>
+        <div class="hero-copy">
+          Scans recent public Hugging Face repositories for image, video, text-to-speech and
+          speech-to-text models. An optional wider desk can also collect LLM and multimodal
+          releases. The paper remembers what you have already seen, so later checks can separate
+          genuinely new uploads from model updates.
+        </div>
+        <div class="hero-actions">
+          <button class="primary-btn" id="updateBtn"><span id="updateIcon">↻</span> Update newspaper</button>
+          <button class="secondary-btn" id="favoritesBtn">☆ Reading list</button>
+          <button class="secondary-btn" id="printBtn">Print edition</button>
+        </div>
+      </div>
+
+      <aside class="briefing">
+        <h3>Newsroom briefing</h3>
+        <div class="stat-grid">
+          <div class="stat"><strong id="statModels">0</strong><span>Models loaded</span></div>
+          <div class="stat"><strong id="statNew">0</strong><span>New uploads</span></div>
+          <div class="stat"><strong id="statUpdated">0</strong><span>Updated</span></div>
+          <div class="stat"><strong id="statSaved">0</strong><span>Saved</span></div>
+        </div>
+        <div class="last-check" id="lastCheck">No successful update yet. Press “Update newspaper” to build the first edition.</div>
+      </aside>
+    </section>
+
+    <div class="progress-wrap" id="progressWrap">
+      <div class="progress-row"><span id="progressText">Contacting Hugging Face…</span><span id="progressCount">0 / 7</span></div>
+      <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+    </div>
+
+    <div class="notice hidden" id="notice"></div>
+
+    <div class="toolbar">
+      <label class="search">
+        <span>⌕</span>
+        <input id="searchInput" type="search" autocomplete="off" placeholder="Search models, publishers, libraries or tags…">
+      </label>
+      <select class="select" id="sortSelect" aria-label="Sort models">
+        <option value="newest">Newest first</option>
+        <option value="score">Momentum score</option>
+        <option value="downloads">Most downloads</option>
+        <option value="likes">Most likes</option>
+      </select>
+      <button class="icon-btn" id="settingsBtn" title="Settings" aria-label="Open settings">⚙</button>
+    </div>
+
+    <div class="filter-strip" id="filterStrip">
+      <button class="filter-btn active" data-filter="all">All <span class="filter-count" data-count="all">0</span></button>
+      <button class="filter-btn" data-filter="new">New <span class="filter-count" data-count="new">0</span></button>
+      <button class="filter-btn" data-filter="updated">Updated <span class="filter-count" data-count="updated">0</span></button>
+      <button class="filter-btn" data-filter="text-to-image">Text → Image <span class="filter-count" data-count="text-to-image">0</span></button>
+      <button class="filter-btn" data-filter="image-to-image">Image Edit <span class="filter-count" data-count="image-to-image">0</span></button>
+      <button class="filter-btn" data-filter="text-to-video">Text → Video <span class="filter-count" data-count="text-to-video">0</span></button>
+      <button class="filter-btn" data-filter="image-to-video">Image → Video <span class="filter-count" data-count="image-to-video">0</span></button>
+      <button class="filter-btn" data-filter="video-to-video">Video Edit <span class="filter-count" data-count="video-to-video">0</span></button>
+      <button class="filter-btn" data-filter="text-to-speech">Text → Speech <span class="filter-count" data-count="text-to-speech">0</span></button>
+      <button class="filter-btn" data-filter="automatic-speech-recognition">Speech → Text <span class="filter-count" data-count="automatic-speech-recognition">0</span></button>
+      <button class="filter-btn hidden" id="otherModelsFilter" data-filter="other-models">LLMs &amp; Other <span class="filter-count" data-count="other-models">0</span></button>
+      <button class="filter-btn" data-filter="quantized">Quantized <span class="filter-count" data-count="quantized">0</span></button>
+      <button class="filter-btn" data-filter="favorites">Saved <span class="filter-count" data-count="favorites">0</span></button>
+    </div>
+
+    <section id="headlineSection" class="hidden">
+      <div class="section-heading">
+        <div><h2>Front-page headlines</h2><p>Recent releases with the strongest mix of activity and metadata.</p></div>
+      </div>
+      <div class="headlines" id="headlines"></div>
+    </section>
+
+    <section>
+      <div class="section-heading">
+        <div>
+          <h2 id="feedTitle">Latest model reports</h2>
+          <p id="resultSummary">Run an update to load the latest edition.</p>
+        </div>
+      </div>
+      <div class="feed" id="feed">
+        <div class="empty">
+          <div class="symbol">🗞️</div>
+          <h3>The presses are ready</h3>
+          <div>Press “Update newspaper” to collect the newest public image, video and speech model releases.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div>Built as a single local HTML file. Public model metadata is fetched directly from Hugging Face.</div>
+    <div>Edition 2 • Not affiliated with or endorsed by Hugging Face.</div>
+  </footer>
+</div>
+
+<div class="drawer-backdrop" id="drawerBackdrop">
+  <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="drawer-head">
+      <h2 id="settingsTitle">Newsroom settings</h2>
+      <button class="icon-btn" id="closeSettingsBtn" aria-label="Close settings">×</button>
+    </div>
+
+    <div class="setting-group">
+      <h3>Edition size</h3>
+      <div class="field">
+        <label for="perTaskSelect">Models requested per category</label>
+        <select id="perTaskSelect">
+          <option value="20">20 per category — faster</option>
+          <option value="40">40 per category — balanced</option>
+          <option value="75">75 per category — deep scan</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="ageSelect">Show models modified within</label>
+        <select id="ageSelect">
+          <option value="3">Last 3 days</option>
+          <option value="7">Last 7 days</option>
+          <option value="14">Last 14 days</option>
+          <option value="30">Last 30 days</option>
+          <option value="90">Last 90 days</option>
+          <option value="0">No age limit</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="setting-group">
+      <h3>Discovery scope</h3>
+      <div class="toggle-row">
+        <div><strong>Include other models and LLMs</strong><span>Adds text-generation, vision-language and audio-language releases. This makes updates slower and much larger.</span></div>
+        <label class="switch"><input id="includeOtherToggle" type="checkbox"><span class="slider"></span></label>
+      </div>
+    </div>
+
+    <div class="setting-group">
+      <h3>Feed cleanup</h3>
+      <div class="toggle-row">
+        <div><strong>Hide LoRAs and adapters</strong><span>Keep the edition focused on full model repositories.</span></div>
+        <label class="switch"><input id="hideLorasToggle" type="checkbox"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div><strong>Hide obvious merges</strong><span>Filters repositories labeled as merges or mixes.</span></div>
+        <label class="switch"><input id="hideMergesToggle" type="checkbox"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div><strong>Require model files</strong><span>Hide entries where the API lists no common weight file.</span></div>
+        <label class="switch"><input id="requireWeightsToggle" type="checkbox"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div><strong>Modern animations</strong><span>Disable this when you prefer a completely still interface.</span></div>
+        <label class="switch"><input id="motionToggle" type="checkbox"><span class="slider"></span></label>
+      </div>
+    </div>
+
+    <div class="setting-group">
+      <h3>Publishers to highlight</h3>
+      <div class="field">
+        <label for="watchPublishers">Comma-separated Hugging Face usernames or organizations</label>
+        <textarea id="watchPublishers" rows="4" placeholder="Lightricks, black-forest-labs, Tencent, stabilityai"></textarea>
+      </div>
+    </div>
+
+    <div class="setting-group">
+      <h3>Local data</h3>
+      <div class="hero-actions">
+        <button class="secondary-btn" id="exportBtn">Export reading list</button>
+        <button class="secondary-btn" id="clearIgnoredBtn">Restore ignored models</button>
+        <button class="secondary-btn" id="resetBtn">Reset newspaper</button>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<div class="modal-backdrop" id="modalBackdrop">
+  <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-head">
+      <h2 id="modalTitle">Model details</h2>
+      <button class="icon-btn" id="closeModalBtn" aria-label="Close model details">×</button>
+    </div>
+    <div id="modalContent"></div>
+  </section>
+</div>
+
+<div class="toast-stack" id="toastStack"></div>
+
+<script>
+(() => {
+  "use strict";
+
+  const API = "https://huggingface.co/api/models";
+  const HUB = "https://huggingface.co/";
+  const CORE_TASKS = [
+    { id: "text-to-image", label: "Text → Image" },
+    { id: "image-to-image", label: "Image Edit" },
+    { id: "text-to-video", label: "Text → Video" },
+    { id: "image-to-video", label: "Image → Video" },
+    { id: "video-to-video", label: "Video Edit" },
+    { id: "text-to-speech", label: "Text → Speech" },
+    { id: "automatic-speech-recognition", label: "Speech → Text" }
+  ];
+  const OTHER_TASKS = [
+    { id: "text-generation", label: "LLM / Text Generation", other: true },
+    { id: "image-text-to-text", label: "Vision-Language", other: true },
+    { id: "audio-text-to-text", label: "Audio-Language", other: true }
+  ];
+  const TASKS = [...CORE_TASKS, ...OTHER_TASKS];
+
+  const KEYS = {
+    settings: "hf_news_settings_v1",
+    lastUpdate: "hf_news_last_update_v1",
+    cache: "hf_news_cache_v1",
+    favorites: "hf_news_favorites_v1",
+    ignored: "hf_news_ignored_v1",
+    firstSeen: "hf_news_first_seen_v1"
+  };
+
+  const defaults = {
+    perTask: 40,
+    maxAgeDays: 14,
+    hideLoras: true,
+    hideMerges: true,
+    requireWeights: false,
+    includeOtherModels: false,
+    motion: true,
+    watchedPublishers: "Lightricks, black-forest-labs, Tencent, stabilityai, Wan-AI, HiDream-ai"
+  };
+
+  const state = {
+    models: [],
+    filtered: [],
+    filter: "all",
+    query: "",
+    sort: "newest",
+    settings: { ...defaults, ...loadJSON(KEYS.settings, {}) },
+    favorites: new Set(loadJSON(KEYS.favorites, [])),
+    ignored: new Set(loadJSON(KEYS.ignored, [])),
+    firstSeen: loadJSON(KEYS.firstSeen, {}),
+    lastUpdate: localStorage.getItem(KEYS.lastUpdate) || "",
+    detailCache: new Map(),
+    busy: false
+  };
+
+  const $ = (selector, root = document) => root.querySelector(selector);
+  const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+
+  const els = {
+    updateBtn: $("#updateBtn"),
+    updateIcon: $("#updateIcon"),
+    progressWrap: $("#progressWrap"),
+    progressText: $("#progressText"),
+    progressCount: $("#progressCount"),
+    progressBar: $("#progressBar"),
+    notice: $("#notice"),
+    searchInput: $("#searchInput"),
+    sortSelect: $("#sortSelect"),
+    feed: $("#feed"),
+    feedTitle: $("#feedTitle"),
+    resultSummary: $("#resultSummary"),
+    headlines: $("#headlines"),
+    headlineSection: $("#headlineSection"),
+    settingsBtn: $("#settingsBtn"),
+    drawerBackdrop: $("#drawerBackdrop"),
+    closeSettingsBtn: $("#closeSettingsBtn"),
+    modalBackdrop: $("#modalBackdrop"),
+    closeModalBtn: $("#closeModalBtn"),
+    modalTitle: $("#modalTitle"),
+    modalContent: $("#modalContent"),
+    toastStack: $("#toastStack"),
+    lastCheck: $("#lastCheck")
+  };
+
+  function loadJSON(key, fallback) {
+    try {
+      const value = localStorage.getItem(key);
+      return value ? JSON.parse(value) : structuredClone(fallback);
+    } catch {
+      return structuredClone(fallback);
+    }
+  }
+
+  function saveJSON(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); }
+    catch (error) { toast("Browser storage is unavailable: " + error.message, true); }
+  }
+
+  function escapeHTML(value = "") {
+    return String(value).replace(/[&<>"']/g, ch => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
+    })[ch]);
+  }
+
+  function formatNumber(value) {
+    const n = Number(value || 0);
+    if (n >= 1e9) return (n / 1e9).toFixed(n >= 1e10 ? 0 : 1) + "B";
+    if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "K";
+    return String(n);
+  }
+
+  function formatBytes(value) {
+    let n = Number(value || 0);
+    if (!n) return "Unknown";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(i > 1 ? 1 : 0)} ${units[i]}`;
+  }
+
+  function relativeDate(dateString) {
+    if (!dateString) return "Unknown date";
+    const time = new Date(dateString).getTime();
+    if (!Number.isFinite(time)) return "Unknown date";
+    const seconds = Math.round((time - Date.now()) / 1000);
+    const abs = Math.abs(seconds);
+    const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+    if (abs < 60) return rtf.format(seconds, "second");
+    if (abs < 3600) return rtf.format(Math.round(seconds / 60), "minute");
+    if (abs < 86400) return rtf.format(Math.round(seconds / 3600), "hour");
+    if (abs < 2592000) return rtf.format(Math.round(seconds / 86400), "day");
+    return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(time));
+  }
+
+  function exactDate(dateString) {
+    if (!dateString) return "Unknown";
+    const d = new Date(dateString);
+    return Number.isFinite(d.getTime())
+      ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(d)
+      : "Unknown";
+  }
+
+  function titleFromId(id = "") {
+    const part = id.split("/").pop() || id;
+    return part.replace(/[-_]+/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+  }
+
+  function publisherFromId(id = "") {
+    return id.includes("/") ? id.split("/")[0] : "Independent uploader";
+  }
+
+  function initials(value = "") {
+    const parts = value.replace(/[^a-zA-Z0-9 ]/g, " ").split(/\s+/).filter(Boolean);
+    return (parts.slice(0, 2).map(p => p[0]).join("") || "HF").toUpperCase();
+  }
+
+  function modelText(model) {
+    const siblings = Array.isArray(model.siblings) ? model.siblings.map(f => f.rfilename || "").join(" ") : "";
+    return [
+      model.id, model.author, model.pipeline_tag, model.library_name,
+      ...(model.tags || []), siblings
+    ].filter(Boolean).join(" ").toLowerCase();
+  }
+
+  function isLora(model) {
+    const t = modelText(model);
+    return /\blora\b|low.?rank|adapter|\bpeft\b/.test(t);
+  }
+
+  function isMerge(model) {
+    const t = modelText(model);
+    return /\bmerge\b|\bmerged\b|model.?mix|checkpoint.?mix/.test(t);
+  }
+
+  function quantFormats(model) {
+    const t = modelText(model);
+    const formats = [];
+    const checks = [
+      ["GGUF", /\bgguf\b/], ["FP8", /\bfp8\b|float8/], ["INT4", /\bint4\b|4.?bit|q4_/],
+      ["INT8", /\bint8\b|8.?bit|q8_/], ["AWQ", /\bawq\b/], ["GPTQ", /\bgptq\b/],
+      ["BNB", /bitsandbytes|\bbnb\b/]
+    ];
+    for (const [label, regex] of checks) if (regex.test(t)) formats.push(label);
+    return [...new Set(formats)];
+  }
+
+  function hasWeights(model) {
+    if (!Array.isArray(model.siblings)) return false;
+    return model.siblings.some(file => /\.(safetensors|bin|ckpt|pt|pth|gguf)$/i.test(file.rfilename || ""));
+  }
+
+  function ageDays(dateString) {
+    const t = new Date(dateString || 0).getTime();
+    return Number.isFinite(t) ? Math.max(0, (Date.now() - t) / 86400000) : 99999;
+  }
+
+  function momentum(model) {
+    const recency = Math.max(0, 48 - ageDays(model.lastModified) * 4);
+    const downloads = Math.min(27, Math.log10((model.downloads || 0) + 1) * 6.5);
+    const likes = Math.min(20, Math.log10((model.likes || 0) + 1) * 8);
+    const metadata = (model.pipeline_tag ? 2 : 0) + (model.library_name ? 2 : 0) + (hasWeights(model) ? 2 : 0);
+    const watched = isWatchedPublisher(model) ? 14 : 0;
+    return recency + downloads + likes + metadata + watched;
+  }
+
+  function isWatchedPublisher(model) {
+    const watched = String(state.settings.watchedPublishers || "")
+      .split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
+    const publisher = publisherFromId(model.id).toLowerCase();
+    return watched.includes(publisher);
+  }
+
+  function classifyStatus(model, previousUpdate) {
+    if (!previousUpdate) return "latest";
+    const cutoff = new Date(previousUpdate).getTime();
+    const created = new Date(model.createdAt || 0).getTime();
+    const modified = new Date(model.lastModified || 0).getTime();
+    if (Number.isFinite(created) && created > cutoff) return "new";
+    if (!state.firstSeen[model.id] && modified > cutoff) return "new";
+    if (Number.isFinite(modified) && modified > cutoff) return "updated";
+    return "latest";
+  }
+
+  function normalize(raw, taskHint, previousUpdate) {
+    const id = raw.id || raw.modelId || "";
+    if (!id) return null;
+    const model = {
+      ...raw,
+      id,
+      author: raw.author || publisherFromId(id),
+      pipeline_tag: raw.pipeline_tag || taskHint || "unknown",
+      taskHint,
+      tags: Array.isArray(raw.tags) ? raw.tags : [],
+      siblings: Array.isArray(raw.siblings) ? raw.siblings : [],
+      lastModified: raw.lastModified || raw.last_modified || raw.createdAt || "",
+      createdAt: raw.createdAt || raw.created_at || "",
+      downloads: Number(raw.downloads || 0),
+      likes: Number(raw.likes || 0),
+      library_name: raw.library_name || raw.library || ""
+    };
+    model.isOther = OTHER_TASKS.some(task => task.id === model.pipeline_tag || task.id === model.taskHint);
+    model.quantFormats = quantFormats(model);
+    model.isQuantized = model.quantFormats.length > 0;
+    model.hasWeights = hasWeights(model);
+    model.status = classifyStatus(model, previousUpdate);
+    model.score = momentum(model);
+    return model;
+  }
+
+  function digest(model) {
+    const task = TASKS.find(t => t.id === model.pipeline_tag)?.label ||
+      TASKS.find(t => t.id === model.taskHint)?.label || model.pipeline_tag || "Generation model";
+    const parts = [task];
+    if (model.library_name) parts.push(model.library_name);
+    if (model.quantFormats.length) parts.push(model.quantFormats.join(", "));
+    if (model.hasWeights) parts.push("model files listed");
+    if (isWatchedPublisher(model)) parts.push("watched publisher");
+    return parts.join(" • ") + ".";
+  }
+
+  async function fetchTask(task, limit) {
+    const params = new URLSearchParams({
+      filter: task.id,
+      sort: "lastModified",
+      direction: "-1",
+      limit: String(limit),
+      full: "true",
+      config: "true"
+    });
+    const response = await fetch(`${API}?${params.toString()}`, {
+      headers: { "Accept": "application/json" },
+      cache: "no-store"
+    });
+    if (!response.ok) throw new Error(`${task.label}: HTTP ${response.status}`);
+    const data = await response.json();
+    if (!Array.isArray(data)) throw new Error(`${task.label}: unexpected API response`);
+    return data;
+  }
+
+  async function updateNews() {
+    if (state.busy) return;
+    state.busy = true;
+    const startedAt = new Date().toISOString();
+    const previousUpdate = state.lastUpdate;
+    setBusy(true);
+    showNotice("", false, true);
+    const activeTasks = state.settings.includeOtherModels ? TASKS : CORE_TASKS;
+    let completedTasks = 0;
+    setProgress(0, activeTasks.length, "Starting a fresh scan…");
+
+    try {
+      const jobs = activeTasks.map(task =>
+        fetchTask(task, state.settings.perTask)
+          .then(data => {
+            completedTasks += 1;
+            setProgress(completedTasks, activeTasks.length, `${task.label} desk received ${data.length} reports`);
+            return { task, data };
+          })
+      );
+
+      const results = await Promise.allSettled(jobs);
+      const merged = new Map();
+      const failures = [];
+
+      for (const result of results) {
+        if (result.status === "rejected") {
+          failures.push(result.reason?.message || "Unknown request error");
+          continue;
+        }
+        const { task, data } = result.value;
+        for (const raw of data) {
+          const model = normalize(raw, task.id, previousUpdate);
+          if (!model) continue;
+          const current = merged.get(model.id);
+          if (!current || new Date(model.lastModified) > new Date(current.lastModified)) merged.set(model.id, model);
+        }
+      }
+
+      if (!merged.size) {
+        throw new Error("No model data was returned. Your browser may have blocked requests from a local file, or Hugging Face may be temporarily unavailable.");
+      }
+
+      state.models = [...merged.values()];
+      for (const model of state.models) {
+        if (!state.firstSeen[model.id]) state.firstSeen[model.id] = startedAt;
+      }
+
+      state.lastUpdate = startedAt;
+      localStorage.setItem(KEYS.lastUpdate, startedAt);
+      saveJSON(KEYS.firstSeen, state.firstSeen);
+      saveJSON(KEYS.cache, state.models);
+
+      if (failures.length) {
+        showNotice(`The edition loaded, but ${failures.length} section${failures.length === 1 ? "" : "s"} failed: ${failures.join(" • ")}`, true);
+      } else {
+        showNotice("", false, true);
+      }
+
+      renderAll();
+      toast(`Edition updated with ${state.models.length} unique model repositories.`);
+    } catch (error) {
+      showNotice(
+        `<strong>Update failed.</strong> ${escapeHTML(error.message)}<br>
+         This page requires internet access. If your browser blocks Hugging Face requests from a <code>file:///</code> page,
+         try opening the file in a different modern browser. Your saved reading list is untouched.`,
+        true
+      );
+      toast("Could not update the newspaper.", true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function setBusy(busy) {
+    state.busy = busy;
+    els.updateBtn.disabled = busy;
+    els.updateIcon.classList.toggle("spin", busy);
+    els.progressWrap.classList.toggle("active", busy);
+    if (!busy) setTimeout(() => els.progressWrap.classList.remove("active"), 600);
+  }
+
+  function setProgress(done, total, text) {
+    els.progressText.textContent = text;
+    els.progressCount.textContent = `${done} / ${total}`;
+    els.progressBar.style.width = `${Math.round((done / total) * 100)}%`;
+  }
+
+  function showNotice(message, error = false, hide = false) {
+    els.notice.classList.toggle("hidden", hide || !message);
+    els.notice.classList.toggle("error", error);
+    els.notice.innerHTML = message;
+  }
+
+  function filteredModels() {
+    const maxAge = Number(state.settings.maxAgeDays);
+    const query = state.query.trim().toLowerCase();
+
+    let items = state.models.filter(model => {
+      if (state.ignored.has(model.id)) return false;
+      if (model.isOther && !state.settings.includeOtherModels) return false;
+      if (maxAge > 0 && ageDays(model.lastModified) > maxAge) return false;
+      if (state.settings.hideLoras && isLora(model)) return false;
+      if (state.settings.hideMerges && isMerge(model)) return false;
+      if (state.settings.requireWeights && !model.hasWeights) return false;
+      if (query && !modelText(model).includes(query)) return false;
+
+      switch (state.filter) {
+        case "all": return true;
+        case "new": return model.status === "new";
+        case "updated": return model.status === "updated";
+        case "other-models": return model.isOther;
+        case "quantized": return model.isQuantized;
+        case "favorites": return state.favorites.has(model.id);
+        default: return model.pipeline_tag === state.filter || model.taskHint === state.filter;
+      }
+    });
+
+    items.sort((a, b) => {
+      if (state.sort === "downloads") return b.downloads - a.downloads;
+      if (state.sort === "likes") return b.likes - a.likes;
+      if (state.sort === "score") return b.score - a.score;
+      return new Date(b.lastModified) - new Date(a.lastModified);
+    });
+    return items;
+  }
+
+  function renderAll() {
+    state.filtered = filteredModels();
+    renderStats();
+    renderCounts();
+    renderHeadlines();
+    renderFeed();
+    renderLastCheck();
+  }
+
+  function renderStats() {
+    const visibleBase = state.models.filter(m => !state.ignored.has(m.id));
+    $("#statModels").textContent = formatNumber(visibleBase.length);
+    $("#statNew").textContent = formatNumber(visibleBase.filter(m => m.status === "new").length);
+    $("#statUpdated").textContent = formatNumber(visibleBase.filter(m => m.status === "updated").length);
+    $("#statSaved").textContent = formatNumber(state.favorites.size);
+  }
+
+  function countFor(filter) {
+    const old = state.filter;
+    state.filter = filter;
+    const count = filteredModels().length;
+    state.filter = old;
+    return count;
+  }
+
+  function renderCounts() {
+    const otherButton = $("#otherModelsFilter");
+    if (otherButton) otherButton.classList.toggle("hidden", !state.settings.includeOtherModels);
+    $$("[data-count]").forEach(node => {
+      node.textContent = countFor(node.dataset.count);
+    });
+  }
+
+  function renderHeadlines() {
+    if (!state.models.length || state.filter === "favorites" || state.query) {
+      els.headlineSection.classList.add("hidden");
+      return;
+    }
+
+    const candidates = filteredModels()
+      .filter(m => m.status !== "latest" || ageDays(m.lastModified) <= 3)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3);
+
+    if (!candidates.length) {
+      els.headlineSection.classList.add("hidden");
+      return;
+    }
+
+    els.headlineSection.classList.remove("hidden");
+    els.headlines.innerHTML = candidates.map((model, i) => `
+      <article class="headline" data-inspect="${escapeHTML(model.id)}">
+        <div class="headline-number">0${i + 1}</div>
+        <span class="status ${model.status}">${model.status}</span>
+        <h3>${escapeHTML(titleFromId(model.id))}</h3>
+        <p>${escapeHTML(digest(model))}</p>
+        <div class="headline-meta">
+          <span>${escapeHTML(publisherFromId(model.id))}</span>
+          <span>${escapeHTML(relativeDate(model.lastModified))}</span>
+        </div>
+      </article>
+    `).join("");
+
+    $$("[data-inspect]", els.headlines).forEach(card => {
+      card.addEventListener("click", () => inspectModel(card.dataset.inspect));
+    });
+  }
+
+  function renderFeed() {
+    const labels = {
+      all: "Latest model reports", new: "New repository uploads", updated: "Recently updated models",
+      "text-to-image": "Text-to-image desk", "image-to-image": "Image editing desk",
+      "text-to-video": "Text-to-video desk", "image-to-video": "Image-to-video desk",
+      "video-to-video": "Video editing desk", "text-to-speech": "Text-to-speech desk",
+      "automatic-speech-recognition": "Speech-to-text desk", "other-models": "LLMs and other model releases",
+      quantized: "Quantized releases", favorites: "Your reading list"
+    };
+    els.feedTitle.textContent = labels[state.filter] || "Latest model reports";
+    els.resultSummary.textContent = state.models.length
+      ? `${state.filtered.length} matching report${state.filtered.length === 1 ? "" : "s"} from the current local edition.`
+      : "Run an update to load the latest edition.";
+
+    if (!state.filtered.length) {
+      els.feed.innerHTML = `
+        <div class="empty">
+          <div class="symbol">${state.models.length ? "⌕" : "🗞️"}</div>
+          <h3>${state.models.length ? "No reports match this view" : "The presses are ready"}</h3>
+          <div>${state.models.length
+            ? "Try another section, clear the search, or loosen the newsroom filters."
+            : "Press “Update newspaper” to collect the newest public image and video model releases."}</div>
+        </div>`;
+      return;
+    }
+
+    els.feed.innerHTML = state.filtered.map((model, index) => cardHTML(model, index)).join("");
+    bindCardActions();
+  }
+
+  function cardHTML(model, index) {
+    const saved = state.favorites.has(model.id);
+    const task = TASKS.find(t => t.id === model.pipeline_tag)?.label ||
+      TASKS.find(t => t.id === model.taskHint)?.label || model.pipeline_tag || "Model";
+    const badges = [
+      `<span class="badge task">${escapeHTML(task)}</span>`,
+      model.library_name ? `<span class="badge">${escapeHTML(model.library_name)}</span>` : "",
+      ...model.quantFormats.slice(0, 3).map(x => `<span class="badge quant">${escapeHTML(x)}</span>`),
+      isWatchedPublisher(model) ? `<span class="badge">★ Watched publisher</span>` : "",
+      model.hasWeights ? `<span class="badge">Weights listed</span>` : ""
+    ].filter(Boolean).join("");
+
+    return `
+      <article class="card" style="animation-delay:${Math.min(index * 25, 350)}ms">
+        <div class="card-top">
+          <div class="avatar">${escapeHTML(initials(publisherFromId(model.id)))}</div>
+          <span class="status ${model.status}">${model.status}</span>
+        </div>
+        <h3>${escapeHTML(titleFromId(model.id))}</h3>
+        <div class="author">${escapeHTML(model.id)}</div>
+        <p class="digest">${escapeHTML(digest(model))}</p>
+        <div class="badges">${badges}</div>
+        <div class="metrics">
+          <div class="metric"><strong>${formatNumber(model.downloads)}</strong>Downloads</div>
+          <div class="metric"><strong>${formatNumber(model.likes)}</strong>Likes</div>
+          <div class="metric"><strong>${escapeHTML(relativeDate(model.lastModified))}</strong>Modified</div>
+        </div>
+        <div class="card-actions">
+          <button class="small-btn" data-action="inspect" data-id="${escapeHTML(model.id)}">Details</button>
+          <button class="small-btn ${saved ? "saved" : ""}" data-action="save" data-id="${escapeHTML(model.id)}">${saved ? "★ Saved" : "☆ Save"}</button>
+          <button class="small-btn" data-action="open" data-id="${escapeHTML(model.id)}">Open Hub</button>
+          <button class="small-btn danger" data-action="ignore" data-id="${escapeHTML(model.id)}" title="Hide this model">×</button>
+        </div>
+      </article>`;
+  }
+
+  function bindCardActions() {
+    $$("[data-action]", els.feed).forEach(button => {
+      button.addEventListener("click", event => {
+        event.preventDefault();
+        const { action, id } = button.dataset;
+        if (action === "inspect") inspectModel(id);
+        if (action === "save") toggleFavorite(id);
+        if (action === "open") window.open(HUB + id, "_blank", "noopener,noreferrer");
+        if (action === "ignore") ignoreModel(id);
+      });
+    });
+  }
+
+  function toggleFavorite(id) {
+    if (state.favorites.has(id)) {
+      state.favorites.delete(id);
+      toast("Removed from the reading list.");
+    } else {
+      state.favorites.add(id);
+      toast("Saved to the reading list.");
+    }
+    saveJSON(KEYS.favorites, [...state.favorites]);
+    renderAll();
+  }
+
+  function ignoreModel(id) {
+    state.ignored.add(id);
+    saveJSON(KEYS.ignored, [...state.ignored]);
+    toast("Model hidden. You can restore ignored models in Settings.");
+    renderAll();
+  }
+
+  function repoPath(id) {
+    return String(id || "").split("/").map(encodeURIComponent).join("/");
+  }
+
+  function fileByteSize(file) {
+    return Number(file?.size || file?.lfs?.size || 0) || 0;
+  }
+
+  function totalFileSize(files) {
+    return (files || []).reduce((sum, file) => sum + fileByteSize(file), 0);
+  }
+
+  function isWeightFile(file) {
+    const name = String(file?.rfilename || file?.path || "");
+    return /\.(safetensors|bin|ckpt|pt|pth|gguf|onnx)$/i.test(name);
+  }
+
+  function inlineMarkdown(raw = "", id = "") {
+    let safe = escapeHTML(raw);
+    safe = safe.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, '<img loading="lazy" alt="$1" src="$2">');
+    safe = safe.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    safe = safe.replace(/`([^`]+)`/g, '<code>$1</code>');
+    safe = safe.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    safe = safe.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+    safe = safe.replace(/(^|\s)\*([^*\n]+)\*(?=\s|$)/g, '$1<em>$2</em>');
+    return safe;
+  }
+
+  function markdownToHTML(markdown = "", id = "") {
+    let source = String(markdown || "").replace(/\r/g, "");
+    source = source.replace(/^---\n[\s\S]*?\n---\n?/, "");
+    const lines = source.split("\n");
+    const out = [];
+    let inCode = false;
+    let code = [];
+    let listType = "";
+
+    const closeList = () => {
+      if (listType) out.push(`</${listType}>`);
+      listType = "";
+    };
+
+    for (const line of lines) {
+      if (/^```/.test(line)) {
+        if (inCode) {
+          out.push(`<pre><code>${escapeHTML(code.join("\n"))}</code></pre>`);
+          code = [];
+          inCode = false;
+        } else {
+          closeList();
+          inCode = true;
+        }
+        continue;
+      }
+      if (inCode) { code.push(line); continue; }
+
+      const heading = line.match(/^(#{1,4})\s+(.+)$/);
+      if (heading) {
+        closeList();
+        const level = heading[1].length;
+        out.push(`<h${level}>${inlineMarkdown(heading[2], id)}</h${level}>`);
+        continue;
+      }
+
+      const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
+      if (unordered) {
+        if (listType !== "ul") { closeList(); listType = "ul"; out.push("<ul>"); }
+        out.push(`<li>${inlineMarkdown(unordered[1], id)}</li>`);
+        continue;
+      }
+
+      const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+      if (ordered) {
+        if (listType !== "ol") { closeList(); listType = "ol"; out.push("<ol>"); }
+        out.push(`<li>${inlineMarkdown(ordered[1], id)}</li>`);
+        continue;
+      }
+
+      if (/^>\s?/.test(line)) {
+        closeList();
+        out.push(`<blockquote>${inlineMarkdown(line.replace(/^>\s?/, ""), id)}</blockquote>`);
+        continue;
+      }
+
+      if (!line.trim()) { closeList(); continue; }
+      closeList();
+      out.push(`<p>${inlineMarkdown(line, id)}</p>`);
+    }
+
+    if (inCode) out.push(`<pre><code>${escapeHTML(code.join("\n"))}</code></pre>`);
+    closeList();
+    return out.join("\n") || '<p>No readable model card text was returned.</p>';
+  }
+
+  async function fetchTreeFiles(id) {
+    const response = await fetch(`${API}/${repoPath(id)}/tree/main?recursive=true&expand=false`, {
+      headers: { "Accept": "application/json" },
+      cache: "no-store"
+    });
+    if (!response.ok) throw new Error(`file tree HTTP ${response.status}`);
+    const data = await response.json();
+    if (!Array.isArray(data)) return [];
+    return data.filter(item => item.type !== "directory").map(item => ({
+      ...item,
+      rfilename: item.rfilename || item.path || ""
+    }));
+  }
+
+  async function loadFullDetails(id) {
+    const cached = state.detailCache.get(id);
+    if (cached) return cached;
+
+    const encoded = repoPath(id);
+    const [metadataResult, readmeResult] = await Promise.allSettled([
+      fetch(`${API}/${encoded}?blobs=true`, {
+        headers: { "Accept": "application/json" },
+        cache: "no-store"
+      }).then(response => {
+        if (!response.ok) throw new Error(`model metadata HTTP ${response.status}`);
+        return response.json();
+      }),
+      fetch(`${HUB}${encoded}/resolve/main/README.md`, {
+        headers: { "Accept": "text/plain" },
+        cache: "no-store"
+      }).then(response => {
+        if (!response.ok) throw new Error(`README HTTP ${response.status}`);
+        return response.text();
+      })
+    ]);
+
+    let detail = metadataResult.status === "fulfilled"
+      ? metadataResult.value
+      : state.models.find(model => model.id === id);
+    if (!detail) throw metadataResult.reason || new Error("Model metadata is unavailable.");
+
+    let files = Array.isArray(detail.siblings) ? detail.siblings : [];
+    let totalSize = totalFileSize(files);
+    let sizeSource = totalSize ? "file metadata" : "";
+    let treeError = "";
+
+    if (!totalSize) {
+      try {
+        const treeFiles = await fetchTreeFiles(id);
+        if (treeFiles.length) {
+          files = treeFiles;
+          totalSize = totalFileSize(files);
+          sizeSource = totalSize ? "repository file tree" : "";
+        }
+      } catch (error) {
+        treeError = error.message;
+      }
+    }
+
+    if (!totalSize && Number(detail.usedStorage || 0) > 0) {
+      totalSize = Number(detail.usedStorage);
+      sizeSource = "Hub-reported storage";
+    }
+
+    detail = { ...detail, siblings: files };
+    const full = {
+      detail,
+      readme: readmeResult.status === "fulfilled" ? readmeResult.value : "",
+      readmeError: readmeResult.status === "rejected" ? readmeResult.reason?.message || "README unavailable" : "",
+      metadataError: metadataResult.status === "rejected" ? metadataResult.reason?.message || "Metadata unavailable" : "",
+      treeError,
+      totalSize,
+      weightsSize: files.filter(isWeightFile).reduce((sum, file) => sum + fileByteSize(file), 0),
+      sizeSource
+    };
+    state.detailCache.set(id, full);
+    return full;
+  }
+
+  function inspectModel(id) {
+    els.modalBackdrop.classList.add("open");
+    els.modalTitle.textContent = titleFromId(id);
+    const cachedModel = state.models.find(model => model.id === id);
+    const full = state.detailCache.get(id);
+    if (full) renderDetails(full.detail, { full });
+    else if (cachedModel) renderDetails(cachedModel);
+    else els.modalContent.innerHTML = `<div class="notice error">This model is no longer present in the current edition.</div>`;
+  }
+
+  function renderDetails(detail, options = {}) {
+    const full = options.full || null;
+    const warning = options.warning || "";
+    const id = detail.id || detail.modelId || "";
+    const card = detail.cardData || {};
+    const config = detail.config || {};
+    const files = Array.isArray(detail.siblings) ? detail.siblings : [];
+    const quickKnownSize = totalFileSize(files);
+    const knownSize = full ? full.totalSize : quickKnownSize;
+    const formats = quantFormats(detail);
+    const license = card.license || (detail.tags || []).find(t => String(t).startsWith("license:"))?.split(":").slice(1).join(":") || "Not declared";
+    const architectures = config.architectures || detail.architectures || [];
+    const baseModel = card.base_model || card.baseModel || detail.baseModels || "Not declared";
+    const library = detail.library_name || card.library_name || "Not declared";
+    const pipeline = detail.pipeline_tag || "Not declared";
+    const sizeText = knownSize ? formatBytes(knownSize) : (full ? "Unavailable" : "Load details to calculate");
+
+    const fileRows = full && files.length
+      ? files.slice(0, 180).map(file => `
+          <div class="file">
+            <code>${escapeHTML(file.rfilename || file.path || "Unnamed file")}</code>
+            <span>${fileByteSize(file) ? formatBytes(fileByteSize(file)) : "—"}</span>
+          </div>`).join("")
+      : "";
+
+    els.modalContent.innerHTML = `
+      ${warning ? `<div class="notice">${escapeHTML(warning)}</div>` : ""}
+      <p class="detail-lead">Quick metadata loads immediately. Use <strong>Load details</strong> to fetch the model card and file sizes only when you need them.</p>
+      <div class="modal-grid">
+        <div class="detail-box"><b>Repository</b><span>${escapeHTML(id)}</span></div>
+        <div class="detail-box"><b>Publisher</b><span>${escapeHTML(detail.author || publisherFromId(id))}</span></div>
+        <div class="detail-box"><b>Pipeline</b><span>${escapeHTML(pipeline)}</span></div>
+        <div class="detail-box"><b>Library</b><span>${escapeHTML(library)}</span></div>
+        <div class="detail-box"><b>License</b><span>${escapeHTML(Array.isArray(license) ? license.join(", ") : license)}</span></div>
+        <div class="detail-box"><b>Base model</b><span>${escapeHTML(Array.isArray(baseModel) ? baseModel.join(", ") : baseModel)}</span></div>
+        <div class="detail-box"><b>Architecture</b><span>${escapeHTML(Array.isArray(architectures) ? architectures.join(", ") || "Not declared" : architectures)}</span></div>
+        <div class="detail-box"><b>Quantization signals</b><span>${escapeHTML(formats.join(", ") || "None detected")}</span></div>
+        <div class="detail-box"><b>Created</b><span>${escapeHTML(exactDate(detail.createdAt))}</span></div>
+        <div class="detail-box"><b>Last modified</b><span>${escapeHTML(exactDate(detail.lastModified))}</span></div>
+        <div class="detail-box"><b>Downloads</b><span>${formatNumber(detail.downloads)}</span></div>
+        <div class="detail-box"><b>Repository size</b><span>${escapeHTML(sizeText)}</span></div>
+      </div>
+      ${full ? `
+        <div class="size-pills">
+          <div class="size-pill">Total repository files <strong>${formatBytes(full.totalSize)}</strong></div>
+          <div class="size-pill">Detected weight files <strong>${formatBytes(full.weightsSize)}</strong></div>
+          <div class="size-pill">Files counted <strong>${files.length}</strong></div>
+          <div class="size-pill">Size source <strong>${escapeHTML(full.sizeSource || "Unavailable")}</strong></div>
+        </div>` : ""}
+      <div class="detail-actions">
+        ${full ? `<button class="primary-btn" disabled>✓ Details loaded</button>` : `<button class="primary-btn" id="modalLoadDetails">↧ Load details</button>`}
+        <button class="secondary-btn" id="modalOpenHub">Open on Hugging Face</button>
+        <button class="secondary-btn" id="modalSave">${state.favorites.has(id) ? "★ Remove from reading list" : "☆ Save to reading list"}</button>
+      </div>
+      ${!full ? `<div class="load-detail-note">The deeper check requests per-file metadata and the README for this repository. It is deliberately on demand so opening ordinary cards remains fast.</div>` : ""}
+      <div class="badges" style="margin-top:18px">
+        ${(detail.tags || []).slice(0, 40).map(tag => `<span class="badge">${escapeHTML(tag)}</span>`).join("")}
+      </div>
+      ${full ? `
+        ${(full.metadataError || full.treeError) ? `<div class="notice">${escapeHTML([full.metadataError, full.treeError].filter(Boolean).join(" • "))}</div>` : ""}
+        <div class="file-list">
+          <div class="section-heading" style="margin-top:0"><div><h2 style="font-size:1.45rem">Repository files</h2><p>${files.length} file${files.length === 1 ? "" : "s"} checked for the size total.</p></div></div>
+          ${fileRows || `<div class="notice">No file listing with sizes was returned for this repository.</div>`}
+        </div>
+        <div class="readme-card">
+          <div class="readme-head"><h3>Model card / README</h3><span>${full.readme ? `${formatNumber(full.readme.length)} characters` : "Unavailable"}</span></div>
+          <div class="readme-content">${full.readme ? markdownToHTML(full.readme, id) : `<div class="notice">${escapeHTML(full.readmeError || "No README.md was found on the main branch.")}</div>`}</div>
+        </div>` : ""}`;
+
+    $("#modalOpenHub").addEventListener("click", () => window.open(HUB + id, "_blank", "noopener,noreferrer"));
+    $("#modalSave").addEventListener("click", () => {
+      toggleFavorite(id);
+      $("#modalSave").textContent = state.favorites.has(id) ? "★ Remove from reading list" : "☆ Save to reading list";
+    });
+
+    const loadButton = $("#modalLoadDetails");
+    if (loadButton) {
+      loadButton.addEventListener("click", async () => {
+        loadButton.disabled = true;
+        loadButton.innerHTML = '<span class="spin">↻</span> Loading README and sizes…';
+        try {
+          const loaded = await loadFullDetails(id);
+          renderDetails(loaded.detail, { full: loaded });
+          toast(`Loaded full details for ${titleFromId(id)}.`);
+        } catch (error) {
+          renderDetails(detail, { warning: `Full details could not be loaded: ${error.message}` });
+          toast("Could not load the deeper model details.", true);
+        }
+      });
+    }
+  }
+
+  function openSettings() {
+    syncSettingsUI();
+    els.drawerBackdrop.classList.add("open");
+  }
+
+  function closeSettings() {
+    els.drawerBackdrop.classList.remove("open");
+  }
+
+  function syncSettingsUI() {
+    $("#perTaskSelect").value = String(state.settings.perTask);
+    $("#ageSelect").value = String(state.settings.maxAgeDays);
+    $("#hideLorasToggle").checked = !!state.settings.hideLoras;
+    $("#hideMergesToggle").checked = !!state.settings.hideMerges;
+    $("#requireWeightsToggle").checked = !!state.settings.requireWeights;
+    $("#includeOtherToggle").checked = !!state.settings.includeOtherModels;
+    $("#motionToggle").checked = !!state.settings.motion;
+    $("#watchPublishers").value = state.settings.watchedPublishers || "";
+  }
+
+  function readSettingsUI() {
+    state.settings = {
+      perTask: Number($("#perTaskSelect").value),
+      maxAgeDays: Number($("#ageSelect").value),
+      hideLoras: $("#hideLorasToggle").checked,
+      hideMerges: $("#hideMergesToggle").checked,
+      requireWeights: $("#requireWeightsToggle").checked,
+      includeOtherModels: $("#includeOtherToggle").checked,
+      motion: $("#motionToggle").checked,
+      watchedPublishers: $("#watchPublishers").value.trim()
+    };
+    saveJSON(KEYS.settings, state.settings);
+    document.body.classList.toggle("no-motion", !state.settings.motion);
+    for (const model of state.models) model.score = momentum(model);
+    renderAll();
+  }
+
+  function exportReadingList() {
+    const entries = state.models
+      .filter(model => state.favorites.has(model.id))
+      .map(model => ({
+        id: model.id,
+        url: HUB + model.id,
+        pipeline: model.pipeline_tag,
+        library: model.library_name || null,
+        lastModified: model.lastModified,
+        downloads: model.downloads,
+        likes: model.likes,
+        quantization: model.quantFormats
+      }));
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      source: "huggingface_newspaper.html",
+      models: entries,
+      savedIdsNotInCurrentEdition: [...state.favorites].filter(id => !state.models.some(m => m.id === id))
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `huggingface_reading_list_${new Date().toISOString().slice(0,10)}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    toast(`Exported ${entries.length} saved model${entries.length === 1 ? "" : "s"}.`);
+  }
+
+  function restoreIgnored() {
+    if (!state.ignored.size) return toast("There are no ignored models.");
+    state.ignored.clear();
+    saveJSON(KEYS.ignored, []);
+    renderAll();
+    toast("Ignored models restored.");
+  }
+
+  function resetNewspaper() {
+    if (!confirm("Reset the cached edition, reading list, ignored models and previous update history?")) return;
+    Object.values(KEYS).forEach(key => localStorage.removeItem(key));
+    state.models = [];
+    state.filtered = [];
+    state.favorites = new Set();
+    state.ignored = new Set();
+    state.firstSeen = {};
+    state.lastUpdate = "";
+    state.detailCache.clear();
+    state.settings = structuredClone(defaults);
+    document.body.classList.remove("no-motion");
+    syncSettingsUI();
+    renderAll();
+    closeSettings();
+    showNotice("", false, true);
+    toast("The local newspaper data was reset.");
+  }
+
+  function renderLastCheck() {
+    if (!state.lastUpdate) {
+      els.lastCheck.textContent = "No successful update yet. Press “Update newspaper” to build the first edition.";
+      return;
+    }
+    els.lastCheck.innerHTML = `Last successful check: <strong>${escapeHTML(exactDate(state.lastUpdate))}</strong><br>
+      Later updates will compare against this edition.`;
+  }
+
+  function toast(message, error = false) {
+    const node = document.createElement("div");
+    node.className = "toast" + (error ? " error" : "");
+    node.textContent = message;
+    els.toastStack.appendChild(node);
+    setTimeout(() => node.remove(), 4200);
+  }
+
+  function loadCache() {
+    const cached = loadJSON(KEYS.cache, []);
+    if (!Array.isArray(cached) || !cached.length) return;
+    state.models = cached.map(raw => {
+      const model = normalize(raw, raw.taskHint, "");
+      model.status = raw.status || "latest";
+      return model;
+    }).filter(Boolean);
+    renderAll();
+  }
+
+  function updateClock() {
+    $("#clock").textContent = new Intl.DateTimeFormat(undefined, {
+      weekday: "long", day: "2-digit", month: "long", year: "numeric",
+      hour: "2-digit", minute: "2-digit"
+    }).format(new Date());
+  }
+
+  els.updateBtn.addEventListener("click", updateNews);
+  $("#favoritesBtn").addEventListener("click", () => {
+    state.filter = "favorites";
+    $$(".filter-btn").forEach(b => b.classList.toggle("active", b.dataset.filter === "favorites"));
+    renderAll();
+    $("#feedTitle").scrollIntoView({ behavior: state.settings.motion ? "smooth" : "auto", block: "start" });
+  });
+  $("#printBtn").addEventListener("click", () => window.print());
+
+  els.searchInput.addEventListener("input", event => {
+    state.query = event.target.value;
+    renderAll();
+  });
+  els.sortSelect.addEventListener("change", event => {
+    state.sort = event.target.value;
+    renderAll();
+  });
+
+  $$(".filter-btn").forEach(button => {
+    button.addEventListener("click", () => {
+      state.filter = button.dataset.filter;
+      $$(".filter-btn").forEach(b => b.classList.toggle("active", b === button));
+      renderAll();
+    });
+  });
+
+  els.settingsBtn.addEventListener("click", openSettings);
+  els.closeSettingsBtn.addEventListener("click", closeSettings);
+  els.drawerBackdrop.addEventListener("click", event => {
+    if (event.target === els.drawerBackdrop) closeSettings();
+  });
+
+  ["perTaskSelect","ageSelect","hideLorasToggle","hideMergesToggle","requireWeightsToggle","includeOtherToggle","motionToggle","watchPublishers"]
+    .forEach(id => $("#" + id).addEventListener(id === "watchPublishers" ? "change" : "input", readSettingsUI));
+
+  $("#exportBtn").addEventListener("click", exportReadingList);
+  $("#clearIgnoredBtn").addEventListener("click", restoreIgnored);
+  $("#resetBtn").addEventListener("click", resetNewspaper);
+
+  els.closeModalBtn.addEventListener("click", () => els.modalBackdrop.classList.remove("open"));
+  els.modalBackdrop.addEventListener("click", event => {
+    if (event.target === els.modalBackdrop) els.modalBackdrop.classList.remove("open");
+  });
+
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape") {
+      closeSettings();
+      els.modalBackdrop.classList.remove("open");
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      els.searchInput.focus();
+    }
+  });
+
+  document.body.classList.toggle("no-motion", !state.settings.motion);
+  syncSettingsUI();
+  updateClock();
+  setInterval(updateClock, 30000);
+  loadCache();
+  renderLastCheck();
+})();
+</script>
+</body>
+</html>
