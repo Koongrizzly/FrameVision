@@ -2445,7 +2445,7 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
     negative_prompt = str(
         _extra_option(extra, ("--negative-prompt", "--negative_prompt", "--neg-prompt"), "") or ""
     ).strip() or None
-    guidance_scale = _float_option(extra, ("--video-cfg-guidance-scale",), 1.0)
+    guidance_scale = _float_option(extra, ("--video-cfg-guidance-scale",), 3.0)
     stg_scale = _float_option(extra, ("--video-stg-guidance-scale",), 0.0)
     guidance_rescale = _float_option(extra, ("--video-rescale-scale",), 0.7)
     modality_scale = _float_option(extra, ("--a2v-guidance-scale",), 1.0)

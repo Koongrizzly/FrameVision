@@ -10246,7 +10246,7 @@ def _ltx23_build_vramlab_direct_args(
 
     cmd.extend([
         "--extra",
-        "--video-cfg-guidance-scale", str(_safe_float(settings.get("video_cfg_guidance_scale"), 2.0)),
+        "--video-cfg-guidance-scale", str(_safe_float(settings.get("video_cfg_guidance_scale"), 3.0)),
         "--video-stg-guidance-scale", str(_safe_float(settings.get("video_stg_guidance_scale"), 0.0)),
         "--video-rescale-scale", str(_safe_float(settings.get("video_rescale_scale"), 0.7)),
         "--audio-cfg-guidance-scale", str(_safe_float(settings.get("audio_cfg_guidance_scale"), 1.0)),

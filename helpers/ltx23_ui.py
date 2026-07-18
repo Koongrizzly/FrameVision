@@ -985,7 +985,7 @@ class LTX23UISettings:
     remux_shortest: bool = True
     remux_replace_output: bool = False
     safe_ltx_audio_load: bool = True
-    video_cfg_guidance_scale: float = 2.0
+    video_cfg_guidance_scale: float = 3.0
     scheduler_shift: float = 5.0
     video_stg_guidance_scale: float = 0.0
     video_rescale_scale: float = 0.7
@@ -1477,7 +1477,7 @@ class LTX23RunnerWidget(QWidget):
 
         guidance_group = QGroupBox("Video guidance")
         guidance_form = QFormLayout(guidance_group)
-        self.video_cfg_spin = self._double_spin(0.0, 20.0, 0.1, 2.0)
+        self.video_cfg_spin = self._double_spin(0.0, 20.0, 0.1, 3.0)
         self.shift_slider = WheelGuardSlider(Qt.Horizontal)
         self.shift_slider.setRange(0, 1000)
         self.shift_slider.setSingleStep(5)
@@ -1496,7 +1496,7 @@ class LTX23RunnerWidget(QWidget):
         self.enhance_prompt_check = QCheckBox("Enhance prompt")
         self._set_tooltip(
             self.video_cfg_spin,
-            "Video CFG guidance controls how strongly the prompt pulls the video. Default 1.0 for the distilled workflow. "
+            "Video CFG guidance controls how strongly the prompt pulls the video. Default 3.0 for the distilled workflow. "
             "Higher values can follow the prompt harder but may look less natural and can slow the run.",
         )
         self._set_tooltip(
@@ -3047,7 +3047,7 @@ class LTX23RunnerWidget(QWidget):
         self.remux_shortest_check.setChecked(bool(s["remux_shortest"]))
         self.remux_replace_check.setChecked(bool(s["remux_replace_output"]))
         self._audio_mode_changed(audio_mode)
-        self.video_cfg_spin.setValue(float(s.get("video_cfg_guidance_scale", 2.0)))
+        self.video_cfg_spin.setValue(float(s.get("video_cfg_guidance_scale", 3.0)))
         self._set_shift_value(float(s.get("scheduler_shift", 5.0)))
         self.video_stg_spin.setValue(float(s.get("video_stg_guidance_scale", 0.0)))
         self.video_rescale_spin.setValue(float(s.get("video_rescale_scale", 0.7)))

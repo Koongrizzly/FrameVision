@@ -9166,7 +9166,7 @@ class PipelineWorker(QThread):
                     args += ["--seed", "1234"]
 
                 native_extra_args = [
-                    "--video-cfg-guidance-scale", "2",
+                    "--video-cfg-guidance-scale", "3",
                     "--video-stg-guidance-scale", "0",
                     "--video-rescale-scale", "0.7",
                     "--audio-cfg-guidance-scale", "1",
@@ -17397,7 +17397,7 @@ class PipelineWorker(QThread):
                 # Keep --vram-profile auto so the CLI owns 12/16/24GB profile limits
                 # such as main hot-window and Stage-2 block limits.
                 extra_args = [
-                    "--video-cfg-guidance-scale", "2",
+                    "--video-cfg-guidance-scale", "3",
                     "--video-stg-guidance-scale", "0",
                     "--video-rescale-scale", "0.7",
                     "--audio-cfg-guidance-scale", "1",
