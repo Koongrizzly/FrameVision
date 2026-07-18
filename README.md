@@ -3,7 +3,7 @@
 </p>
 
  <p align="center">                                  
-✨  FrameVision 2.5.1  ✨
+✨  FrameVision 2.5.2  ✨
  <p align="center">     
 All-in-one Sound/Image/Video Tool 
   <p align="center">     
@@ -104,8 +104,25 @@ Run **`framevision.exe`** — it automatically:
  <p align="center">  Update changelogs 
    
 ---
+
 <details>
-<summary>June 28 2026 Framevision V2.5.1 small uopdate brings Krea 2 and Boggu img</summary>
+<summary>July 15 2026 Framevision V2.5.2 small uopdate brings LTX 2.3 INT4 (lower size and vram, works on RTX 30XX and up cards) selection</summary>
+  
+  - easiest switch for users who already have the full fp16 installed : It can be deleted in the 'remove/hide optional installs' section from the optional installs menu, next go to optional installs and select the INT4 low vram model selection for the LTX install, let it delete the original environment and reinstall to make sure all needed dependencies get installed to run int4 models
+  
+  - when finished go to the ltx tab in the app, move down and select 'folder locations/executable paths' -> select INT4 -> it should auto select the folder and needed files but double check to make sure it points at the correct INT model folder and files
+  
+  - Enjoy 5 second 720p videos in 2 minutes (on an RTX 3090, speed depends on amount of available vram, profile selection under the hood should support 12/16/24 gig vram cards, it will work on 8 gig of vram also but much slower). If it spills in shared memory or you want to create 10+ second clips you can still turn on the framevision vram lab to help (but while testing turning it off was much faster (less offloading) but ofcourse needs enough vram for this.)
+
+  - Planner and Music clip creator now prefer INT4 when installed, if not installed it will keep using FP16 or FP8. Default CFG for int4 was set to 3 instead of 2 (seems to work better)
+  
+  - several bugfixes in the app, also added a couple of new easter eggs (made for testing the new chat gpt 5.6, results are pretty good)
+    
+
+</details>
+
+<details>
+<summary>June 28 2026 Framevision V2.5.1 small uopdate brings Krea 2 and Boogu img</summary>
   
   - Krea 2 GGuf loader, download your favorite version for Vram use and use it it framevision
     Fast and detailed images. Works with sd-cli for an easy & fast install
