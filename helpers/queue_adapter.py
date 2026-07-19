@@ -1167,84 +1167,6 @@ def enqueue_qwen2511_from_widget(inner):
         "outfile": out_file,
     }
     return make_job_json("qwen2511_image_edit", init_img, out_dir, args, str(d["pending"]), priority=500)
-
-
-def enqueue_qwen2511_int4_request(request: dict, root=None):
-    """Queue a Qwen 2511 Nunchaku INT4 edit using the helper's native request payload.
-
-    This intentionally uses a distinct job type from the existing Qwen 2511
-    GGUF/sd-cli editor so the worker cannot route an INT4 job through the wrong
-    backend.
-    """
-    from pathlib import Path as _P
-    try:
-        from helpers.job_helper import make_job_json
-    except Exception:
-        from job_helper import make_job_json
-
-    if not isinstance(request, dict):
-        raise RuntimeError("Qwen 2511 INT4 request is invalid.")
-
-    base = _P(root).expanduser().resolve() if root else _base_root().resolve()
-    env_python = base / "environments" / ".qwen2511_int" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    helper_script = base / "helpers" / "qwen2511_int.py"
-    if not env_python.is_file():
-        raise RuntimeError("Qwen 2511 INT4 environment Python not found: " + str(env_python))
-    if not helper_script.is_file():
-        raise RuntimeError("Qwen 2511 INT4 helper not found: " + str(helper_script))
-
-    prompt = str(request.get("prompt") or "").strip()
-    references = [str(x).strip() for x in (request.get("references") or []) if str(x).strip()]
-    model = str(request.get("model") or "").strip()
-    if not prompt:
-        raise RuntimeError("Enter an edit instruction before queueing.")
-    if not references:
-        raise RuntimeError("Add at least one reference image before queueing.")
-    for ref in references:
-        if not _P(ref).expanduser().is_file():
-            raise RuntimeError("Reference image not found: " + ref)
-    if not model:
-        raise RuntimeError("No Qwen 2511 INT4 model profile is selected.")
-
-    output = dict(request.get("output") or {})
-    out_dir = _P(str(output.get("folder") or (base / "output" / "edits"))).expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    request_copy = dict(request)
-    request_copy["command"] = "generate"
-    request_copy["references"] = references
-    request_copy["output"] = output
-    request_copy["output"]["folder"] = str(out_dir)
-
-    preview = " ".join(prompt.split())[:80]
-    label = "Qwen 2511 INT4: " + (preview or "image edit")
-    args = {
-        "label": label,
-        "engine": "qwen2511_int4",
-        "backend": "qwen2511_int4",
-        "model": model,
-        "request": request_copy,
-        "env_python": str(env_python),
-        "helper_script": str(helper_script),
-        "root": str(base),
-    }
-    d = jobs_dirs()
-    return make_job_json(
-        "qwen2511_int4_image_edit",
-        references[0],
-        str(out_dir),
-        args,
-        str(d["pending"]),
-        priority=500,
-    )
-
-
-def enqueue_qwen2511_int4_from_widget(inner):
-    """Compatibility wrapper for callers that have the embedded INT4 widget."""
-    if inner is None or not hasattr(inner, "build_request"):
-        raise RuntimeError("Qwen 2511 INT4 widget is unavailable.")
-    root = getattr(inner, "root", None)
-    return enqueue_qwen2511_int4_request(inner.build_request(), root=root)
-
 # --- FrameVision: queue helpers for Upsc & external commands ---
 def _is_video_path(p: str) -> bool:
     try:
@@ -2374,3 +2296,85 @@ def enqueue_lens_turbo_u4(job: dict) -> bool:
         except Exception:
             pass
         return False
+
+# ---------------------------------------------------------------------------
+# Qwen 2511 Nunchaku queue integration
+# Uses FrameVision's existing tools_ffmpeg/external-command worker route.
+# This avoids requiring a custom worker.py job handler.
+# ---------------------------------------------------------------------------
+def enqueue_qwen2511_int4_request(request: dict, root=None):
+    import json as _json
+    import uuid as _uuid
+    from pathlib import Path as _P
+
+    if not isinstance(request, dict):
+        raise RuntimeError("Qwen 2511 request is invalid.")
+
+    base = _P(root).expanduser().resolve() if root else _base_root().resolve()
+    env_python = base / "environments" / ".qwen2511_int" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    helper_script = base / "helpers" / "qwen2511_int.py"
+    if not env_python.is_file():
+        raise RuntimeError("Qwen 2511 environment Python not found: " + str(env_python))
+    if not helper_script.is_file():
+        raise RuntimeError("Qwen 2511 helper not found: " + str(helper_script))
+
+    prompt = str(request.get("prompt") or "").strip()
+    references = [str(x).strip() for x in (request.get("references") or []) if str(x).strip()]
+    model = str(request.get("model") or "").strip()
+    if not prompt:
+        raise RuntimeError("Enter an edit instruction before queueing.")
+    if not references:
+        raise RuntimeError("Add at least one reference image before queueing.")
+    for ref in references:
+        if not _P(ref).expanduser().is_file():
+            raise RuntimeError("Reference image not found: " + ref)
+    if not model:
+        raise RuntimeError("No Qwen 2511 model profile is selected.")
+
+    output = dict(request.get("output") or {})
+    out_dir = _P(str(output.get("folder") or (base / "output" / "edits"))).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output["folder"] = str(out_dir)
+
+    request_copy = dict(request)
+    request_copy["command"] = "generate"
+    request_copy["references"] = references
+    request_copy["output"] = output
+
+    request_dir = base / "temp" / "qwen2511_int_queue"
+    request_dir.mkdir(parents=True, exist_ok=True)
+    request_path = request_dir / ("qwen2511_" + _uuid.uuid4().hex + ".json")
+    request_path.write_text(_json.dumps(request_copy, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    cmd = [
+        str(env_python), "-u", str(helper_script),
+        "--queue-job", str(request_path),
+        "--root", str(base),
+    ]
+    fmt = str(output.get("format") or "png").lower().lstrip(".")
+    if fmt not in {"png", "jpg", "jpeg", "webp"}:
+        fmt = "png"
+    preview = " ".join(prompt.split())[:80]
+    label = "Qwen 2511 INT4: " + (preview or "image edit")
+    args = {
+        "label": label,
+        "engine": "qwen2511_int4",
+        "backend": "qwen2511_int4",
+        "model": model,
+        "ffmpeg_cmd": cmd,
+        "cwd": str(base),
+        "scan_dir": str(out_dir),
+        "scan_ext": "." + ("jpg" if fmt == "jpeg" else fmt),
+        "queue_family": "qwen2511_int4",
+        "request_file": str(request_path),
+        "env_python": str(env_python),
+        "helper_script": str(helper_script),
+    }
+    return enqueue_tool_job("tools_ffmpeg", references[0], str(out_dir), args, priority=500)
+
+
+def enqueue_qwen2511_int4_from_widget(inner):
+    if inner is None or not hasattr(inner, "build_request"):
+        raise RuntimeError("Qwen 2511 widget is unavailable.")
+    return enqueue_qwen2511_int4_request(inner.build_request(), root=getattr(inner, "root", None))
+

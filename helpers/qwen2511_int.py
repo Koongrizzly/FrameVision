@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FrameVision helper UI and persistent backend for Qwen-Image-Edit-2511 INT4.
+FrameVision helper UI and persistent backend for Qwen-Image-Edit-2511 Nunchaku checkpoints.
 
 Expected location:
     <FrameVision root>/helpers/qwen2511_int.py
@@ -36,6 +36,7 @@ SETTINGS_SCHEMA = 1
 EVENT_PREFIX = "FVQWEN_EVENT "
 SUPPORTED_IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 SUPPORTED_LORAS = {".safetensors", ".bin", ".pt"}
+AUTO_PROFILE_STEPS_DEFAULT = 4
 
 LIGHTNING_SCHEDULER_CONFIG = {
     "base_image_seq_len": 256,
@@ -127,14 +128,144 @@ def worker_log(message: str, level: str = "info") -> None:
     worker_event("log", level=level, message=str(message))
 
 
+def _safe_relpath(path: Path, start: Path) -> str:
+    try:
+        return str(path.relative_to(start)).replace("\\", "/")
+    except Exception:
+        return str(path).replace("\\", "/")
+
+
+def _checkpoint_steps_from_name(name: str, fallback: int = AUTO_PROFILE_STEPS_DEFAULT) -> int:
+    lower = str(name or "").lower()
+    if any(token in lower for token in ("mid_r128", "8step", "8-step", "_8s", "_8_")):
+        return 8
+    return int(fallback)
+
+
+def _safetensors_metadata(checkpoint: Path) -> dict[str, Any]:
+    """Read only the safetensors JSON header without loading tensor data."""
+    try:
+        with checkpoint.open("rb") as handle:
+            raw = handle.read(8)
+            if len(raw) != 8:
+                return {}
+            header_size = int.from_bytes(raw, "little", signed=False)
+            if header_size <= 0 or header_size > 64 * 1024 * 1024:
+                return {}
+            header = json.loads(handle.read(header_size).decode("utf-8"))
+        metadata = header.get("__metadata__", {}) if isinstance(header, dict) else {}
+        return metadata if isinstance(metadata, dict) else {}
+    except Exception:
+        return {}
+
+
+def _is_nunchaku_checkpoint(checkpoint: Path) -> bool:
+    # Nunchaku's loader reads metadata["config"] while constructing the model.
+    # ComfyUI single-file quantizations can share similar filenames but do not
+    # contain this field and must not be offered to the Nunchaku backend.
+    metadata = _safetensors_metadata(checkpoint)
+    config = metadata.get("config")
+    if not config:
+        return False
+    try:
+        parsed = json.loads(config) if isinstance(config, str) else config
+        return isinstance(parsed, dict)
+    except Exception:
+        return False
+
+
+def _auto_profile_from_checkpoint(model_dir: Path, checkpoint: Path) -> Optional[tuple[str, dict[str, Any]]]:
+    try:
+        rel = checkpoint.relative_to(model_dir)
+    except Exception:
+        return None
+    rel_text = str(rel).replace("\\", "/")
+    lower_rel = rel_text.lower()
+    lower_name = checkpoint.name.lower()
+    if lower_name.endswith('.safetensors') is False:
+        return None
+    if not any(token in lower_name for token in ("qwen", "2511", "convrot", "nunchaku")):
+        return None
+    if not _is_nunchaku_checkpoint(checkpoint):
+        return None
+    if any(part.lower() in {"base", "loras"} for part in checkpoint.parts):
+        return None
+
+    precision = "int8" if "int8" in lower_name or "/int8/" in f"/{lower_rel}/" else "int4"
+    if precision == "int8":
+        if "convrot" in lower_name:
+            key = "int8-convrot"
+            label = "INT8 ConvRot test · 4 steps"
+        else:
+            key = "int8-auto"
+            label = "INT8 checkpoint · 4 steps"
+    else:
+        key = f"auto-{checkpoint.stem}"
+        label = f"Detected checkpoint · {checkpoint.stem}"
+
+    size_gib = None
+    try:
+        size_gib = round(checkpoint.stat().st_size / (1024 ** 3), 2)
+    except Exception:
+        pass
+
+    profile = {
+        "label": label,
+        "relative_path": rel_text,
+        "steps": _checkpoint_steps_from_name(lower_name),
+        "precision": precision,
+    }
+    if size_gib:
+        profile["size_gib"] = size_gib
+    return key, profile
+
+
+def _augment_profiles_with_autodetect(root: Path, models: dict[str, Any]) -> dict[str, Any]:
+    model_dir = model_root(root)
+    merged: dict[str, Any] = {}
+    existing_paths: set[str] = set()
+    for key, value in models.items() if isinstance(models, dict) else []:
+        if not isinstance(value, dict):
+            continue
+        profile = dict(value)
+        rel = str(profile.get("relative_path", "")).replace("\\", "/")
+        if rel:
+            existing_paths.add(rel.lower())
+        merged[str(key)] = profile
+
+    for checkpoint in model_dir.rglob("*.safetensors"):
+        auto_item = _auto_profile_from_checkpoint(model_dir, checkpoint)
+        if not auto_item:
+            continue
+        auto_key, auto_profile = auto_item
+        rel = str(auto_profile.get("relative_path", "")).replace("\\", "/")
+        if rel.lower() in existing_paths:
+            continue
+        key = auto_key
+        suffix = 2
+        while key in merged:
+            key = f"{auto_key}-{suffix}"
+            suffix += 1
+        merged[key] = auto_profile
+        existing_paths.add(rel.lower())
+    return merged
+
+
 def _load_profiles(root: Path) -> dict[str, Any]:
     path = model_root(root) / "model_profiles.json"
     profiles = read_json(path, {})
-    if not isinstance(profiles, dict) or "models" not in profiles:
+    if not isinstance(profiles, dict):
+        profiles = {}
+    models = profiles.get("models", {})
+    if not isinstance(models, dict):
+        models = {}
+    merged = _augment_profiles_with_autodetect(root, models)
+    if not merged:
         raise FileNotFoundError(
-            f"Model profile file is missing or invalid: {path}. Run Qwen2511_INT4_install.py first."
+            f"No Qwen checkpoint profiles were found in {model_root(root)}. "
+            f"Run Qwen2511_INT4_install.py or place a compatible Nunchaku checkpoint there."
         )
-    return profiles
+    return {"models": merged}
 
 
 def _resolve_model(root: Path, key: str) -> tuple[dict[str, Any], Path]:
@@ -143,9 +274,9 @@ def _resolve_model(root: Path, key: str) -> tuple[dict[str, Any], Path]:
     if key not in models:
         raise KeyError(f"Unknown model profile: {key}")
     profile = dict(models[key])
-    checkpoint = model_root(root) / profile["relative_path"]
+    checkpoint = model_root(root) / str(profile["relative_path"])
     if not checkpoint.exists():
-        raise FileNotFoundError(f"Selected INT4 checkpoint is not installed: {checkpoint}")
+        raise FileNotFoundError(f"Selected checkpoint is not installed: {checkpoint}")
     return profile, checkpoint
 
 
@@ -846,23 +977,15 @@ class Qwen2511IntWidget(QWidget):
     # ------------------------------ UI construction ------------------------------
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(10, 10, 10, 10)
-        outer.setSpacing(8)
+        # Keep the embedded tool compact: the surrounding FrameVision section already
+        # identifies it, so the large title/subtitle/status header only wastes space.
+        outer.setContentsMargins(10, 2, 10, 10)
+        outer.setSpacing(6)
 
-        header = QHBoxLayout()
-        title_box = QVBoxLayout()
-        title = QLabel(APP_NAME)
-        title.setObjectName("PageTitle")
-        subtitle = QLabel("Fast multi-reference editing with the installed Nunchaku INT4 profiles")
-        subtitle.setObjectName("Subtitle")
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        header.addLayout(title_box)
-        header.addStretch(1)
-        self.install_badge = QLabel("Checking installation…")
-        self.install_badge.setObjectName("StatusBadge")
-        header.addWidget(self.install_badge)
-        outer.addLayout(header)
+        # Retain a hidden status object because update_install_status() also updates
+        # the detailed installation text used on the Settings tab.
+        self.install_badge = QLabel(self)
+        self.install_badge.hide()
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -1001,7 +1124,7 @@ class Qwen2511IntWidget(QWidget):
         lora_group = QGroupBox("Custom LoRAs")
         lora_layout = QVBoxLayout(lora_group)
         lora_note = QLabel(
-            "Optional. Use LoRAs trained for Qwen-Image/Edit in Diffusers format. The 4/8-step Lightning LoRA is already baked into these INT4 checkpoints."
+            "Optional. Use LoRAs trained for Qwen-Image/Edit in Diffusers format. The 4/8-step Lightning LoRA is already baked into these checkpoints."
         )
         lora_note.setWordWrap(True)
         lora_note.setObjectName("Hint")
@@ -1171,7 +1294,7 @@ class Qwen2511IntWidget(QWidget):
         self.install_details.setObjectName("Hint")
         self.model_combo = NoWheelComboBox()
         self.model_combo.setToolTip(
-            "Only downloaded checkpoints are selectable. Switching model profiles reloads the persistent backend."
+            "Only downloaded checkpoints are selectable. Switching model profiles reloads the persistent backend. Compatible Nunchaku checkpoints dropped into the model folder are auto-detected."
         )
         self.model_combo.currentIndexChanged.connect(self.model_changed)
         refresh_models = QPushButton("Refresh")
@@ -1233,7 +1356,7 @@ class Qwen2511IntWidget(QWidget):
         self.queue_check.setChecked(True)
         self.queue_check.setToolTip(
             "When enabled, the footer adds this edit to jobs/pending instead of running it immediately. "
-            "The Queue worker launches the same Qwen 2511 INT4 backend and settings."
+            "The Queue worker launches the same Qwen backend and settings."
         )
         self.queue_check.toggled.connect(self.queue_mode_changed)
         queue_hint = QLabel(
@@ -1333,7 +1456,10 @@ class Qwen2511IntWidget(QWidget):
 
     # ------------------------------- model/settings ------------------------------
     def installed_profiles(self) -> dict[str, dict[str, Any]]:
-        profiles = read_json(self.model_dir / "model_profiles.json", {})
+        try:
+            profiles = _load_profiles(self.root)
+        except Exception:
+            profiles = {"models": {}}
         result: dict[str, dict[str, Any]] = {}
         for key, profile in profiles.get("models", {}).items() if isinstance(profiles, dict) else []:
             checkpoint = self.model_dir / str(profile.get("relative_path", ""))
@@ -1370,7 +1496,7 @@ class Qwen2511IntWidget(QWidget):
             missing.append("shared Qwen assets")
         profiles = self.installed_profiles()
         if not profiles:
-            missing.append("INT4 checkpoint")
+            missing.append("checkpoint")
 
         if missing:
             self.install_badge.setText("Missing: " + ", ".join(missing))
@@ -1379,10 +1505,29 @@ class Qwen2511IntWidget(QWidget):
             self.install_badge.setText(f"Ready · {len(profiles)} model{'s' if len(profiles) != 1 else ''}")
             self.install_badge.setProperty("ok", True)
 
+        incompatible = []
+        try:
+            known_paths = {
+                str(item.get("relative_path", "")).replace("\\", "/").lower()
+                for item in profiles.values()
+            }
+            for checkpoint in self.model_dir.rglob("*.safetensors"):
+                rel = str(checkpoint.relative_to(self.model_dir)).replace("\\", "/")
+                name = checkpoint.name.lower()
+                if rel.lower() in known_paths or any(part.lower() in {"base", "loras"} for part in checkpoint.parts):
+                    continue
+                if any(token in name for token in ("qwen", "2511", "convrot", "nunchaku")) and not _is_nunchaku_checkpoint(checkpoint):
+                    incompatible.append(rel)
+        except Exception:
+            incompatible = []
+        extra = ""
+        if incompatible:
+            extra = "\nIgnored non-Nunchaku single-file checkpoint(s): " + ", ".join(incompatible)
         self.install_details.setText(
             f"Environment: {self.env_python}\n"
             f"Model root: {self.model_dir}\n"
             f"Installed profiles: {', '.join(profiles) if profiles else 'none'}"
+            f"{extra}"
         )
 
     def load_settings(self) -> None:
@@ -1860,7 +2005,7 @@ class Qwen2511IntWidget(QWidget):
         if not request["references"]:
             return "Add at least one reference image."
         if not request["model"]:
-            return "No installed INT4 model is selected."
+            return "No installed model is selected."
         if not self.env_python.exists():
             return f"Dedicated environment Python was not found: {self.env_python}"
         output = Path(request["output"]["folder"]).expanduser()
@@ -1906,7 +2051,7 @@ class Qwen2511IntWidget(QWidget):
             self.progress.setRange(0, 1)
             self.progress.setValue(1)
             self.progress.setFormat("Queued")
-            self.append_log(f"Added Qwen 2511 INT4 edit to FrameVision queue: {job_id}")
+            self.append_log(f"Added Qwen 2511 edit to FrameVision queue: {job_id}")
             QMessageBox.information(self, APP_NAME, "The edit was added to the FrameVision queue.")
         except Exception as exc:
             self.status_label.setText("Queue failed")
