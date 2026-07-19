@@ -1046,6 +1046,10 @@ class LTX23RunnerWidget(QWidget):
         self._prepared_start_video_source = ""
         self._prepared_end_frame_path = ""
         self._prepared_end_video_source = ""
+        # Every queued Continue/End-video job must own its extracted boundary
+        # frame. A deterministic source-video cache lets an earlier queued job
+        # delete the PNG while a later job still needs it.
+        self._video_frame_job_counter = 0
         self._fast_iclora_user_preference = True
         self._fast_iclora_auto_forced_off = False
         self._fast_iclora_base_tooltip = (
@@ -3487,13 +3491,22 @@ class LTX23RunnerWidget(QWidget):
             pass
         return "ffprobe"
 
-    def _video_frame_output_path(self, video_path: Path, boundary: str) -> Path:
+    def _next_video_frame_job_token(self) -> str:
+        """Return a unique token for one command/queue job's temp frames."""
+        self._video_frame_job_counter = int(getattr(self, "_video_frame_job_counter", 0)) + 1
+        return f"{os.getpid()}_{time.time_ns()}_{self._video_frame_job_counter}"
+
+    def _video_frame_output_path(self, video_path: Path, boundary: str, job_token: str) -> Path:
+        # Include the per-job token deliberately. Two queued jobs may use the
+        # exact same source video, but they must never share a temporary PNG:
+        # the queue correctly removes each job's temp files when that job ends.
         try:
             stat = video_path.stat()
-            key = f"{video_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{boundary}"
+            source_key = f"{video_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
         except Exception:
-            key = f"{video_path}|{boundary}|{time.time()}"
-        digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()[:12]
+            source_key = str(video_path)
+        key = f"{source_key}|{boundary}|{job_token}"
+        digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()[:16]
         safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", video_path.stem).strip("._") or "video"
         return DEFAULT_VIDEO_FRAME_DIR / f"{safe_stem}_{boundary}_{digest}.png"
 
@@ -3541,12 +3554,12 @@ class LTX23RunnerWidget(QWidget):
             pass
         return 0
 
-    def _extract_video_boundary_frame(self, video_text: str, boundary: str) -> str:
+    def _extract_video_boundary_frame(self, video_text: str, boundary: str, job_token: str) -> str:
         video_path = Path(video_text).expanduser()
         if not video_path.exists():
             raise FileNotFoundError(f"Video file not found: {video_path}")
         DEFAULT_VIDEO_FRAME_DIR.mkdir(parents=True, exist_ok=True)
-        output_path = self._video_frame_output_path(video_path, boundary)
+        output_path = self._video_frame_output_path(video_path, boundary, job_token)
         if output_path.exists() and output_path.stat().st_size > 0:
             return str(output_path)
 
@@ -3657,6 +3670,9 @@ class LTX23RunnerWidget(QWidget):
 
     def _prepare_video_input_frames(self) -> Dict[str, str]:
         resolved: Dict[str, str] = {}
+        # One token is shared by the start/end boundary frames belonging to this
+        # command, while the next queued command receives a different token.
+        job_token = self._next_video_frame_job_token()
         start_video = self.start_video_row.text().strip() if hasattr(self, "start_video_row") else ""
         end_video = self.end_video_row.text().strip() if hasattr(self, "end_video_row") else ""
 
@@ -3664,7 +3680,7 @@ class LTX23RunnerWidget(QWidget):
             # "Continue video" must continue from the final decoded frame of the
             # selected start video. Using the first frame here creates a visible
             # story/time jump when the videos are glued together.
-            frame = self._extract_video_boundary_frame(start_video, "end")
+            frame = self._extract_video_boundary_frame(start_video, "end", job_token)
             self._prepared_start_frame_path = frame
             self._prepared_start_video_source = start_video
             resolved["start"] = frame
@@ -3673,7 +3689,7 @@ class LTX23RunnerWidget(QWidget):
             # "End with video" must guide the generated clip toward the first
             # decoded frame of the selected end video. Using the end video's last
             # frame makes the glued result jump when the end video begins.
-            frame = self._extract_video_boundary_frame(end_video, "start")
+            frame = self._extract_video_boundary_frame(end_video, "start", job_token)
             self._prepared_end_frame_path = frame
             self._prepared_end_video_source = end_video
             resolved["end"] = frame

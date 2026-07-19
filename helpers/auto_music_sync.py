@@ -15400,6 +15400,36 @@ class AutoMusicSyncWidget(QWidget):
             return "1280x704"
         return "832x512"
 
+    def _planner_bridge_ltx_resolution_for_plan(self, plan_path: str = "") -> str:
+        """Use the job's saved LTX bucket when reviewing an existing plan.
+
+        Review image recreation used to omit the resolution completely, causing
+        image backends to fall back to their landscape default.  Reading the
+        saved plan also prevents an older portrait job from changing aspect when
+        the visible output selector has since been switched to landscape.
+        """
+        try:
+            path = str(plan_path or "").strip()
+            if path and os.path.isfile(path):
+                data = _musicclip_read_json_file(path)
+                if isinstance(data, dict):
+                    containers = [
+                        data.get("bridge_generation_settings"),
+                        data.get("generation_settings"),
+                        data.get("settings"),
+                        data,
+                    ]
+                    for container in containers:
+                        if not isinstance(container, dict):
+                            continue
+                        raw = str(container.get("ltx_resolution") or "").strip()
+                        match = re.search(r"(\d{3,5})\s*[xX×]\s*(\d{3,5})", raw)
+                        if match:
+                            return f"{int(match.group(1))}x{int(match.group(2))}"
+        except Exception:
+            pass
+        return self._planner_bridge_ltx_resolution()
+
 
     def _planner_bridge_generation_settings(self) -> dict:
         """Collect existing Music Clip Creator pacing settings for bridge JSON.
@@ -17741,12 +17771,15 @@ class AutoMusicSyncWidget(QWidget):
                 pass
             return
 
+        start_image_resolution = self._planner_bridge_ltx_resolution_for_plan(plan_path)
         payload = {
             "root_dir": _musicclip_project_root(),
             "ltx_backend": self._current_ltx_generation_backend(),
             "ltx_director_plan_path": plan_path,
             "shot_id": shot_id,
             "image_model": image_model,
+            "resolution": start_image_resolution,
+            "ltx_resolution": start_image_resolution,
             "character_reference": self._planner_bridge_character_reference_payload(),
         }
 
@@ -19659,6 +19692,7 @@ class AutoMusicSyncWidget(QWidget):
         if model_msg:
             self._set_planner_bridge_status(f"Planner Bridge: {model_msg}")
         self._ltx_review_release_previews()
+        review_resolution = self._planner_bridge_ltx_resolution_for_plan(plan_path)
         payload = {
             "root_dir": _musicclip_project_root(),
             "ltx_backend": self._current_ltx_generation_backend(),
@@ -19666,6 +19700,8 @@ class AutoMusicSyncWidget(QWidget):
             "shot_id": str(row.get("shot_id") or getattr(self, "_ltx_review_selected_shot_id", "") or "").strip(),
             "action": str(action or "image_and_clip"),
             "image_model": image_model,
+            "resolution": review_resolution,
+            "ltx_resolution": review_resolution,
             "character_reference": self._ltx_review_character_reference_payload(),
             "image_prompt": str(getattr(self, "edit_ltx_review_image_prompt", None).toPlainText() if getattr(self, "edit_ltx_review_image_prompt", None) is not None else row.get("image_prompt") or "").strip(),
             "image_seed": self._ltx_review_parse_seed(getattr(self, "edit_ltx_review_image_seed", None).text() if getattr(self, "edit_ltx_review_image_seed", None) is not None else row.get("image_seed", "")),
@@ -19799,6 +19835,9 @@ class AutoMusicSyncWidget(QWidget):
             image_seed = payload.get("image_seed")
             clip_seed = payload.get("clip_seed")
             image_model = str(payload.get("image_model") or "z_image").strip() or "z_image"
+            review_resolution = str(payload.get("resolution") or payload.get("ltx_resolution") or "").strip()
+            if not review_resolution:
+                review_resolution = self._planner_bridge_ltx_resolution_for_plan(plan_path)
             character_reference = payload.get("character_reference") if isinstance(payload.get("character_reference"), dict) else {}
             start_path = str(item_state.get("current_start_image_path") or payload.get("current_start_image_path") or "").strip()
             if image_prompt:
@@ -19827,6 +19866,8 @@ class AutoMusicSyncWidget(QWidget):
                     "image_model": image_model,
                     "image_prompt_override": image_prompt,
                     "seed": image_seed,
+                    "resolution": review_resolution,
+                    "ltx_resolution": review_resolution,
                     "output_dir": review_dir,
                     "start_image_name": f"{stem}_review_start.png",
                     "start_image_payload_name": f"{stem}_review_start_image_payload.json",
@@ -19897,7 +19938,8 @@ class AutoMusicSyncWidget(QWidget):
                     "clip_prompt_override": clip_prompt,
                     "video_prompt_override": clip_prompt,
                     "steps": 8,
-                    "resolution": self._planner_bridge_ltx_resolution(),
+                    "resolution": review_resolution,
+                    "ltx_resolution": review_resolution,
                     "allow_no_audio": False,
                     "character_reference": character_reference,
                     "output_dir": review_dir,
