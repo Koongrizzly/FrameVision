@@ -9112,6 +9112,271 @@ def _hidream_cli_path(root: Path) -> str:
     return ""
 
 
+
+_QWEN2511_INT4_MUSIC_QUALITY_ORDER = (
+    "best-low-step",
+    "fidelity",
+    "recommended",
+    "fastest",
+)
+
+
+def _qwen2511_int4_install(root: Path) -> Dict[str, Any]:
+    model_root = (root / "models" / "qwen2511_int").resolve()
+    env_python = (root / "environments" / ".qwen2511_int" / "Scripts" / "python.exe").resolve()
+    helper = (root / "helpers" / "qwen2511_int.py").resolve()
+    profiles_path = (model_root / "model_profiles.json").resolve()
+    base = (model_root / "base" / "Qwen-Image-Edit-2511").resolve()
+
+    required = (
+        base / "model_index.json",
+        base / "vae" / "config.json",
+        base / "text_encoder" / "config.json",
+        base / "tokenizer" / "tokenizer_config.json",
+        base / "processor" / "preprocessor_config.json",
+    )
+    if not env_python.is_file() or not helper.is_file() or not profiles_path.is_file():
+        return {}
+    if not all(path.is_file() and path.stat().st_size > 0 for path in required):
+        return {}
+
+    try:
+        payload = _read_json_file(str(profiles_path))
+        models = payload.get("models") if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+    if not isinstance(models, dict):
+        return {}
+
+    for key in _QWEN2511_INT4_MUSIC_QUALITY_ORDER:
+        profile = models.get(key)
+        if not isinstance(profile, dict):
+            continue
+        rel = _safe_str(profile.get("relative_path"))
+        filename = _safe_str(profile.get("filename"))
+        checkpoint = model_root / (rel or ("int4/" + filename))
+        if checkpoint.is_file() and checkpoint.stat().st_size > 1024 * 1024:
+            return {
+                "env_python": str(env_python),
+                "helper": str(helper),
+                "model_root": str(model_root),
+                "profile_key": key,
+                "profile_label": _safe_str(profile.get("label"), key),
+                "steps": _safe_int(profile.get("steps"), 4),
+                "checkpoint": str(checkpoint),
+            }
+    return {}
+
+
+class _Qwen2511Int4BatchSession:
+    def __init__(self, root: Path, progress_callback: Optional[Callable[[str], None]] = None) -> None:
+        self.root = Path(root).resolve()
+        self.progress_callback = progress_callback
+        self.proc: Optional[subprocess.Popen] = None
+        self.install = _qwen2511_int4_install(self.root)
+
+    def _emit(self, message: str) -> None:
+        if callable(self.progress_callback):
+            try:
+                self.progress_callback(str(message or ""))
+            except Exception:
+                pass
+
+    def start(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            return
+        if not self.install:
+            raise RuntimeError("Qwen2511 INT4 is selected, but no usable INT4 installation was found.")
+        env = os.environ.copy()
+        env.update({
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONUTF8": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "FRAMEVISION_ROOT": str(self.root),
+        })
+        self.proc = subprocess.Popen(
+            [
+                self.install["env_python"],
+                "-u",
+                self.install["helper"],
+                "--server",
+                "--root",
+                str(self.root),
+            ],
+            cwd=str(self.root),
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        while True:
+            line = self.proc.stdout.readline() if self.proc.stdout is not None else ""
+            if line == "":
+                raise RuntimeError(
+                    f"Qwen2511 INT4 backend stopped during startup (exit code {self.proc.poll()})."
+                )
+            line = line.rstrip("\r\n")
+            if line.startswith("FVQWEN_EVENT "):
+                event = json.loads(line[len("FVQWEN_EVENT "):])
+                if _safe_str(event.get("event")) == "ready":
+                    return
+            elif line:
+                self._emit(line)
+
+    def generate(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        self.start()
+        if self.proc is None or self.proc.stdin is None or self.proc.stdout is None:
+            raise RuntimeError("Qwen2511 INT4 backend is unavailable.")
+
+        refs = _existing_unique_reference_paths(job.get("reference_paths"), limit=5)
+        if not refs:
+            raise RuntimeError("Qwen2511 INT4 reference edit requires at least one valid reference image.")
+
+        output_path = Path(_safe_str(job.get("start_image_path"))).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        request = {
+            "command": "generate",
+            "prompt": _safe_str(job.get("prompt")),
+            "negative_prompt": _safe_str(job.get("negative_prompt")),
+            "references": refs,
+            "loras": [],
+            "model": self.install["profile_key"],
+            "width": _safe_int(job.get("width"), 1600),
+            "height": _safe_int(job.get("height"), 896),
+            "seed": _safe_int(job.get("seed"), -1),
+            "count": 1,
+            "true_cfg_scale": 1.0,
+            "steps": _safe_int(self.install.get("steps"), 4),
+            "max_sequence_length": 512,
+            "offload": "auto",
+            "blocks_on_gpu": 1,
+            "pin_memory": False,
+            "cleanup_between": False,
+            "output": {
+                "folder": str(output_path.parent),
+                "format": "png",
+                "jpeg_quality": 95,
+                "auto_name": False,
+                "manual_name": output_path.stem,
+            },
+        }
+        self.proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+
+        result = None
+        while True:
+            line = self.proc.stdout.readline()
+            if line == "":
+                raise RuntimeError(
+                    f"Qwen2511 INT4 backend stopped before returning an image (exit code {self.proc.poll()})."
+                )
+            line = line.rstrip("\r\n")
+            if not line.startswith("FVQWEN_EVENT "):
+                if line:
+                    self._emit(line)
+                continue
+            event = json.loads(line[len("FVQWEN_EVENT "):])
+            event_name = _safe_str(event.get("event"))
+            if event_name == "status":
+                self._emit(_safe_str(event.get("message")))
+            elif event_name == "model_loaded":
+                self._emit(
+                    f"Loaded {_safe_str(event.get('model_label'), self.install['profile_label'])} "
+                    f"· offload={_safe_str(event.get('offload'), 'auto')}"
+                )
+            elif event_name == "error":
+                raise RuntimeError(_safe_str(event.get("message"), "Qwen2511 INT4 generation failed."))
+            elif event_name == "result":
+                result = event
+                break
+
+        outputs = [Path(_safe_str(x)).resolve() for x in _as_list((result or {}).get("outputs")) if _safe_str(x)]
+        if not outputs or not outputs[0].is_file():
+            raise RuntimeError("Qwen2511 INT4 returned no output image.")
+        generated = outputs[0]
+        if generated != output_path:
+            if output_path.exists():
+                output_path.unlink()
+            try:
+                shutil.move(str(generated), str(output_path))
+            except Exception:
+                shutil.copy2(str(generated), str(output_path))
+                try:
+                    generated.unlink()
+                except Exception:
+                    pass
+        return {
+            "ok": True,
+            "shot_id": _safe_str(job.get("shot_id")),
+            "output_image": str(output_path),
+            "profile_key": self.install["profile_key"],
+            "profile_label": self.install["profile_label"],
+            "reference_paths_passed": refs,
+        }
+
+    def close(self) -> None:
+        proc = self.proc
+        self.proc = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None and proc.stdin is not None:
+                proc.stdin.write(json.dumps({"command": "quit"}) + "\n")
+                proc.stdin.flush()
+                try:
+                    proc.wait(timeout=20)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            pass
+
+
+def _run_qwen2511_int4_batch_start_images(
+    root: Path,
+    *,
+    jobs: List[Dict[str, Any]],
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    session = _Qwen2511Int4BatchSession(root, progress_callback=progress_callback)
+    results: List[Dict[str, Any]] = []
+    try:
+        for index, job in enumerate(jobs, start=1):
+            if callable(progress_callback):
+                progress_callback(
+                    f"Qwen2511 INT4 image {index}/{len(jobs)}: {_safe_str(job.get('shot_id'))}"
+                )
+            try:
+                results.append(session.generate(job))
+            except Exception as exc:
+                results.append({
+                    "ok": False,
+                    "shot_id": _safe_str(job.get("shot_id")),
+                    "error": str(exc),
+                })
+    finally:
+        session.close()
+    ok_count = sum(1 for item in results if _safe_bool(item.get("ok"), False))
+    return {
+        "ok": ok_count == len(results),
+        "jobs": results,
+        "message": f"Qwen2511 INT4 batch finished: {ok_count}/{len(results)} image(s).",
+    }
+
+
 def _hidream_batch_cli_path(root: Path) -> str:
     root = Path(root).resolve()
     candidates = [
@@ -9619,14 +9884,14 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
             brief,
             character_reference,
             image_prompt_keys=["director_image_prompt"],
-            passed_to_model=(image_model == "hidream"),
+            passed_to_model=(image_model in {"hidream", "qwen2511_int4"}),
         )
         character_reference = dict(shot.get("character_reference") or character_reference)
         shot_id = _safe_str(shot.get("id")) or shot_id
         _emit(f"Selected {shot_id}")
 
         if image_model in {"existing", "use existing start image", "existing_start_image"}:
-            return {"ok": False, "message": "Use existing start image does not need generation. Pick Flux Klein 9B, Z-Image Turbo, or HiDream."}
+            return {"ok": False, "message": "Use existing start image does not need generation. Pick Flux Klein 9B, Z-Image Turbo, HiDream, or Qwen 2511 INT4."}
 
         out_dir_raw = _safe_str(payload.get("output_dir"))
         if out_dir_raw:
@@ -9669,6 +9934,8 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
             # the Music Clip Creator landscape/portrait choice. Reference/edit
             # shots are lowered after reference routing below.
             default_resolution = "1088x1920" if requested_portrait else "1920x1088"
+        elif image_model == "qwen2511_int4":
+            default_resolution = "896x1600" if requested_portrait else "1600x896"
         width, height, resolution = _parse_resolution_value(resolution_source, default_resolution)
         seed_raw = payload.get("seed", None)
         if seed_raw in (None, ""):
@@ -9687,27 +9954,34 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
         collapsed_to_single_ref_warning = bool(loaded_reference_count > 1 and wanted_reference_count > 1 and len(selected_reference_paths) == 1)
         shot_subject_mode = _safe_str(shot.get("shot_subject_mode"), "environment_only") or "environment_only"
         image_model_forced_to_hidream_for_reference = False
-        if selected_reference_paths and image_model == "hidream":
-            # HiDream reference/edit workflow test size: keep plain HiDream
-            # generation at its existing default, but use 1376x768 whenever
-            # direct reference images are actually selected for the shot.
-            width, height, resolution = _parse_resolution_value(hidream_reference_edit_resolution, hidream_reference_edit_resolution)
+        direct_reference_models = {"hidream", "qwen2511_int4"}
+        if selected_reference_paths and image_model in direct_reference_models:
+            width, height, resolution = _parse_resolution_value(
+                hidream_reference_edit_resolution,
+                hidream_reference_edit_resolution,
+            )
             shot["image_model_reference_resolution_override"] = hidream_reference_edit_resolution
-            shot["reference_routing_reason"] = _join_parts([shot.get("reference_routing_reason"), f"HiDream reference/edit resolution override: {hidream_reference_edit_resolution}"])
-        if selected_reference_paths and image_model != "hidream":
-            # At this point references have already been selected by the prompt
-            # director / character-reference router.  Do not let a text-only image
-            # model generate random people when direct reference paths exist.
+            model_label = "Qwen2511 INT4" if image_model == "qwen2511_int4" else "HiDream"
+            shot["reference_routing_reason"] = _join_parts([
+                shot.get("reference_routing_reason"),
+                f"{model_label} reference/edit resolution override: {hidream_reference_edit_resolution}",
+            ])
+        if selected_reference_paths and image_model not in direct_reference_models:
             image_model_forced_to_hidream_for_reference = True
             image_model = "hidream"
-            # Match the HiDream reference/edit workflow size when refs force a
-            # text-only selection over to HiDream. Plain HiDream generation still
-            # keeps its existing default above.
-            width, height, resolution = _parse_resolution_value(hidream_reference_edit_resolution, hidream_reference_edit_resolution)
+            width, height, resolution = _parse_resolution_value(
+                hidream_reference_edit_resolution,
+                hidream_reference_edit_resolution,
+            )
             shot["image_model_reference_resolution_override"] = hidream_reference_edit_resolution
             shot["image_model_reference_mode"] = "direct_reference_image"
-            shot["reference_routing_reason"] = _join_parts([shot.get("reference_routing_reason"), "start-image model forced to HiDream because selected reference paths are loaded"])
-        reference_paths_to_pass = selected_reference_paths if image_model == "hidream" else []
+            shot["reference_routing_reason"] = _join_parts([
+                shot.get("reference_routing_reason"),
+                "start-image model forced to HiDream because selected reference paths are loaded",
+            ])
+        reference_paths_to_pass = (
+            selected_reference_paths if image_model in direct_reference_models else []
+        )
         character_reference_passed = False
         image_model_reference_mode = "direct_reference_image_pending" if reference_paths_to_pass else ("environment_only" if shot_subject_mode == "environment_only" else (_safe_str(shot.get("image_model_reference_mode")) or "text_only"))
 
@@ -9758,7 +10032,7 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
                 "reference_handoff_supported": bool(reference_paths_to_pass),
                 "reference_handoff_reason": "prepare_only_pending_generation",
             },
-            "skipped_reference_reason": _safe_str("selected_reference_paths_not_added_to_hidream_command" if selected_reference_paths and image_model == "hidream" else "image_model_has_no_direct_reference_input" if selected_reference_paths and image_model != "hidream" else shot.get("skipped_reference_reason") or ""),
+            "skipped_reference_reason": _safe_str("selected_reference_paths_not_added_to_image_command" if selected_reference_paths and image_model in {"hidream", "qwen2511_int4"} else "image_model_has_no_direct_reference_input" if selected_reference_paths and image_model not in {"hidream", "qwen2511_int4"} else shot.get("skipped_reference_reason") or ""),
             "environment_prompt_omitted_subjects": bool(shot.get("environment_prompt_omitted_subjects")),
             "character_reference": {
                 "enabled": bool(_safe_bool(character_reference.get("enabled"), False)),
@@ -9806,7 +10080,13 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
                 "resolution": resolution,
                 "width": width,
                 "height": height,
-                "steps": _safe_int(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("steps"), 28) if image_model == "hidream" else 0,
+                "steps": (
+                    _safe_int(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("steps"), 28)
+                    if image_model == "hidream"
+                    else _safe_int((_qwen2511_int4_install(root) or {}).get("steps"), 4)
+                    if image_model == "qwen2511_int4"
+                    else 0
+                ),
                 "guidance_scale": _safe_float(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("guidance_scale"), 0.0) if image_model == "hidream" else 0.0,
                 "shift": _safe_float(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("shift"), 1.0) if image_model == "hidream" else 1.0,
                 "scheduler_name": _safe_str(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("scheduler_name"), "flash") if image_model == "hidream" else "",
@@ -9869,10 +10149,43 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
             model_files = result.get("model_files") if isinstance(result.get("model_files"), dict) else {}
             actual_image_model_reference_paths_passed = _existing_unique_reference_paths(result.get("actual_image_model_reference_paths_passed") or ((result.get("reference_handoff") or {}).get("reference_paths_passed") if isinstance(result.get("reference_handoff"), dict) else []), limit=5)
             reference_handoff = result.get("reference_handoff") if isinstance(result.get("reference_handoff"), dict) else {}
+        elif image_model == "qwen2511_int4":
+            session = _Qwen2511Int4BatchSession(root, progress_callback=progress_callback)
+            try:
+                qresult = session.generate({
+                    "shot_id": shot_id,
+                    "prompt": prompt,
+                    "negative_prompt": negative,
+                    "reference_paths": reference_paths_to_pass,
+                    "start_image_path": str(start_path),
+                    "width": width,
+                    "height": height,
+                    "seed": seed,
+                })
+            finally:
+                session.close()
+            result = qresult
+            command_summary = {
+                "type": "qwen2511_int4_server",
+                "profile_key": qresult.get("profile_key"),
+                "profile_label": qresult.get("profile_label"),
+            }
+            model_files = (_qwen2511_int4_install(root) or {})
+            actual_image_model_reference_paths_passed = _existing_unique_reference_paths(
+                qresult.get("reference_paths_passed"), limit=5
+            )
+            reference_handoff = {
+                "reference_paths_requested": list(reference_paths_to_pass),
+                "reference_paths_passed": list(actual_image_model_reference_paths_passed),
+                "reference_arg_name": "references",
+                "reference_arg_source": "qwen2511_int4_server",
+                "reference_handoff_supported": True,
+                "reference_handoff_reason": "direct_reference_paths_passed_to_qwen2511_int4",
+            }
         else:
             return {"ok": False, "message": f"Unknown start-image model: {image_model}"}
 
-        character_reference_passed = bool(image_model == "hidream" and actual_image_model_reference_paths_passed)
+        character_reference_passed = bool(image_model in {"hidream", "qwen2511_int4"} and actual_image_model_reference_paths_passed)
         image_model_reference_mode = "direct_reference_image" if character_reference_passed else ("environment_only" if not selected_reference_paths and shot_subject_mode == "environment_only" else "text_only_reference_not_passed")
         shot["available_reference_sheet_paths"] = available_reference_sheet_paths
         shot["loaded_reference_count"] = loaded_reference_count
@@ -9942,7 +10255,7 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
             "image_model_reference_mode": image_model_reference_mode,
             "actual_image_model_reference_paths_passed": actual_image_model_reference_paths_passed,
             "reference_handoff": reference_handoff,
-            "skipped_reference_reason": "" if character_reference_passed else _safe_str("selected_reference_paths_not_added_to_hidream_command" if selected_reference_paths and image_model == "hidream" else "image_model_has_no_direct_reference_input" if selected_reference_paths and image_model != "hidream" else shot.get("skipped_reference_reason") or ""),
+            "skipped_reference_reason": "" if character_reference_passed else _safe_str("selected_reference_paths_not_added_to_image_command" if selected_reference_paths and image_model in {"hidream", "qwen2511_int4"} else "image_model_has_no_direct_reference_input" if selected_reference_paths and image_model not in {"hidream", "qwen2511_int4"} else shot.get("skipped_reference_reason") or ""),
             "environment_prompt_omitted_subjects": bool(shot.get("environment_prompt_omitted_subjects")),
             "character_reference": {
                 "enabled": bool(_safe_bool(character_reference.get("enabled"), False)),
@@ -11741,6 +12054,7 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
         image_phase_skipped_for_ready_clip = 0
         report["execution_order"] = "all_start_images_then_all_ltx_videos"
         hidream_batch_prepared_jobs: List[Dict[str, Any]] = []
+        qwen2511_int4_batch_prepared_jobs: List[Dict[str, Any]] = []
         report["image_phase"] = {
             "status": "running",
             "generated_count": 0,
@@ -11830,6 +12144,9 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
                 if prepared_model == "hidream":
                     hidream_batch_prepared_jobs.append(prepared)
                     _emit(f"Phase 1/2 image {image_idx}/{len(shots)}: queued {image_sid} for warm HiDream batch")
+                elif prepared_model == "qwen2511_int4":
+                    qwen2511_int4_batch_prepared_jobs.append(prepared)
+                    _emit(f"Phase 1/2 image {image_idx}/{len(shots)}: queued {image_sid} for warm Qwen2511 INT4 batch")
                 else:
                     image_result = generate_ltx_start_image_for_shot(image_payload)
                     if not isinstance(image_result, dict) or not bool(image_result.get("ok")):
@@ -11852,6 +12169,64 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
                 "failures": dict(image_phase_failures),
             })
             _save_report()
+
+        if qwen2511_int4_batch_prepared_jobs and not _safe_bool(report.get("cancelled"), False):
+            try:
+                _emit(
+                    f"Phase 1/2 - running warm Qwen2511 INT4 batch for "
+                    f"{len(qwen2511_int4_batch_prepared_jobs)} queued image(s)"
+                )
+                batch_results = _run_qwen2511_int4_batch_start_images(
+                    root,
+                    jobs=qwen2511_int4_batch_prepared_jobs,
+                    progress_callback=lambda msg: _emit(f"Qwen2511 INT4 batch: {msg}"),
+                )
+                result_map = {}
+                if isinstance(batch_results.get("jobs"), list):
+                    for item in batch_results.get("jobs") or []:
+                        if isinstance(item, dict):
+                            result_map[_safe_str(item.get("shot_id"))] = item
+                for prepared in qwen2511_int4_batch_prepared_jobs:
+                    sid = _safe_str(prepared.get("shot_id"))
+                    res = result_map.get(sid) or {}
+                    final_image_path = _safe_str(
+                        res.get("output_image") or prepared.get("start_image_path")
+                    )
+                    if bool(res.get("ok")) and final_image_path and os.path.isfile(final_image_path):
+                        prepared_start_images[sid] = final_image_path
+                        image_phase_generated += 1
+                    else:
+                        image_phase_failures[sid] = _safe_str(
+                            res.get("error")
+                            or batch_results.get("message")
+                            or "Qwen2511 INT4 batch generation failed."
+                        )
+                        _emit(f"Start image failed for {sid}: {image_phase_failures[sid]}")
+                    report["image_phase"].update({
+                        "generated_count": image_phase_generated,
+                        "reused_count": image_phase_reused,
+                        "skipped_for_ready_clip_count": image_phase_skipped_for_ready_clip,
+                        "failed_count": len(image_phase_failures),
+                        "prepared_start_images": dict(prepared_start_images),
+                        "failures": dict(image_phase_failures),
+                    })
+                    _save_report()
+            except Exception as batch_exc:
+                batch_msg = str(batch_exc)
+                for prepared in qwen2511_int4_batch_prepared_jobs:
+                    sid = _safe_str(prepared.get("shot_id"))
+                    if sid not in prepared_start_images and sid not in image_phase_failures:
+                        image_phase_failures[sid] = batch_msg
+                _emit(f"Qwen2511 INT4 warm batch failed: {batch_msg}")
+                report["image_phase"].update({
+                    "generated_count": image_phase_generated,
+                    "reused_count": image_phase_reused,
+                    "skipped_for_ready_clip_count": image_phase_skipped_for_ready_clip,
+                    "failed_count": len(image_phase_failures),
+                    "prepared_start_images": dict(prepared_start_images),
+                    "failures": dict(image_phase_failures),
+                })
+                _save_report()
 
         if hidream_batch_prepared_jobs and not _safe_bool(report.get("cancelled"), False):
             try:

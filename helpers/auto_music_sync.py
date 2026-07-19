@@ -12029,8 +12029,7 @@ class AutoMusicSyncWidget(QWidget):
             self.combo_bridge_character_source.addItem("Reference images", "reference_images")
             self.combo_bridge_character_source.setToolTip(
                 "Built-in character bible uses the typed character/subject description with the selected image model. "
-                "Reference images switches to a dedicated reference-image workflow and shows the reference sheet section. "
-                "When available, you can choose HiDream or Qwen2511 INT4 for that workflow."
+                "Reference images switches to the HiDream reference/edit workflow and shows the reference sheet section."
             )
             bridge_form.addRow("Character source:", self.combo_bridge_character_source)
             self.label_bridge_character_source_note = QLabel(
@@ -12047,16 +12046,10 @@ class AutoMusicSyncWidget(QWidget):
             self.combo_ltx_single_image_mode.addItem("Krea 2", "krea2")
             self.combo_ltx_single_image_mode.addItem("Flux Klein 9B", "flux_klein_9b")
             self.combo_ltx_single_image_mode.addItem("HiDream", "hidream")
-            try:
-                _ok_qwen, _label_qwen, _key_qwen = self._find_qwen2511_int4_reference_model_for_ltx()
-            except Exception:
-                _ok_qwen, _label_qwen, _key_qwen = False, "", ""
-            if _ok_qwen:
-                self.combo_ltx_single_image_mode.addItem("Qwen 2511 INT4", "qwen2511_int4")
             self.combo_ltx_single_image_mode.setCurrentIndex(1)
             self.combo_ltx_single_image_mode.setToolTip(
                 "Choose whether to use a ready-made start image or generate one with an image model. "
-                "When Reference images is selected, only HiDream and installed Qwen2511 INT4 are available."
+                "When Reference images is selected, this is locked to HiDream."
             )
             bridge_form.addRow("Start image mode:", self.combo_ltx_single_image_mode)
 
@@ -15333,23 +15326,6 @@ class AutoMusicSyncWidget(QWidget):
         if any_valid and not ref_mode:
             warnings.append("Reference image paths are saved, but Built-in character bible mode is active, so the reference-image workflow is not used.")
 
-        selected_ref_image_model = "hidream"
-        qwen_profile_key = ""
-        qwen_profile_label = ""
-        try:
-            if active:
-                selected_ref_image_model = self._current_ltx_reference_image_model()
-                if selected_ref_image_model == "qwen2511_int4":
-                    ok, label, key = self._find_qwen2511_int4_reference_model_for_ltx()
-                    if ok:
-                        qwen_profile_key = str(key or "")
-                        qwen_profile_label = str(label or "")
-                    else:
-                        selected_ref_image_model = "hidream"
-                        warnings.append("Qwen2511 INT4 was selected for reference images, but no installed INT4 model was detected. Falling back to HiDream.")
-        except Exception:
-            selected_ref_image_model = "hidream"
-
         return {
             "enabled": active,
             "reference_mode": bool(ref_mode),
@@ -15364,13 +15340,6 @@ class AutoMusicSyncWidget(QWidget):
             "source": "user_loaded_image" if active else "none",
             "max_character_reference_slots": 5,
             "character_reference_sheets": sheets if active else {},
-            "reference_image_model": selected_ref_image_model if active else "",
-            "reference_image_model_label": (
-                "Qwen 2511 INT4" if active and selected_ref_image_model == "qwen2511_int4" else ("HiDream" if active else "")
-            ),
-            "qwen2511_int4_preferred_profile_key": qwen_profile_key if active else "",
-            "qwen2511_int4_preferred_profile_label": qwen_profile_label if active else "",
-            "qwen2511_int4_profile_order": list(self._qwen2511_int4_quality_order_for_ltx()) if active else [],
             "warnings": warnings,
         }
 
@@ -16415,94 +16384,6 @@ class AutoMusicSyncWidget(QWidget):
         worker.start()
 
 
-
-    def _qwen2511_int4_quality_order_for_ltx(self) -> tuple[str, ...]:
-        """Music Clip Creator preference order for Qwen2511 INT4 reference images.
-
-        For this tool we prefer the 4-step quality-r128-b15 model first, then
-        the 8-step fidelity model, then the remaining 4-step variants.
-        """
-        return ("best-low-step", "fidelity", "recommended", "fastest")
-
-    def _find_qwen2511_int4_reference_model_for_ltx(self) -> tuple[bool, str, str]:
-        """Return availability, model label and model key for Qwen2511 INT4."""
-        try:
-            root = Path(_musicclip_project_root()).resolve()
-            env_python = root / "environments" / ".qwen2511_int" / "Scripts" / "python.exe"
-            helper = root / "helpers" / "qwen2511_int.py"
-            model_root = root / "models" / "qwen2511_int"
-            profiles_path = model_root / "model_profiles.json"
-            base = model_root / "base" / "Qwen-Image-Edit-2511"
-            required = (
-                base / "model_index.json",
-                base / "vae" / "config.json",
-                base / "text_encoder" / "config.json",
-                base / "tokenizer" / "tokenizer_config.json",
-                base / "processor" / "preprocessor_config.json",
-            )
-            if not env_python.is_file() or not helper.is_file() or not profiles_path.is_file():
-                return False, "", ""
-            if not all(p.is_file() and p.stat().st_size > 0 for p in required):
-                return False, "", ""
-
-            payload = json.loads(profiles_path.read_text(encoding="utf-8"))
-            models = payload.get("models") if isinstance(payload, dict) else {}
-            if not isinstance(models, dict):
-                return False, "", ""
-
-            for key in self._qwen2511_int4_quality_order_for_ltx():
-                prof = models.get(key)
-                if not isinstance(prof, dict):
-                    continue
-                rel = str(prof.get("relative_path") or "").strip()
-                filename = str(prof.get("filename") or "").strip()
-                checkpoint = model_root / (rel or ("int4/" + filename))
-                try:
-                    if checkpoint.is_file() and checkpoint.stat().st_size > 1024 * 1024:
-                        label = str(prof.get("label") or key)
-                        return True, label, key
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        return False, "", ""
-
-    def _ltx_reference_image_model_choices(self) -> tuple[list[str], str]:
-        """Return allowed image models for reference-image mode and a preferred default."""
-        allowed = ["hidream"]
-        preferred = "hidream"
-        try:
-            ok, _label, _key = self._find_qwen2511_int4_reference_model_for_ltx()
-            if ok:
-                allowed.append("qwen2511_int4")
-                preferred = "hidream"
-        except Exception:
-            pass
-        return allowed, preferred
-
-    def _set_combo_item_enabled_by_data(self, combo: QComboBox, data_value: str, enabled: bool) -> None:
-        try:
-            model = combo.model()
-            if model is None:
-                return
-            for idx in range(combo.count()):
-                if str(combo.itemData(idx) or "") == str(data_value or ""):
-                    item = model.item(idx)
-                    if item is not None and hasattr(item, "setEnabled"):
-                        item.setEnabled(bool(enabled))
-                    break
-        except Exception:
-            pass
-
-    def _current_ltx_reference_image_model(self) -> str:
-        """Return the active start-image model for reference-image mode."""
-        combo = getattr(self, "combo_ltx_single_image_mode", None)
-        mode = str(combo.currentData() if combo is not None else "hidream").strip() or "hidream"
-        allowed, preferred = self._ltx_reference_image_model_choices()
-        if mode in allowed:
-            return mode
-        return preferred or "hidream"
-
     def _find_hidream_reference_dev_model_for_ltx(self) -> tuple[bool, str]:
         """Return whether a usable HiDream Dev model exists for reference-image LTX paths.
 
@@ -16728,35 +16609,19 @@ class AutoMusicSyncWidget(QWidget):
                 return False
             refs = self._planner_bridge_character_reference_payload() if hasattr(self, "_planner_bridge_character_reference_payload") else {}
             if isinstance(refs, dict) and refs.get("enabled"):
-                ref_model = str(refs.get("reference_image_model") or "hidream").strip().lower()
-                if ref_model == "qwen2511_int4":
-                    ok, label, key = self._find_qwen2511_int4_reference_model_for_ltx()
-                    if not ok:
-                        msg = "Reference images are loaded and Qwen2511 INT4 is selected, but no usable Qwen2511 INT4 installation was found. Verify helpers/qwen2511_int.py, environments/.qwen2511_int, and models/qwen2511_int are installed."
-                        self._set_planner_bridge_status(f"Planner Bridge: {msg}")
-                        try:
-                            QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
-                        except Exception:
-                            pass
-                        return False
+                ok, label = self._find_hidream_reference_dev_model_for_ltx()
+                if not ok:
+                    msg = "Reference images are loaded, but no usable HiDream Dev BF16 / Dev FP8 model folder was found. The check now accepts renamed/newer Dev folders too; verify the HiDream Dev model is under the FrameVision models folder."
+                    self._set_planner_bridge_status(f"Planner Bridge: {msg}")
                     try:
-                        self._set_planner_bridge_status(f"Planner Bridge: Reference images active — Qwen2511 INT4 detected ({label}).")
+                        QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
                     except Exception:
                         pass
-                else:
-                    ok, label = self._find_hidream_reference_dev_model_for_ltx()
-                    if not ok:
-                        msg = "Reference images are loaded, but no usable HiDream Dev BF16 / Dev FP8 model folder was found. The check now accepts renamed/newer Dev folders too; verify the HiDream Dev model is under the FrameVision models folder."
-                        self._set_planner_bridge_status(f"Planner Bridge: {msg}")
-                        try:
-                            QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
-                        except Exception:
-                            pass
-                        return False
-                    try:
-                        self._set_planner_bridge_status(f"Planner Bridge: Reference images active — {label} detected.")
-                    except Exception:
-                        pass
+                    return False
+                try:
+                    self._set_planner_bridge_status(f"Planner Bridge: Reference images active — {label} detected.")
+                except Exception:
+                    pass
             return True
         except Exception as exc:
             self._set_planner_bridge_status(f"Planner Bridge: LTX validation failed: {exc}")
@@ -17505,47 +17370,28 @@ class AutoMusicSyncWidget(QWidget):
                     else "Example: a woman with wavy long black hair and a funny green alien"
                 )
             note = getattr(self, "label_bridge_character_source_note", None)
-            image_combo = getattr(self, "combo_ltx_single_image_mode", None)
-            selected_ref_model = "hidream"
-            if ref_mode and image_combo is not None:
-                try:
-                    selected_ref_model = self._current_ltx_reference_image_model()
-                except Exception:
-                    selected_ref_model = "hidream"
             if note is not None:
                 try:
-                    if ref_mode:
-                        if selected_ref_model == "qwen2511_int4":
-                            note.setText("Reference image mode — Qwen2511 INT4 reference/edit workflow is used.")
-                        else:
-                            note.setText("Reference image mode — HiDream reference/edit workflow is used.")
-                    else:
-                        note.setText("Built-in character bible mode — reference image section auto-hidden.")
+                    note.setText(
+                        "Reference image mode — HiDream reference/edit workflow is used."
+                        if ref_mode
+                        else "Built-in character bible mode — reference image section auto-hidden."
+                    )
                 except Exception:
                     pass
+            image_combo = getattr(self, "combo_ltx_single_image_mode", None)
             if image_combo is not None:
                 if ref_mode:
-                    allowed, preferred = self._ltx_reference_image_model_choices()
                     image_combo.blockSignals(True)
-                    try:
-                        for _mode in ("existing", "z_image", "krea2", "flux_klein_9b", "hidream", "qwen2511_int4"):
-                            self._set_combo_item_enabled_by_data(image_combo, _mode, _mode in allowed)
-                        current_mode = str(image_combo.currentData() or "").strip()
-                        if current_mode not in allowed:
-                            self._ltx_combo_set_data(image_combo, preferred)
-                    finally:
-                        image_combo.blockSignals(False)
-                    image_combo.setEnabled(True)
-                    image_combo.setToolTip(
-                        "Reference images are active, so only HiDream and installed Qwen2511 INT4 are available for start-image creation."
-                    )
+                    self._ltx_combo_set_data(image_combo, "hidream")
+                    image_combo.blockSignals(False)
+                    image_combo.setEnabled(False)
+                    image_combo.setToolTip("Reference images are active, so the start-image workflow is locked to HiDream reference/edit mode.")
                 else:
-                    for _mode in ("existing", "z_image", "krea2", "flux_klein_9b", "hidream", "qwen2511_int4"):
-                        self._set_combo_item_enabled_by_data(image_combo, _mode, True)
                     image_combo.setEnabled(True)
                     image_combo.setToolTip(
                         "Choose whether to use a ready-made start image or generate one with an image model. "
-                        "When Reference images is selected, only HiDream and installed Qwen2511 INT4 remain available."
+                        "When Reference images is selected, this is locked to HiDream."
                     )
             self._update_ltx_single_image_mode_ui()
         except Exception:
@@ -17576,13 +17422,10 @@ class AutoMusicSyncWidget(QWidget):
             source_combo = getattr(self, "combo_bridge_character_source", None)
             if source_combo is not None and str(source_combo.currentData() or "") == "reference_images":
                 combo = getattr(self, "combo_ltx_single_image_mode", None)
-                if combo is not None:
-                    allowed, preferred = self._ltx_reference_image_model_choices()
-                    current_mode = str(combo.currentData() or "").strip()
-                    if current_mode not in allowed:
-                        combo.blockSignals(True)
-                        self._ltx_combo_set_data(combo, preferred)
-                        combo.blockSignals(False)
+                if combo is not None and str(combo.currentData() or "") != "hidream":
+                    combo.blockSignals(True)
+                    self._ltx_combo_set_data(combo, "hidream")
+                    combo.blockSignals(False)
             combo = getattr(self, "combo_ltx_single_image_mode", None)
             mode = combo.currentData() if combo is not None else "existing"
             visible = str(mode or "existing") == "existing"
@@ -17920,7 +17763,7 @@ class AutoMusicSyncWidget(QWidget):
         image_combo = getattr(self, "combo_ltx_single_image_mode", None)
         image_model = str(image_combo.currentData() if image_combo is not None else "flux_klein_9b")
         if image_model == "existing":
-            msg = "Use existing start image does not need generation. Pick Flux Klein 9B, Z-Image Turbo, Krea 2, HiDream, or Qwen 2511 INT4."
+            msg = "Use existing start image does not need generation. Pick Flux Klein 9B, Z-Image Turbo, Krea 2, or HiDream."
             self._set_planner_bridge_status(f"Planner Bridge: {msg}")
             try:
                 QMessageBox.information(self, "Planner Bridge", msg, QMessageBox.Ok)
@@ -19639,25 +19482,6 @@ class AutoMusicSyncWidget(QWidget):
         payload = self._ltx_review_character_reference_payload()
         refs_enabled = self._ltx_review_has_real_character_refs(payload)
         if refs_enabled:
-            preferred = str(payload.get("reference_image_model") or "").strip().lower()
-            if not preferred:
-                try:
-                    plan_path = self._ltx_review_current_plan_path()
-                    if plan_path and os.path.isfile(plan_path):
-                        data = _musicclip_read_json_file(plan_path)
-                        preferred = str(
-                            (data.get("character_reference") or {}).get("reference_image_model")
-                            or data.get("image_mode")
-                            or data.get("image_model")
-                            or ""
-                        ).strip().lower()
-                except Exception:
-                    preferred = ""
-            if preferred == "qwen2511_int4":
-                ok, label, key = self._find_qwen2511_int4_reference_model_for_ltx()
-                if ok:
-                    return "qwen2511_int4", f"Using Qwen2511 INT4 for reference-image review ({label})."
-                return "", "Qwen2511 INT4 was selected for reference-image review, but no usable INT4 installation was found."
             ok, label = self._find_hidream_reference_dev_model_for_ltx()
             if ok:
                 if "FP8" in label.upper():
