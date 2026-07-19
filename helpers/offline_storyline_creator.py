@@ -510,6 +510,51 @@ class StorylineGenerator:
 
 
     @staticmethod
+    def _clean_direct_i2v_prompt(prompt: str) -> str:
+        """Keep only direct visible motion instructions suitable for literal I2V models."""
+        raw = StorylineGenerator._normalize_prompt_text(prompt)
+        if not raw:
+            return ""
+        raw = raw.replace(";", ". ")
+        raw = re.sub(r"\b(?:camera move|focus on this beat|end by|identity anchors)\s*[:.]\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r",\s*sparks? flying(?: between them)?\b.*?(?=[.!?]|$)", "", raw, flags=re.IGNORECASE)
+        parts = re.split(r"(?<=[.!?])\s+", raw)
+        motion_rx = re.compile(
+            r"\b(?:walk|run|step|enter|leave|turn|look|glance|watch|notice|reach|touch|hold|grab|raise|lower|open|close|"
+            r"dance|sway|spin|jump|lean|nod|smile|laugh|speak|talk|move|approach|pull|push|lift|drop|throw|catch|"
+            r"drive|fly|bank|roll|fight|strike|kick|wave|point|sit|stand|kneel|brush|follow|cross|climb|descend|rise|"
+            r"fall|pass|pause|stop|continue|toss|sip|drink|blink|breathe|gesture|pan|track|tilt|push in|pull back|"
+            r"pulse|flicker|drift|ripple|moving|driving|breathing|gesturing)\w*\b",
+            flags=re.IGNORECASE,
+        )
+        kept: List[str] = []
+        for part in parts:
+            text = re.sub(r"\s+", " ", part).strip(" ,.;:-")
+            if not text:
+                continue
+            low = text.lower()
+            if re.match(r"^(?:start from|use the (?:uploaded|source) image|keep the same|preserve|do not|don't|avoid|bridge|introduce|transition|payoff|build tension|force a decision)\b", low):
+                continue
+            if any(term in low for term in ("next beat", "story beat", "who wants what", "what has become harder", "what payoff is being prepared")):
+                continue
+            if not motion_rx.search(text):
+                continue
+            text = re.sub(r"\s+and\s+(?:(?:start|begin)(?:s|ning)?\s+to\s+)?(?:understand|realize|feel|know|remember)\b.*$", "", text, flags=re.IGNORECASE).strip(" ,.;:-")
+            text = re.sub(r"\bthey notice each other(?:'s|’s) unique style\b", "They turn toward each other and exchange a brief look", text, flags=re.IGNORECASE)
+            if text:
+                kept.append(text)
+            if len(kept) >= 3:
+                break
+        if not kept:
+            return "The visible subject makes one clear natural movement."
+        out = ". ".join(kept).strip()
+        if len(out) > 420:
+            out = out[:420].rsplit(" ", 1)[0].rstrip(" ,.;:-")
+        return out.rstrip(" .") + "."
+
+
+
+    @staticmethod
     def _strip_json_fences(text: str) -> str:
         raw = str(text or "").replace("\r", "").strip()
         raw = re.sub(r"^\s*```(?:json|JSON)?\s*", "", raw)
@@ -1586,6 +1631,10 @@ Rules:
 - Keep each prompt faithful to its matching story beat.
 - Focus on one main visible action per shot.
 - Optional: add one small secondary motion or one simple camera move only if useful.
+- Use direct positive motion sentences. Describe only what should visibly happen.
+- Never include workflow instructions such as start from the image, keep the same, preserve, avoid, do not, next beat, transition, payoff, build tension, reveal, or force a decision.
+- Keep every recurring subject that is visible in the source image visible during the shot.
+- Any camera move must be unambiguous, short, and keep all visible subjects in frame; never request a reveal of a new location.
 - Prefer actions over poses. Do not write poster captions, static pose descriptions, or appearance-only lines.
 - Do not invent resolutions, props, or actions that are not in the beat.
 - Do not flatten the action into idle breathing, standing, or drifting unless the beat itself is calm.
@@ -1869,11 +1918,14 @@ Rules:
 - Keep the same main subject and setting from the source prompt.
 - Focus on visible action first, not appearance or pose.
 - Use one main action, plus at most one small secondary motion if useful.
-- Add only useful camera motion, and keep it simple.
+- Add only useful camera motion, and keep it simple and unambiguous.
+- Use direct positive motion sentences. Describe only what should visibly happen.
+- Never include workflow instructions such as start from the image, keep the same, preserve, avoid, do not, next beat, transition, payoff, build tension, reveal, or force a decision.
+- Keep every recurring subject that is visible in the source image visible during the shot.
+- Any camera move must keep all visible subjects in frame and must not reveal a new location.
 - Do not write poster captions, pose descriptions, heroic pose language, or still-image wording like illustration caption.
-- Do not add poetic filler, emotional commentary, or repeated mood labels.
+- Do not add poetic filler, emotional commentary, repeated mood labels, or story-writing terminology.
 - Do not pad with lighting essays or cinematic wording unless it affects visible motion.
-- Do not say static, keep the same frame, no movement, gentle wonder, tranquil mood, or similar filler.
 - Return one compact motion prompt per line.
 - Return only the {shot_count} numbered prompts.
 """.strip()
@@ -1897,7 +1949,9 @@ Rules:
                 i2v_model_hint=i2v_model_hint,
             )
             i2v_prompts = self._clean_prompt_list_items(i2v_prompts, story_outline if story_outline else source_for_i2v)
-            i2v_prompts = self._apply_style_to_prompt_list(i2v_prompts, style_hint)
+            # Style belongs in the source image prompt. Appending it to literal I2V
+            # motion prompts encourages redraws and scene changes.
+            i2v_prompts = [self._clean_direct_i2v_prompt(p) for p in i2v_prompts]
             i2v_prompts = self._clean_prompt_list_items(i2v_prompts, story_outline if story_outline else source_for_i2v)
             self._log(self._format_lines_for_log("Image-to-video prompts", i2v_prompts))
 

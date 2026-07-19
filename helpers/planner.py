@@ -644,7 +644,7 @@ def _planner_append_camera_effect_suffix(prompt: Any, camera_hint: Any = '', dyn
         return base
     if move.lower() in base.lower():
         return base
-    return base.rstrip(' .') + ', ' + move + '.'
+    return base.rstrip(' .') + '. ' + move.rstrip(' .') + '.'
 
 def _pick_flux_klein_models_highest(force_klein_b: int = 0) -> Dict[str, str]:
     """Auto-pick FLUX.2 Klein GGUF wiring for stable-diffusion.cpp sd-cli.
@@ -2281,7 +2281,7 @@ _PLANNER_SETTINGS_PATH = _root() / "presets" / "setsave" / "planner_settings.jso
 _PLANNER_UPSCALE_JSON_NAME = "planner_upscale.json"
 
 # Planner image-to-video prompt schema version
-_PLANNER_I2V_SCHEMA_VERSION = 5
+_PLANNER_I2V_SCHEMA_VERSION = 6
 
 
 def _load_planner_settings() -> Dict[str, Any]:
@@ -3888,7 +3888,7 @@ def _load_shots_list(shots_json_path: str) -> List[Dict[str, Any]]:
 # -----------------------------
 
 def _plan_characters(plan_obj: Any) -> List[Dict[str, Any]]:
-    """Extract a best-effort character list from plan.json."""
+    """Extract normalized character records from plan.json without discarding taxonomy."""
     out: List[Dict[str, Any]] = []
     if isinstance(plan_obj, dict):
         chars = plan_obj.get("characters")
@@ -3898,10 +3898,62 @@ def _plan_characters(plan_obj: Any) -> List[Dict[str, Any]]:
                     name = str(c.get("name") or c.get("id") or '').strip()
                     role = str(c.get("role") or c.get("type") or '').strip()
                     if name:
-                        out.append({"name": name, "role": role})
+                        item = dict(c)
+                        item["name"] = name
+                        item["role"] = role
+                        taxonomy = str(item.get("taxonomy") or "human").strip().lower()
+                        item["taxonomy"] = taxonomy if taxonomy in ("human", "animal", "creature") else "human"
+                        out.append(item)
                 elif isinstance(c, str) and c.strip():
-                    out.append({"name": c.strip(), "role": ""})
+                    out.append({"name": c.strip(), "role": "", "taxonomy": "human"})
     return out
+
+
+def _planner_sanitize_plan_characters(plan_obj: Any, default_taxonomy: str, source_text: Any) -> Dict[str, Any]:
+    """Remove contradictory taxonomy/species fields before they reach shot generation."""
+    plan = dict(plan_obj or {}) if isinstance(plan_obj, dict) else {}
+    chars = plan.get("characters")
+    if not isinstance(chars, list):
+        return plan
+    default_tax = str(default_taxonomy or "human").strip().lower()
+    if default_tax not in ("human", "animal", "creature"):
+        default_tax = "human"
+    source_low = str(source_text or '').lower()
+    nonhuman_terms = (
+        'animal', 'creature', 'monster', 'alien', 'dragon', 'dog', 'cat', 'wolf', 'fox',
+        'owl', 'bird', 'bear', 'rabbit', 'horse', 'tiger', 'lion', 'robot', 'android',
+    )
+    source_explicit_nonhuman = any(re.search(r'\b' + re.escape(term) + r'\b', source_low) for term in nonhuman_terms)
+    cleaned: List[Any] = []
+    for raw in chars:
+        if not isinstance(raw, dict):
+            cleaned.append(raw)
+            continue
+        item = dict(raw)
+        taxonomy = str(item.get('taxonomy') or default_tax or 'human').strip().lower()
+        if taxonomy not in ('human', 'animal', 'creature'):
+            taxonomy = default_tax
+        # Human prompts sometimes receive symbolic animal species from the LLM.
+        # If the source did not explicitly ask for a non-human subject, normalize it.
+        if default_tax == 'human' and not source_explicit_nonhuman:
+            taxonomy = 'human'
+        item['taxonomy'] = taxonomy
+        if taxonomy == 'human':
+            item.pop('species', None)
+            item.pop('base_anatomy', None)
+        else:
+            species = str(item.get('species') or '').strip()
+            if species:
+                # Keep a species only when that species is supported by the source prompt
+                # or the overall default taxonomy is already non-human.
+                species_token = species.lower()
+                species_supported = default_tax != 'human' or any(tok and tok in source_low for tok in re.findall(r'[a-z]+', species_token))
+                if not species_supported:
+                    item.pop('species', None)
+        cleaned.append(item)
+    plan['characters'] = cleaned
+    return plan
+
 
 def _normalize_no_item(s: str) -> str:
     s = (s or '').strip()
@@ -4218,233 +4270,200 @@ def _planner_sentence_chunks(text: Any) -> List[str]:
     return out
 
 
-_PLANNER_I2V_CAMERA_USE_RATE_DYNAMIC = 0.60
-_PLANNER_I2V_CAMERA_USE_RATE_SLOW = 0.35
-_PLANNER_I2V_CAMERA_RECENT_LIMIT = 3
+_PLANNER_I2V_CAMERA_USE_RATE_DYNAMIC = 0.45
+_PLANNER_I2V_CAMERA_USE_RATE_SLOW = 0.30
+_PLANNER_I2V_CAMERA_RECENT_LIMIT = 4
 _PLANNER_I2V_CAMERA_RECENT: List[str] = []
 _PLANNER_I2V_CAMERA_RECENT_FAMILIES: List[str] = []
 
+# These camera moves are deliberately direct and conservative. LTX INT4 follows
+# camera wording very literally, so every move keeps the existing subjects and
+# setting readable instead of asking for reveals, drops, whip moves, or reframes.
 _PLANNER_I2V_CAMERA_VARIANTS: List[Dict[str, Any]] = [
     {
-        'id': 'close_breath',
-        'family': 'close',
-        'weight': 1.0,
-        'buckets': ('close',),
-        'text': 'slight push-in or breathing handheld drift that keeps the shot alive',
-    },
-    {
-        'id': 'wide_reveal',
-        'family': 'wide',
-        'weight': 1.0,
-        'buckets': ('wide',),
-        'text': 'slow dolly or pan that reveals depth through the scene',
-    },
-    {
-        'id': 'overhead_glide',
-        'family': 'overhead',
-        'weight': 1.0,
-        'buckets': ('overhead',),
-        'text': 'gentle overhead glide across the scene',
-    },
-    {
-        'id': 'angle_drift',
-        'family': 'angle',
-        'weight': 1.0,
-        'buckets': ('angle',),
-        'text': 'subtle perspective drift that carries the angle forward',
-    },
-    {
-        'id': 'handheld_float',
-        'family': 'handheld',
-        'weight': 1.0,
-        'buckets': ('handheld',),
-        'text': 'soft handheld float with controlled micro-movement',
-    },
-    {
-        'id': 'general_drift',
-        'family': 'general',
-        'weight': 1.0,
-        'buckets': ('general', 'close', 'wide', 'angle', 'handheld'),
-        'text': 'slow controlled camera drift',
-    },
-    {
-        'id': 'general_push_lateral',
-        'family': 'general',
-        'weight': 1.0,
-        'buckets': ('general', 'close', 'wide', 'angle'),
-        'text': 'slow push or lateral drift that carries the shot forward',
-    },
-    {
-        'id': 'close_snap_push',
+        'id': 'small_push',
         'family': 'push',
-        'weight': 0.95,
-        'buckets': ('close', 'angle', 'general'),
-        'text': 'short snap push-in that lands on the subject and settles',
+        'weight': 1.0,
+        'buckets': ('general', 'close', 'angle'),
+        'text': 'The camera moves slightly closer and keeps every visible subject fully inside the frame',
     },
     {
-        'id': 'wide_track_left',
+        'id': 'small_pull',
+        'family': 'pull',
+        'weight': 0.9,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'The camera moves slightly backward while keeping the same visible subjects in frame',
+    },
+    {
+        'id': 'track_left',
         'family': 'track',
         'weight': 0.95,
-        'buckets': ('wide', 'general'),
-        'text': 'smooth lateral track from left to right through the scene',
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'The camera tracks a short distance from left to right and keeps the subjects centered',
     },
     {
-        'id': 'wide_track_right',
+        'id': 'track_right',
         'family': 'track',
         'weight': 0.95,
-        'buckets': ('wide', 'general'),
-        'text': 'smooth lateral track from right to left through the scene',
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'The camera tracks a short distance from right to left and keeps the subjects centered',
     },
     {
-        'id': 'angle_arc_left',
-        'family': 'arc',
+        'id': 'follow_back',
+        'family': 'follow',
+        'weight': 1.0,
+        'buckets': ('general', 'wide', 'close'),
+        "text": "The camera moves backward at the subjects' pace and keeps every visible person in frame",
+    },
+    {
+        'id': 'follow_side',
+        'family': 'follow',
         'weight': 0.9,
-        'buckets': ('angle', 'wide', 'general'),
-        'text': 'short arcing move around the subject from the left with brisk cinematic energy',
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'The camera follows beside the moving subject at the same speed',
     },
     {
-        'id': 'angle_arc_right',
-        'family': 'arc',
-        'weight': 0.9,
-        'buckets': ('angle', 'wide', 'general'),
-        'text': 'short arcing move around the subject from the right with a clean finish',
-    },
-    {
-        'id': 'tilt_rise',
-        'family': 'tilt',
+        'id': 'pan_left',
+        'family': 'pan',
         'weight': 0.85,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'controlled upward tilt that catches the subject and settles',
+        'text': 'The camera pans a small distance to the left while keeping the subjects visible',
     },
     {
-        'id': 'tilt_drop',
-        'family': 'tilt',
+        'id': 'pan_right',
+        'family': 'pan',
         'weight': 0.85,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'controlled downward tilt that lands on the subject and settles',
+        'text': 'The camera pans a small distance to the right while keeping the subjects visible',
     },
     {
-        'id': 'pedestal_up',
-        'family': 'pedestal',
-        'weight': 0.8,
-        'buckets': ('general', 'wide', 'angle'),
-        'text': 'brief pedestal rise that adds vertical energy',
+        'id': 'shallow_arc_left',
+        'family': 'arc',
+        'weight': 0.7,
+        'buckets': ('general', 'angle', 'wide'),
+        'text': 'The camera makes a shallow side arc from the left and keeps the existing background in view',
     },
     {
-        'id': 'pedestal_down',
-        'family': 'pedestal',
-        'weight': 0.8,
-        'buckets': ('general', 'wide', 'angle'),
-        'text': 'brief pedestal drop that lands into the frame and settles',
+        'id': 'shallow_arc_right',
+        'family': 'arc',
+        'weight': 0.7,
+        'buckets': ('general', 'angle', 'wide'),
+        'text': 'The camera makes a shallow side arc from the right and keeps the existing background in view',
     },
     {
-        'id': 'diagonal_creep',
-        'family': 'diagonal',
-        'weight': 0.75,
-        'buckets': ('general', 'wide', 'angle', 'close'),
-        'text': 'diagonal camera creep with slight foreground parallax',
-    },
-    {
-        'id': 'profile_slide',
-        'family': 'profile',
-        'weight': 0.9,
-        'buckets': ('angle', 'general'),
-        'text': 'profile-side slide as the camera glides past with intent',
-    },
-    {
-        'id': 'pull_back_reveal',
-        'family': 'pullback',
-        'weight': 0.8,
-        'buckets': ('wide', 'general'),
-        'text': 'short pull-back reveal that opens the frame before the next beat',
-    },
-    {
-        'id': 'handheld_surge',
+        'id': 'micro_handheld',
         'family': 'handheld',
-        'weight': 0.85,
+        'weight': 0.8,
         'buckets': ('handheld', 'general', 'close'),
-        'text': 'loose handheld surge toward the subject with music-video energy',
+        'text': 'The camera has small controlled handheld movement and keeps the framing readable',
     },
     {
-        'id': 'low_angle_surge',
-        'family': 'angle',
+        'id': 'profile_follow',
+        'family': 'profile',
         'weight': 0.8,
         'buckets': ('angle', 'general'),
-        'text': 'low-angle surge forward that makes the subject feel larger',
+        'text': 'The camera follows from the side and keeps the full visible action in frame',
     },
     {
-        'id': 'high_angle_drop',
-        'family': 'angle',
-        'weight': 0.8,
-        'buckets': ('angle', 'general', 'overhead'),
-        'text': 'high-angle drop into the shot that tightens the frame',
-    },
-    {
-        'id': 'whip_settle',
-        'family': 'whip',
+        'id': 'tilt_up_small',
+        'family': 'tilt',
         'weight': 0.65,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'quick whip-like lateral move that snaps into place fast',
+        'text': 'The camera tilts upward only slightly and keeps the subjects visible',
     },
     {
-        'id': 'shock_zoom',
-        'family': 'impact',
-        'weight': 0.35,
-        'buckets': ('general', 'close', 'angle', 'wide'),
-        'text': 'sudden shock zoom toward the subject with impact',
+        'id': 'tilt_down_small',
+        'family': 'tilt',
+        'weight': 0.65,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'The camera tilts downward only slightly and keeps the subjects visible',
     },
     {
-        'id': 'impact_punch',
-        'family': 'impact',
-        'weight': 0.35,
-        'buckets': ('general', 'close', 'angle'),
-        'text': 'fast punch-in toward the subject with a tiny recoil tremor',
+        'id': 'diagonal_left',
+        'family': 'diagonal',
+        'weight': 0.7,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'The camera moves diagonally a short distance to the left while holding the subjects in frame',
+    },
+    {
+        'id': 'diagonal_right',
+        'family': 'diagonal',
+        'weight': 0.7,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'The camera moves diagonally a short distance to the right while holding the subjects in frame',
+    },
+    {
+        'id': 'foreground_slide_left',
+        'family': 'foreground',
+        'weight': 0.65,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'The camera slides left a short distance with mild foreground parallax and keeps the existing view',
+    },
+    {
+        'id': 'foreground_slide_right',
+        'family': 'foreground',
+        'weight': 0.65,
+        'buckets': ('general', 'wide', 'angle'),
+        'text': 'The camera slides right a short distance with mild foreground parallax and keeps the existing view',
+    },
+    {
+        'id': 'close_hold',
+        'family': 'close',
+        'weight': 0.75,
+        'buckets': ('close', 'general'),
+        'text': 'The camera holds the current close framing with only a small natural movement',
+    },
+    {
+        'id': 'wide_hold',
+        'family': 'wide',
+        'weight': 0.75,
+        'buckets': ('wide', 'general'),
+        'text': 'The camera holds the current wide framing while the visible action continues',
     },
 ]
 
-
 _PLANNER_I2V_CAMERA_VARIANTS_SLOW: List[Dict[str, Any]] = [
     {
-        'id': 'slow_push_in',
+        'id': 'slow_small_push',
         'family': 'slow_push',
         'weight': 1.0,
         'buckets': ('general', 'close', 'angle'),
-        'text': 'very slow cinematic push-in that gently tightens the frame',
+        'text': 'The camera moves very slightly closer and keeps every visible subject in frame',
     },
     {
-        'id': 'slow_pull_back',
+        'id': 'slow_small_pull',
         'family': 'slow_pull',
         'weight': 0.9,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'very slow cinematic pull-back that opens the frame a little',
+        'text': 'The camera moves very slightly backward and keeps the same subjects visible',
     },
     {
         'id': 'slow_pan_left',
         'family': 'slow_pan',
         'weight': 0.85,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'slow cinematic pan from right to left',
+        'text': 'The camera pans gently to the left and keeps the existing scene in view',
     },
     {
         'id': 'slow_pan_right',
         'family': 'slow_pan',
         'weight': 0.85,
         'buckets': ('general', 'wide', 'angle'),
-        'text': 'slow cinematic pan from left to right',
+        'text': 'The camera pans gently to the right and keeps the existing scene in view',
     },
     {
-        'id': 'slow_close_breath',
-        'family': 'slow_close',
+        'id': 'slow_follow',
+        'family': 'slow_follow',
         'weight': 0.8,
-        'buckets': ('close', 'general'),
-        'text': 'close framing with a tiny cinematic breathing motion',
+        'buckets': ('general', 'wide', 'close'),
+        'text': 'The camera follows the visible movement at the same pace and keeps the subjects in frame',
     },
     {
-        'id': 'slow_overhead_glide',
-        'family': 'slow_overhead',
-        'weight': 0.75,
-        'buckets': ('overhead', 'general', 'wide'),
-        'text': 'slow overhead glide with very gentle cinematic drift',
+        'id': 'slow_hold',
+        'family': 'slow_hold',
+        'weight': 0.8,
+        'buckets': ('general', 'close', 'wide', 'angle', 'overhead'),
+        'text': 'The camera keeps the current framing with a small natural movement',
     },
 ]
 
@@ -4467,7 +4486,7 @@ def _planner_camera_bucket_from_hint(camera_hint: Any) -> str:
         return 'overhead'
     if any(k in c for k in ('handheld', 'shaky')):
         return 'handheld'
-    if any(k in c for k in ('low angle', 'high angle', 'profile', 'side', 'side view', 'profile view', 'three-quarter', '3/4')):
+    if any(k in c for k in ('low angle', 'high angle', 'profile', 'side', 'three-quarter', '3/4')):
         return 'angle'
     return 'general'
 
@@ -4477,16 +4496,17 @@ def _planner_camera_motion_from_hint(camera_hint: Any, dynamic_mode: bool = True
 
     use_rate = float(_PLANNER_I2V_CAMERA_USE_RATE_DYNAMIC if bool(dynamic_mode) else _PLANNER_I2V_CAMERA_USE_RATE_SLOW)
     variant_pool = _PLANNER_I2V_CAMERA_VARIANTS if bool(dynamic_mode) else _PLANNER_I2V_CAMERA_VARIANTS_SLOW
-
+    if bool(dynamic_mode):
+        # Literal/quantized LTX models can turn arcs, pedestal/tilt moves, diagonal
+        # moves, and parallax slides into a reframe or location change. Keep the
+        # camera-effects option, but use only moves that preserve the current shot.
+        safe_families = {'push', 'pull', 'track', 'follow', 'pan', 'handheld', 'profile', 'close', 'wide'}
+        variant_pool = [item for item in variant_pool if str(item.get('family') or '') in safe_families]
     if random.random() > use_rate:
         return ''
 
     bucket = _planner_camera_bucket_from_hint(camera_hint)
-    candidates = [
-        dict(item)
-        for item in variant_pool
-        if bucket in tuple(item.get('buckets') or ())
-    ]
+    candidates = [dict(item) for item in variant_pool if bucket in tuple(item.get('buckets') or ())]
     if not candidates:
         candidates = [dict(item) for item in variant_pool if 'general' in tuple(item.get('buckets') or ())]
     if not candidates:
@@ -4494,7 +4514,6 @@ def _planner_camera_motion_from_hint(camera_hint: Any, dynamic_mode: bool = True
 
     recent_ids = list(_PLANNER_I2V_CAMERA_RECENT[-int(_PLANNER_I2V_CAMERA_RECENT_LIMIT):])
     recent_families = list(_PLANNER_I2V_CAMERA_RECENT_FAMILIES[-2:])
-
     filtered = [
         item for item in candidates
         if str(item.get('id') or '') not in recent_ids and str(item.get('family') or '') not in recent_families
@@ -4510,7 +4529,6 @@ def _planner_camera_motion_from_hint(camera_hint: Any, dynamic_mode: bool = True
         if bucket != 'general' and bucket in tuple(item.get('buckets') or ()):
             weight *= 1.15
         weights.append(max(0.05, weight))
-
     try:
         picked = random.choices(filtered, weights=weights, k=1)[0]
     except Exception:
@@ -4524,41 +4542,19 @@ def _planner_camera_motion_from_hint(camera_hint: Any, dynamic_mode: bool = True
     if family:
         _PLANNER_I2V_CAMERA_RECENT_FAMILIES.append(family)
         _PLANNER_I2V_CAMERA_RECENT_FAMILIES = _PLANNER_I2V_CAMERA_RECENT_FAMILIES[-int(_PLANNER_I2V_CAMERA_RECENT_LIMIT):]
-
     return str(picked.get('text') or '').strip()
 
 
 def _planner_i2v_end_state_hint(phase: Any, notes: Any, next_text: Any) -> str:
-    ph = str(phase or '').strip().lower()
-    nt = _planner_compact_text(next_text, 180)
-    base = 'finish the shot with a small readable progression of the same action, landing in a pose that can cut cleanly to the next shot'
-    if ph in ('hook', 'intro', 'setup', 'opening'):
-        base = 'end with the subject slightly deeper into the moment, as if the scene has just started to come alive'
-    elif ph in ('build', 'middle', 'obstacle', 'escalation'):
-        base = 'end with the action clearly advanced but still controlled, preserving the same location and staging'
-    elif ph in ('climax', 'payoff', 'twist'):
-        base = 'end on the strongest readable beat of the action without breaking identity, layout, or scene logic'
-    elif ph in ('ending', 'resolve', 'resolution', 'outro'):
-        base = 'end in a settled resolved pose with the energy gently landing, ready for a final cut or hold'
-    try:
-        n = str(notes or '').strip().lower()
-    except Exception:
-        n = ''
-    if 'loop' in n:
-        base = 'end in a pose and framing that can loop cleanly back into the opening moment without a visible jump'
-    if nt:
-        base += f'; bridge naturally toward the next beat: {nt}'
-    return base
+    # Retained for schema compatibility only. The final prompt no longer tells LTX
+    # to prepare the next shot because INT4 interprets that as a scene transformation.
+    _ = phase, notes, next_text
+    return ''
 
 
 def _planner_character_lock_lines(manifest: Dict[str, Any], shot_text: Any, enc: Optional[Dict[str, Any]] = None, own_active: bool = False) -> List[str]:
     locks: List[str] = []
-
-    # Own Character Bible is a txt2img codeword-replacement feature only.
-    # Do NOT convert manual own-character entries into i2v continuity or identity-anchor locks.
     _ = enc, own_active
-
-    # Also add normalized Character Bible locks when available.
     try:
         bible = (manifest.get('project') or {}).get('character_bible')
         bible = [x for x in (bible or []) if isinstance(x, dict)] if isinstance(bible, list) else []
@@ -4598,14 +4594,10 @@ def _planner_character_lock_lines(manifest: Dict[str, Any], shot_text: Any, enc:
                 bits.append(_planner_compact_text(c.get('outfit') or '', 80))
             bits.extend([_planner_compact_text(x, 40) for x in (c.get('do_not_change') or [])[:2]])
             bits = [b for b in bits if b]
-            if bits:
-                locks.append(f'{nm}: ' + '; '.join(bits[:4]))
-            else:
-                locks.append(f'{nm}: keep identity unchanged')
+            locks.append(f'{nm}: ' + '; '.join(bits[:4]) if bits else f'{nm}: keep identity unchanged')
         except Exception:
             continue
 
-    # De-duplicate while keeping order.
     seen = set()
     out: List[str] = []
     for item in locks:
@@ -4617,36 +4609,359 @@ def _planner_character_lock_lines(manifest: Dict[str, Any], shot_text: Any, enc:
     return out[:4]
 
 
+_PLANNER_I2V_META_PATTERNS = (
+    r'\bintroduce\b', r'\btransition\b', r'\bpayoff\b', r'\bbuild tension\b',
+    r'\bforce a decision\b', r'\breveal (?:new info|a clue|clue)\b', r'\bshow obstacle\b',
+    r'\bwho wants what\b', r'\bwhat changed\b', r'\bwhat got harder\b',
+    r'\bwhat has become harder\b', r'\bprepared? next\b', r'\bnext beat\b',
+    r'\bbridge naturally\b', r'\bstory beat\b', r'\bstory progression\b',
+    r'\bdecisive move\b', r'\bhighest-pressure moment\b', r'\bcentral action\b',
+    r'\bgoal can actually be won\b', r'\bthe scene has just started to come alive\b',
+)
+
+_PLANNER_I2V_ACTION_RX = re.compile(
+    r'\b(?:walk(?:s|ed|ing)?|run(?:s|ning|ran)?|step(?:s|ped|ping)?|enter(?:s|ed|ing)?|'
+    r'leave(?:s|d|ing)?|turn(?:s|ed|ing)?|look(?:s|ed|ing)?|glance(?:s|d|ing)?|watch(?:es|ed|ing)?|'
+    r'notice(?:s|d|ing)?|reach(?:es|ed|ing)?|touch(?:es|ed|ing)?|hold(?:s|ing)?|held|'
+    r'grab(?:s|bed|bing)?|raise(?:s|d|ing)?|lower(?:s|ed|ing)?|open(?:s|ed|ing)?|close(?:s|d|ing)?|'
+    r'dance(?:s|d|ing)?|sway(?:s|ed|ing)?|spin(?:s|ning|spun)?|jump(?:s|ed|ing)?|lean(?:s|ed|ing)?|'
+    r'nod(?:s|ded|ding)?|smile(?:s|d|ing)?|laugh(?:s|ed|ing)?|speak(?:s|ing|spoke)?|talk(?:s|ed|ing)?|'
+    r'move(?:s|d|ing)?|approach(?:es|ed|ing)?|pull(?:s|ed|ing)?|push(?:es|ed|ing)?|lift(?:s|ed|ing)?|'
+    r'drop(?:s|ped|ping)?|throw(?:s|ing|threw|thrown)?|catch(?:es|ing|caught)?|drive(?:s|d|driving|drove)?|'
+    r'fly(?:s|ing|flew|flown)?|bank(?:s|ed|ing)?|roll(?:s|ed|ing)?|fight(?:s|ing|fought)?|'
+    r'strike(?:s|striking|struck)?|kick(?:s|ed|ing)?|wave(?:s|d|ing)?|point(?:s|ed|ing)?|'
+    r'sit(?:s|ting|sat)?|stand(?:s|ing|stood)?|kneel(?:s|ed|ing)?|brush(?:es|ed|ing)?|'
+    r'follow(?:s|ed|ing)?|cross(?:es|ed|ing)?|climb(?:s|ed|ing)?|descend(?:s|ed|ing)?|'
+    r'rise(?:s|rising|rose|risen)?|fall(?:s|ing|fell|fallen)?|pass(?:es|ed|ing)?|pause(?:s|d|ing)?|'
+    r'stop(?:s|ped|ping)?|continue(?:s|d|ing)?|toss(?:es|ed|ing)?|sip(?:s|ped|ping)?|drink(?:s|ing|drank)?|'
+    r'blink(?:s|ed|ing)?|breathe(?:s|d)?|gesture(?:s|d)?|moving|driving|breathing|gesturing)\b',
+    re.IGNORECASE,
+)
+
+
 def _planner_sanitize_i2v_text(text: Any, max_len: int = 260) -> str:
     try:
         s = str(text or '')
     except Exception:
         s = ''
     s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-    repls = [
-        (r"\bwhile keeping\b", "while"),
-        (r"\bkeep(?:ing)? the same\b", "stay in"),
-        (r"\bkeep(?:ing)? continuity with\b", "follow on from"),
-        (r"\bkeep(?:ing)? continuity\b", "match continuity"),
-        (r"\bkeep(?:ing)? the subject framed almost exactly the same\b", "stay centered on the subject"),
-        (r"\bnear-static\b", "barely moving"),
-        (r"\bstatic\b", "still"),
-        (r"\bstable framing\b", "clean framing"),
-        (r"\bcomposition stable\b", "composition clean"),
-        (r"\bholds? the frame steady\b", "settles into the frame"),
-        (r"\bmatch the source image exactly\b", "start from the uploaded image with no reset"),
-        (r"\bframe 1 must match the source image exactly\b", "start from the uploaded image with no reset"),
-        (r"\buse the image as the hard visual anchor\b", "use the uploaded image as the visual anchor"),
-        (r"\bpreserve the same setting and layout from the input image\b", "stay in the same setting and layout as the uploaded image"),
-        (r"\bhold the same mood\b", "stay in the same mood"),
-        (r"\bkeep the same lighting feel\b", "stay in the same lighting feel"),
-        (r"\bdo not\b", "avoid"),
+    s = re.sub(r'\s*[;:]+\s*', '; ', s)
+    s = re.sub(r'\s{2,}', ' ', s).strip(" \t\n-–—,;:")
+    if len(s) > int(max(32, max_len)):
+        cut = s[: int(max(32, max_len))]
+        for sep in ('. ', ', ', '; '):
+            if sep in cut:
+                candidate = cut.rsplit(sep, 1)[0].strip()
+                if len(candidate) >= 40:
+                    cut = candidate
+                    break
+        if len(cut) > int(max(32, max_len)):
+            cut = cut.rsplit(' ', 1)[0].strip()
+        s = cut.strip(' ,.;:-')
+    return s
+
+
+def _planner_i2v_has_meta_text(text: Any) -> bool:
+    s = str(text or '').strip()
+    if not s:
+        return False
+    return any(re.search(pat, s, flags=re.IGNORECASE) for pat in _PLANNER_I2V_META_PATTERNS)
+
+
+def _planner_i2v_clean_action_candidate(text: Any, max_len: int = 220) -> str:
+    s = _planner_sanitize_i2v_text(text, max(320, int(max_len) + 80))
+    if not s:
+        return ''
+    # A truncated T2I sentence is worse than a shorter complete action.
+    if '…' in s:
+        s = s.split('…', 1)[0].strip(' ,.;:-')
+    s = re.sub(r'\.{3,}.*$', '', s).strip(' ,.;:-')
+    # Strip local fallback/writer-language tails without touching the visible action before them.
+    tail_markers = [
+        r',\s*looking toward the destination that matters most.*$',
+        r',\s*pausing before the next move.*$',
+        r',\s*committing to the decisive move.*$',
+        r',\s*driving straight into the highest-pressure moment.*$',
+        r',\s*moving through the aftermath of what just changed.*$',
+        r',\s*taking in the visible result of the final choice.*$',
+        r',\s*and the feeling shifts toward.*$',
+        r',\s*the feeling shifts toward.*$',
+        r',\s*who wants what.*$',
+        r',\s*whether the goal can actually be won.*$',
     ]
-    for pat, rep in repls:
-        s = re.sub(pat, rep, s, flags=re.IGNORECASE)
-    s = re.sub(r"\s*[;:]+\s*", "; ", s)
-    s = re.sub(r"\s{2,}", " ", s).strip(" \t\n-–—,;:")
-    return _planner_compact_text(s, max_len)
+    for pat in tail_markers:
+        s = re.sub(pat, '', s, flags=re.IGNORECASE).strip(' ,.;:-')
+    s = re.sub(r'\b(?:focus on this beat|end by|camera move|identity anchors)\s*[:;]\s*', '', s, flags=re.IGNORECASE)
+    s = re.sub(
+        r'^(?:(?:extreme\s+wide|wide|medium|close(?:-up)?|overhead|high\s+angle|low\s+angle|over-the-shoulder|insert\s+detail|pov|dutch\s+angle)\s+shot\s*,\s*)',
+        '', s, flags=re.IGNORECASE,
+    )
+    s = re.sub(r'^(?:cinematic|natural|dramatic|soft|neon|warm|cool)\s+lighting\s*,\s*', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'^(?:curious|urgent|resolved|neutral|tense|calm|romantic|mysterious)\s*,\s*', '', s, flags=re.IGNORECASE)
+    s = _planner_sanitize_i2v_text(s, max_len)
+    return s.strip(' ,.;:-')
+
+
+def _planner_i2v_subject_label(manifest: Dict[str, Any], shot: Dict[str, Any], rec: Dict[str, Any], source_text: str) -> str:
+    tokens: List[str] = []
+    subs = shot.get('subjects')
+    if isinstance(subs, list):
+        for item in subs[:3]:
+            if isinstance(item, dict):
+                label = _planner_compact_text(item.get('name') or item.get('label') or item.get('id') or '', 60)
+            else:
+                label = _planner_compact_text(item, 60)
+            if label:
+                tokens.append(label)
+    if tokens:
+        return ' and '.join(tokens[:3])
+
+    text = str(source_text or '')
+    low = text.lower()
+    if re.search(r'\b(?:without (?:needing )?(?:the )?(?:main )?(?:character|subject|person) in frame|environment[- ]only|no (?:character|subject|person) in frame)\b', low):
+        return ''
+    generic_patterns = [
+        (r'\b(?:the\s+)?two women\b', 'the two women'),
+        (r'\b(?:the\s+)?two men\b', 'the two men'),
+        (r'\b(?:the\s+)?two girls\b', 'the two girls'),
+        (r'\b(?:the\s+)?two boys\b', 'the two boys'),
+        (r'\b(?:the\s+)?two people\b', 'the two people'),
+        (r'\b(?:the\s+)?couple\b', 'the couple'),
+        (r'\b(?:the\s+|a\s+)?woman\b', 'the woman'),
+        (r'\b(?:the\s+|a\s+)?man\b', 'the man'),
+        (r'\b(?:the\s+|a\s+)?girl\b', 'the girl'),
+        (r'\b(?:the\s+|a\s+)?boy\b', 'the boy'),
+        (r'\b(?:the\s+|a\s+)?child\b', 'the child'),
+        (r'\b(?:the\s+|a\s+)?dog\b', 'the dog'),
+        (r'\b(?:the\s+|a\s+)?cat\b', 'the cat'),
+        (r'\b(?:the\s+|a\s+)?animal\b', 'the animal'),
+        (r'\b(?:the\s+|a\s+)?creature\b', 'the creature'),
+        (r'\b(?:the\s+|a\s+)?vehicle\b', 'the vehicle'),
+        (r'\b(?:the\s+|a\s+)?car\b', 'the car'),
+        (r'\b(?:the\s+|a\s+)?aircraft\b', 'the aircraft'),
+        (r'\b(?:the\s+|a\s+)?jet\b', 'the jet'),
+    ]
+    for pat, label in generic_patterns:
+        if re.search(pat, low, flags=re.IGNORECASE):
+            return label
+    if re.search(r'\bwomen\b', low):
+        return 'the women'
+    if re.search(r'\bmen\b', low):
+        return 'the men'
+    if re.search(r'\bwoman\b', low):
+        return 'the woman'
+    if re.search(r'\bman\b', low):
+        return 'the man'
+
+    # Names from a normalized plan or character bible are useful only when they
+    # are actually present in this shot text.
+    names: List[str] = []
+    try:
+        for item in ((manifest.get('project') or {}).get('character_bible') or []):
+            if isinstance(item, dict):
+                nm = str(item.get('name') or '').strip()
+                if nm and re.search(r'(?<![A-Za-z0-9_])' + re.escape(nm) + r'(?![A-Za-z0-9_])', text, flags=re.IGNORECASE):
+                    names.append(nm)
+    except Exception:
+        names = []
+    if names:
+        return ' and '.join(names[:3])
+    if not re.search(r'\b(?:person|people|woman|women|man|men|girl|girls|boy|boys|child|children|dog|cat|animal|creature|car|vehicle|jet|aircraft|subject|character|they|their|both)\b', low):
+        return ''
+    return 'the visible subject'
+
+
+def _planner_i2v_explicit_subject(text: Any, subject_label: str = '') -> bool:
+    s = str(text or '').strip()
+    if not s:
+        return False
+    if subject_label:
+        core = re.sub(r'^the\s+', '', str(subject_label), flags=re.IGNORECASE).strip()
+        if core and re.search(r'(?<![A-Za-z0-9_])' + re.escape(core) + r'(?![A-Za-z0-9_])', s, flags=re.IGNORECASE):
+            return True
+    return bool(re.search(
+        r'\b(?:they|their|both|together|she|her|he|his|woman|women|man|men|person|people|girl|girls|boy|boys|'
+        r'child|children|dog|cat|animal|creature|car|vehicle|jet|aircraft|subject|character)\b',
+        s, flags=re.IGNORECASE,
+    ))
+
+
+def _planner_i2v_environment_fragment(text: Any) -> bool:
+    s = str(text or '').strip()
+    if not s:
+        return False
+    return bool(re.match(
+        r'^(?:with\b|more than\b|each sip\b|the setting\b|the surroundings\b|the aftermath\b|a route\b|the route\b|'
+        r'the path\b|open foreground\b|layered midground\b|a clear landmark\b|clear lines\b|reflective materials\b|'
+        r'enough empty space\b|high visual energy\b|a readable center\b|sharp environmental stakes\b|'
+        r'the most concentrated version\b|a dominant landmark\b|atmosphere that\b|light that\b)',
+        s, flags=re.IGNORECASE,
+    ))
+
+
+def _planner_i2v_finalize_action(candidate: str, subject_label: str) -> str:
+    text = _planner_i2v_clean_action_candidate(candidate, 220)
+    if not text or _planner_i2v_environment_fragment(text):
+        return ''
+    label = str(subject_label or '').strip()
+    label_cap = label[:1].upper() + label[1:] if label else ''
+    plural = bool(re.search(r'\b(?:two|women|men|people|girls|boys|they|both|couple)\b', label, flags=re.IGNORECASE) or ' and ' in label.lower())
+
+    # Remove metaphors that a direct video model may render literally.
+    text = re.sub(r',\s*sparks? flying(?: between them)?\b.*$', '', text, flags=re.IGNORECASE).strip(' ,.;:-')
+    text = re.sub(r'\bthey notice each other(?:\'s|’s) unique style\b', 'They turn toward each other and exchange a brief look', text, flags=re.IGNORECASE)
+
+    # Remove abstract interpretation after a visible action.
+    text = re.sub(
+        r'\s+and\s+(?:(?:start|begin)(?:s|ning)?\s+to\s+)?(?:understand|realize|feel|know|remember)\b.*$',
+        '', text, flags=re.IGNORECASE,
+    ).strip(' ,.;:-')
+
+    # "A spark forms when they touch" is writer language. Keep only the action.
+    when_action = re.search(
+        r'\bwhen\s+((?:they|both|she|he|the\s+(?:woman|women|man|men|person|people|girl|girls|boy|boys|couple))\s+'
+        r'(?:walk|run|step|enter|leave|turn|look|glance|watch|notice|reach|touch|hold|grab|dance|sway|brush|toss|move)\w*\b.*)$',
+        text, flags=re.IGNORECASE,
+    )
+    if when_action:
+        text = when_action.group(1).strip(' ,.;:-')
+        text = text[:1].upper() + text[1:]
+
+    # Convert descriptive eye-motion fragments into a direct instruction.
+    eye_match = re.match(r'^(?:her|his|their)\s+eyes\s+(?:catching|watching|following|tracking)\b(?:\s+(.*))?$', text, flags=re.IGNORECASE)
+    if eye_match and label:
+        target = str(eye_match.group(1) or '').strip(' ,.;:-')
+        if len(target) < 5 or target.lower() in {'ev', 'eve', 'every'}:
+            target = 'the stage'
+        verb = 'watch' if plural else 'watches'
+        follow_verb = 'follow' if plural else 'follows'
+        text = f'{label_cap} {verb} {target} and {follow_verb} it with natural eye movement'
+        return _planner_sanitize_i2v_text(text, 220)
+
+    # A bare participle has no actor. Attach it to the known visible subject.
+    gerund = re.match(
+        r'^(?:her|his|their)?\s*(walking|running|stepping|entering|leaving|turning|looking|glancing|watching|noticing|'
+        r'reaching|touching|holding|grabbing|raising|lowering|opening|closing|dancing|swaying|spinning|jumping|leaning|'
+        r'nodding|smiling|laughing|speaking|talking|moving|approaching|pulling|pushing|lifting|dropping|throwing|catching|'
+        r'driving|flying|banking|rolling|fighting|striking|kicking|waving|pointing|sitting|standing|kneeling|brushing|'
+        r'following|crossing|climbing|descending|rising|falling|passing|pausing|stopping|tossing|sipping|drinking|'
+        r'blinking|breathing|gesturing)\b(.*)$',
+        text, flags=re.IGNORECASE,
+    )
+    if label and gerund:
+        aux = 'are' if plural else 'is'
+        text = f'{label_cap} {aux} {gerund.group(1).lower()}{gerund.group(2)}'
+    elif label and not _planner_i2v_explicit_subject(text, label):
+        text = f'{label_cap} {text[:1].lower() + text[1:]}'
+
+    # Pure mental or abstract statements are not useful motion instructions.
+    if re.search(r'\b(?:feels?|understands?|realizes?|wants?|hopes?|remembers?|tension begins|connection forms|spark forms)\b', text, flags=re.IGNORECASE) and not _PLANNER_I2V_ACTION_RX.search(text):
+        return ''
+    return _planner_sanitize_i2v_text(text, 220)
+
+
+def _planner_i2v_extract_visible_action(shot: Dict[str, Any], rec: Dict[str, Any], subject_label: str) -> str:
+    stage = shot.get('stage_directions') if isinstance(shot.get('stage_directions'), dict) else {}
+    explicit_values = [
+        shot.get('i2v_action'), shot.get('motion_prompt'), shot.get('action'), shot.get('subject_motion'),
+        stage.get('action'), rec.get('i2v_action'), rec.get('motion_prompt'),
+    ]
+    for value in explicit_values:
+        candidate = _planner_i2v_finalize_action(str(value or ''), subject_label)
+        if candidate and _PLANNER_I2V_ACTION_RX.search(candidate) and not _planner_i2v_has_meta_text(candidate):
+            return candidate
+
+    sources = [
+        shot.get('visual_description'), shot.get('seed'),
+        rec.get('prompt_user_override'), rec.get('prompt_compiled'), rec.get('prompt_used'), rec.get('prompt_spec'),
+    ]
+    candidates: List[Tuple[int, int, int, str]] = []
+    order = 0
+    for src in sources:
+        for sentence in _planner_sentence_chunks(src):
+            pieces: List[Tuple[str, bool]] = [(sentence, False)]
+            if ',' in sentence:
+                pieces.extend((x.strip(), True) for x in sentence.split(',') if len(x.strip()) >= 10)
+            for piece, is_clause in pieces:
+                order += 1
+                candidate = _planner_i2v_clean_action_candidate(piece, 220)
+                if not candidate or _planner_i2v_environment_fragment(candidate):
+                    continue
+                has_action = bool(_PLANNER_I2V_ACTION_RX.search(candidate))
+                explicit_subject = _planner_i2v_explicit_subject(candidate, subject_label)
+                if not has_action:
+                    continue
+                # With no known subject, never turn scenery wording such as "open foreground"
+                # into a literal action request.
+                if not subject_label and not explicit_subject:
+                    continue
+
+                score = 10
+                action_count = len(_PLANNER_I2V_ACTION_RX.findall(candidate))
+                if action_count > 1 and not is_clause:
+                    score += min(5, (action_count - 1) * 3)
+                if explicit_subject:
+                    score += 4
+                if is_clause:
+                    score += 2
+                if re.match(r'^(?:her|his|their)\s+eyes\b', candidate, flags=re.IGNORECASE):
+                    score += 5
+                if re.match(r'^(?:her|his|their)?\s*(?:walking|running|stepping|entering|leaving|turning|looking|glancing|watching|noticing|reaching|touching|holding|dancing|swaying|tossing|brushing)\b', candidate, flags=re.IGNORECASE):
+                    score += 3
+                if re.search(r'\b(?:skirt|dress|shirt|jacket|hair|blonde|dark-haired|darker-haired|decollet|wearing|dressed|sleek|bold red|appearance)\b', candidate, flags=re.IGNORECASE):
+                    score -= 7
+                if _planner_i2v_has_meta_text(candidate):
+                    score -= 20
+                # Prefer a precise action clause over a long T2I description.
+                score -= max(0, (len(candidate) - 120) // 20)
+                candidates.append((score, 1 if is_clause else 0, -order, candidate))
+    if candidates:
+        candidates.sort(reverse=True)
+        candidate = _planner_i2v_finalize_action(candidates[0][3], subject_label)
+        if candidate and _PLANNER_I2V_ACTION_RX.search(candidate):
+            return candidate
+
+    label = str(subject_label or '').strip()
+    if not label:
+        return ''
+    if label == 'the visible subject':
+        return 'The visible subject makes one clear natural movement that continues the current action'
+    label_cap = label[:1].upper() + label[1:]
+    plural = bool(re.search(r'\b(?:two|women|men|people|girls|boys|they|both|couple)\b', label, flags=re.IGNORECASE))
+    verb = 'continue' if plural else 'continues'
+    return f'{label_cap} {verb} the current visible action with one clear natural movement'
+
+
+def _planner_i2v_environment_motion(source_text: Any, action_text: Any) -> str:
+    src = str(source_text or '')
+    low = src.lower()
+    action_low = str(action_text or '').lower()
+    if any(k in low for k in ('nightclub', 'dance floor', 'dancefloor', 'club lights', 'techno club', 'concert', 'stage lights')):
+        if not ('lights pulse' in action_low or 'crowd' in action_low):
+            return 'Club lights pulse while the background crowd moves to the beat'
+    if any(k in low for k in ('forest', 'woods', 'jungle', 'trees')):
+        return 'Leaves and small branches move naturally in the background'
+    if any(k in low for k in ('ocean', 'sea', 'lake', 'river', 'water')):
+        return 'The visible water ripples naturally'
+    if any(k in low for k in ('rain', 'storm', 'snow')):
+        return 'The visible weather continues moving naturally through the scene'
+    if any(k in low for k in ('smoke', 'fog', 'mist', 'steam')):
+        return 'The visible smoke or mist drifts naturally'
+    if any(k in low for k in ('fire', 'flame', 'campfire')):
+        return 'The visible flames flicker naturally'
+    if any(k in low for k in ('street', 'city', 'traffic', 'crowd')):
+        return 'Background people and traffic continue their natural movement'
+    return ''
+
+
+def _planner_i2v_visibility_line(subject_label: str, camera_line: str) -> str:
+    low = str(subject_label or '').lower()
+    plural = bool(re.search(r'\b(?:two|three|four|people|women|men|girls|boys|couple)\b', low) or ' and ' in low)
+    if not plural:
+        return ''
+    if camera_line:
+        return ''
+    return 'The framing keeps every visible subject in view throughout the shot'
 
 
 def _planner_build_i2v_schema(
@@ -4658,116 +4973,73 @@ def _planner_build_i2v_schema(
     enc: Optional[Dict[str, Any]] = None,
     own_active: bool = False,
 ) -> Dict[str, Any]:
+    _ = prev_shot, next_shot
     stage = shot.get('stage_directions') if isinstance(shot.get('stage_directions'), dict) else {}
-    camera = _planner_compact_text(stage.get('camera') or shot.get('camera') or '', 120)
-    purpose = _planner_compact_text(stage.get('purpose') or shot.get('notes') or shot.get('purpose') or '', 180)
-    mood = _planner_compact_text(stage.get('mood') or shot.get('mood') or '', 80)
-    lighting = _planner_compact_text(stage.get('lighting') or shot.get('lighting') or '', 80)
-
-    visual = _planner_compact_text(shot.get('visual_description') or shot.get('seed') or '', 280)
+    camera_hint = _planner_compact_text(stage.get('camera') or shot.get('camera') or '', 100)
+    visual = _planner_compact_text(shot.get('visual_description') or shot.get('seed') or '', 420)
     compiled = _planner_compact_text(
-        rec.get('prompt_user_override')
-        or rec.get('prompt_compiled')
-        or rec.get('prompt_used')
-        or rec.get('prompt_spec')
-        or visual,
-        320,
+        rec.get('prompt_user_override') or rec.get('prompt_compiled') or rec.get('prompt_used') or rec.get('prompt_spec') or visual,
+        420,
     )
-
-    prev_text = _planner_compact_text((prev_shot or {}).get('visual_description') or (prev_shot or {}).get('seed') or '', 160)
-    next_text = _planner_compact_text((next_shot or {}).get('visual_description') or (next_shot or {}).get('seed') or '', 160)
-
-    subject_tokens: List[str] = []
-    subs = shot.get('subjects')
-    if isinstance(subs, list):
-        for s in subs[:3]:
-            if isinstance(s, dict):
-                label = _planner_compact_text(s.get('name') or s.get('label') or s.get('id') or '', 60)
-            else:
-                label = _planner_compact_text(s, 60)
-            if label:
-                subject_tokens.append(label)
-
-    subject_label = ', '.join(subject_tokens[:3]).strip()
-    if not subject_label:
-        subject_label = 'the main subject from the uploaded image'
-
-    sent_visual = _planner_sentence_chunks(visual)
-    sent_compiled = _planner_sentence_chunks(compiled)
-    scene_anchor = sent_visual[0] if sent_visual else (sent_compiled[0] if sent_compiled else visual or compiled)
-
-    if purpose:
-        subject_motion = f'{subject_label} continues the shot with visible motion; {purpose.lower()}'
-    else:
-        subject_motion = f'{subject_label} continues the moment already shown in the uploaded image with one clear natural action'
-
-    environment_bits: List[str] = []
-    if scene_anchor:
-        environment_bits.append(f'stay in the same setting and layout; {scene_anchor}')
-    if mood:
-        environment_bits.append(f'stay in the same mood; {mood}')
-    if lighting:
-        environment_bits.append(f'stay in the same lighting feel; {lighting}')
-    environment_bits.append('let the location breathe with natural motion such as atmosphere drift, cloth or hair movement, reflections, crowd motion, weather, dust, smoke, or passing background activity when it fits the scene')
-    environment_motion = '; '.join([b for b in environment_bits if b])
+    source_text = ' '.join([x for x in (visual, compiled) if x]).strip()
+    subject_label = _planner_i2v_subject_label(manifest, shot, rec, source_text)
+    subject_motion = _planner_i2v_extract_visible_action(shot, rec, subject_label)
+    environment_motion = _planner_i2v_environment_motion(source_text, subject_motion)
 
     use_dynamic_camera = bool((enc or {}).get('use_20_camera_effects', True))
-    camera_motion = _planner_camera_motion_from_hint(camera, dynamic_mode=use_dynamic_camera)
-    shot_intent = purpose or (f'play the {str(shot.get("phase") or "current").strip()} beat clearly with visible movement' if str(shot.get('phase') or '').strip() else 'continue the image as a moving shot without inventing a new location or subject')
+    camera_motion = _planner_camera_motion_from_hint(camera_hint, dynamic_mode=use_dynamic_camera)
+    # Environment-only shots should not receive a random follow/arc/track command.
+    # Ambient motion is enough and avoids turning a location insert into a scene change.
+    if not subject_label:
+        camera_motion = ''
+    if camera_motion and re.search(r'\b(?:two|three|four|people|women|men|girls|boys|couple)\b', subject_label.lower()):
+        if 'visible' not in camera_motion.lower() and 'subjects' not in camera_motion.lower():
+            camera_motion = camera_motion.rstrip(' .') + '. Keep every visible subject in frame'
+    visibility_line = _planner_i2v_visibility_line(subject_label, camera_motion)
 
-    start_parts = ['start from the uploaded image with no reset or reframe']
-    if compiled:
-        start_parts.append(f'use this as the visual anchor; {compiled}')
-    if prev_text:
-        start_parts.append(f'follow on naturally from the previous beat; {prev_text}')
-    start_state = '; '.join(start_parts)
-
-    end_state = _planner_i2v_end_state_hint(shot.get('phase') or purpose, shot.get('notes') or purpose, next_text)
-
-    continuity_locks: List[str] = []
-    continuity_locks.extend(_planner_character_lock_lines(manifest, ' '.join([visual, compiled, scene_anchor]), enc=enc, own_active=own_active))
-
-    _seen = set()
-    continuity_locks = [x for x in continuity_locks if x and not (x.lower() in _seen or _seen.add(x.lower()))]
+    continuity_locks = _planner_character_lock_lines(manifest, source_text, enc=enc, own_active=own_active)
+    seen = set()
+    continuity_locks = [x for x in continuity_locks if x and not (x.lower() in seen or seen.add(x.lower()))]
 
     return {
         'schema_version': int(_PLANNER_I2V_SCHEMA_VERSION),
-        'subject_motion': _planner_sanitize_i2v_text(subject_motion, 260),
-        'environment_motion': _planner_sanitize_i2v_text(environment_motion, 320),
-        'camera_motion': _planner_sanitize_i2v_text(camera_motion, 220),
-        'shot_intent': _planner_sanitize_i2v_text(shot_intent, 220),
-        'start_state': _planner_sanitize_i2v_text(start_state, 360),
-        'end_state': _planner_sanitize_i2v_text(end_state, 280),
+        'mode': 'direct_visible_motion_v6',
+        'subject_label': _planner_sanitize_i2v_text(subject_label, 80),
+        'subject_motion': _planner_sanitize_i2v_text(subject_motion, 220),
+        'environment_motion': _planner_sanitize_i2v_text(environment_motion, 160),
+        'camera_motion': _planner_sanitize_i2v_text(camera_motion, 180),
+        'visibility': _planner_sanitize_i2v_text(visibility_line, 140),
+        # Kept as empty compatibility fields for older inspector/UI code.
+        'shot_intent': '',
+        'start_state': '',
+        'end_state': '',
         'continuity_locks': [_planner_sanitize_i2v_text(x, 120) for x in continuity_locks[:4]],
     }
 
 
 def _planner_format_i2v_prompt(schema: Dict[str, Any]) -> str:
-    locks = schema.get('continuity_locks') if isinstance(schema.get('continuity_locks'), list) else []
-    lock_text = '; '.join([_planner_sanitize_i2v_text(x, 90) for x in locks if _planner_sanitize_i2v_text(x, 90)])
-    subject_motion = _planner_sanitize_i2v_text(schema.get('subject_motion') or '', 260)
-    environment_motion = _planner_sanitize_i2v_text(schema.get('environment_motion') or '', 300)
-    camera_line = _planner_sanitize_i2v_text(schema.get('camera_motion') or '', 180)
-    shot_intent = _planner_sanitize_i2v_text(schema.get('shot_intent') or '', 180)
-    start_state = _planner_sanitize_i2v_text(schema.get('start_state') or '', 220)
-    end_state = _planner_sanitize_i2v_text(schema.get('end_state') or '', 220)
-
     parts: List[str] = []
-    if start_state:
-        parts.append(start_state)
-    if subject_motion:
-        parts.append(subject_motion)
-    if camera_line:
-        parts.append(f'Camera move; {camera_line}')
-    if environment_motion:
-        parts.append(environment_motion)
-    if shot_intent:
-        parts.append(f'Focus on this beat; {shot_intent}')
-    if end_state:
-        parts.append(f'End by; {end_state}')
-    if lock_text:
-        parts.append(f'Identity anchors; {lock_text}')
-    return '. '.join([p.strip().rstrip('. ') for p in parts if p and p.strip()]).strip() + '.'
+    for key in ('subject_motion', 'environment_motion', 'camera_motion', 'visibility'):
+        value = _planner_sanitize_i2v_text(schema.get(key) or '', 240)
+        if not value:
+            continue
+        if _planner_i2v_has_meta_text(value):
+            continue
+        value = value.strip().rstrip('. ')
+        if value:
+            parts.append(value)
+    # De-duplicate repeated sentences while preserving order.
+    seen = set()
+    clean_parts: List[str] = []
+    for item in parts:
+        k = re.sub(r'\s+', ' ', item).strip().lower()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        clean_parts.append(item)
+    if not clean_parts:
+        clean_parts = ['The visible action continues with one clear natural movement']
+    return '. '.join(clean_parts).strip() + '.'
 
 
 def _planner_i2v_prompts_are_current(path: str) -> bool:
@@ -4783,7 +5055,7 @@ def _planner_i2v_prompts_are_current(path: str) -> bool:
         first = shots[0] if isinstance(shots[0], dict) else {}
         prompt = str(first.get('prompt') or '').strip()
         schema = first.get('schema') if isinstance(first.get('schema'), dict) else {}
-        return bool(prompt) and bool(schema)
+        return bool(prompt) and bool(schema) and str(schema.get('mode') or '').startswith('direct_visible_motion')
     except Exception:
         return False
 
@@ -5940,24 +6212,151 @@ def _parse_story_shot_lines(blob: str, n_shots: int, plan_obj: Any, duration_sec
     return out
 
 
+def _story_beat_text(item: Any) -> str:
+    if isinstance(item, str):
+        return _sanitize_visual_description(item).strip()
+    if isinstance(item, dict):
+        for key in ('text', 'moment', 'beat', 'action', 'description', 'summary', 'event'):
+            value = item.get(key)
+            if value:
+                return _sanitize_visual_description(str(value)).strip()
+    return ''
+
+
+def _story_event_candidates(plan_obj: Any, user_prompt: str, extra_info: str = '') -> List[str]:
+    """Build ordered visible events from the user's narrative and plan beats."""
+    candidates: List[str] = []
+
+    def _add(raw: Any) -> None:
+        text = str(raw or '').replace('\r\n', '\n').replace('\r', '\n').strip()
+        if not text:
+            return
+        # Semicolons and line breaks can mark separate events. Em dashes are kept
+        # inside their sentence because their trailing fragment is often commentary
+        # (for example "more than just dancing"), not a new visible action.
+        chunks: List[str] = []
+        for sent in _planner_sentence_chunks(text):
+            split_parts = re.split(r'\s*;\s*', sent)
+            chunks.extend([p for p in split_parts if p.strip()])
+        if not chunks:
+            chunks = [text]
+        for chunk in chunks:
+            clean = _sanitize_visual_description(chunk)
+            clean = re.sub(r'\s+', ' ', clean).strip(' ,.;:-')
+            if '…' in clean:
+                clean = clean.split('…', 1)[0].strip(' ,.;:-')
+            clean = re.sub(r'\b(?:who wants what|what has become harder|what was revealed|what payoff is being prepared next)\b.*$', '', clean, flags=re.IGNORECASE).strip(' ,.;:-')
+            if len(clean) < 12 or _planner_i2v_environment_fragment(clean):
+                continue
+            has_action = bool(_PLANNER_I2V_ACTION_RX.search(clean))
+            has_subject = _planner_i2v_explicit_subject(clean)
+            # Keep only filmable events. Internal feelings, abstract tension, and
+            # writer metadata must not become LTX instructions.
+            if not has_action or not has_subject:
+                continue
+            if _planner_i2v_has_meta_text(clean):
+                continue
+            if re.search(r'\b(?:feels?|understands?|realizes?|wants?|hopes?|remembers?|promise of connection|tension begins to build|something shift)\b', clean, flags=re.IGNORECASE) and not re.search(r'\b(?:walk|run|step|enter|turn|look|glance|watch|notice|reach|touch|hold|dance|sway|brush|toss|move)\w*\b', clean, flags=re.IGNORECASE):
+                continue
+            if any(_story_prompt_texts_overlap(clean, old) for old in candidates):
+                continue
+            candidates.append(clean)
+
+    # The user's narrative normally contains the most faithful order and details.
+    _add(user_prompt)
+    if isinstance(plan_obj, dict):
+        for beat in (plan_obj.get('beats') or []):
+            _add(_story_beat_text(beat))
+        # Use the logline only as a last source of missing visible action.
+        if len(candidates) < 2:
+            _add(plan_obj.get('logline') or '')
+    if len(candidates) < 2:
+        _add(extra_info)
+    return candidates
+
+
+def _story_subjects_for_event(plan_obj: Any, event_text: Any) -> List[Dict[str, Any]]:
+    text = str(event_text or '')
+    low = text.lower()
+    out: List[Dict[str, Any]] = []
+    for char in _plan_characters(plan_obj):
+        name = str(char.get('name') or '').strip()
+        if name and re.search(r'(?<![A-Za-z0-9_])' + re.escape(name) + r'(?![A-Za-z0-9_])', text, flags=re.IGNORECASE):
+            out.append({'name': name, 'taxonomy': str(char.get('taxonomy') or 'human')})
+    if out:
+        return out[:3]
+    generic = [
+        (r'\btwo women\b', 'the two women'), (r'\btwo men\b', 'the two men'),
+        (r'\btwo girls\b', 'the two girls'), (r'\btwo boys\b', 'the two boys'),
+        (r'\btwo people\b', 'the two people'), (r'\bthe couple\b', 'the couple'),
+        (r'\b(?:a|the) woman\b', 'the woman'), (r'\b(?:a|the) man\b', 'the man'),
+        (r'\b(?:a|the) girl\b', 'the girl'), (r'\b(?:a|the) boy\b', 'the boy'),
+        (r'\b(?:a|the) dog\b', 'the dog'), (r'\b(?:a|the) cat\b', 'the cat'),
+        (r'\b(?:a|the) creature\b', 'the creature'), (r'\b(?:a|the) animal\b', 'the animal'),
+        (r'\b(?:a|the) car\b', 'the car'), (r'\b(?:a|the) jet\b', 'the jet'),
+    ]
+    for pat, label in generic:
+        if re.search(pat, low, flags=re.IGNORECASE):
+            return [{'name': label}]
+    if re.search(r'\bwomen\b', low):
+        return [{'name': 'the women'}]
+    if re.search(r'\bmen\b', low):
+        return [{'name': 'the men'}]
+    if re.search(r'\bwoman\b', low):
+        return [{'name': 'the woman'}]
+    if re.search(r'\bman\b', low):
+        return [{'name': 'the man'}]
+    if re.search(r'\b(?:they|their|both|together)\b', low):
+        chars = _plan_characters(plan_obj)
+        if chars:
+            return [{'name': str(c.get('name') or '').strip(), 'taxonomy': str(c.get('taxonomy') or 'human')} for c in chars[:2] if str(c.get('name') or '').strip()]
+    return []
+
+
+def _story_fit_events_to_shots(events: List[str], n_shots: int) -> List[str]:
+    vals = [str(x or '').strip() for x in (events or []) if str(x or '').strip()]
+    if not vals:
+        return []
+    if n_shots <= 1:
+        return [vals[0]]
+    if len(vals) == n_shots:
+        return vals[:]
+    if len(vals) > n_shots:
+        # Even sampling preserves the beginning and ending while avoiding a dump
+        # of nearly identical early sentences.
+        picked: List[str] = []
+        for i in range(n_shots):
+            idx = int(round((i * (len(vals) - 1)) / float(max(1, n_shots - 1))))
+            picked.append(vals[max(0, min(len(vals) - 1, idx))])
+        return picked
+    out: List[str] = []
+    for i in range(n_shots):
+        idx = int(round((i * (len(vals) - 1)) / float(max(1, n_shots - 1))))
+        out.append(vals[max(0, min(len(vals) - 1, idx))])
+    return out
+
+
 def _build_local_story_fallback_shots(plan_obj: Any, user_prompt: str, extra_info: str, n_shots: int, duration_sec: float = 0.0) -> List[Dict[str, Any]]:
     try:
         n_shots = max(1, int(n_shots or 0))
     except Exception:
         n_shots = 1
     plan = _normalize_story_arc(plan_obj, duration_sec, n_shots)
-    sections = [s for s in (plan.get("arc_sections") or []) if isinstance(s, dict)]
+    sections = [s for s in (plan.get('arc_sections') or []) if isinstance(s, dict)]
     if not sections:
-        sections = [{"index": 1, "key": "setup", "label": "Setup", "job": "introduce the world", "change": "reveal new info", "emotion_shift": "curiosity becomes focus", "start_shot": 1, "end_shot": n_shots}]
+        sections = [{'index': 1, 'key': 'setup', 'label': 'Setup', 'job': 'introduce the world', 'change': 'reveal new info', 'emotion_shift': '', 'start_shot': 1, 'end_shot': n_shots}]
 
-    base_prompt = _compact_story_text(user_prompt or plan.get("prompt") or ((plan.get("story_engine") or {}).get("who_wants_what") if isinstance(plan.get("story_engine"), dict) else "") or "the main subject is in motion", 220).strip(" .")
-    extra = _compact_story_text(extra_info or plan.get("extra_info") or "", 140).strip(" .")
+    events = _story_event_candidates(plan, user_prompt, extra_info)
+    if not events:
+        fallback = _sanitize_visual_description(user_prompt or plan.get('logline') or 'The visible subject continues the current action')
+        events = [fallback]
+    fitted_events = _story_fit_events_to_shots(events, n_shots)
 
     def _section_for_shot(i: int) -> Dict[str, Any]:
         for sec in sections:
             try:
-                st = int(sec.get("start_shot") or 1)
-                en = int(sec.get("end_shot") or st)
+                st = int(sec.get('start_shot') or 1)
+                en = int(sec.get('end_shot') or st)
             except Exception:
                 st, en = 1, n_shots
             if st <= i <= en:
@@ -5967,77 +6366,40 @@ def _build_local_story_fallback_shots(plan_obj: Any, user_prompt: str, extra_inf
     out: List[Dict[str, Any]] = []
     for i in range(1, n_shots + 1):
         sec = _section_for_shot(i)
-        sec_key = _story_section_key(sec.get("key"))
+        sec_key = _story_section_key(sec.get('key'))
         defaults = _story_section_defaults(sec_key)
-        st = int(sec.get("start_shot") or i)
-        en = int(sec.get("end_shot") or i)
+        st = int(sec.get('start_shot') or i)
+        en = int(sec.get('end_shot') or i)
         idx_in_sec = max(1, i - st + 1)
         sec_len = max(1, en - st + 1)
-        purpose = _normalize_shot_purpose("", sec_key, idx_in_sec, sec_len)
+        purpose = _normalize_shot_purpose('', sec_key, idx_in_sec, sec_len)
         progression = _progression_defaults_for_section(sec_key)
-        cues = _STORY_FALLBACK_VISUAL_CUES.get(sec_key, _STORY_FALLBACK_VISUAL_CUES["setup"])
-        seed_base = f"{base_prompt}|{sec_key}|{purpose}|{i}/{n_shots}"
-        action = _story_fallback_pick(cues.get("actions") or [], seed_base + "|action") or "moving through the next readable beat"
-        location = _story_fallback_pick(cues.get("locations") or [], seed_base + "|location") or "in the active part of the setting"
-        details = _story_fallback_pick(cues.get("details") or [], seed_base + "|details") or "layered surroundings, readable depth, a clear landmark, and atmosphere that supports the action"
-        emotion = _compact_story_text(sec.get("emotion_shift") or defaults.get("emotion") or "", 80)
-        reveal = _compact_story_text(progression.get("revealed_now") or progression.get("different_now") or "", 100)
-        harder = _compact_story_text(progression.get("harder_now") or progression.get("prepares_payoff") or "", 100)
-
-        scenic_cutaway = bool((i == 1 and n_shots >= 4) or (purpose in ("transition", "reveal clue", "show obstacle", "payoff") and (i % 4 == 0)))
-        world = _story_world_phrase(plan_obj, user_prompt, extra_info)
-
-        if scenic_cutaway:
-            if purpose == "introduce":
-                sentence1 = f"The setting around {world} opens up {location}, with {details}."
-                sentence2 = f"A clear route deeper into the scene and a strong landmark make {reveal or 'the world itself'} easy to read."
-            elif purpose == "reveal clue":
-                sentence1 = f"A new clue stands out {location} in {world}, with {details}."
-                sentence2 = f"The surroundings make {reveal or 'the next step'} feel newly important while the path ahead stays open."
-            elif purpose == "show obstacle":
-                sentence1 = f"The path ahead {location} in {world} now feels blocked, with {details}."
-                sentence2 = f"Compressed space, visual pressure, and signs of disruption show how {harder or 'the situation'} has become harder."
-            elif purpose == "payoff":
-                sentence1 = f"The aftermath settles {location} in {world}, with {details}."
-                sentence2 = f"The changed atmosphere and visible traces of the previous action make {reveal or 'the outcome'} easy to read."
-            else:
-                sentence1 = f"A route deeper into {world} comes into focus {location}, with {details}."
-                sentence2 = f"The surroundings quietly prepare {reveal or harder or 'the next beat'} without needing the main character in frame."
-        else:
-            sentence1 = f"{base_prompt}, {action} {location}.".strip()
-            if extra and not _story_prompt_texts_overlap(sentence1, extra):
-                sentence1 = f"{sentence1[:-1]} while {extra}." if sentence1.endswith('.') else f"{sentence1} while {extra}."
-            sentence2 = f"{details}."
-            if emotion or reveal or harder:
-                tail_parts = []
-                if emotion:
-                    tail_parts.append(f"the feeling shifts toward {emotion}")
-                if reveal:
-                    tail_parts.append(reveal)
-                elif harder:
-                    tail_parts.append(harder)
-                if tail_parts:
-                    sentence2 = f"{details}, and {', '.join(tail_parts)}."
-
-        visual = _sanitize_visual_description(f"{sentence1} {sentence2}")
-        stage = _story_stage_defaults(sec_key, purpose, f"parse|{i}|{visual}")
+        visual = _sanitize_visual_description(fitted_events[i - 1] if i - 1 < len(fitted_events) else events[-1])
+        visual = re.sub(r'\s+', ' ', visual).strip(' ,.;:-')
+        if not visual:
+            visual = 'The visible subject continues the current action'
+        if not re.search(r'[.!?]$', visual):
+            visual += '.'
+        subjects = _story_subjects_for_event(plan, visual)
+        stage = _story_stage_defaults(sec_key, purpose, f'fallback|{i}|{visual}')
         out.append({
-            "id": f"S{i:02d}",
-            "stage_directions": stage,
-            "visual_description": visual,
-            "subjects": [],
-            "seed": visual,
-            "camera": stage.get("camera") or "medium shot",
-            "lighting": stage.get("lighting") or "cinematic lighting",
-            "mood": stage.get("mood") or "neutral",
-            "notes": f"{purpose}; {str(sec.get('job') or defaults.get('job') or '').strip()}".strip(" ;"),
-            "story_section": str(sec.get("label") or defaults.get("label") or sec_key.title()).strip(),
-            "section_change": str(sec.get("change") or defaults.get("change") or "reveal new info").strip(),
-            "shot_purpose": purpose,
-            "story_progression": progression,
+            'id': f'S{i:02d}',
+            'stage_directions': stage,
+            'visual_description': visual,
+            'subjects': subjects,
+            'seed': visual,
+            'camera': stage.get('camera') or 'medium shot',
+            'lighting': stage.get('lighting') or 'cinematic lighting',
+            'mood': stage.get('mood') or 'neutral',
+            # Purpose remains metadata for the inspector; it is no longer sent to LTX.
+            'notes': str(purpose or '').strip(),
+            'story_section': str(sec.get('label') or defaults.get('label') or sec_key.title()).strip(),
+            'section_change': str(sec.get('change') or defaults.get('change') or 'reveal new info').strip(),
+            'shot_purpose': purpose,
+            'story_progression': progression,
+            'story_role': str(purpose or '').strip(),
         })
     return out
-
 
 
 def _character_names_from_bible(bible: List[Dict[str, Any]]) -> List[str]:
@@ -6197,6 +6559,28 @@ def _story_shots_overfocus_character(shots: List[Dict[str, Any]], plan_obj: Any)
 
 
 def _rebalance_auto_story_presence(shots: List[Dict[str, Any]], plan_obj: Any, user_prompt: str, extra_info: str) -> int:
+    # Do not manufacture empty-location cutaways just because most shots contain
+    # the recurring cast. Only rebalance when the authored plan explicitly asks
+    # for a location/object/aftermath shot without the main subjects.
+    explicit_cutaway = False
+    try:
+        beat_texts = [_story_beat_text(x) for x in ((plan_obj or {}).get('beats') or [])] if isinstance(plan_obj, dict) else []
+        for bt in beat_texts:
+            low = str(bt or '').lower()
+            if not low:
+                continue
+            asks_environment = any(k in low for k in (
+                'empty room', 'empty street', 'location alone', 'environment only', 'without the character',
+                'without the characters', 'aftermath', 'abandoned', 'the setting changes', 'the path is blocked',
+                'an object reveals', 'a clue appears',
+            ))
+            if asks_environment and not _shot_has_people_hint(low):
+                explicit_cutaway = True
+                break
+    except Exception:
+        explicit_cutaway = False
+    if not explicit_cutaway:
+        return 0
     if not _story_shots_overfocus_character(shots, plan_obj):
         return 0
     n = len(shots or [])
@@ -12090,7 +12474,7 @@ class PipelineWorker(QThread):
 
                 beats = list(getattr(project, 'story_outline', None) or [])
                 t2i_prompts = _offline_force_style_and_strip_negative(list(getattr(project, 'text_to_image_prompts', None) or []), style_hint, negative_hint)
-                i2v_prompts = _offline_force_style_and_strip_negative(list(getattr(project, 'image_to_video_prompts', None) or []), style_hint, negative_hint)
+                i2v_prompts = _offline_force_style_and_strip_negative(list(getattr(project, 'image_to_video_prompts', None) or []), '', negative_hint)
                 if not beats or not t2i_prompts or not i2v_prompts:
                     raise RuntimeError('Offline Storyline Creator returned incomplete output.')
 
@@ -12415,7 +12799,8 @@ class PipelineWorker(QThread):
                         "story_engine keys: who_wants_what, what_blocks_them, what_happens_if_they_fail.\n"
                         "arc_sections item keys: key, label, job, change, emotion_shift.\n"
                         "Use 4-6 arc_sections depending on duration and complexity.\n"
-                        "beats must show real progression, not random variety.\n"
+                        f"beats must contain exactly {_plan_shot_hint} distinct visible events, one intended event per shot.\n"
+                        "Each beat must state who does what and what visibly changes; never use abstract writer labels as the beat itself.\n"
                         "Keep the strongest story turns from the outline.\n\n"
                         f"PROMPT: {self.job.prompt}\n"
                         + (f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n")
@@ -12444,7 +12829,7 @@ class PipelineWorker(QThread):
                         "1. If PROMPT/EXTRA_INFO/OWN_CHARACTERS does not clearly specify animals/creatures/non-human subjects, assume the story is about HUMANS.\n"
                         "2. Separate STAGE DIRECTIONS (metadata) from VISUAL_DESCRIPTION (what appears on screen)\n"
                         "3. Characters must include taxonomy detection: set 'taxonomy' to 'human', 'animal', or 'creature'\n"
-                        "4. For animals: use 'species' (e.g., 'Red Fox', 'Snowy Owl') not 'hair/outfit'\n"
+                        "4. For animals: use 'species' only when the prompt explicitly describes an animal; for humans omit species completely\n"
                         "5. visual_description must NEVER contain: 'Camera:', 'Shot:', 'Lighting:', 'Cut to', 'Fade'\n"
                         "6. visual_description must NEVER contain technical cinematography terms\n"
                         "7. If you use character names, keep identity consistent in every beat/shot (name + taxonomy/species) and do not change species.\n"
@@ -12452,7 +12837,8 @@ class PipelineWorker(QThread):
                         "9. Every plan MUST include a simple story engine with: who_wants_what, what_blocks_them, what_happens_if_they_fail\n"
                         "10. Keep arc_sections compact and simple even for longer videos; do not expand into extra long-form sectioning just because duration is higher\n"
                         "11. Every arc section must say what changes: reveal new info, increase danger, change location, shift emotion, or force a decision\n"
-                        "12. beats should describe progression, not random variety\n"
+                        "12. beats must be distinct visible events with a named or clearly described subject performing a concrete action\n"
+                        "13. Never use story-writing labels such as introduce, transition, payoff, reveal, force a decision, or who wants what as beat content\n"
                         "\n"
                         "Example BAD visual_description (will break generation):\n"
                         "'Camera: static, Lighting: cool. Cut to the scene.'\n"
@@ -12466,7 +12852,8 @@ class PipelineWorker(QThread):
                         "- story_engine keys: who_wants_what, what_blocks_them, what_happens_if_they_fail.\n"
                         "- arc_sections item keys: key, label, job, change, emotion_shift.\n"
                         "- Produce 3-4 arc_sections only; do not expand section count for longer durations.\n"
-                        "- beats should summarize progression across the arc, not just visual variety.\n"
+                        f"- beats must contain exactly {_plan_shot_hint} distinct visible events, one intended event per shot.\n"
+                        "- Every beat must state who does what and what visibly changes; no writer labels or abstract story goals.\n"
                         "- Keep it short and actionable for prompt generation.\n\n"
                         f"PROMPT: {self.job.prompt}\n"
                         + (f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n")
@@ -12566,6 +12953,11 @@ class PipelineWorker(QThread):
                     "videoclip_preset": self.job.encoding.get("videoclip_preset"),
                 }
                 parsed["planner_plan_fingerprint"] = plan_fingerprint
+                parsed = _planner_sanitize_plan_characters(
+                    parsed,
+                    default_taxonomy,
+                    f"{self.job.prompt} {self.job.extra_info}",
+                )
                 parsed = _normalize_story_arc(parsed, float(getattr(self.job, "approx_duration_sec", 0) or 0.0), 0)
 
                 _safe_write_json(plan_path, parsed)
@@ -13004,7 +13396,7 @@ class PipelineWorker(QThread):
                     "The JSON must be a single object with key 'shots' as an array. "
                     "Each shot MUST include fields: id, stage_directions, visual_description, subjects, story_section, shot_purpose, story_progression. "
                     "story_progression must be an object with keys: different_now, harder_now, revealed_now, prepares_payoff. "
-                    "CRITICAL: visual_description must be 2-3 sentences of pure visual content with NO technical cinematography terms. It MUST include surroundings: clearly state the setting/location and add 3-7 concrete environmental details (foreground/midground/background cues, materials or objects, time of day, and atmosphere). It MUST NOT contain: Camera:, Shot:, Lighting:, Cut to, Fade. The sequence must follow the plan's story_engine and arc_sections, so the middle never becomes filler. Every section must change something real: reveal new info, increase danger, change location, shift emotion, or force a decision. Every shot must have a clear job such as introduce, build tension, show obstacle, reveal clue, transition, or payoff. Not every shot should keep the protagonist on screen: use environment-only or object-led shots whenever they better establish place, reveal a clue, show an obstacle, or show aftermath. Aim for roughly 20-35% of the shot list to be non-portrait story beats focused on location, clue, path, obstacle, or changed world. Avoid front-facing centered portraits unless the beat specifically needs a reaction or payoff. Default to humans unless the plan/prompt explicitly indicates animals or creatures; do not introduce animal protagonists unless requested." + " If OWN_CHARACTERS is provided, every shot MUST include those characters in subjects and visual_description, and you must not introduce new named protagonists."
+                    "CRITICAL: visual_description must be 2-3 sentences of pure visual content with NO technical cinematography terms. It MUST include surroundings: clearly state the setting/location and add 3-7 concrete environmental details (foreground/midground/background cues, materials or objects, time of day, and atmosphere). It MUST NOT contain: Camera:, Shot:, Lighting:, Cut to, Fade. The sequence must follow the plan's story_engine and arc_sections, so the middle never becomes filler. Every section must change something real: reveal new info, increase danger, change location, shift emotion, or force a decision. Every shot must have a clear internal purpose, but visual_description must contain only the visible event and never that purpose label. Keep recurring subjects on screen whenever the event involves them. Use an environment-only or object-led shot only when PLAN_JSON explicitly contains that event; never invent cutaways merely to vary framing. Avoid front-facing centered portraits unless the beat specifically needs a reaction or payoff. Default to humans unless the plan/prompt explicitly indicates animals or creatures; do not introduce animal protagonists unless requested." + " If OWN_CHARACTERS is provided, every shot MUST include those characters in subjects and visual_description, and you must not introduce new named protagonists."
                 )
                 _story_creativity = _planner_story_creativity_profile(self.job.encoding)
                 _own_llama_story = bool(_story_creativity.get('use_own_llama'))
@@ -13020,9 +13412,10 @@ class PipelineWorker(QThread):
                         "- Every shot must feel like the next real beat of the story, not a cosmetic variation of the previous one.\n"
                         "- Let the plot move: reveal something, change power, alter the plan, raise danger, shift emotion, or move to a more charged place.\n"
                         "- Use strong, memorable set pieces when the idea supports them.\n"
-                        "- Do not keep the protagonist visible in every shot; use environment beats, clue beats, obstacle beats, object beats, or reaction beats when they serve the story better.\n"
+                        "- Keep recurring subjects visible whenever the event involves them. Use an environment-only shot only when the plan explicitly describes an environment event.\n"
                         "- Keep continuity, but avoid repetition and looping behavior.\n"
                         "- Keep one main readable beat per shot so image/video generation stays stable.\n"
+                        "- visual_description must state the visible event directly; never put introduce, transition, payoff, build tension, reveal, force a decision, or next beat inside visual_description.\n"
                         "- Use ids like S01, S02, ... up to the requested count.\n\n"
                         f"REQUESTED_SHOTS: {n_shots}\n"
                         f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n"
@@ -13046,14 +13439,15 @@ class PipelineWorker(QThread):
                         "- story_progression: {different_now, harder_now, revealed_now, prepares_payoff}\n"
                         "- visual_description: 2-3 sentences of pure visual content, NO technical terms\n- visual_description MUST include setting + surroundings (location plus 3-7 concrete environmental details; include foreground/midground/background cues, time of day, weather/atmosphere, and a distinctive prop/landmark when relevant).\n"
                         "- Use ids like S01, S02, ... up to the requested count.\n"
-                        "- Keep each shot to ONE clear action and ONE main subject (the subject can be one or two characters if needed).\n"
+                        "- Keep each shot to ONE clear visible action and ONE main subject group (one or two characters if needed).\n"
+                        "- visual_description must describe the event itself, never the narrative purpose or instructions for a future shot.\n"
                         "- Keep continuity across shots.\n"
                         "- Follow PLAN_JSON.story_engine and PLAN_JSON.arc_sections.\n"
                         "- story_section must use the relevant arc section label for that shot.\n"
                         "- stage_directions.purpose and shot_purpose must describe why the shot exists: introduce, build tension, show obstacle, reveal clue, transition, payoff, or force a decision.\n"
                         "- Make the middle progress: each section must reveal something, raise pressure, move somewhere new, shift emotion, or force a choice.\n"
                         "- Across the full shot list, progression must be visible: what changed, what got harder, what was revealed, and what payoff is being prepared next.\n"
-                        "- Do not keep the protagonist visible in every shot; use environment-only or object-led beats when they make the story clearer.\n"
+                        "- Keep recurring subjects visible whenever the event involves them. Do not invent an environment-only cutaway merely for variety.\n"
                         "- Avoid portrait-first wording unless a close emotional beat is really needed.\n\n"
                         f"REQUESTED_SHOTS: {n_shots}\n"
                         f"DEFAULT_SUBJECT_TAXONOMY: {default_taxonomy}\n"
@@ -13117,7 +13511,7 @@ class PipelineWorker(QThread):
                             "- One shot per line, no numbering.\n"
                             "- Keep continuity, but make each line visually different from the others.\n"
                             "- The middle must progress instead of repeating the setup.\n"
-                            "- Do not keep the protagonist visible in every line; use environment-only or clue/obstacle lines when that tells the story better.\n"
+                            "- Keep recurring subjects visible when the event involves them. Do not invent environment-only cutaways merely for variety.\n"
                             "- Use the plan's arc sections and section changes.\n"
                             "- No camera labels, no shot labels, no technical prefixes.\n\n"
                             "PLAN_JSON:\n" + json.dumps(plan_obj, ensure_ascii=False)
