@@ -95,6 +95,24 @@ def _hidream_hidden_by_remove_hide() -> bool:
     )
 
 
+def _qwen2511_gguf_hidden_by_remove_hide() -> bool:
+    """Return True when only the embedded GGUF backend selector is hidden."""
+    return _remove_hide_entry_hidden(
+        "qwen_edit_2511_gguf",
+        "qwen2511_gguf",
+        "qwen2511_sd_cpp",
+    )
+
+
+def _qwen2511_int4_hidden_by_remove_hide() -> bool:
+    """Return True when the embedded Nunchaku INT4 backend is hidden."""
+    return _remove_hide_entry_hidden(
+        "qwen_edit_2511_int4",
+        "qwen2511_int4",
+        "qwen2511_nunchaku_int4",
+    )
+
+
 def _load_firered_pane_class():
     try:
         from helpers.firered import FireRedPane  # type: ignore
@@ -984,6 +1002,15 @@ class Qwen2511Pane(QtWidgets.QWidget):
 
         self.hidream_pane = None
         self.fire_red_pane = None
+
+        # The Qwen Edit outer tab contains two switchable backends. GGUF is
+        # constructed normally; INT4 is imported only when the user selects it.
+        self.qwen_int_widget = None
+        self._qwen_int_module = None
+        self._qwen_int_placeholder = None
+        self._qwen_backend = "gguf"
+        self._qwen_int_loading = False
+
         self._lazy_tab_loaded = set()
         self._lazy_tab_loading = False
         # Lazy optional tabs start as lightweight placeholders, but once a tab
@@ -1049,9 +1076,13 @@ class Qwen2511Pane(QtWidgets.QWidget):
         )
 
     def closeEvent(self, event):
-        # Flush any pending autosave to ensure settings persist.
+        # Flush both backend UIs and stop the persistent INT4 worker cleanly.
         try:
             self._save_settings(silent=True)
+        except Exception:
+            pass
+        try:
+            self._shutdown_qwen_int_backend(remove_widget=False)
         except Exception:
             pass
         return super().closeEvent(event)
@@ -1063,6 +1094,10 @@ class Qwen2511Pane(QtWidgets.QWidget):
             result = None
         try:
             self._schedule_deferred_lazy_tab_autoload()
+        except Exception:
+            pass
+        try:
+            self._refresh_qwen_backend_visibility()
         except Exception:
             pass
         return result
@@ -1470,7 +1505,9 @@ class Qwen2511Pane(QtWidgets.QWidget):
             pass
         outer.addWidget(self.tabs, 1)
 
-        # --- Qwen Edit page (existing UI) ---
+        # --- Qwen GGUF page (existing UI) ---
+        # This page is placed inside a backend stack below an always-visible
+        # GGUF / INT4 selector. The outer editor tabs remain unchanged.
         qwen_page = QtWidgets.QWidget(self)
         q_outer = QtWidgets.QVBoxLayout(qwen_page)
         q_outer.setContentsMargins(0, 0, 0, 0)
@@ -2171,7 +2208,70 @@ class Qwen2511Pane(QtWidgets.QWidget):
         bar.addLayout(top_row)
         bar.addLayout(bottom_row)
 
-        self.tabs.addTab(qwen_page, "Qwen Edit")
+        # Always-visible backend selector for the Qwen Edit tab. It lives
+        # outside both backend pages, so the user can switch back from INT4 at
+        # any time without leaving the Qwen Edit outer tab.
+        self.qwen_host_page = QtWidgets.QWidget(self)
+        qwen_host_layout = QtWidgets.QVBoxLayout(self.qwen_host_page)
+        qwen_host_layout.setContentsMargins(0, 0, 0, 0)
+        qwen_host_layout.setSpacing(0)
+
+        self.qwen_backend_bar = QtWidgets.QFrame(self.qwen_host_page)
+        self.qwen_backend_bar.setObjectName("qwenBackendBar")
+        backend_layout = QtWidgets.QHBoxLayout(self.qwen_backend_bar)
+        backend_layout.setContentsMargins(12, 8, 12, 8)
+        backend_layout.setSpacing(8)
+
+        backend_label = QtWidgets.QLabel("Qwen backend")
+        backend_label.setToolTip(
+            "Switches only the Qwen Edit engine. Flux Klein, HiDream and FireRed "
+            "remain available as separate outer tabs."
+        )
+        backend_layout.addWidget(backend_label)
+
+        self.btn_backend_gguf = QtWidgets.QPushButton("GGUF")
+        self.btn_backend_gguf.setCheckable(True)
+        self.btn_backend_gguf.setToolTip(
+            "Uses the existing stable-diffusion.cpp GGUF editor. This is the "
+            "broadest compatibility choice, including RTX 50XX cards."
+        )
+        self.btn_backend_int4 = QtWidgets.QPushButton("INT4 · Nunchaku")
+        self.btn_backend_int4.setCheckable(True)
+        self.btn_backend_int4.setToolTip(
+            "Uses the low-step Nunchaku INT4 editor. Intended mainly for RTX "
+            "30XX and RTX 40XX cards; RTX 50XX cards should use GGUF."
+        )
+
+        self.qwen_backend_group = QtWidgets.QButtonGroup(self)
+        self.qwen_backend_group.setExclusive(True)
+        self.qwen_backend_group.addButton(self.btn_backend_gguf, 0)
+        self.qwen_backend_group.addButton(self.btn_backend_int4, 1)
+        self.btn_backend_gguf.setChecked(True)
+        self.btn_backend_gguf.clicked.connect(
+            lambda checked=False: self._select_qwen_backend("gguf", persist=True)
+        )
+        self.btn_backend_int4.clicked.connect(
+            lambda checked=False: self._select_qwen_backend("int4", persist=True)
+        )
+
+        backend_layout.addWidget(self.btn_backend_gguf)
+        backend_layout.addWidget(self.btn_backend_int4)
+        backend_layout.addStretch(1)
+
+        self.qwen_backend_status = QtWidgets.QLabel("")
+        self.qwen_backend_status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        backend_layout.addWidget(self.qwen_backend_status)
+
+        qwen_host_layout.addWidget(self.qwen_backend_bar, 0)
+
+        self.qwen_backend_stack = QtWidgets.QStackedWidget(self.qwen_host_page)
+        self.qwen_backend_stack.addWidget(qwen_page)
+        self._qwen_int_placeholder = self._make_qwen_int_status_page()
+        self.qwen_backend_stack.addWidget(self._qwen_int_placeholder)
+        qwen_host_layout.addWidget(self.qwen_backend_stack, 1)
+
+        self.tabs.addTab(self.qwen_host_page, "Qwen Edit")
+        self._refresh_qwen_backend_visibility()
 
         # --- Optional tool pages ---
         # Flux Klein and FireRed can stay lazy. HiDream must be eager-loaded:
@@ -2211,16 +2311,328 @@ class Qwen2511Pane(QtWidgets.QWidget):
         # Ensure banner text matches the default selected tab.
         self._on_tab_changed(self.tabs.currentIndex())
 
-    def _hidden_optional_tabs_state(self) -> tuple[bool, bool, bool]:
-        """Return current hidden state for Flux, HiDream, FireRed."""
+    # -------------------------- Qwen backend switching --------------------------
+
+    def _qwen_int_paths(self) -> dict:
+        root = Path(APP_ROOT)
+        env_python = root / "environments" / ".qwen2511_int" / (
+            "Scripts/python.exe" if os.name == "nt" else "bin/python"
+        )
+        model_dir = root / "models" / "qwen2511_int"
+        return {
+            "helper": root / "helpers" / "qwen2511_int.py",
+            "env_python": env_python,
+            "model_dir": model_dir,
+            "base_index": model_dir / "base" / "Qwen-Image-Edit-2511" / "model_index.json",
+            "int4_dir": model_dir / "int4",
+        }
+
+    def _qwen_int_install_state(self) -> tuple[bool, str]:
+        paths = self._qwen_int_paths()
+        missing = []
+        if not paths["helper"].is_file():
+            missing.append("helper")
+        if not paths["env_python"].is_file():
+            missing.append("environment")
+        if not paths["base_index"].is_file():
+            missing.append("shared Qwen assets")
+        checkpoint_dir = paths["int4_dir"]
+        checkpoints = list(checkpoint_dir.glob("*.safetensors")) if checkpoint_dir.is_dir() else []
+        if not checkpoints:
+            missing.append("INT4 checkpoint")
+        if missing:
+            return False, "Missing: " + ", ".join(missing)
+        return True, f"{len(checkpoints)} INT4 model{'s' if len(checkpoints) != 1 else ''} installed"
+
+    def _make_qwen_int_status_page(self, detail: str = "") -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget(self)
+        page.setObjectName("qwenIntStatusPage")
+        lay = QtWidgets.QVBoxLayout(page)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.setSpacing(12)
+
+        title = QtWidgets.QLabel("Qwen Edit 2511 · INT4 Nunchaku")
+        font = title.font()
+        font.setPointSize(max(12, font.pointSize() + 2))
+        font.setBold(True)
+        title.setFont(font)
+        lay.addWidget(title)
+
+        message = QtWidgets.QLabel()
+        message.setObjectName("qwenIntStatusMessage")
+        message.setWordWrap(True)
+        message.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        if detail:
+            message.setText(detail)
+        else:
+            message.setText(
+                "The INT4 backend is not ready yet. Install a Qwen2511 INT4 "
+                "profile through Optional Installs, then click Refresh."
+            )
+        lay.addWidget(message)
+
+        hardware = QtWidgets.QLabel(
+            "INT4 is mainly for RTX 30XX and RTX 40XX cards. "
+            "RTX 50XX cards should use the GGUF backend."
+        )
+        hardware.setWordWrap(True)
+        lay.addWidget(hardware)
+
+        buttons = QtWidgets.QHBoxLayout()
+        refresh = QtWidgets.QPushButton("Refresh INT4 installation")
+        refresh.setToolTip(
+            "Rescans the dedicated environment, shared Qwen assets and downloaded "
+            "INT4 checkpoints without restarting FrameVision."
+        )
+        refresh.clicked.connect(self._refresh_qwen_int_after_install)
+        buttons.addWidget(refresh)
+        buttons.addStretch(1)
+        lay.addLayout(buttons)
+        lay.addStretch(1)
+        return page
+
+    def _replace_qwen_int_stack_page(self, widget: QtWidgets.QWidget) -> None:
+        if not hasattr(self, "qwen_backend_stack") or self.qwen_backend_stack is None:
+            return
+        old = self.qwen_backend_stack.widget(1) if self.qwen_backend_stack.count() > 1 else None
+        if self.qwen_backend_stack.count() > 1:
+            self.qwen_backend_stack.removeWidget(old)
+        self.qwen_backend_stack.insertWidget(1, widget)
+        self._qwen_int_placeholder = widget if widget is not self.qwen_int_widget else None
+        if old is not None and old is not widget:
+            try:
+                old.deleteLater()
+            except Exception:
+                pass
+
+    def _load_qwen_int_widget(self) -> bool:
+        if self.qwen_int_widget is not None:
+            return True
+        if self._qwen_int_loading:
+            return False
+
+        installed, detail = self._qwen_int_install_state()
+        if not installed:
+            self._replace_qwen_int_stack_page(self._make_qwen_int_status_page(detail))
+            return False
+
+        self._qwen_int_loading = True
+        try:
+            try:
+                from helpers import qwen2511_int as int4_module  # type: ignore
+            except Exception:
+                import qwen2511_int as int4_module  # type: ignore
+
+            factory = getattr(int4_module, "create_widget", None)
+            if not callable(factory):
+                cls = getattr(int4_module, "Qwen2511IntWidget", None)
+                if cls is None:
+                    raise RuntimeError("qwen2511_int.py has no create_widget factory")
+                widget = cls(parent=self.qwen_backend_stack, root=Path(APP_ROOT))
+            else:
+                widget = factory(parent=self.qwen_backend_stack, root=Path(APP_ROOT))
+
+            try:
+                widget.setProperty("_fv_skip_restore", True)
+                widget.setProperty("_fv_skip_snapshot", True)
+            except Exception:
+                pass
+
+            self._qwen_int_module = int4_module
+            self.qwen_int_widget = widget
+            self._replace_qwen_int_stack_page(widget)
+            return True
+        except Exception as exc:
+            detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+            self.qwen_int_widget = None
+            self._qwen_int_module = None
+            self._replace_qwen_int_stack_page(
+                self._make_qwen_int_status_page(
+                    "The INT4 UI could not be loaded.\n\nReason:\n" + detail
+                )
+            )
+            return False
+        finally:
+            self._qwen_int_loading = False
+
+    def _shutdown_qwen_int_backend(self, remove_widget: bool = False) -> None:
+        widget = getattr(self, "qwen_int_widget", None)
+        if widget is not None:
+            try:
+                save = getattr(widget, "save_settings", None)
+                if callable(save):
+                    save()
+            except Exception:
+                pass
+            try:
+                stop = getattr(widget, "stop_backend", None)
+                if callable(stop):
+                    stop()
+            except Exception:
+                pass
+
+        if remove_widget and widget is not None:
+            self.qwen_int_widget = None
+            self._qwen_int_module = None
+            self._replace_qwen_int_stack_page(self._make_qwen_int_status_page())
+            try:
+                widget.deleteLater()
+            except Exception:
+                pass
+
+    def _refresh_qwen_int_after_install(self) -> None:
+        self._refresh_qwen_int_backend_visibility()
+        if self._qwen_backend == "int4":
+            if self._load_qwen_int_widget():
+                self.qwen_backend_stack.setCurrentIndex(1)
+        self._update_qwen_banner()
+
+    def _refresh_qwen_backend_visibility(
+        self,
+        gguf_hidden: Optional[bool] = None,
+        int4_hidden: Optional[bool] = None,
+    ) -> None:
+        """Refresh backend selectors without removing the outer Qwen editor tab."""
+        if gguf_hidden is None:
+            gguf_hidden = bool(_qwen2511_gguf_hidden_by_remove_hide())
+        if int4_hidden is None:
+            int4_hidden = bool(_qwen2511_int4_hidden_by_remove_hide())
+
+        if hasattr(self, "btn_backend_gguf") and self.btn_backend_gguf is not None:
+            self.btn_backend_gguf.setVisible(not gguf_hidden)
+            self.btn_backend_gguf.setEnabled(not gguf_hidden)
+
+        self._refresh_qwen_int_backend_visibility(int4_hidden)
+
+        # Never remove qwen_host_page: it owns the other image editor tabs.
+        if gguf_hidden and self._qwen_backend == "gguf":
+            if not int4_hidden:
+                self._select_qwen_backend("int4", persist=True)
+            else:
+                # Both backends are hidden. Keep the container alive so the
+                # sibling Flux/HiDream/FireRed tabs remain reachable.
+                self.qwen_backend_status.setText("Qwen GGUF and INT4 are hidden")
+        elif int4_hidden and self._qwen_backend == "int4":
+            if not gguf_hidden:
+                self._select_qwen_backend("gguf", persist=True)
+
+        if not gguf_hidden and not int4_hidden:
+            try:
+                self.qwen_backend_bar.setVisible(True)
+            except Exception:
+                pass
+
+    def _refresh_qwen_int_backend_visibility(self, hidden: Optional[bool] = None) -> None:
+        if hidden is None:
+            hidden = bool(_qwen2511_int4_hidden_by_remove_hide())
+
+        if hasattr(self, "btn_backend_int4") and self.btn_backend_int4 is not None:
+            self.btn_backend_int4.setVisible(not hidden)
+            self.btn_backend_int4.setEnabled(not hidden)
+
+        installed, detail = self._qwen_int_install_state()
+        if hasattr(self, "qwen_backend_status") and self.qwen_backend_status is not None:
+            if hidden:
+                self.qwen_backend_status.setText("INT4 hidden")
+            elif installed:
+                self.qwen_backend_status.setText(detail)
+            else:
+                self.qwen_backend_status.setText("INT4 not installed")
+
+        if hidden:
+            if self._qwen_backend == "int4":
+                self._select_qwen_backend("gguf", persist=True)
+            self._shutdown_qwen_int_backend(remove_widget=True)
+        elif self._qwen_backend == "int4" and self.qwen_int_widget is None:
+            # Do not import eagerly unless INT4 is the selected backend.
+            if installed:
+                self._load_qwen_int_widget()
+
+    def _select_qwen_backend(self, backend: str, persist: bool = True) -> None:
+        selected = str(backend or "gguf").strip().lower()
+        if selected not in {"gguf", "int4"}:
+            selected = "gguf"
+
+        gguf_hidden = bool(_qwen2511_gguf_hidden_by_remove_hide())
+        int4_hidden = bool(_qwen2511_int4_hidden_by_remove_hide())
+
+        if selected == "int4" and int4_hidden:
+            selected = "gguf" if not gguf_hidden else "int4"
+        elif selected == "gguf" and gguf_hidden:
+            selected = "int4" if not int4_hidden else "gguf"
+
+        if selected == "int4":
+            loaded = self._load_qwen_int_widget()
+            self.qwen_backend_stack.setCurrentIndex(1)
+            if hasattr(self, "btn_backend_int4"):
+                self.btn_backend_int4.setChecked(True)
+            if not loaded:
+                pass
+        else:
+            self.qwen_backend_stack.setCurrentIndex(0)
+            if hasattr(self, "btn_backend_gguf"):
+                self.btn_backend_gguf.setChecked(True)
+
+        self._qwen_backend = selected
+        if persist:
+            try:
+                self._settings["qwen_backend"] = selected
+                _write_json(SETSAVE_PATH, self._settings)
+            except Exception:
+                pass
+        self._update_qwen_banner()
+
+    def _update_qwen_banner(self) -> None:
+        try:
+            if not hasattr(self, "tabs") or self.tabs is None:
+                return
+            idx = self.tabs.currentIndex()
+            title = str(self.tabs.tabText(idx)).strip() if idx >= 0 else ""
+            if title != "Qwen Edit":
+                return
+            if self._qwen_backend == "int4":
+                self.banner.setText("Qwen Edit 2511 · INT4 Nunchaku")
+            else:
+                self.banner.setText("Qwen Edit 2511 · GGUF")
+        except Exception:
+            pass
+
+    def prepare_optional_entry_removal(self, entry_id: str) -> None:
+        """Prepare only the selected Qwen backend without deleting the shared pane."""
+        entry_id = str(entry_id)
+        if entry_id in {
+            "qwen_edit_2511_gguf",
+            "qwen2511_gguf",
+            "qwen2511_sd_cpp",
+        }:
+            if not _qwen2511_int4_hidden_by_remove_hide():
+                self._select_qwen_backend("int4", persist=True)
+            self._refresh_qwen_backend_visibility()
+            return
+
+        if entry_id not in {
+            "qwen_edit_2511_int4",
+            "qwen2511_int4",
+            "qwen2511_nunchaku_int4",
+        }:
+            return
+        if not _qwen2511_gguf_hidden_by_remove_hide():
+            self._select_qwen_backend("gguf", persist=True)
+        self._shutdown_qwen_int_backend(remove_widget=True)
+        self._refresh_qwen_backend_visibility()
+
+    def _hidden_optional_tabs_state(self) -> tuple[bool, bool, bool, bool, bool]:
+        """Return hidden state for Flux, HiDream, FireRed, Qwen GGUF and INT4."""
         try:
             return (
                 bool(_flux_klein_hidden_by_remove_hide()),
                 bool(_hidream_hidden_by_remove_hide()),
                 bool(_firered_hidden_by_remove_hide()),
+                bool(_qwen2511_gguf_hidden_by_remove_hide()),
+                bool(_qwen2511_int4_hidden_by_remove_hide()),
             )
         except Exception:
-            return (False, False, False)
+            return (False, False, False, False, False)
 
     def _find_tab_index_by_title(self, title: str) -> int:
         try:
@@ -2276,11 +2688,12 @@ class Qwen2511Pane(QtWidgets.QWidget):
                 pass
 
     def refresh_hidden_tools(self) -> None:
-        """Refresh Flux/HiDream/FireRed tab visibility without restarting."""
+        """Refresh optional outer tabs and the Qwen INT4 selector live."""
         try:
             if not hasattr(self, "tabs") or self.tabs is None:
                 return
-            flux_hidden, hidream_hidden, firered_hidden = self._hidden_optional_tabs_state()
+            flux_hidden, hidream_hidden, firered_hidden, gguf_hidden, int4_hidden = self._hidden_optional_tabs_state()
+            self._refresh_qwen_backend_visibility(gguf_hidden, int4_hidden)
 
             # Remove hidden tabs first, so stale lazy placeholders cannot show errors.
             if flux_hidden:
@@ -2740,9 +3153,11 @@ class Qwen2511Pane(QtWidgets.QWidget):
                     f"{tab_text} was selected last time.\nFrameVision will import it shortly...",
                 )
 
+            if tab_text in {"Qwen Edit", "Qwen Edit 2511"}:
+                self._update_qwen_banner()
+                return
+
             banner_map = {
-                "Qwen Edit": "Qwen Edit 2511 (gguf loader)",
-                "Qwen Edit 2511": "Qwen Edit 2511 (gguf loader)",
                 "Flux Klein": "FLUX Klein 2 Create + Edit (4B & 9B gguf loader)",
                 "HiDream Image Edit": "HiDream Image Edit (BF16 Base / Dev)",
                 "Firered 1.1": "Firered 1.1 edit (gguf loader)",
@@ -3488,6 +3903,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
     def _load_defaults(self):
         self._reload_model_lists()
         d = default_model_paths()
+        self._settings.setdefault("qwen_backend", "gguf")
         self._settings.setdefault("sdcli_path", DEFAULT_SDCLI)
         self._settings.setdefault("models_box_open", True)
         self._settings.setdefault("paths_box_open", True)
@@ -3760,6 +4176,13 @@ class Qwen2511Pane(QtWidgets.QWidget):
         set_combo_to_path(self.cb_mmproj, s.get("mmproj_path", ""))
         set_combo_to_path(self.cb_vae, s.get("vae_path", ""))
 
+        # Restore the selected Qwen backend only after both stack pages and all
+        # GGUF controls exist. Missing or hidden INT4 safely falls back to GGUF.
+        try:
+            self._select_qwen_backend(str(s.get("qwen_backend", "gguf")), persist=False)
+        except Exception:
+            self._select_qwen_backend("gguf", persist=False)
+
     def _autosave_pause(self):
         try:
             self._autosave_suspended = int(getattr(self, "_autosave_suspended", 0)) + 1
@@ -3852,6 +4275,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         if int(getattr(self, "_autosave_suspended", 0)) > 0:
             return
         s = {
+            "qwen_backend": str(getattr(self, "_qwen_backend", "gguf") or "gguf"),
             "sdcli_path": self.ed_sdcli.text().strip(),
             "models_box_open": bool(getattr(self, "g_models", None).isChecked() if getattr(self, "g_models", None) is not None else True),
             "lora_box_open": bool(getattr(self, "g_lora", None).isChecked() if getattr(self, "g_lora", None) is not None else True),

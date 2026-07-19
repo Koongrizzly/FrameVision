@@ -971,6 +971,306 @@ def _run_hidream_planner_image(*, t2i_job: Dict[str, Any], images_dir: str, sid:
         raise RuntimeError(f"HiDream isolated Planner CLI failed: {e}")
 
 
+
+# Qwen Edit 2511 Nunchaku INT4 helpers for Planner
+_QWEN2511_INT4_QUALITY_ORDER = (
+    "fidelity",
+    "best-low-step",
+    "recommended",
+    "fastest",
+)
+
+
+def _qwen2511_int4_install_paths() -> Dict[str, Path]:
+    root = _root()
+    return {
+        "env_python": (root / "environments" / ".qwen2511_int" / "Scripts" / "python.exe").resolve(),
+        "helper": (root / "helpers" / "qwen2511_int.py").resolve(),
+        "model_root": (root / "models" / "qwen2511_int").resolve(),
+        "profiles": (root / "models" / "qwen2511_int" / "model_profiles.json").resolve(),
+        "base": (root / "models" / "qwen2511_int" / "base" / "Qwen-Image-Edit-2511").resolve(),
+    }
+
+
+def _qwen2511_int4_best_installed() -> Optional[Dict[str, Any]]:
+    """Return the highest-quality installed INT4 profile or None."""
+    paths = _qwen2511_int4_install_paths()
+    if not paths["env_python"].is_file() or not paths["helper"].is_file():
+        return None
+    base = paths["base"]
+    required = (
+        base / "model_index.json",
+        base / "vae" / "config.json",
+        base / "text_encoder" / "config.json",
+        base / "tokenizer" / "tokenizer_config.json",
+        base / "processor" / "preprocessor_config.json",
+    )
+    if not all(path.is_file() and path.stat().st_size > 0 for path in required):
+        return None
+    try:
+        payload = json.loads(paths["profiles"].read_text(encoding="utf-8"))
+        models = payload.get("models") or {}
+    except Exception:
+        return None
+    for key in _QWEN2511_INT4_QUALITY_ORDER:
+        profile = models.get(key)
+        if not isinstance(profile, dict):
+            continue
+        rel = str(profile.get("relative_path") or "").strip()
+        filename = str(profile.get("filename") or "").strip()
+        checkpoint = paths["model_root"] / (rel or ("int4/" + filename))
+        try:
+            if checkpoint.is_file() and checkpoint.stat().st_size > 1024 * 1024:
+                return {
+                    "key": key,
+                    "label": str(profile.get("label") or key),
+                    "steps": int(profile.get("steps") or (8 if key == "fidelity" else 4)),
+                    "checkpoint": str(checkpoint),
+                }
+        except Exception:
+            continue
+    return None
+
+
+class _Qwen2511Int4PlannerSession:
+    """Persistent helper backend for normal Planner image batches and review retries."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+        self.proc = None
+
+    def _ensure_started(self, log_func: Optional[Callable[[str], None]] = None) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            return
+        paths = _qwen2511_int4_install_paths()
+        py = paths["env_python"]
+        helper = paths["helper"]
+        if not py.is_file():
+            raise RuntimeError(f"Qwen2511 INT4 environment Python not found: {py}")
+        if not helper.is_file():
+            raise RuntimeError(f"Qwen2511 INT4 helper not found: {helper}")
+        env = os.environ.copy()
+        env.update({
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONUTF8": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "FRAMEVISION_ROOT": str(self.root),
+        })
+        if log_func:
+            log_func(f"[Qwen2511 INT4] Starting resident backend: {py}")
+        self.proc = subprocess.Popen(
+            [str(py), "-u", str(helper), "--server", "--root", str(self.root)],
+            cwd=str(self.root),
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        while True:
+            line = self.proc.stdout.readline() if self.proc.stdout is not None else ""
+            if line == "":
+                raise RuntimeError(
+                    f"Qwen2511 INT4 backend stopped during startup (exit code {self.proc.poll()})."
+                )
+            line = line.rstrip("\r\n")
+            if line.startswith("FVQWEN_EVENT "):
+                event = json.loads(line[len("FVQWEN_EVENT "):])
+                if str(event.get("event") or "") == "ready":
+                    return
+            elif line and log_func:
+                log_func(f"[Qwen2511 INT4] {line}")
+
+    def generate(
+        self,
+        *,
+        profile: Dict[str, Any],
+        prompt: str,
+        negative: str,
+        references: List[str],
+        output_path: str,
+        width: int,
+        height: int,
+        seed: int,
+        lora_path: str = "",
+        log_func: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        self._ensure_started(log_func=log_func)
+        if self.proc is None or self.proc.stdin is None or self.proc.stdout is None:
+            raise RuntimeError("Qwen2511 INT4 backend is unavailable.")
+
+        refs = [str(Path(p).resolve()) for p in references if p and Path(p).is_file()]
+        if not refs:
+            raise RuntimeError("Qwen2511 INT4 needs at least one valid reference image.")
+        target = Path(output_path).resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        loras = []
+        if lora_path and Path(lora_path).is_file():
+            loras.append({"enabled": True, "path": str(Path(lora_path).resolve()), "strength": 1.0})
+
+        request = {
+            "command": "generate",
+            "prompt": str(prompt or "").strip(),
+            "negative_prompt": str(negative or ""),
+            "references": refs,
+            "loras": loras,
+            "model": str(profile["key"]),
+            "width": int(width),
+            "height": int(height),
+            "seed": int(seed),
+            "count": 1,
+            "true_cfg_scale": 1.0,
+            "steps": int(profile.get("steps") or 4),
+            "max_sequence_length": 512,
+            "offload": "auto",
+            "blocks_on_gpu": 1,
+            "pin_memory": False,
+            "cleanup_between": False,
+            "output": {
+                "folder": str(target.parent),
+                "format": "png",
+                "jpeg_quality": 95,
+                "auto_name": False,
+                "manual_name": target.stem,
+            },
+        }
+        self.proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+
+        result = None
+        while True:
+            line = self.proc.stdout.readline()
+            if line == "":
+                raise RuntimeError(
+                    f"Qwen2511 INT4 backend exited before returning an image (exit code {self.proc.poll()})."
+                )
+            line = line.rstrip("\r\n")
+            if not line.startswith("FVQWEN_EVENT "):
+                if line and log_func:
+                    log_func(f"[Qwen2511 INT4] {line}")
+                continue
+            event = json.loads(line[len("FVQWEN_EVENT "):])
+            event_name = str(event.get("event") or "")
+            if event_name == "status" and log_func:
+                log_func(f"[Qwen2511 INT4] {event.get('message') or ''}")
+            elif event_name == "model_loaded" and log_func:
+                log_func(
+                    f"[Qwen2511 INT4] Loaded {event.get('model_label') or profile.get('label')} "
+                    f"· offload={event.get('offload') or 'auto'}"
+                )
+            elif event_name == "error":
+                raise RuntimeError(str(event.get("message") or "Qwen2511 INT4 failed."))
+            elif event_name == "result":
+                result = event
+                break
+
+        outputs = [Path(str(p)).resolve() for p in list((result or {}).get("outputs") or [])]
+        if not outputs or not outputs[0].is_file():
+            raise RuntimeError("Qwen2511 INT4 returned no output image.")
+        generated = outputs[0]
+        if generated != target:
+            if target.exists():
+                target.unlink()
+            try:
+                shutil.move(str(generated), str(target))
+            except Exception:
+                shutil.copy2(str(generated), str(target))
+                try:
+                    generated.unlink()
+                except Exception:
+                    pass
+        if not target.is_file() or target.stat().st_size < 1024:
+            raise RuntimeError("Qwen2511 INT4 returned an empty output image.")
+        return {
+            "ok": True,
+            "files": [str(target)],
+            "out_file": str(target),
+            "rc": 0,
+            "backend": "qwen2511_int4",
+            "model": str(profile["key"]),
+            "steps": int(profile.get("steps") or 4),
+        }
+
+    def close(self, tag: str = "") -> None:
+        proc = self.proc
+        self.proc = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None and proc.stdin is not None:
+                proc.stdin.write(json.dumps({"command": "quit"}) + "\n")
+                proc.stdin.flush()
+                try:
+                    proc.wait(timeout=20)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            pass
+        for stream in (getattr(proc, "stdin", None), getattr(proc, "stdout", None)):
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
+
+
+_QWEN2511_INT4_PLANNER_SESSION: Optional[_Qwen2511Int4PlannerSession] = None
+
+
+def _run_qwen2511_int4_planner_image(
+    *,
+    profile: Dict[str, Any],
+    prompt: str,
+    negative: str,
+    references: List[str],
+    output_path: str,
+    width: int,
+    height: int,
+    seed: int,
+    lora_path: str = "",
+    log_func: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    global _QWEN2511_INT4_PLANNER_SESSION
+    if _QWEN2511_INT4_PLANNER_SESSION is None:
+        _QWEN2511_INT4_PLANNER_SESSION = _Qwen2511Int4PlannerSession(_root())
+    return _QWEN2511_INT4_PLANNER_SESSION.generate(
+        profile=profile,
+        prompt=prompt,
+        negative=negative,
+        references=references,
+        output_path=output_path,
+        width=width,
+        height=height,
+        seed=seed,
+        lora_path=lora_path,
+        log_func=log_func,
+    )
+
+
+def _release_qwen2511_int4_planner_model(tag: str = "") -> None:
+    global _QWEN2511_INT4_PLANNER_SESSION
+    session = _QWEN2511_INT4_PLANNER_SESSION
+    _QWEN2511_INT4_PLANNER_SESSION = None
+    if session is not None:
+        try:
+            session.close(tag=tag)
+        except Exception:
+            pass
+
+
 # Lens Image (Lens Turbo U4) helpers for Planner
 # Uses helpers/lens_turbo_u4_ui.py as the source of truth for runtime defaults and
 # dedicated-env generation. Planner only maps its aspect choice to Lens' 1024 base buckets.
@@ -1906,6 +2206,13 @@ def _vram_release(tag: str = "") -> None:
     # when the image batch is finished, cancelled, or when review/regen starts.
     try:
         f = globals().get("_release_lens_planner_model")
+        if callable(f):
+            f(tag=tag)
+    except Exception:
+        pass
+
+    try:
+        f = globals().get("_release_qwen2511_int4_planner_model")
         if callable(f):
             f(tag=tag)
     except Exception:
@@ -9886,177 +10193,206 @@ class PipelineWorker(QThread):
         res = None
 
         if use_qwen2511:
-            try:
-                from helpers import qwen2511 as _q2511  # type: ignore
-            except Exception:
-                import qwen2511 as _q2511  # type: ignore
+            _int4_profile = _qwen2511_int4_best_installed()
+            if _int4_profile is not None:
+                aspect_mode = str(self.job.encoding.get("aspect_mode") or '')
+                _hq = bool(self.job.encoding.get("qwen2511_high_quality") or False)
+                bw, bh = (1280, 720) if _hq else (1024, 576)
+                qw, qh = _apply_aspect_to_size(bw, bh, aspect_mode)
+                self.signals.log.emit(f"[IMG] regen {sid} [Qwen2511 INT4: {_int4_profile.get('label')}]")
+                res = _run_qwen2511_int4_planner_image(
+                    profile=_int4_profile,
+                    prompt=str(new_prompt).strip(),
+                    negative=str(negative or ''),
+                    references=list(ref_files[:2]),
+                    output_path=str(target),
+                    width=int(qw),
+                    height=int(qh),
+                    seed=int(seed_int),
+                    log_func=lambda m: self.signals.log.emit(str(m)),
+                )
+                out_file = target if os.path.exists(target) else None
+                try:
+                    rec2 = manifest.setdefault("shots", {}).get(sid) or {}
+                    rec2["ref_strategy"] = "qwen2511_best"
+                    rec2["qwen2511_backend"] = "int4"
+                    rec2["qwen2511_int4_model"] = str(_int4_profile.get("key") or '')
+                    manifest.setdefault("shots", {})[sid] = rec2
+                    _safe_write_json(manifest_path, manifest)
+                except Exception:
+                    pass
+            else:
+                try:
+                    from helpers import qwen2511 as _q2511  # type: ignore
+                except Exception:
+                    import qwen2511 as _q2511  # type: ignore
 
-            try:
-                at = self.job.attachments or {}
-            except Exception:
-                at = {}
-            try:
-                ref_files = (at.get("ref_images") or []) or (at.get("images") or [])
-            except Exception:
-                ref_files = []
-            refs = list(ref_files[:2])
+                try:
+                    at = self.job.attachments or {}
+                except Exception:
+                    at = {}
+                try:
+                    ref_files = (at.get("ref_images") or []) or (at.get("images") or [])
+                except Exception:
+                    ref_files = []
+                refs = list(ref_files[:2])
 
-            aspect_mode = str(self.job.encoding.get("aspect_mode") or '')
-            _hq = bool(self.job.encoding.get("qwen2511_high_quality") or False)
+                aspect_mode = str(self.job.encoding.get("aspect_mode") or '')
+                _hq = bool(self.job.encoding.get("qwen2511_high_quality") or False)
 
-            bw, bh = (1280, 720) if _hq else (1024, 576)
+                bw, bh = (1280, 720) if _hq else (1024, 576)
 
-            qw, qh = _apply_aspect_to_size(bw, bh, aspect_mode)
-            q_job = {
-                "prompt": str(new_prompt).strip(),
-                "negative_prompt": negative,
-                "negative": negative,
-                "seed": seed_int,
-                "width": int(qw),
-                "height": int(qh),
-                "vae_device": "cpu",
-                "vae_on_cpu": True,
-                "vae_cpu": True,
-                "use_vae_on_cpu": True,
-                "refs": refs,
-                "ref_images": refs,
-                "batch": 1,
-                "out_file": target,
-            }
+                qw, qh = _apply_aspect_to_size(bw, bh, aspect_mode)
+                q_job = {
+                    "prompt": str(new_prompt).strip(),
+                    "negative_prompt": negative,
+                    "negative": negative,
+                    "seed": seed_int,
+                    "width": int(qw),
+                    "height": int(qh),
+                    "vae_device": "cpu",
+                    "vae_on_cpu": True,
+                    "vae_cpu": True,
+                    "use_vae_on_cpu": True,
+                    "refs": refs,
+                    "ref_images": refs,
+                    "batch": 1,
+                    "out_file": target,
+                }
 
-            try:
-                if hasattr(_q2511, "build_sdcli_cmd") and hasattr(_q2511, "detect_sdcli_caps"):
-                    sdcli_path = getattr(_q2511, "DEFAULT_SDCLI", "sd-cli.exe")
-                    try:
-                        sp = getattr(_q2511, "SETSAVE_PATH", "")
-                        if sp and hasattr(_q2511, "_read_jsonish"):
-                            _s = _q2511._read_jsonish(sp)
-                            if isinstance(_s, dict) and _s.get("sdcli_path"):
-                                sdcli_path = str(_s.get("sdcli_path"))
-                    except Exception:
-                        pass
-
-                    caps = _q2511.detect_sdcli_caps(sdcli_path)
-                    try:
-                        d = _q2511.default_model_paths() if hasattr(_q2511, "default_model_paths") else {}
-                    except Exception:
-                        d = {}
-                    unet_path = str(d.get("unet") or '')
-                    llm_path = str(d.get("llm") or '')
-                    mmproj_path = str(d.get("mmproj") or '')
-                    vae_path = str(d.get("vae") or '')
-                    # Qwen Edit 2511 UNet GGUF auto-pick (prefer Q5, then Q4, then any).
-                    # Models are expected under: <root>/models/qwen2511gguf/unet/*.gguf
-                    try:
-                        _unet_dir = _root() / "models" / "qwen2511gguf" / "unet"
-                        _ggufs = []
+                try:
+                    if hasattr(_q2511, "build_sdcli_cmd") and hasattr(_q2511, "detect_sdcli_caps"):
+                        sdcli_path = getattr(_q2511, "DEFAULT_SDCLI", "sd-cli.exe")
                         try:
-                            if _unet_dir.exists():
-                                _ggufs = [str(x) for x in _unet_dir.glob("*.gguf") if x.is_file()]
+                            sp = getattr(_q2511, "SETSAVE_PATH", "")
+                            if sp and hasattr(_q2511, "_read_jsonish"):
+                                _s = _q2511._read_jsonish(sp)
+                                if isinstance(_s, dict) and _s.get("sdcli_path"):
+                                    sdcli_path = str(_s.get("sdcli_path"))
                         except Exception:
+                            pass
+
+                        caps = _q2511.detect_sdcli_caps(sdcli_path)
+                        try:
+                            d = _q2511.default_model_paths() if hasattr(_q2511, "default_model_paths") else {}
+                        except Exception:
+                            d = {}
+                        unet_path = str(d.get("unet") or '')
+                        llm_path = str(d.get("llm") or '')
+                        mmproj_path = str(d.get("mmproj") or '')
+                        vae_path = str(d.get("vae") or '')
+                        # Qwen Edit 2511 UNet GGUF auto-pick (prefer Q5, then Q4, then any).
+                        # Models are expected under: <root>/models/qwen2511gguf/unet/*.gguf
+                        try:
+                            _unet_dir = _root() / "models" / "qwen2511gguf" / "unet"
                             _ggufs = []
-                        if _ggufs:
-                            def _qwen2511_prio(_p: str):
-                                _n = os.path.basename(_p).lower()
-                                # Common names: ...-Q5_K_M.gguf / ...-Q4_K_M.gguf
-                                if re.search(r"(?:^|[-_\s])q5(?:$|[-_\s])", _n) or ("q5" in _n):
-                                    return (0, _n)
-                                if re.search(r"(?:^|[-_\s])q4(?:$|[-_\s])", _n) or ("q4" in _n):
-                                    return (1, _n)
-                                return (2, _n)
-                            _ggufs = sorted(_ggufs, key=_qwen2511_prio)
-                            unet_path = str(_ggufs[0])
-                        else:
-                            # If helper defaults didn't provide a valid UNet either, hard fail with a clear popup.
-                            if not (unet_path and os.path.exists(unet_path)):
-                                QMessageBox.warning(
-                                    self,
-                                    "Qwen Edit 2511 missing model",
-                                    "Qwen Edit 2511 cannot run because no UNet GGUF was found.\n\n"
-                                    "Please download at least one model to:\n"
-                                    "models/qwen2511gguf/unet/\n\n"
-                                    "Recommended: qwen-image-edit-2511-Q5_K_M.gguf"
-                                )
-                                raise RuntimeError("Qwen2511: no UNet GGUF found in models/qwen2511gguf/unet")
-                    except Exception:
-                        # Let the caller decide whether to fall back; we only guarantee we don't crash here.
-                        pass
+                            try:
+                                if _unet_dir.exists():
+                                    _ggufs = [str(x) for x in _unet_dir.glob("*.gguf") if x.is_file()]
+                            except Exception:
+                                _ggufs = []
+                            if _ggufs:
+                                def _qwen2511_prio(_p: str):
+                                    _n = os.path.basename(_p).lower()
+                                    # Common names: ...-Q5_K_M.gguf / ...-Q4_K_M.gguf
+                                    if re.search(r"(?:^|[-_\s])q5(?:$|[-_\s])", _n) or ("q5" in _n):
+                                        return (0, _n)
+                                    if re.search(r"(?:^|[-_\s])q4(?:$|[-_\s])", _n) or ("q4" in _n):
+                                        return (1, _n)
+                                    return (2, _n)
+                                _ggufs = sorted(_ggufs, key=_qwen2511_prio)
+                                unet_path = str(_ggufs[0])
+                            else:
+                                # If helper defaults didn't provide a valid UNet either, hard fail with a clear popup.
+                                if not (unet_path and os.path.exists(unet_path)):
+                                    QMessageBox.warning(
+                                        self,
+                                        "Qwen Edit 2511 missing model",
+                                        "Qwen Edit 2511 cannot run because no UNet GGUF was found.\n\n"
+                                        "Please download at least one model to:\n"
+                                        "models/qwen2511gguf/unet/\n\n"
+                                        "Recommended: qwen-image-edit-2511-Q5_K_M.gguf"
+                                    )
+                                    raise RuntimeError("Qwen2511: no UNet GGUF found in models/qwen2511gguf/unet")
+                        except Exception:
+                            # Let the caller decide whether to fall back; we only guarantee we don't crash here.
+                            pass
 
-                    tmp_blank = os.path.join(images_dir, f"_blank_{self.job.job_id}_{sid}_{int(time.time()*1000)}.png")
+                        tmp_blank = os.path.join(images_dir, f"_blank_{self.job.job_id}_{sid}_{int(time.time()*1000)}.png")
 
-                    try:
-                        if hasattr(_q2511, "_write_blank_png"):
-                                            _q2511._write_blank_png(tmp_blank, int(q_job.get("width") or 1024), int(q_job.get("height") or 576))
-                    except Exception:
-                        tmp_blank = ""
+                        try:
+                            if hasattr(_q2511, "_write_blank_png"):
+                                                _q2511._write_blank_png(tmp_blank, int(q_job.get("width") or 1024), int(q_job.get("height") or 576))
+                        except Exception:
+                            tmp_blank = ""
 
-                    cmd = _q2511.build_sdcli_cmd(
-                        sdcli_path=sdcli_path,
-                        caps=caps,
-                        init_img=tmp_blank,
-                        mask_path="",
-                        ref_images=refs,
-                        use_increase_ref_index=True,
-                        disable_auto_resize_ref_images=False,
-                        prompt=str(q_job.get("prompt") or ''),
-                        negative=str(q_job.get("negative_prompt") or q_job.get("negative") or ''),
-                        unet_path=unet_path,
-                        llm_path=llm_path,
-                        mmproj_path=mmproj_path,
-                        vae_path=vae_path,
-                        steps=int(q_job.get("steps") or 20),
-                        cfg=float(q_job.get("cfg") or 4.0),
-                        seed=int(q_job.get("seed") or 0),
-                        width=int(q_job.get("width") or 1024),
+                        cmd = _q2511.build_sdcli_cmd(
+                            sdcli_path=sdcli_path,
+                            caps=caps,
+                            init_img=tmp_blank,
+                            mask_path="",
+                            ref_images=refs,
+                            use_increase_ref_index=True,
+                            disable_auto_resize_ref_images=False,
+                            prompt=str(q_job.get("prompt") or ''),
+                            negative=str(q_job.get("negative_prompt") or q_job.get("negative") or ''),
+                            unet_path=unet_path,
+                            llm_path=llm_path,
+                            mmproj_path=mmproj_path,
+                            vae_path=vae_path,
+                            steps=int(q_job.get("steps") or 20),
+                            cfg=float(q_job.get("cfg") or 4.0),
+                            seed=int(q_job.get("seed") or 0),
+                            width=int(q_job.get("width") or 1024),
 
-                                        height=int(q_job.get("height") or 576),
-                        strength=1.0,
-                        sampling_method="euler",
-                        shift=2.3,
-                        out_file=str(q_job.get("out_file") or ''),
-                        use_vae_tiling=False,
-                        vae_tile_size="",
-                        vae_tile_overlap=0.0,
-                        use_offload=False,
-                        use_mmap=False,
-                        use_vae_on_cpu=True,
-                        use_clip_on_cpu=False,
-                        use_diffusion_fa=True,
-                        lora_model_dir="",
-                        lora_name=str(q_job.get("lora") or q_job.get("lora_path") or ''),
-                        lora_strength=float(q_job.get("lora_strength") or q_job.get("lora_scale") or 1.0),
-                    )
+                                            height=int(q_job.get("height") or 576),
+                            strength=1.0,
+                            sampling_method="euler",
+                            shift=2.3,
+                            out_file=str(q_job.get("out_file") or ''),
+                            use_vae_tiling=False,
+                            vae_tile_size="",
+                            vae_tile_overlap=0.0,
+                            use_offload=False,
+                            use_mmap=False,
+                            use_vae_on_cpu=True,
+                            use_clip_on_cpu=False,
+                            use_diffusion_fa=True,
+                            lora_model_dir="",
+                            lora_name=str(q_job.get("lora") or q_job.get("lora_path") or ''),
+                            lora_strength=float(q_job.get("lora_strength") or q_job.get("lora_scale") or 1.0),
+                        )
 
-                    rc = 1
-                    try:
-                        if hasattr(_q2511, "_run_capture"):
-                            rc, _out_text = _q2511._run_capture(cmd)
-                        else:
-                            rc = os.system(" ".join([str(x) for x in cmd]))
-                    except Exception:
                         rc = 1
+                        try:
+                            if hasattr(_q2511, "_run_capture"):
+                                rc, _out_text = _q2511._run_capture(cmd)
+                            else:
+                                rc = os.system(" ".join([str(x) for x in cmd]))
+                        except Exception:
+                            rc = 1
 
-                    ok = (rc == 0 and os.path.exists(target))
-                    res = {"ok": bool(ok), "files": ([target] if ok else []), "out_file": target, "rc": int(rc)}
+                        ok = (rc == 0 and os.path.exists(target))
+                        res = {"ok": bool(ok), "files": ([target] if ok else []), "out_file": target, "rc": int(rc)}
 
-                    try:
-                        if tmp_blank and os.path.exists(tmp_blank):
-                            os.remove(tmp_blank)
-                    except Exception:
-                        pass
-                else:
-                    raise RuntimeError("sd-cli builder not available")
-            except Exception:
-                if hasattr(_q2511, "generate_one_from_job"):
-                    res = _q2511.generate_one_from_job(q_job, images_dir)
-                elif hasattr(_q2511, "run_job"):
-                    res = _q2511.run_job(q_job, images_dir)
-                elif hasattr(_q2511, "run"):
-                    res = _q2511.run(q_job, images_dir)
-                else:
-                    raise RuntimeError("qwen2511 entrypoint not found")
+                        try:
+                            if tmp_blank and os.path.exists(tmp_blank):
+                                os.remove(tmp_blank)
+                        except Exception:
+                            pass
+                    else:
+                        raise RuntimeError("sd-cli builder not available")
+                except Exception:
+                    if hasattr(_q2511, "generate_one_from_job"):
+                        res = _q2511.generate_one_from_job(q_job, images_dir)
+                    elif hasattr(_q2511, "run_job"):
+                        res = _q2511.run_job(q_job, images_dir)
+                    elif hasattr(_q2511, "run"):
+                        res = _q2511.run(q_job, images_dir)
+                    else:
+                        raise RuntimeError("qwen2511 entrypoint not found")
 
-            out_file = target if os.path.exists(target) else None
+                out_file = target if os.path.exists(target) else None
 
         else:
             # FireRed Edit regen path (sd-cli). Must NOT fall through to txt2img backend.
@@ -14267,10 +14603,24 @@ class PipelineWorker(QThread):
                 except Exception:
                     multi_lora = ""
 
+                _qwen2511_int4_profile = None
                 if use_qwen2511:
-                    self.signals.log.emit(f"[REF] Using Qwen Edit 2511 for images (refs: {len(used_ref_files)}).")
-                    if multi_lora:
-                        self.signals.log.emit("[REF] Multi-angle LoRA detected; planner will apply it on a cadence.")
+                    try:
+                        _qwen2511_int4_profile = _qwen2511_int4_best_installed()
+                    except Exception:
+                        _qwen2511_int4_profile = None
+                    if _qwen2511_int4_profile is not None:
+                        self.signals.log.emit(
+                            f"[REF] Using Qwen Edit 2511 INT4 for images (refs: {len(used_ref_files)}; model: {_qwen2511_int4_profile.get('label')})."
+                        )
+                        if multi_lora:
+                            self.signals.log.emit(
+                                "[REF] Multi-angle LoRA detected but skipped for Qwen2511 INT4; planner will use prompt-based angle variation instead."
+                            )
+                    else:
+                        self.signals.log.emit(f"[REF] Using Qwen Edit 2511 for images (refs: {len(used_ref_files)}).")
+                        if multi_lora:
+                            self.signals.log.emit("[REF] Multi-angle LoRA detected; planner will apply it on a cadence.")
                 if use_flux_klein_edit:
                     self.signals.log.emit(f"[REF] Using Flux Klein Edit for images (refs: {len(used_ref_files)}).")
                 if use_hidream_ref_edit:
@@ -15483,201 +15833,242 @@ class PipelineWorker(QThread):
                     res = None
 
                     if use_qwen2511:
-                        # Call into helpers/qwen2511.py (best-effort, with fallbacks)
-                        try:
-                            from helpers import qwen2511 as _q2511  # type: ignore
-                        except Exception:
-                            import qwen2511 as _q2511  # type: ignore
-
-                        # Default test/output resolution for this chunk: 1024x576 (16:9)
-                        aspect_mode = str(self.job.encoding.get("aspect_mode") or '')
-                        _hq = bool(self.job.encoding.get("qwen2511_high_quality") or False)
-
-                        bw, bh = (1280, 720) if _hq else (1024, 576)
-
-                        qw, qh = _apply_aspect_to_size(bw, bh, aspect_mode)
-                        q_job = {
-                            "prompt": prompt,
-                            "negative_prompt": negative,
-                            "negative": negative,
-                            "seed": int(sh.get("seed_int") or _planner_seed_int_for_job(seed_txt, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
-                            "width": int(qw),
-                            "height": int(qh),
-                            "vae_device": "cpu",
-                            "vae_on_cpu": True,
-                            "vae_cpu": True,
-                            "use_vae_on_cpu": True,
-                                                        "refs": list(used_ref_files[:2]),
-                            "ref_images": list(used_ref_files[:2]),
-                            "batch": 1,
-                            "out_file": os.path.join(images_dir, f"{self.job.job_id}_{sid}.png"),
-                        }
-
-                        # Multi-angle cadence: every 5 images, 3 become multi-angle variants.
-                        idx0 = int(i - 1) % 5
-                        do_multi = (idx0 in (0, 2, 4))
-                        if do_multi and multi_lora:
-                            q_job["lora_path"] = multi_lora
-                            q_job["lora"] = multi_lora
-                            q_job["multi_angle"] = True
-                            q_job["prompt"] = (q_job["prompt"] or '') + "\\n\\nMulti-angle variant: different camera angle of the same subject."
-
-                        # Update manifest per-shot record with ref info
-                        try:
-                            shot_map = manifest.setdefault("shots", {})
-                            rec = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
-                            rec["ref_strategy"] = "qwen2511_best"
-                            rec["refs_used"] = list(used_ref_files[:2])
-                            rec["multi_angle"] = bool(do_multi and bool(multi_lora))
-                            shot_map[sid] = rec
-                        except Exception:
-                            pass
-
-                        self.signals.log.emit(f"[IMG] {sid} ({i}/{total}) [qwen2511]")
-                        # Planner-side execution: prefer sd-cli command build so VAE-on-CPU is honored.
-                        try:
-                            if hasattr(_q2511, "build_sdcli_cmd") and hasattr(_q2511, "detect_sdcli_caps"):
-                                # sd-cli path (prefer saved settings if available)
-                                sdcli_path = getattr(_q2511, "DEFAULT_SDCLI", "sd-cli.exe")
-                                try:
-                                    sp = getattr(_q2511, "SETSAVE_PATH", "")
-                                    if sp and hasattr(_q2511, "_read_jsonish"):
-                                        _s = _q2511._read_jsonish(sp)
-                                        if isinstance(_s, dict) and _s.get("sdcli_path"):
-                                            sdcli_path = str(_s.get("sdcli_path"))
-                                except Exception:
-                                    pass
-                        
-                                caps = _q2511.detect_sdcli_caps(sdcli_path)
-                        
-                                # Resolve model paths (fallback to helper defaults)
-                                try:
-                                    d = _q2511.default_model_paths() if hasattr(_q2511, "default_model_paths") else {}
-                                except Exception:
-                                    d = {}
-                                unet_path = str(d.get("unet") or '')
-                                llm_path = str(d.get("llm") or '')
-                                mmproj_path = str(d.get("mmproj") or '')
-                                vae_path = str(d.get("vae") or '')
-                                # Prefer Q5, then Q4, then any other UNet GGUF in models/qwen2511gguf/unet
-                                try:
-                                    _unet_dir = _root() / "models" / "qwen2511gguf" / "unet"
-                                    _cand = [str(x) for x in _unet_dir.glob("*.gguf") if x.is_file()] if _unet_dir.exists() else []
-                                    if _cand:
-                                        def _q2511_prio(p: str):
-                                            n = os.path.basename(p).lower()
-                                            mm = re.search(r"(?:^|[-_\s])q(\d+)(?:$|[-_\s])", n)
-                                            q = int(mm.group(1)) if mm else None
-                                            if q == 5:
-                                                return (0, n)
-                                            if q == 4:
-                                                return (1, n)
-                                            return (2, n)
-                                        _cand = sorted(_cand, key=_q2511_prio)
-                                        unet_path = str(_cand[0])
-                                except Exception:
-                                    pass
-
-                                try:
-                                    if unet_path:
-                                        self.signals.log.emit(f"[qwen2511] UNet selected: {os.path.basename(unet_path)}")
-                                except Exception:
-                                    pass
-
-                        
-                                refs = list(q_job.get("ref_images") or q_job.get("refs") or [])[:2]
-                        
-                                # Create blank canvas as image 1 (keeps ref numbering stable)
-                                tmp_blank = os.path.join(images_dir, f"_blank_{self.job.job_id}_{sid}_{int(time.time()*1000)}.png")
-                                try:
-                                    if hasattr(_q2511, "_write_blank_png"):
-                                        _q2511._write_blank_png(tmp_blank, int(q_job.get("width") or 1024), int(q_job.get("height") or 576))
-                                except Exception:
-                                    tmp_blank = ""
-                        
-                                _sm = str(q_job.get("sampling_method") or q_job.get("sampler") or "euler").strip().lower()
-                                if _sm != "euler":
-                                    _sm = "euler"
-                        
-                                # IMPORTANT: enforce VAE on CPU for VRAM headroom.
-                                _use_vae_cpu = True
-                        
-                                cmd = _q2511.build_sdcli_cmd(
-                                    sdcli_path=sdcli_path,
-                                    caps=caps,
-                                    init_img=tmp_blank,
-                                    mask_path=str(q_job.get("mask_path") or ''),
-                                    ref_images=refs,
-                                    use_increase_ref_index=True,
-                                    disable_auto_resize_ref_images=False,
-                                    prompt=str(q_job.get("prompt") or ''),
-                                    negative=str(q_job.get("negative_prompt") or q_job.get("negative") or ''),
-                                    unet_path=unet_path,
-                                    llm_path=llm_path,
-                                    mmproj_path=mmproj_path,
-                                    vae_path=vae_path,
-                                    steps=int(q_job.get("steps") or 20),
-                                    cfg=float(q_job.get("cfg") or 4.0),
-                                    seed=int(q_job.get("seed") or 0),
-                                    width=int(q_job.get("width") or 1024),
-                                    height=int(q_job.get("height") or 576),
-                                    strength=float(q_job.get("strength") or 1.0),
-                                    sampling_method=_sm,
-                                    shift=float(q_job.get("shift") or q_job.get("flow") or 2.3),
-                                    out_file=str(q_job.get("out_file") or ''),
-                                    use_vae_tiling=False,
-                                    vae_tile_size="",
-                                    vae_tile_overlap=0.0,
-                                    use_offload=False,
-                                    use_mmap=False,
-                                    use_vae_on_cpu=_use_vae_cpu,
-                                    use_clip_on_cpu=False,
-                                    use_diffusion_fa=True,
-                                    lora_model_dir=str(q_job.get("lora_model_dir") or ''),
-                                    lora_name=str(q_job.get("lora_name") or q_job.get("lora") or q_job.get("lora_path") or ''),
-                                    lora_strength=float(q_job.get("lora_strength") or q_job.get("lora_scale") or 1.0),
-                                )
-                        
-                                rc = 1
-                                try:
-                                    if hasattr(_q2511, "_run_capture"):
-                                        rc, _out_text = _q2511._run_capture(cmd)
-                                    else:
-                                        rc = os.system(" ".join([str(x) for x in cmd]))
-                                except Exception:
-                                    rc = 1
-                        
-                                out_file = str(q_job.get("out_file") or '')
-                                ok = (rc == 0 and out_file and os.path.exists(out_file))
-                                res = {"ok": bool(ok), "files": ([out_file] if ok else []), "out_file": out_file, "rc": int(rc)}
-                        
-                                try:
-                                    if tmp_blank and os.path.exists(tmp_blank):
-                                        os.remove(tmp_blank)
-                                except Exception:
-                                    pass
-                            else:
-                                raise RuntimeError("build_sdcli_cmd/detect_sdcli_caps not found")
-                        except Exception as _e:
-                            # If the user is missing the UNet GGUF, we already showed a popup; do not fall back.
+                        _int4_profile = _qwen2511_int4_best_installed()
+                        if _int4_profile is not None:
+                            aspect_mode = str(self.job.encoding.get("aspect_mode") or '')
+                            _hq = bool(self.job.encoding.get("qwen2511_high_quality") or False)
+                            bw, bh = (1280, 720) if _hq else (1024, 576)
+                            qw, qh = _apply_aspect_to_size(bw, bh, aspect_mode)
+                            _qseed = int(sh.get("seed_int") or _planner_seed_int_for_job(
+                                seed_txt, (self.job.encoding or {}).get("planner_job_variation_seed"),
+                                sid=sid, purpose="image") or 0)
+                            _qtarget = os.path.join(images_dir, f"{self.job.job_id}_{sid}.png")
+                            idx0 = int(i - 1) % 5
+                            do_multi = (idx0 in (0, 2, 4))
+                            _qprompt = str(prompt or '')
+                            if do_multi:
+                                _qprompt += "\n\nMulti-angle variant: different camera angle of the same subject."
+                            self.signals.log.emit(
+                                f"[IMG] {sid} ({i}/{total}) [Qwen2511 INT4: {_int4_profile.get('label')}]"
+                            )
+                            res = _run_qwen2511_int4_planner_image(
+                                profile=_int4_profile,
+                                prompt=_qprompt,
+                                negative=str(negative or ''),
+                                references=list(used_ref_files[:2]),
+                                output_path=_qtarget,
+                                width=int(qw),
+                                height=int(qh),
+                                seed=int(_qseed),
+                                log_func=lambda m: self.signals.log.emit(str(m)),
+                            )
                             try:
-                                if "Qwen2511: no UNet GGUF found" in str(_e):
-                                    raise
+                                shot_map = manifest.setdefault("shots", {})
+                                rec = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
+                                rec["ref_strategy"] = "qwen2511_best"
+                                rec["refs_used"] = list(used_ref_files[:2])
+                                rec["multi_angle"] = bool(do_multi and bool(multi_lora))
+                                rec["qwen2511_backend"] = "int4"
+                                rec["qwen2511_int4_model"] = str(_int4_profile.get("key") or '')
+                                shot_map[sid] = rec
                             except Exception:
                                 pass
-                            # Fallback to helper entrypoints
-                            q_job["use_vae_on_cpu"] = True
-                            q_job["vae_on_cpu"] = True
-                            q_job["vae_cpu"] = True
-                            q_job["vae_device"] = "cpu"
-                            if hasattr(_q2511, "generate_one_from_job"):
-                                res = _q2511.generate_one_from_job(q_job, images_dir)
-                            elif hasattr(_q2511, "run_job"):
-                                res = _q2511.run_job(q_job, images_dir)
-                            elif hasattr(_q2511, "run"):
-                                res = _q2511.run(q_job, images_dir)
-                            else:
-                                raise RuntimeError("qwen2511 entrypoint not found (expected build_sdcli_cmd or generate_one_from_job/run_job/run)")
+                        else:
+                            # Call into helpers/qwen2511.py (best-effort, with fallbacks)
+                            try:
+                                from helpers import qwen2511 as _q2511  # type: ignore
+                            except Exception:
+                                import qwen2511 as _q2511  # type: ignore
+
+                            # Default test/output resolution for this chunk: 1024x576 (16:9)
+                            aspect_mode = str(self.job.encoding.get("aspect_mode") or '')
+                            _hq = bool(self.job.encoding.get("qwen2511_high_quality") or False)
+
+                            bw, bh = (1280, 720) if _hq else (1024, 576)
+
+                            qw, qh = _apply_aspect_to_size(bw, bh, aspect_mode)
+                            q_job = {
+                                "prompt": prompt,
+                                "negative_prompt": negative,
+                                "negative": negative,
+                                "seed": int(sh.get("seed_int") or _planner_seed_int_for_job(seed_txt, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
+                                "width": int(qw),
+                                "height": int(qh),
+                                "vae_device": "cpu",
+                                "vae_on_cpu": True,
+                                "vae_cpu": True,
+                                "use_vae_on_cpu": True,
+                                                            "refs": list(used_ref_files[:2]),
+                                "ref_images": list(used_ref_files[:2]),
+                                "batch": 1,
+                                "out_file": os.path.join(images_dir, f"{self.job.job_id}_{sid}.png"),
+                            }
+
+                            # Multi-angle cadence: every 5 images, 3 become multi-angle variants.
+                            idx0 = int(i - 1) % 5
+                            do_multi = (idx0 in (0, 2, 4))
+                            if do_multi and multi_lora:
+                                q_job["lora_path"] = multi_lora
+                                q_job["lora"] = multi_lora
+                                q_job["multi_angle"] = True
+                                q_job["prompt"] = (q_job["prompt"] or '') + "\\n\\nMulti-angle variant: different camera angle of the same subject."
+
+                            # Update manifest per-shot record with ref info
+                            try:
+                                shot_map = manifest.setdefault("shots", {})
+                                rec = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
+                                rec["ref_strategy"] = "qwen2511_best"
+                                rec["refs_used"] = list(used_ref_files[:2])
+                                rec["multi_angle"] = bool(do_multi and bool(multi_lora))
+                                shot_map[sid] = rec
+                            except Exception:
+                                pass
+
+                            self.signals.log.emit(f"[IMG] {sid} ({i}/{total}) [qwen2511]")
+                            # Planner-side execution: prefer sd-cli command build so VAE-on-CPU is honored.
+                            try:
+                                if hasattr(_q2511, "build_sdcli_cmd") and hasattr(_q2511, "detect_sdcli_caps"):
+                                    # sd-cli path (prefer saved settings if available)
+                                    sdcli_path = getattr(_q2511, "DEFAULT_SDCLI", "sd-cli.exe")
+                                    try:
+                                        sp = getattr(_q2511, "SETSAVE_PATH", "")
+                                        if sp and hasattr(_q2511, "_read_jsonish"):
+                                            _s = _q2511._read_jsonish(sp)
+                                            if isinstance(_s, dict) and _s.get("sdcli_path"):
+                                                sdcli_path = str(_s.get("sdcli_path"))
+                                    except Exception:
+                                        pass
+                        
+                                    caps = _q2511.detect_sdcli_caps(sdcli_path)
+                        
+                                    # Resolve model paths (fallback to helper defaults)
+                                    try:
+                                        d = _q2511.default_model_paths() if hasattr(_q2511, "default_model_paths") else {}
+                                    except Exception:
+                                        d = {}
+                                    unet_path = str(d.get("unet") or '')
+                                    llm_path = str(d.get("llm") or '')
+                                    mmproj_path = str(d.get("mmproj") or '')
+                                    vae_path = str(d.get("vae") or '')
+                                    # Prefer Q5, then Q4, then any other UNet GGUF in models/qwen2511gguf/unet
+                                    try:
+                                        _unet_dir = _root() / "models" / "qwen2511gguf" / "unet"
+                                        _cand = [str(x) for x in _unet_dir.glob("*.gguf") if x.is_file()] if _unet_dir.exists() else []
+                                        if _cand:
+                                            def _q2511_prio(p: str):
+                                                n = os.path.basename(p).lower()
+                                                mm = re.search(r"(?:^|[-_\s])q(\d+)(?:$|[-_\s])", n)
+                                                q = int(mm.group(1)) if mm else None
+                                                if q == 5:
+                                                    return (0, n)
+                                                if q == 4:
+                                                    return (1, n)
+                                                return (2, n)
+                                            _cand = sorted(_cand, key=_q2511_prio)
+                                            unet_path = str(_cand[0])
+                                    except Exception:
+                                        pass
+
+                                    try:
+                                        if unet_path:
+                                            self.signals.log.emit(f"[qwen2511] UNet selected: {os.path.basename(unet_path)}")
+                                    except Exception:
+                                        pass
+
+                        
+                                    refs = list(q_job.get("ref_images") or q_job.get("refs") or [])[:2]
+                        
+                                    # Create blank canvas as image 1 (keeps ref numbering stable)
+                                    tmp_blank = os.path.join(images_dir, f"_blank_{self.job.job_id}_{sid}_{int(time.time()*1000)}.png")
+                                    try:
+                                        if hasattr(_q2511, "_write_blank_png"):
+                                            _q2511._write_blank_png(tmp_blank, int(q_job.get("width") or 1024), int(q_job.get("height") or 576))
+                                    except Exception:
+                                        tmp_blank = ""
+                        
+                                    _sm = str(q_job.get("sampling_method") or q_job.get("sampler") or "euler").strip().lower()
+                                    if _sm != "euler":
+                                        _sm = "euler"
+                        
+                                    # IMPORTANT: enforce VAE on CPU for VRAM headroom.
+                                    _use_vae_cpu = True
+                        
+                                    cmd = _q2511.build_sdcli_cmd(
+                                        sdcli_path=sdcli_path,
+                                        caps=caps,
+                                        init_img=tmp_blank,
+                                        mask_path=str(q_job.get("mask_path") or ''),
+                                        ref_images=refs,
+                                        use_increase_ref_index=True,
+                                        disable_auto_resize_ref_images=False,
+                                        prompt=str(q_job.get("prompt") or ''),
+                                        negative=str(q_job.get("negative_prompt") or q_job.get("negative") or ''),
+                                        unet_path=unet_path,
+                                        llm_path=llm_path,
+                                        mmproj_path=mmproj_path,
+                                        vae_path=vae_path,
+                                        steps=int(q_job.get("steps") or 20),
+                                        cfg=float(q_job.get("cfg") or 4.0),
+                                        seed=int(q_job.get("seed") or 0),
+                                        width=int(q_job.get("width") or 1024),
+                                        height=int(q_job.get("height") or 576),
+                                        strength=float(q_job.get("strength") or 1.0),
+                                        sampling_method=_sm,
+                                        shift=float(q_job.get("shift") or q_job.get("flow") or 2.3),
+                                        out_file=str(q_job.get("out_file") or ''),
+                                        use_vae_tiling=False,
+                                        vae_tile_size="",
+                                        vae_tile_overlap=0.0,
+                                        use_offload=False,
+                                        use_mmap=False,
+                                        use_vae_on_cpu=_use_vae_cpu,
+                                        use_clip_on_cpu=False,
+                                        use_diffusion_fa=True,
+                                        lora_model_dir=str(q_job.get("lora_model_dir") or ''),
+                                        lora_name=str(q_job.get("lora_name") or q_job.get("lora") or q_job.get("lora_path") or ''),
+                                        lora_strength=float(q_job.get("lora_strength") or q_job.get("lora_scale") or 1.0),
+                                    )
+                        
+                                    rc = 1
+                                    try:
+                                        if hasattr(_q2511, "_run_capture"):
+                                            rc, _out_text = _q2511._run_capture(cmd)
+                                        else:
+                                            rc = os.system(" ".join([str(x) for x in cmd]))
+                                    except Exception:
+                                        rc = 1
+                        
+                                    out_file = str(q_job.get("out_file") or '')
+                                    ok = (rc == 0 and out_file and os.path.exists(out_file))
+                                    res = {"ok": bool(ok), "files": ([out_file] if ok else []), "out_file": out_file, "rc": int(rc)}
+                        
+                                    try:
+                                        if tmp_blank and os.path.exists(tmp_blank):
+                                            os.remove(tmp_blank)
+                                    except Exception:
+                                        pass
+                                else:
+                                    raise RuntimeError("build_sdcli_cmd/detect_sdcli_caps not found")
+                            except Exception as _e:
+                                # If the user is missing the UNet GGUF, we already showed a popup; do not fall back.
+                                try:
+                                    if "Qwen2511: no UNet GGUF found" in str(_e):
+                                        raise
+                                except Exception:
+                                    pass
+                                # Fallback to helper entrypoints
+                                q_job["use_vae_on_cpu"] = True
+                                q_job["vae_on_cpu"] = True
+                                q_job["vae_cpu"] = True
+                                q_job["vae_device"] = "cpu"
+                                if hasattr(_q2511, "generate_one_from_job"):
+                                    res = _q2511.generate_one_from_job(q_job, images_dir)
+                                elif hasattr(_q2511, "run_job"):
+                                    res = _q2511.run_job(q_job, images_dir)
+                                elif hasattr(_q2511, "run"):
+                                    res = _q2511.run(q_job, images_dir)
+                                else:
+                                    raise RuntimeError("qwen2511 entrypoint not found (expected build_sdcli_cmd or generate_one_from_job/run_job/run)")
 
                     else:
                         # stable-diffusion.cpp sd-cli backends (Flux Klein / FireRed Edit)
@@ -30562,26 +30953,47 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             except Exception:
                 pass
 
-            # Auto-detect multi-angle LoRA (if present) and inform user.
+            # Decide whether Planner will auto-use the resident INT4 backend.
             try:
-                lora = _find_newest_qwen2511_multi_angle_lora()
-                if lora:
-                    self._ref_multi_angle_lora = lora
-                    QMessageBox.information(
-                        self,
-                        'Multi-angle LoRA',
-                        'Multi-angle LoRA detected and will be auto-enabled for some shots:\n\n' + str(lora),
-                    )
-                else:
-                    self._ref_multi_angle_lora = ''
-                    QMessageBox.information(
-                        self,
-                        'Multi-angle LoRA',
-                        'No multi-angle LoRA detected under models/loras/.\n'
-                        'The planner will still run Qwen Edit 2511 without it.',
-                    )
+                _int4_profile = _qwen2511_int4_best_installed()
             except Exception:
+                _int4_profile = None
+
+            if _int4_profile is not None:
                 self._ref_multi_angle_lora = ''
+                try:
+                    QMessageBox.information(
+                        self,
+                        'Qwen 2511 backend',
+                        'Planner detected a Qwen2511 INT4 installation and will auto-use:\n\n'
+                        + str(_int4_profile.get('label') or 'INT4')
+                        + '\n\n'
+                        'The multi-angle LoRA is not used with the INT4 backend. '
+                        'Planner will create angle variation with prompt instructions instead.',
+                    )
+                except Exception:
+                    pass
+            else:
+                # GGUF fallback path keeps the existing multi-angle LoRA behavior.
+                try:
+                    lora = _find_newest_qwen2511_multi_angle_lora()
+                    if lora:
+                        self._ref_multi_angle_lora = lora
+                        QMessageBox.information(
+                            self,
+                            'Multi-angle LoRA',
+                            'Multi-angle LoRA detected and will be auto-enabled for some shots:\n\n' + str(lora),
+                        )
+                    else:
+                        self._ref_multi_angle_lora = ''
+                        QMessageBox.information(
+                            self,
+                            'Multi-angle LoRA',
+                            'No multi-angle LoRA detected under models/loras/.\n'
+                            'The planner will still run Qwen Edit 2511 without it.',
+                        )
+                except Exception:
+                    self._ref_multi_angle_lora = ''
 
         elif result == 'flux_klein_edit':
             self._ref_strategy = 'flux_klein_edit'
@@ -31268,6 +31680,12 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             ref_lora = (getattr(self, "_ref_multi_angle_lora", "") or '').strip()
         except Exception:
             ref_lora = ""
+        try:
+            if str(getattr(self, "_ref_strategy", "") or "") == "qwen2511_best":
+                if _qwen2511_int4_best_installed() is not None:
+                    ref_lora = ""
+        except Exception:
+            pass
 
         try:
             has_refs = bool((attachments or {}).get("ref_images"))

@@ -138,13 +138,33 @@ def build_registry() -> List[Entry]:
             helper_paths=["/helpers/sdxl_inpaint.py"],
         ),
         Entry(
-            id="qwen_edit_2511",
-            title="Qwen Edit 2511",
+            id="qwen_edit_2511_gguf",
+            title="Qwen Edit 2511 GGUF",
             # Qwen GGUF generation uses a model-specific sd-cli build, not a private Python env.
             # Do not delete /.qwen2512/bin from here; it may be shared by 2511/2512.
             model_paths=["/models/qwen2511gguf/"],
             helper_paths=["/helpers/qwen2511.py"],
-            shared_helper_note="Uses the shared Qwen sd-cli bin; this entry only removes the 2511 model files.",
+            shared_helper_note=(
+                "Uses the shared Qwen sd-cli bin; this entry only removes the 2511 GGUF model files. "
+                "Hiding removes only the GGUF backend selector. The Qwen editor container and its "
+                "Flux Klein, HiDream and FireRed tabs remain available."
+            ),
+        ),
+        Entry(
+            id="qwen_edit_2511_int4",
+            title="Qwen Edit 2511 INT4 (Nunchaku)",
+            env_paths=["/environments/.qwen2511_int/"],
+            # Keep the Nunchaku source repo separate in size reporting and delete
+            # it after the model/runtime assets.
+            model_paths=["/models/qwen2511_int/"],
+            repo_paths=["/models/qwen2511_int/repo/"],
+            helper_paths=["/helpers/qwen2511_int.py"],
+            exclude_paths=["/models/qwen2511_int/repo/"],
+            shared_helper_note=(
+                "Primarily for RTX 30XX and RTX 40XX cards. RTX 50XX cards should "
+                "use the Qwen Edit 2511 GGUF backend. Hiding removes only the INT4 "
+                "selector; GGUF and the other image editor tabs remain available."
+            ),
         ),
         Entry(
             id="qwen_image_2512",
@@ -311,6 +331,20 @@ def load_state(state_path: str) -> Dict:
         out.update(data)
         if not isinstance(out.get("hidden_ids"), list):
             out["hidden_ids"] = []
+
+        # Older builds used qwen_edit_2511 for the complete Qwen editor pane.
+        # It now means only the GGUF backend selector. Migrate the flag so
+        # FrameVision no longer hides the outer tab that also contains Flux,
+        # HiDream and FireRed.
+        hidden_ids = set(str(value) for value in out.get("hidden_ids", []))
+        if "qwen_edit_2511" in hidden_ids:
+            hidden_ids.discard("qwen_edit_2511")
+            hidden_ids.add("qwen_edit_2511_gguf")
+            out["hidden_ids"] = sorted(hidden_ids)
+            try:
+                save_state(state_path, out)
+            except Exception:
+                pass
         return out
     except Exception:
         return dict(DEFAULT_STATE)
@@ -776,6 +810,33 @@ def remove_entry(app_root: str, registry: List[Entry], e: Entry) -> List[Tuple[b
     return results
 
 
+def _prepare_live_widgets_for_entry_removal(entry_id: str) -> None:
+    """Allow open tool panes to release model processes before files are deleted."""
+    try:
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+        called = set()
+        for widget in app.allWidgets():
+            fn = getattr(widget, "prepare_optional_entry_removal", None)
+            if not callable(fn):
+                continue
+            key = id(fn)
+            if key in called:
+                continue
+            called.add(key)
+            try:
+                fn(str(entry_id))
+            except Exception:
+                pass
+        try:
+            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 # -------------------------
 # UI components
 # -------------------------
@@ -786,7 +847,7 @@ class _SizeSignals(QtCore.QObject):
 
 
 class _SizeOnDiskJob(QtCore.QRunnable):
-    """Background job to compute env+model size for an Entry."""
+    """Background job to compute environment, model and repository size."""
 
     def __init__(self, app_root: str, entry: Entry):
         super().__init__()
@@ -799,40 +860,33 @@ class _SizeOnDiskJob(QtCore.QRunnable):
             r = entry_paths_resolved(self.app_root, self.entry)
             env_paths = [p for p in r.get("envs", []) if os.path.exists(p)]
             model_paths = [p for p in r.get("models", []) if os.path.exists(p)]
+            repo_paths = [p for p in r.get("repos", []) if os.path.exists(p)]
             excludes = [p for p in r.get("excludes", []) if p]
 
-            # Avoid double counting when envs live inside model folders (e.g., GFPGAN),
-            # and ignore nested subpaths that belong to another entry (e.g., wan_turbo under WAN 2.2).
-            env_bytes = sum(_path_size_bytes_excluding(p, model_paths + excludes) for p in env_paths)
-            model_bytes = sum(_path_size_bytes_excluding(p, env_paths + excludes) for p in model_paths)
+            # Keep each category separate without double counting nested roots.
+            env_bytes = sum(
+                _path_size_bytes_excluding(p, model_paths + repo_paths + excludes)
+                for p in env_paths
+            )
+            model_bytes = sum(
+                _path_size_bytes_excluding(p, env_paths + repo_paths + excludes)
+                for p in model_paths
+            )
+            repo_bytes = sum(
+                _path_size_bytes_excluding(p, env_paths + model_paths)
+                for p in repo_paths
+            )
 
-            # True union size for Total (dedupe nested roots across env+models)
-            all_roots = []
-            for p in (env_paths + model_paths):
-                if p and os.path.exists(p):
-                    all_roots.append(p)
-            # Deduplicate and remove roots that are inside another root.
-            uniq = []
-            seen = set()
-            for p in all_roots:
-                pn = _norm_path(p)
-                if pn not in seen:
-                    uniq.append(p)
-                    seen.add(pn)
-            uniq.sort(key=lambda x: len(_norm_path(x)))
-            kept: List[str] = []
-            for p in uniq:
-                if any(_is_within(p, k) for k in kept):
-                    continue
-                kept.append(p)
-            total = 0
-            for p in kept:
-                total += _path_size_bytes_excluding(p, excludes)
+            # Each category excludes nested roots belonging to the other
+            # categories, so their sum is the true union size while still
+            # respecting entry-specific excludes.
+            total = env_bytes + model_bytes + repo_bytes
 
             # Human-friendly summary. Keep it short (UI width varies).
             parts = []
             parts.append(f"Env: {_format_bytes(env_bytes)}" if env_paths else "Env: —")
             parts.append(f"Models: {_format_bytes(model_bytes)}" if model_paths else "Models: —")
+            parts.append(f"Repo: {_format_bytes(repo_bytes)}" if repo_paths else "Repo: —")
             parts.append(f"Total: {_format_bytes(total)}")
             self.signals.done.emit(" | ".join(parts))
         except Exception:
@@ -1048,7 +1102,11 @@ class EntryCard(QtWidgets.QFrame):
         if ret != QtWidgets.QMessageBox.Ok:
             return
 
+        _prepare_live_widgets_for_entry_removal(self.entry.id)
         results = remove_entry(self.app_root, self.registry, self.entry)
+        # Refresh any open tool pane again after deletion so installation badges
+        # and backend placeholders immediately reflect the files now on disk.
+        _prepare_live_widgets_for_entry_removal(self.entry.id)
 
         # Show result dialog
         ok_all = all(ok for ok, _ in results)

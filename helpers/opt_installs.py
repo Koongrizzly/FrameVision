@@ -1038,6 +1038,60 @@ def _run_qwen2511_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return _run_qwen2511_gguf(root, "Q8_0")
 
 
+def _find_qwen2511_int4_installer(root: Path) -> Optional[Path]:
+    """Return the Qwen2511 Nunchaku INT4 installer when present."""
+    candidates = [
+        root / "presets" / "extra_env" / "Qwen2511_INT4_install.py",
+        root / "scripts" / "Qwen2511_INT4_install.py",
+        root / "Qwen2511_INT4_install.py",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _run_qwen2511_int4(root: Path, model_key: str) -> Optional[Tuple[str, List[str], Path]]:
+    """Install one Qwen-Image-Edit-2511 Nunchaku INT4 profile.
+
+    The installer owns environments/.qwen2511_int and models/qwen2511_int.
+    --non-interactive prevents a second console selection prompt because the
+    desired profile was already selected in Optional Installs.
+    """
+    script = _find_qwen2511_int4_installer(root)
+    if script is None:
+        return None
+    py = _venv_python(root)
+    if py is None or not py.exists():
+        return None
+    args = [
+        "-u",
+        str(script),
+        "--root",
+        str(root),
+        "--model",
+        model_key,
+        "--non-interactive",
+    ]
+    return (str(py), args, root)
+
+
+def _run_qwen2511_int4_recommended(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_int4(root, "recommended")
+
+
+def _run_qwen2511_int4_fastest(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_int4(root, "fastest")
+
+
+def _run_qwen2511_int4_best_low_step(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_int4(root, "best-low-step")
+
+
+def _run_qwen2511_int4_fidelity(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_qwen2511_int4(root, "fidelity")
+
+
 
 def _find_ideogram4_gguf_installer(root: Path) -> Optional[Path]:
     """Return the Ideogram 4 GGUF installer script when present."""
@@ -1616,6 +1670,43 @@ OptionalInstall(
             runner=_run_qwen2512_q8,
         ),
         OptionalInstall(
+            key="qwen2511_int4_recommended",
+            title="Qwen2511 Image Edit INT4 Lightning (Recommended · quality R64 · 4 steps)",
+            description=(
+                "Nunchaku INT4 for RTX 30XX and 40XX cards. Recommended balance of speed, "
+                "VRAM use and edit quality. RTX 50XX users should choose one of the GGUF "
+                "installs below because these INT4 checkpoints are not compatible with Blackwell."
+            ),
+            runner=_run_qwen2511_int4_recommended,
+        ),
+        OptionalInstall(
+            key="qwen2511_int4_fastest",
+            title="Qwen2511 Image Edit INT4 Lightning (Fastest / lowest footprint · R32 · 4 steps)",
+            description=(
+                "Fastest Nunchaku INT4 choice and the smallest-rank low-VRAM baseline for RTX "
+                "30XX and 40XX cards. RTX 50XX users should choose a Qwen2511 GGUF install below."
+            ),
+            runner=_run_qwen2511_int4_fastest,
+        ),
+        OptionalInstall(
+            key="qwen2511_int4_best_low_step",
+            title="Qwen2511 Image Edit INT4 Lightning (Best low-step · quality R128 · 4 steps)",
+            description=(
+                "Highest-rank four-step INT4 quality choice for RTX 30XX and 40XX cards. Larger "
+                "than the R32/R64 files but still uses only four steps. RTX 50XX should use GGUF."
+            ),
+            runner=_run_qwen2511_int4_best_low_step,
+        ),
+        OptionalInstall(
+            key="qwen2511_int4_fidelity",
+            title="Qwen2511 Image Edit INT4 Lightning (Best measured fidelity · R128 · 8 steps)",
+            description=(
+                "Eight-step INT4 option for stronger measured source fidelity when the four-step "
+                "models are not enough. Intended mainly for RTX 30XX and 40XX; RTX 50XX should use GGUF."
+            ),
+            runner=_run_qwen2511_int4_fidelity,
+        ),
+        OptionalInstall(
             key="qwen2511_q3",
             title="Qwen2511 Image Edit GGUF (Q3_K_S)",
             description="Low VRAM / Don't expect perfect results.",
@@ -2025,6 +2116,10 @@ _ENV_DIR_BY_KEY = {
     "hidream_edit_both_fp8": Path("environments") / ".hidream_dev",
     "hidream_edit_all": Path("environments") / ".hidream_dev",
     "sdxl_inpaint_env": Path("environments") / ".sdxl_inpaint",
+    "qwen2511_int4_recommended": Path("environments") / ".qwen2511_int",
+    "qwen2511_int4_fastest": Path("environments") / ".qwen2511_int",
+    "qwen2511_int4_best_low_step": Path("environments") / ".qwen2511_int",
+    "qwen2511_int4_fidelity": Path("environments") / ".qwen2511_int",
     # Not on the UI list yet, but reserved for future use.
     "comfui": Path(".comfui_env"),
 }
@@ -2450,7 +2545,18 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         qwen_lay = qwen_sec.layout_content()
 
         # Qwen Edit 2511
-        _add_group_label("Qwen Edit 2511", qwen_lay)
+        _add_group_label("Qwen Edit 2511 · Nunchaku INT4 (RTX 30XX / 40XX)", qwen_lay)
+        for k in (
+            "qwen2511_int4_recommended",
+            "qwen2511_int4_fastest",
+            "qwen2511_int4_best_low_step",
+            "qwen2511_int4_fidelity",
+        ):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, qwen_lay)
+
+        _add_group_label("Qwen Edit 2511 · GGUF (choose this for RTX 50XX)", qwen_lay)
         for k in ("qwen2511_q3", "qwen2511_q4km", "qwen2511_q5km", "qwen2511_q6k", "qwen2511_q8"):
             opt = by_key.get(k)
             if opt:
@@ -2919,6 +3025,12 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         """
 
         k = (getattr(opt, "key", "") or "").strip()
+
+        # Qwen2511 Nunchaku INT4 owns a dedicated Python environment and must use
+        # the normal keep/delete/reinstall prompt. Check it before the broader
+        # qwen2511_ GGUF rule below.
+        if k.startswith("qwen2511_int4_"):
+            return (self.root_dir / "environments" / ".qwen2511_int").resolve()
 
         # Qwen2511/Qwen2512 GGUF installs download model files and use the Qwen sd-cli bin.
         # They do not own a Python environment, so do not show an env delete/reinstall prompt.
