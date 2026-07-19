@@ -116,6 +116,8 @@ Run **`framevision.exe`** — it automatically:
 
   - Planner and Music clip creator now prefer INT4 when installed, if not installed it will keep using FP16 or FP8. Default CFG for int4 was set to 3 instead of 2 (seems to work better)
   
+  - Qwen edit now also has int4 support for RTX 30xx cards, much faster and less vram needed.
+
   - several bugfixes in the app, also added a couple of new easter eggs (made for testing the new chat gpt 5.6, results are pretty good)
     
 
