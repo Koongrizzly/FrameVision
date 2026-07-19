@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "generated_at_utc": "2026-06-21T19:53:55Z",
+  "generated_at_utc": "2026-07-19T11:32:34Z",
   "generated_from": [
     "ace_setup.bat",
     "background_download.py",
@@ -23,7 +23,9 @@
     "manual-edit: add ComfyUI KJNodes Ideogram prompt-template inspiration credit",
     "manual-edit: fix FrameVision own app and VRAM Lab license/source buttons with GitHub URLs",
     "manual-edit: add Bernini source code and Bernini-R 1.3B Diffusers license entries",
-    "manual-edit: add dots.tts source code and dots.tts-mf Turbo/MeanFlow model license entries"
+    "manual-edit: add dots.tts source code and dots.tts-mf Turbo/MeanFlow model license entries",
+    "manual-edit: add Qwen-Image-Edit-2511 base assets, LAXMAYDAY Nunchaku INT4 model credit, and Nunchaku runtime license entries",
+    "manual-edit: add OzzyGT LTX-2.3 Distilled 1.1 SDNQ INT4 credit, SDNQ GPL-3.0 runtime, and explicit PyTorch/Hugging Face runtime credits; correct Nunchaku license URL"
   ],
   "items": [
     {
@@ -113,6 +115,78 @@
       "license_url": "https://pypi.org/",
       "notes": "Third-party Python packages; licenses vary by package. See each package's metadata / PyPI page for details.",
       "source_url": ""
+    },
+    {
+      "id": "pytorch_runtime",
+      "name": "PyTorch runtime",
+      "category": "python",
+      "installed_by": "default_and_optional",
+      "source": "PyTorch project",
+      "download_url": "https://pytorch.org/",
+      "license": "BSD-3-Clause",
+      "license_url": "https://github.com/pytorch/pytorch/blob/main/LICENSE",
+      "notes": "Core tensor, CUDA, neural-network, and inference runtime used throughout FrameVision's model environments. TorchVision installations are also BSD-3-Clause.",
+      "source_url": "https://github.com/pytorch/pytorch"
+    },
+    {
+      "id": "huggingface_diffusers",
+      "name": "Hugging Face Diffusers",
+      "category": "python",
+      "installed_by": "default_and_optional",
+      "source": "huggingface/diffusers (GitHub / PyPI)",
+      "download_url": "https://pypi.org/project/diffusers/",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/huggingface/diffusers/blob/main/LICENSE",
+      "notes": "Diffusion pipeline and scheduler library used by several FrameVision image and video backends. Individual model weights loaded through Diffusers may use separate model-specific licenses and are listed separately where applicable.",
+      "source_url": "https://github.com/huggingface/diffusers"
+    },
+    {
+      "id": "huggingface_transformers",
+      "name": "Hugging Face Transformers",
+      "category": "python",
+      "installed_by": "default_and_optional",
+      "source": "huggingface/transformers (GitHub / PyPI)",
+      "download_url": "https://pypi.org/project/transformers/",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/huggingface/transformers/blob/main/LICENSE",
+      "notes": "Transformer model, tokenizer, processor, and text-encoder library used by FrameVision. Model checkpoints loaded through Transformers can have separate licenses and remain governed by their own model cards.",
+      "source_url": "https://github.com/huggingface/transformers"
+    },
+    {
+      "id": "huggingface_accelerate",
+      "name": "Hugging Face Accelerate",
+      "category": "python",
+      "installed_by": "default_and_optional",
+      "source": "huggingface/accelerate (GitHub / PyPI)",
+      "download_url": "https://pypi.org/project/accelerate/",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/huggingface/accelerate/blob/main/LICENSE",
+      "notes": "Device placement, CPU offload, mixed-precision, and large-model loading support used by several FrameVision inference environments.",
+      "source_url": "https://github.com/huggingface/accelerate"
+    },
+    {
+      "id": "huggingface_hub_client",
+      "name": "Hugging Face Hub Python client",
+      "category": "python",
+      "installed_by": "default_and_optional",
+      "source": "huggingface/huggingface_hub (GitHub / PyPI)",
+      "download_url": "https://pypi.org/project/huggingface-hub/",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/huggingface/huggingface_hub/blob/main/LICENSE",
+      "notes": "Download and repository client used by FrameVision installers to retrieve model files from Hugging Face. Downloaded models retain their own separate licenses.",
+      "source_url": "https://github.com/huggingface/huggingface_hub"
+    },
+    {
+      "id": "safetensors_library",
+      "name": "Safetensors tensor format library",
+      "category": "python",
+      "installed_by": "default_and_optional",
+      "source": "huggingface/safetensors (GitHub / PyPI)",
+      "download_url": "https://pypi.org/project/safetensors/",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/huggingface/safetensors/blob/main/LICENSE",
+      "notes": "Library and file format used for safely loading many FrameVision model checkpoints. The license of a .safetensors model file is determined by that model's repository, not by the Safetensors library license.",
+      "source_url": "https://github.com/huggingface/safetensors"
     },
     {
       "id": "qwen3_vl_2b_instruct",
@@ -293,6 +367,42 @@
       "license_url": "https://huggingface.co/unsloth/Qwen-Image-2512-GGUF",
       "notes": "",
       "source_url": "https://huggingface.co/unsloth/Qwen-Image-2512-GGUF"
+    },
+    {
+      "id": "qwen_image_edit_2511_base",
+      "name": "Qwen-Image-Edit-2511 base model and shared pipeline assets",
+      "category": "model",
+      "installed_by": "optional_installs",
+      "source": "Qwen/Qwen-Image-Edit-2511 (Hugging Face)",
+      "download_url": "https://huggingface.co/Qwen/Qwen-Image-Edit-2511",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/Qwen/Qwen-Image-Edit-2511/blob/main/LICENSE",
+      "notes": "Base Qwen image-editing model assets used by the INT4 installation, including the processor, tokenizer, Qwen2.5-VL text encoder, scheduler, VAE, and pipeline configuration. The original BF16 transformer weights are excluded because the selected Nunchaku INT4 checkpoint replaces them.",
+      "source_url": "https://huggingface.co/Qwen/Qwen-Image-Edit-2511"
+    },
+    {
+      "id": "qwen_image_edit_2511_nunchaku_int4_models",
+      "name": "Qwen-Image-Edit-2511 Nunchaku INT4 model files",
+      "category": "model",
+      "installed_by": "optional_installs",
+      "source": "LAXMAYDAY/Qwen_image_edit_2511_int4 (Hugging Face)",
+      "download_url": "https://huggingface.co/LAXMAYDAY/Qwen_image_edit_2511_int4",
+      "license": "Apache-2.0 base-model terms; quantized repository does not declare a separate license",
+      "license_url": "https://huggingface.co/Qwen/Qwen-Image-Edit-2511/blob/main/LICENSE",
+      "notes": "Credits LAXMAYDAY for publishing the Nunchaku INT4 safetensors variants used by FrameVision, including the selected 4-step and 8-step Lightning checkpoints. These are quantized derivatives of Qwen-Image-Edit-2511. The Hugging Face quantized repository does not currently expose a separate license declaration, so users should also follow the upstream Qwen Apache-2.0 terms and review the model repository for later updates.",
+      "source_url": "https://huggingface.co/LAXMAYDAY/Qwen_image_edit_2511_int4"
+    },
+    {
+      "id": "nunchaku_int4_runtime",
+      "name": "Nunchaku INT4 inference runtime",
+      "category": "optional",
+      "installed_by": "optional_installs",
+      "source": "nunchaku-ai/nunchaku (GitHub)",
+      "download_url": "https://github.com/nunchaku-ai/nunchaku",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/nunchaku-ai/nunchaku/blob/main/LICENSE",
+      "notes": "Low-bit inference runtime used to load and execute the Qwen-Image-Edit-2511 INT4 checkpoints. FrameVision installs a matching prebuilt Nunchaku wheel and keeps the corresponding source repository for attribution and integration reference. Nunchaku is licensed under Apache-2.0.",
+      "source_url": "https://github.com/nunchaku-ai/nunchaku"
     },
     {
       "id": "qwen25_vl_7b_gguf",
@@ -569,6 +679,30 @@
       "license_url": "https://huggingface.co/Lightricks/LTX-2.3/blob/main/LICENSE",
       "notes": "LTX 2.3 model weights, including full, distilled, LoRA, and upscaler files when installed from the Lightricks/LTX-2.3 repository. Use/redistribution must follow the LTX-2 Community License Agreement and any model-card restrictions.",
       "source_url": "https://huggingface.co/Lightricks/LTX-2.3"
+    },
+    {
+      "id": "ltx_2_3_distilled_1_1_sdnq_int4",
+      "name": "LTX 2.3 Distilled 1.1 SDNQ dynamic INT4 model",
+      "category": "model",
+      "installed_by": "optional_installs",
+      "source": "OzzyGT/LTX-2.3-Distilled-1.1-sdnq-dynamic-int4 (Hugging Face)",
+      "download_url": "https://huggingface.co/OzzyGT/LTX-2.3-Distilled-1.1-sdnq-dynamic-int4",
+      "license": "LTX-2 Community License Agreement",
+      "license_url": "https://huggingface.co/Lightricks/LTX-2.3/blob/main/LICENSE",
+      "notes": "Credits OzzyGT for publishing the SDNQ dynamic INT4 conversion used by FrameVision. This checkpoint is identified by Hugging Face as a quantized derivative of Lightricks/LTX-2.3 and therefore remains subject to the upstream LTX-2 Community License Agreement, including its redistribution, acceptable-use, and commercial-entity conditions.",
+      "source_url": "https://huggingface.co/OzzyGT/LTX-2.3-Distilled-1.1-sdnq-dynamic-int4"
+    },
+    {
+      "id": "sdnq_quantization_engine",
+      "name": "SDNQ quantization engine",
+      "category": "python",
+      "installed_by": "optional_installs",
+      "source": "Disty0/sdnq (GitHub / PyPI)",
+      "download_url": "https://pypi.org/project/sdnq/",
+      "license": "GPL-3.0",
+      "license_url": "https://github.com/Disty0/sdnq/blob/main/LICENSE",
+      "notes": "SD.Next Quantization engine used to load and execute SDNQ quantized model components. SDNQ is distributed under GPL-3.0; preserve the license and source availability obligations when redistributing the software.",
+      "source_url": "https://github.com/Disty0/sdnq"
     },
     {
       "id": "microsoft_lens_model",
