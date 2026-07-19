@@ -628,9 +628,40 @@ def server_main(root: Path) -> int:
     return 0
 
 
+def queue_job_main(root: Path, request_path: str) -> int:
+    """Run one queued edit without importing the PySide6 UI.
+
+    FrameVision's queue worker launches this mode inside the dedicated
+    ``.qwen2511_int`` environment.  The request is a normal ``build_request``
+    payload, so queued and direct generations use exactly the same backend.
+    """
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    server = PipelineServer(root)
+    try:
+        path = Path(request_path).expanduser().resolve()
+        request = read_json(path, None)
+        if not isinstance(request, dict):
+            raise ValueError(f"Queued request is missing or invalid: {path}")
+        request["command"] = "generate"
+        worker_event("ready", root=str(root), pid=os.getpid(), queue_job=True)
+        server.generate(request)
+        return 0
+    except Exception as exc:
+        worker_event("error", message=str(exc), traceback=traceback.format_exc())
+        return 1
+    finally:
+        try:
+            server.unload()
+        except Exception:
+            pass
+
+
 def parse_worker_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--server", action="store_true")
+    parser.add_argument("--queue-job")
     parser.add_argument("--root")
     args, _ = parser.parse_known_args()
     return args
@@ -639,6 +670,8 @@ def parse_worker_args() -> argparse.Namespace:
 _WORKER_ARGS = parse_worker_args()
 if _WORKER_ARGS.server:
     raise SystemExit(server_main(detect_root(_WORKER_ARGS.root)))
+if _WORKER_ARGS.queue_job:
+    raise SystemExit(queue_job_main(detect_root(_WORKER_ARGS.root), _WORKER_ARGS.queue_job))
 
 
 # UI imports are intentionally below the worker dispatch.  The dedicated model
@@ -1194,6 +1227,24 @@ class Qwen2511IntWidget(QWidget):
         output_layout.addWidget(self.filename_preview, 3, 1, 1, 3)
         layout.addWidget(output_group)
 
+        queue_group = QGroupBox("FrameVision queue")
+        queue_layout = QVBoxLayout(queue_group)
+        self.queue_check = QCheckBox("Use FrameVision queue")
+        self.queue_check.setChecked(True)
+        self.queue_check.setToolTip(
+            "When enabled, the footer adds this edit to jobs/pending instead of running it immediately. "
+            "The Queue worker launches the same Qwen 2511 INT4 backend and settings."
+        )
+        self.queue_check.toggled.connect(self.queue_mode_changed)
+        queue_hint = QLabel(
+            "Queued jobs run sequentially with FrameVision's other jobs. Disable this to use the persistent direct-run backend."
+        )
+        queue_hint.setWordWrap(True)
+        queue_hint.setObjectName("Hint")
+        queue_layout.addWidget(self.queue_check)
+        queue_layout.addWidget(queue_hint)
+        layout.addWidget(queue_group)
+
         memory_group = QGroupBox("Memory and backend")
         memory_layout = QGridLayout(memory_group)
         memory_layout.setColumnStretch(1, 1)
@@ -1371,6 +1422,7 @@ class Qwen2511IntWidget(QWidget):
         self.pin_memory_check.setChecked(bool(data.get("pin_memory", False)))
         self.keep_loaded_check.setChecked(bool(data.get("keep_loaded", True)))
         self.cleanup_check.setChecked(bool(data.get("cleanup_between", True)))
+        self.queue_check.setChecked(bool(data.get("use_framevision_queue", True)))
 
         self.reference_paths = []
         self.reference_list.clear()
@@ -1386,6 +1438,7 @@ class Qwen2511IntWidget(QWidget):
         self.auto_name_changed(self.auto_name_check.isChecked())
         self.output_format_changed()
         self.offload_changed()
+        self.queue_mode_changed(self.queue_check.isChecked())
 
     def _set_combo_data(self, combo: QComboBox, value: Any) -> None:
         index = combo.findData(value)
@@ -1422,6 +1475,7 @@ class Qwen2511IntWidget(QWidget):
             "pin_memory": self.pin_memory_check.isChecked(),
             "keep_loaded": self.keep_loaded_check.isChecked(),
             "cleanup_between": self.cleanup_check.isChecked(),
+            "use_framevision_queue": self.queue_check.isChecked(),
         }
 
     def save_settings(self) -> None:
@@ -1462,6 +1516,7 @@ class Qwen2511IntWidget(QWidget):
             self.pin_memory_check,
             self.keep_loaded_check,
             self.cleanup_check,
+            self.queue_check,
         ]
         for widget in widgets:
             if isinstance(widget, QTextEdit):
@@ -1727,6 +1782,21 @@ class Qwen2511IntWidget(QWidget):
         self.blocks_spin.setEnabled(low)
         self.pin_memory_check.setEnabled(low)
 
+    def queue_mode_changed(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self.generate_button.setText("Add to queue" if enabled else "Generate edit")
+        # A model kept by the direct-run backend would compete with the Queue
+        # worker for VRAM. Release it as soon as queue mode is selected.
+        if enabled and not self.running:
+            self.stop_backend()
+        self.cancel_button.setVisible((not enabled) or self.running)
+        if not self.running:
+            self.status_label.setText("Queue mode" if enabled else "Ready")
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+            self.progress.setFormat("Ready to queue" if enabled else "Idle")
+        self.update_generate_enabled()
+
     def update_filename_preview(self) -> None:
         extension = self.format_combo.currentData() or "png"
         seed = self.seed_spin.value()
@@ -1746,6 +1816,11 @@ class Qwen2511IntWidget(QWidget):
             and self.reference_list.count() > 0
         )
         self.generate_button.setEnabled(ready)
+        try:
+            self.queue_check.setEnabled(not self.running)
+            self.generate_button.setText("Add to queue" if self.queue_check.isChecked() else "Generate edit")
+        except Exception:
+            pass
 
     # -------------------------------- generation --------------------------------
     def build_request(self) -> dict[str, Any]:
@@ -1802,8 +1877,12 @@ class Qwen2511IntWidget(QWidget):
             QMessageBox.warning(self, APP_NAME, error)
             return
         self.save_settings()
+        if self.queue_check.isChecked():
+            self.enqueue_generation(request)
+            return
         self.running = True
         self.update_generate_enabled()
+        self.cancel_button.setVisible(True)
         self.cancel_button.setEnabled(True)
         self.progress.setRange(0, max(1, request["steps"] * request["count"]))
         self.progress.setValue(0)
@@ -1812,6 +1891,32 @@ class Qwen2511IntWidget(QWidget):
         self.pending_request = request
         self.generationRequested.emit(request)
         self.ensure_backend()
+
+    def enqueue_generation(self, request: dict[str, Any]) -> None:
+        try:
+            try:
+                from helpers.queue_adapter import enqueue_qwen2511_int4_request
+            except Exception:
+                from queue_adapter import enqueue_qwen2511_int4_request
+            job_id = enqueue_qwen2511_int4_request(request, root=self.root)
+            if not job_id:
+                raise RuntimeError("The queue adapter did not create a job file.")
+            self.stop_backend()
+            self.status_label.setText("Added to queue")
+            self.progress.setRange(0, 1)
+            self.progress.setValue(1)
+            self.progress.setFormat("Queued")
+            self.append_log(f"Added Qwen 2511 INT4 edit to FrameVision queue: {job_id}")
+            QMessageBox.information(self, APP_NAME, "The edit was added to the FrameVision queue.")
+        except Exception as exc:
+            self.status_label.setText("Queue failed")
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+            self.progress.setFormat("Queue failed")
+            self.append_log(f"Could not add edit to queue: {exc}", "error")
+            QMessageBox.critical(self, APP_NAME, f"Could not add the edit to the FrameVision queue:\n\n{exc}")
+        finally:
+            self.update_generate_enabled()
 
     def ensure_backend(self) -> None:
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:

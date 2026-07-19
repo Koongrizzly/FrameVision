@@ -4921,6 +4921,247 @@ def wan22_generate(job, cfg, mani):
 
 
 
+def qwen2511_int4_image_edit(job, cfg, mani):
+    """Run a queued Qwen 2511 Nunchaku INT4 edit in its dedicated environment."""
+    import tempfile as _tempfile
+    from pathlib import Path as _P
+
+    try:
+        args = dict(job.get("args") or {})
+    except Exception:
+        args = {}
+    request = args.get("request") or {}
+    if not isinstance(request, dict):
+        _mark_error(job, "Qwen 2511 INT4 queue request is invalid.")
+        return 2
+
+    env_python = str(args.get("env_python") or "").strip()
+    helper_script = str(args.get("helper_script") or "").strip()
+    root_path = str(args.get("root") or ROOT).strip()
+    if not env_python or not _P(env_python).is_file():
+        _mark_error(job, f"Qwen 2511 INT4 env Python not found: {env_python}")
+        return 2
+    if not helper_script or not _P(helper_script).is_file():
+        _mark_error(job, f"Qwen 2511 INT4 helper not found: {helper_script}")
+        return 2
+
+    references = [str(x).strip() for x in (request.get("references") or []) if str(x).strip()]
+    if not references:
+        _mark_error(job, "Qwen 2511 INT4 requires at least one reference image.")
+        return 2
+    for ref in references:
+        if not _P(ref).expanduser().is_file():
+            _mark_error(job, f"Qwen 2511 INT4 reference image not found: {ref}")
+            return 2
+
+    prompt = str(request.get("prompt") or "").strip()
+    if not prompt:
+        _mark_error(job, "Qwen 2511 INT4 edit instruction is empty.")
+        return 2
+
+    output = dict(request.get("output") or {})
+    try:
+        out_dir = _P(str(output.get("folder") or job.get("out_dir") or (ROOT / "output" / "edits"))).expanduser().resolve()
+    except Exception:
+        out_dir = _P(ROOT / "output" / "edits").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output["folder"] = str(out_dir)
+    request["output"] = output
+    request["command"] = "generate"
+
+    title = str(args.get("label") or ("Qwen 2511 INT4: " + " ".join(prompt.split())[:80])).strip()
+    try:
+        job["title"] = title
+        job["label"] = title
+        job["backend"] = "qwen2511_int4"
+        job["model"] = str(request.get("model") or args.get("model") or "")
+        args["label"] = title
+        job["args"] = args
+    except Exception:
+        pass
+
+    request_dir = _P(root_path) / "temp" / "qwen2511_int_queue"
+    request_dir.mkdir(parents=True, exist_ok=True)
+    job_id = str(job.get("id") or f"{os.getpid()}_{int(time.time())}")
+    request_path = request_dir / f"{job_id}.json"
+    try:
+        request_path.write_text(json.dumps(request, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        _mark_error(job, f"Could not write Qwen 2511 INT4 queue request: {exc}")
+        return 2
+
+    cmd = [env_python, "-u", helper_script, "--queue-job", str(request_path), "--root", root_path]
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("HF_HUB_OFFLINE", "1")
+    env.setdefault("TRANSFORMERS_OFFLINE", "1")
+    env.setdefault("FRAMEVISION_ROOT", root_path)
+
+    try:
+        print("[worker][qwen2511-int4] starting:", title, flush=True)
+        print("[worker][qwen2511-int4] model:", str(request.get("model") or ""), flush=True)
+        print("[worker][qwen2511-int4] refs:", len(references), "output:", str(out_dir), flush=True)
+        _progress_set(1, "Starting Qwen 2511 INT4")
+        _patch_running_json({"stage": "Starting Qwen 2511 INT4", "backend": "qwen2511_int4"})
+    except Exception:
+        pass
+
+    outputs = []
+    reported_error = ""
+    reported_traceback = ""
+    result_event = None
+    code = 1
+    was_cancel = False
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=root_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            bufsize=1,
+        )
+        try:
+            _patch_running_json({"active_pid": int(getattr(proc, "pid", 0) or 0), "active_cmd": " ".join(cmd)})
+        except Exception:
+            pass
+
+        q, _reader = _start_proc_reader(proc)
+        while True:
+            if _cancel_requested():
+                was_cancel = True
+                _note_cancel("Cancelled by user")
+                try:
+                    _kill_process_tree(getattr(proc, "pid", 0) or 0)
+                except Exception:
+                    pass
+                break
+            try:
+                item = q.get(timeout=0.35)
+            except _queue.Empty:
+                if proc.poll() is not None:
+                    break
+                continue
+            if item is _EOF:
+                break
+            line = str(item or "").strip()
+            if not line:
+                continue
+            print("[QWEN2511-INT4]", line, flush=True)
+            try:
+                _patch_running_json({"progress_text": line[-800:], "status_text": line[-800:], "last_message": line[-800:]})
+            except Exception:
+                pass
+
+            if not line.startswith("FVQWEN_EVENT "):
+                continue
+            try:
+                event = json.loads(line[len("FVQWEN_EVENT "):])
+            except Exception:
+                continue
+            event_name = str(event.get("event") or "")
+            if event_name == "status":
+                message = str(event.get("message") or "Generating")
+                try:
+                    _patch_running_json({"stage": message})
+                except Exception:
+                    pass
+            elif event_name == "progress":
+                try:
+                    current = int(event.get("current") or 0)
+                    total = max(1, int(event.get("total") or 1))
+                    image = max(1, int(event.get("image") or 1))
+                    image_total = max(1, int(event.get("image_total") or 1))
+                    overall = (image - 1) * total + max(0, min(current, total))
+                    all_steps = total * image_total
+                    pct = max(1, min(99, int(round((overall / all_steps) * 100.0))))
+                    message = f"Image {image}/{image_total} · step {current}/{total}"
+                    _progress_set(pct, message)
+                    _patch_running_json({"stage": message})
+                except Exception:
+                    pass
+            elif event_name == "model_loaded":
+                try:
+                    job["model"] = str(event.get("model") or request.get("model") or "")
+                    _patch_running_json({"model": job["model"], "stage": "Qwen 2511 INT4 model loaded"})
+                except Exception:
+                    pass
+            elif event_name == "image_saved":
+                path = str(event.get("path") or "").strip()
+                if path and path not in outputs:
+                    outputs.append(path)
+            elif event_name == "result":
+                result_event = event
+                result_outputs = [str(x).strip() for x in (event.get("outputs") or []) if str(x).strip()]
+                if result_outputs:
+                    outputs = result_outputs
+            elif event_name == "error":
+                reported_error = str(event.get("message") or "Qwen 2511 INT4 failed.")
+                reported_traceback = str(event.get("traceback") or "")
+
+        code = int(proc.wait() or 0)
+        if was_cancel:
+            code = 130
+    except Exception as exc:
+        reported_error = f"Qwen 2511 INT4 launch failed: {exc}"
+        code = 2
+    finally:
+        try:
+            request_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    valid_outputs = []
+    for value in outputs:
+        try:
+            op = _P(value).expanduser().resolve()
+            if op.is_file() and op.stat().st_size > 0:
+                valid_outputs.append(str(op))
+        except Exception:
+            pass
+
+    if code == 130:
+        _mark_error(job, "Qwen 2511 INT4 job was cancelled.")
+        return 130
+    if reported_error:
+        if reported_traceback:
+            print(reported_traceback, flush=True)
+        _mark_error(job, reported_error)
+        return code or 1
+    if code != 0:
+        _mark_error(job, f"Qwen 2511 INT4 backend exited with code {code}.")
+        return code
+    if not valid_outputs:
+        _mark_error(job, "Qwen 2511 INT4 finished but produced no image files.")
+        return 1
+
+    try:
+        job["files"] = valid_outputs
+        job["produced"] = valid_outputs[-1]
+        job["output"] = valid_outputs[-1]
+        if isinstance(result_event, dict):
+            job["seeds"] = result_event.get("seeds") or []
+            job["seconds"] = result_event.get("seconds")
+        _progress_set(100, "Qwen 2511 INT4 finished")
+        _patch_running_json({
+            "stage": "Qwen 2511 INT4 finished",
+            "produced": valid_outputs[-1],
+            "files": valid_outputs,
+            "backend": "qwen2511_int4",
+            "model": job.get("model") or str(request.get("model") or ""),
+        })
+    except Exception:
+        pass
+    return 0
+
+
 def qwen2511_image_edit(job, cfg, mani):
     """Run a Qwen2511 (stable-diffusion.cpp sd-cli) image edit job via the queue.
 
@@ -6763,6 +7004,8 @@ def handle_job(jpath: Path):
         elif t in ('boogu_generate','boogu','boogu_image'):
             # Boogu Image is launched through sd-cli and streamed like the other external tool jobs.
             code = tools_ffmpeg(job, cfg, mani)
+        elif t in ("qwen2511_int4_image_edit", "qwen2511_int4_edit", "qwen2511_nunchaku_int4"):
+            code = qwen2511_int4_image_edit(job, cfg, mani)
         elif t in ("qwen2511_image_edit","qwen2511_edit","qwen2511"):
             code = qwen2511_image_edit(job, cfg, mani)
         elif t in ("flux_klein_image_edit","flux_klein_edit","flux_klein","klein_image_edit"):

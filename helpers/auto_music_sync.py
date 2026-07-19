@@ -1687,6 +1687,183 @@ def _musicclip_patch_krea2_bridge(mod):
 
 
 
+_MUSICCLIP_INT4_AUTO_VRAM_THRESHOLD_GB = 23.0
+_MUSICCLIP_CUDA_VRAM_GB_CACHE: Optional[float] = None
+_MUSICCLIP_CUDA_VRAM_PROBED = False
+
+
+def _musicclip_detect_cuda_vram_gb(int4_module=None) -> Optional[float]:
+    """Detect total CUDA VRAM once without importing Torch into the UI process.
+
+    Prefer nvidia-smi because it is fast and does not reserve CUDA memory. Fall
+    back to the isolated .ltx23 Python only when nvidia-smi is unavailable.
+    Unknown cards keep the conservative automatic VRAM planner enabled.
+    """
+    global _MUSICCLIP_CUDA_VRAM_GB_CACHE, _MUSICCLIP_CUDA_VRAM_PROBED
+    if _MUSICCLIP_CUDA_VRAM_PROBED:
+        return _MUSICCLIP_CUDA_VRAM_GB_CACHE
+    _MUSICCLIP_CUDA_VRAM_PROBED = True
+
+    # Optional explicit override for portable/debug installations.
+    for env_name in ("FRAMEVISION_MUSICCLIP_CUDA_VRAM_GB", "FRAMEVISION_LTX23_VRAM_GB"):
+        try:
+            raw = str(os.environ.get(env_name) or "").strip()
+            if raw:
+                value = float(raw)
+                if value > 0:
+                    _MUSICCLIP_CUDA_VRAM_GB_CACHE = value
+                    return value
+        except Exception:
+            pass
+
+    creationflags = 0
+    try:
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    except Exception:
+        creationflags = 0
+
+    candidates = []
+    try:
+        found = shutil.which("nvidia-smi") or shutil.which("nvidia-smi.exe")
+        if found:
+            candidates.append(found)
+    except Exception:
+        pass
+    for base in (os.environ.get("ProgramW6432"), os.environ.get("ProgramFiles")):
+        if base:
+            candidates.append(os.path.join(base, "NVIDIA Corporation", "NVSMI", "nvidia-smi.exe"))
+
+    seen = set()
+    for exe in candidates:
+        try:
+            key = os.path.normcase(os.path.abspath(str(exe)))
+            if key in seen:
+                continue
+            seen.add(key)
+            if os.path.isabs(str(exe)) and not os.path.isfile(str(exe)):
+                continue
+            proc = subprocess.run(
+                [str(exe), "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=6,
+                creationflags=creationflags,
+            )
+            if proc.returncode != 0:
+                continue
+            values = []
+            for line in str(proc.stdout or "").splitlines():
+                match = re.search(r"([0-9]+(?:\.[0-9]+)?)", line)
+                if match:
+                    values.append(float(match.group(1)) / 1024.0)
+            if values:
+                # FrameVision normally uses one card. Respect CUDA_VISIBLE_DEVICES
+                # when it starts with a numeric physical GPU index.
+                selected = 0
+                visible = str(os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip().split(",")[0].strip()
+                if visible.isdigit():
+                    selected = max(0, min(int(visible), len(values) - 1))
+                value = float(values[selected])
+                _MUSICCLIP_CUDA_VRAM_GB_CACHE = value
+                return value
+        except Exception:
+            continue
+
+    # Reliable fallback through the isolated LTX environment. This happens only
+    # once per Music Clip Creator process and does not affect the generation CLI.
+    python_exe = ""
+    try:
+        status_fn = getattr(int4_module, "int4_install_status", None)
+        if callable(status_fn):
+            status = status_fn(Path(_musicclip_project_root()))
+            if isinstance(status, dict):
+                python_exe = str(status.get("python_exe") or "").strip()
+    except Exception:
+        python_exe = ""
+    if not python_exe:
+        root = Path(_musicclip_project_root())
+        for candidate in (
+            root / "environments" / ".ltx23" / "python.exe",
+            root / "environments" / ".ltx23" / "Scripts" / "python.exe",
+            root / "environments" / ".ltx23" / "bin" / "python",
+        ):
+            if candidate.is_file():
+                python_exe = str(candidate)
+                break
+    if python_exe and os.path.isfile(python_exe):
+        try:
+            code = (
+                "import torch; "
+                "print(torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory/(1024**3) "
+                "if torch.cuda.is_available() else '')"
+            )
+            proc = subprocess.run(
+                [python_exe, "-c", code],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=25,
+                creationflags=creationflags,
+            )
+            if proc.returncode == 0:
+                value = float(str(proc.stdout or "").strip().splitlines()[-1])
+                if value > 0:
+                    _MUSICCLIP_CUDA_VRAM_GB_CACHE = value
+                    return value
+        except Exception:
+            pass
+    return None
+
+
+def _musicclip_patch_int4_vram_policy(mod):
+    """Match Music Clip Creator INT4 VRAM flags to the fast LTX UI policy.
+
+    Cards with at least 23 GB use the CLI's fixed per-card profile, which keeps
+    Stage 1 resident enough for the ~9-10 second steps seen on a 24 GB card.
+    Smaller or unknown cards retain the automatic VRAM planner for safety.
+    """
+    if mod is None or bool(getattr(mod, "_framevision_musicclip_int4_vram_policy_patched", False)):
+        return mod
+    try:
+        original_build = getattr(mod, "_build_int4_args", None)
+        if not callable(original_build):
+            return mod
+
+        def _build_with_card_policy(*args, **kwargs):
+            command = list(original_build(*args, **kwargs))
+            command = [
+                item for item in command
+                if str(item) not in {"--int4-auto-vram", "--no-int4-auto-vram"}
+            ]
+            detected_gb = _musicclip_detect_cuda_vram_gb(mod)
+            policy_flag = (
+                "--no-int4-auto-vram"
+                if detected_gb is not None and detected_gb >= _MUSICCLIP_INT4_AUTO_VRAM_THRESHOLD_GB
+                else "--int4-auto-vram"
+            )
+            insert_at = len(command)
+            try:
+                profile_index = command.index("--vram-profile")
+                insert_at = min(len(command), profile_index + 2)
+            except ValueError:
+                try:
+                    insert_at = command.index("--prompt")
+                except ValueError:
+                    pass
+            command.insert(insert_at, policy_flag)
+            return command
+
+        setattr(mod, "_build_int4_args", _build_with_card_policy)
+        base_bridge = getattr(mod, "_BASE", None)
+        if base_bridge is not None:
+            setattr(base_bridge, "_ltx23_build_vramlab_direct_args", _build_with_card_policy)
+        setattr(mod, "_framevision_musicclip_int4_vram_policy_patched", True)
+    except Exception:
+        pass
+    return mod
+
+
 def _load_musicclip_planner_bridge():
     # Original/Wan2GP bridge. Keep this separate so the option can hide again
     # when this file is removed.
@@ -1702,7 +1879,9 @@ def _load_clip2ltx_bridge():
 def _load_music_ltx_int4_bridge():
     # Isolated INT4 adapter. It reuses clip2ltx_cli.py planning/assembly but
     # routes only the generation command to helpers/ltx_int4_cli.py.
-    return _musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("music_ltx_int4.py", "_framevision_music_ltx_int4_bridge"))
+    bridge = _load_musicclip_bridge_file("music_ltx_int4.py", "_framevision_music_ltx_int4_bridge")
+    bridge = _musicclip_patch_int4_vram_policy(bridge)
+    return _musicclip_patch_krea2_bridge(bridge)
 
 
 def _musicclip_default_llama_runner() -> str:
@@ -4118,6 +4297,8 @@ def _musicclip_load_ltx_bridge_module_for_queue(root_dir: str, backend: str = ""
             if not callable(getattr(module, "run_all_ltx_director_shots", None)):
                 errors.append(f"{filename}: run_all_ltx_director_shots is missing")
                 continue
+            if filename == "music_ltx_int4.py":
+                module = _musicclip_patch_int4_vram_policy(module)
             return _musicclip_patch_krea2_bridge(module)
         except BaseException as exc:
             errors.append(f"{filename}: {type(exc).__name__}: {exc}")
