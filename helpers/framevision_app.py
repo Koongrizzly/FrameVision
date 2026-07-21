@@ -2109,81 +2109,82 @@ class VideoPane(QWidget):
                         pm_right = getattr(self, "_compare_right_image_pm_orig", None)
                     elif kind == "video":
                         rf = getattr(self, "_compare_right_frame", None)
-                        if rf is not None and (not rf.isNull()):
+                        if rf is not None and not rf.isNull():
                             pm_right = QPixmap.fromImage(rf)
                 except Exception:
                     pm_right = None
 
-                if pm_right is not None and (not pm_right.isNull()):
-                    def _render(pm):
+                if pm_right is not None and not pm_right.isNull():
+                    from PySide6.QtGui import QPainter, QColor, QPen
+                    from PySide6.QtCore import QRect
+
+                    scale_mode = str(getattr(self, "_compare_scale_mode", "fill") or "fill").lower()
+                    if scale_mode not in ("fill", "fit", "stretch"):
+                        scale_mode = "fill"
+
+                    def _normalized_canvas(pm):
+                        """Render either source into the exact same output canvas."""
+                        canvas = QPixmap(tw, th)
+                        canvas.fill(QColor(0, 0, 0))
+                        if pm is None or pm.isNull():
+                            return canvas
+
+                        # Apply the media player's zoom/pan before compare scaling.
                         try:
-                            if pm is None or pm.isNull():
-                                return None
-                            if mode == 0:
-                                return self._center_zoom(pm, target)
-                            cropped = self._apply_zoom_and_pan(pm)
-                            return self._choose_scaled(cropped, target)
+                            src = self._apply_zoom_and_pan(pm) if z > 1.0 else pm
                         except Exception:
-                            return pm
+                            src = pm
 
-                    sp_left = _render(pm_left)
-                    sp_right = _render(pm_right)
-                    if sp_left is not None and (not sp_left.isNull()) and sp_right is not None and (not sp_right.isNull()):
-                        out = QPixmap(tw, th)
+                        painter = QPainter(canvas)
                         try:
-                            out.fill(Qt.transparent)
-                        except Exception:
-                            pass
+                            if scale_mode == "stretch":
+                                painter.drawPixmap(QRect(0, 0, tw, th), src)
+                            elif scale_mode == "fit":
+                                scaled = src.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                                x = (tw - scaled.width()) // 2
+                                y = (th - scaled.height()) // 2
+                                painter.drawPixmap(x, y, scaled)
+                            else:  # fill / cover
+                                scaled = src.scaled(tw, th, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                                sx = max(0, (scaled.width() - tw) // 2)
+                                sy = max(0, (scaled.height() - th) // 2)
+                                painter.drawPixmap(0, 0, scaled, sx, sy, tw, th)
+                        finally:
+                            painter.end()
+                        return canvas
 
-                        from PySide6.QtGui import QPainter, QColor, QPen
-                        from PySide6.QtCore import QRect
-
-                        p = QPainter(out)
-
-                        oxL = int((tw - sp_left.width()) / 2)
-                        oyL = int((th - sp_left.height()) / 2)
-                        oxR = int((tw - sp_right.width()) / 2)
-                        oyR = int((th - sp_right.height()) / 2)
-
-                        # Base: RIGHT on the canvas
-                        p.drawPixmap(oxR, oyR, sp_right)
-
-                        # Reveal: LEFT from the left edge (so Left stays on the left, Right on the right)
-                        wipe = int(getattr(self, "_compare_wipe", 500) or 500)
-                        wipe = max(0, min(1000, wipe))
-                        reveal = int(round(sp_left.width() * (wipe / 1000.0)))
-
+                    left_canvas = _normalized_canvas(pm_left)
+                    right_canvas = _normalized_canvas(pm_right)
+                    out = QPixmap(tw, th)
+                    out.fill(QColor(0, 0, 0))
+                    p = QPainter(out)
+                    try:
+                        # Left remains left of the divider, right remains right.
+                        p.drawPixmap(0, 0, right_canvas)
+                        wipe = max(0, min(1000, int(getattr(self, "_compare_wipe", 500) or 500)))
+                        cut_x = int(round(tw * (wipe / 1000.0)))
                         p.save()
-                        p.setClipRect(QRect(oxL, oyL, reveal, sp_left.height()))
-                        p.drawPixmap(oxL, oyL, sp_left)
+                        p.setClipRect(QRect(0, 0, cut_x, th))
+                        p.drawPixmap(0, 0, left_canvas)
                         p.restore()
 
-                        x = oxL + reveal
-                        # Cache divider geometry for hover/drag hit-testing
-                        try:
-                            self._compare_divider_x = int(x)
-                            # Reuse existing variable names; these now represent the LEFT (revealed) pane.
-                            self._compare_right_ox = int(oxL)
-                            self._compare_right_oy = int(oyL)
-                            self._compare_right_w = int(max(1, sp_left.width()))
-                            self._compare_right_h = int(max(1, sp_left.height()))
-                        except Exception:
-                            pass
-                        try:
-                            pen = QPen(QColor(255, 255, 255, 200))
-                            pen.setWidth(2)
-                            p.setPen(pen)
-                            p.drawLine(int(x), 0, int(x), th)
-                        except Exception:
-                            pass
-
+                        pen = QPen(QColor(255, 255, 255, 220))
+                        pen.setWidth(2)
+                        p.setPen(pen)
+                        p.drawLine(cut_x, 0, cut_x, th)
+                    finally:
                         p.end()
 
-                        if z <= 1.0:
-                            self._pan_cx = 0.5; self._pan_cy = 0.5
-
-                        self.label.setPixmap(out)
-                        return
+                    self._compare_divider_x = cut_x
+                    self._compare_right_ox = 0
+                    self._compare_right_oy = 0
+                    self._compare_right_w = tw
+                    self._compare_right_h = th
+                    if z <= 1.0:
+                        self._pan_cx = 0.5
+                        self._pan_cy = 0.5
+                    self.label.setPixmap(out)
+                    return
 
             if mode == 0:
                 spm = self._center_zoom(pm_left, target)
@@ -3438,72 +3439,40 @@ class VideoPane(QWidget):
             pass
 
     def _on_compare_right_frame(self, frame):
+        """Store the newest right-hand frame.
 
-        # Early FPS cap: drop compare frames BEFORE converting to QImage.
-        try:
-            import time as _t
-            _tgt = float(getattr(self, '_fps_target', 30.0) or 30.0)
-            if _tgt > 0:
-                if not hasattr(self, '_compare_last_accept_ts'):
-                    self._compare_last_accept_ts = 0.0
-                _now = _t.perf_counter()
-                _interval = max(0.001, 1.0 / float(_tgt))
-                if (_now - float(self._compare_last_accept_ts or 0.0)) < _interval:
-                    return
-                self._compare_last_accept_ts = _now
-        except Exception:
-            pass
+        During playback the left/main video is the render clock.  Rendering again for
+        every right-hand frame made the label repaint up to twice per display frame,
+        which caused visible flicker and uneven playback on higher-resolution clips.
+        When paused/seeking we still request one coalesced repaint so the comparison
+        updates immediately.
+        """
         try:
             img = frame.toImage()
             if img and not img.isNull():
                 self._compare_right_frame = img
+            else:
+                return
         except Exception:
             return
-        if not hasattr(self, "_compare_present_pending"):
-            self._compare_present_pending = False
-        if self._compare_present_pending:
+
+        try:
+            if self.player.playbackState() == QMediaPlayer.PlayingState:
+                return
+        except Exception:
+            pass
+
+        if getattr(self, "_compare_present_pending", False):
             return
         self._compare_present_pending = True
         try:
-            from PySide6.QtCore import QTimer
             QTimer.singleShot(0, self._present_compare_frame)
         except Exception:
-            try:
-                self._present_compare_frame()
-            except Exception:
-                pass
+            self._present_compare_frame()
 
     def _present_compare_frame(self):
-        # Present compare frame; throttle to the same FPS cap as the main presenter.
         try:
             self._compare_present_pending = False
-        except Exception:
-            pass
-
-        # --- FPS throttle ---
-        try:
-            from PySide6.QtCore import QTimer
-            import time as _t
-            if not hasattr(self, '_fps_target') or not self._fps_target:
-                self._fps_target = 30  # default cap
-            if not hasattr(self, '_compare_last_present_ts'):
-                self._compare_last_present_ts = 0.0
-            _now = _t.perf_counter()
-            _interval = max(0.001, 1.0 / float(self._fps_target))
-            _elapsed = _now - float(self._compare_last_present_ts or 0.0)
-            if _elapsed < _interval:
-                _ms = int((_interval - _elapsed) * 1000)
-                if _ms > 0:
-                    # Coalesce: schedule a later present and don't spam the UI thread.
-                    if not getattr(self, "_compare_present_pending", False):
-                        self._compare_present_pending = True
-                        QTimer.singleShot(max(0, _ms), self._present_compare_frame)
-                    return
-            self._compare_last_present_ts = _now
-        except Exception:
-            pass
-
-        try:
             self._refresh_label_pixmap()
         except Exception:
             pass
@@ -3524,7 +3493,7 @@ class VideoPane(QWidget):
             if t is None:
                 t = QTimer(self)
                 try:
-                    t.setInterval(80)
+                    t.setInterval(120)
                 except Exception:
                     pass
                 try:
@@ -3546,66 +3515,82 @@ class VideoPane(QWidget):
             pass
 
     def _compare_sync_tick(self):
+        """Keep the silent right player close to the main player without seek-spam.
+
+        QMediaPlayer positions are not frame-accurate on every Windows backend.  The
+        old 12/25 ms threshold repeatedly sought the right decoder, which is the main
+        cause of freezing, flashing and backwards jumps.  Small drift is harmless;
+        only correct meaningful drift and rate-limit hard seeks.
+        """
         try:
             if not getattr(self, "_compare_active", False) or getattr(self, "_compare_kind", None) != "video":
-                try:
-                    self._compare_end_video_sync()
-                except Exception:
-                    pass
+                self._compare_end_video_sync()
                 return
 
             rp = getattr(self, "_compare_right_player", None)
             if rp is None:
                 return
 
-            # Keep playback rate in sync.
-            try:
-                rp.setPlaybackRate(self.player.playbackRate())
-            except Exception:
-                pass
+            from PySide6.QtMultimedia import QMediaPlayer as _QMP
+            import time as _t
 
-            # Mirror play/pause state.
-            try:
-                from PySide6.QtMultimedia import QMediaPlayer as _QMP
-                lp_state = self.player.playbackState()
-                rp_state = rp.playbackState()
-                if lp_state == _QMP.PlayingState and rp_state != _QMP.PlayingState:
-                    rp.play()
-                    try:
-                        import time as _t
-                        self._compare_sync_soft_until = float(_t.perf_counter()) + 1.6
-                    except Exception:
-                        pass
-                elif lp_state != _QMP.PlayingState and rp_state == _QMP.PlayingState:
-                    rp.pause()
-            except Exception:
-                pass
+            lp_state = self.player.playbackState()
+            rp_state = rp.playbackState()
 
-            # Drift correction (skip while the user is scrubbing).
             try:
-                if hasattr(self, "slider") and self.slider.isSliderDown():
+                base_rate = float(self.player.playbackRate() or 1.0)
+            except Exception:
+                base_rate = 1.0
+
+            # Mirror play/pause, but never restart the decoder on every timer tick.
+            if lp_state == _QMP.PlayingState and rp_state != _QMP.PlayingState:
+                rp.setPosition(int(self.player.position() or 0))
+                rp.setPlaybackRate(base_rate)
+                rp.play()
+                self._compare_last_hard_sync = _t.perf_counter()
+                return
+            if lp_state != _QMP.PlayingState and rp_state == _QMP.PlayingState:
+                rp.pause()
+
+            try:
+                if self.slider.isSliderDown():
                     return
             except Exception:
                 pass
-            try:
-                import time as _t
-                lp = int(self.player.position() or 0)
-                rp_pos = int(rp.position() or 0)
-                delta = rp_pos - lp
-                now = float(_t.perf_counter())
-                soft_until = float(getattr(self, "_compare_sync_soft_until", 0.0) or 0.0)
-                thr = 12 if now <= soft_until else 25
-                if abs(delta) >= thr:
+
+            lp = int(self.player.position() or 0)
+            rr = int(rp.position() or 0)
+            delta = rr - lp
+            now = _t.perf_counter()
+            last_hard = float(getattr(self, "_compare_last_hard_sync", 0.0) or 0.0)
+
+            # While paused, seeking should be exact and immediate.
+            if lp_state != _QMP.PlayingState:
+                if abs(delta) >= 20:
                     rp.setPosition(lp)
-                    # Some backends can "stick" after a position snap; re-issue play if needed.
-                    try:
-                        from PySide6.QtMultimedia import QMediaPlayer as _QMP
-                        if self.player.playbackState() == _QMP.PlayingState:
-                            rp.play()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    self._compare_last_hard_sync = now
+                try:
+                    rp.setPlaybackRate(base_rate)
+                except Exception:
+                    pass
+                return
+
+            # Let normal decoder jitter pass. Correct only visible drift, and no more
+            # than once every 0.75 s so the backend has time to settle.
+            if abs(delta) >= 140 and (now - last_hard) >= 0.75:
+                rp.setPosition(lp)
+                rp.setPlaybackRate(base_rate)
+                rp.play()
+                self._compare_last_hard_sync = now
+            else:
+                # Gentle temporary rate correction avoids a disruptive seek for
+                # medium drift. Keep the adjustment tiny to remain visually stable.
+                if delta > 55:
+                    rp.setPlaybackRate(max(0.90, base_rate * 0.985))
+                elif delta < -55:
+                    rp.setPlaybackRate(min(1.10, base_rate * 1.015))
+                else:
+                    rp.setPlaybackRate(base_rate)
         except Exception:
             pass
 
@@ -3730,6 +3715,7 @@ class VideoPane(QWidget):
                     try:
                         import time as _t
                         self._compare_sync_soft_until = float(_t.perf_counter()) + 1.6
+                        self._compare_last_hard_sync = 0.0
                     except Exception:
                         pass
                     try:
