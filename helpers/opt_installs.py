@@ -1602,19 +1602,19 @@ OptionalInstall(
         ),
         OptionalInstall(
             key="boogu_gguf_q4",
-            title="Boogu Image GGUF (Q4 good default)",
+            title="Boogu Image & edit  GGUF (Q4 good default)",
             description="Boogu text to image and Image edit GGUF files, good default = Q4. Downloads Turbo V2 + Edit GGUF files plus newest sd-cli, VAE, text encoder and mmproj without extra prompts.",
             runner=_run_boogu_gguf_q4,
         ),
         OptionalInstall(
             key="boogu_gguf_q5",
-            title="Boogu Image GGUF (Q5)",
+            title="Boogu Image GGUF a edit (Q5)",
             description="Boogu text to image and Image edit GGUF files. Higher quality / larger than Q4. Downloads Turbo V2 + Edit GGUF files plus newest sd-cli, VAE, text encoder and mmproj without extra prompts.",
             runner=_run_boogu_gguf_q5,
         ),
         OptionalInstall(
             key="boogu_gguf_q8",
-            title="Boogu Image GGUF (Q8)",
+            title="Boogu Image & edit GGUF (Q8)",
             description="Boogu text to image and Image edit GGUF files. Best quality / largest. Downloads Turbo V2 + Edit GGUF files plus newest sd-cli, VAE, text encoder and mmproj without extra prompts.",
             runner=_run_boogu_gguf_q8,
         ),

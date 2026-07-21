@@ -1228,6 +1228,7 @@ class _Qwen2511Int4PlannerSession:
 
 
 _QWEN2511_INT4_PLANNER_SESSION: Optional[_Qwen2511Int4PlannerSession] = None
+_QWEN2511_INT4_PLANNER_FIXED_SEED = 582027446
 
 
 def _run_qwen2511_int4_planner_image(
@@ -1254,7 +1255,9 @@ def _run_qwen2511_int4_planner_image(
         output_path=output_path,
         width=width,
         height=height,
-        seed=seed,
+        # The caller decides the seed. Fresh Planner creation passes the fixed
+        # seed, while review/recreate may pass a user-requested new seed.
+        seed=int(seed),
         lora_path=lora_path,
         log_func=log_func,
     )
@@ -10188,6 +10191,24 @@ class PipelineWorker(QThread):
             except Exception:
                 seed_int = int(seed_int or 0)
 
+        # Restore Qwen reference files for review/resume. Prefer the exact refs
+        # saved with this shot, then fall back to the current job attachments.
+        ref_files = []
+        try:
+            _saved_qwen_refs = rec.get("refs_used") or rec.get("ref_images") or []
+            if isinstance(_saved_qwen_refs, list):
+                ref_files = [str(x) for x in _saved_qwen_refs if str(x or '').strip()]
+        except Exception:
+            ref_files = []
+        if not ref_files:
+            try:
+                _qwen_at = self.job.attachments or {}
+                _qwen_refs = (_qwen_at.get("ref_images") or []) or (_qwen_at.get("images") or [])
+                if isinstance(_qwen_refs, list):
+                    ref_files = [str(x) for x in _qwen_refs if str(x or '').strip()]
+            except Exception:
+                ref_files = []
+
         # Determine if this shot used qwen2511 ref-strategy
         use_qwen2511 = False
         try:
@@ -16253,7 +16274,7 @@ class PipelineWorker(QThread):
                                 output_path=_qtarget,
                                 width=int(qw),
                                 height=int(qh),
-                                seed=int(_qseed),
+                                seed=_QWEN2511_INT4_PLANNER_FIXED_SEED,
                                 log_func=lambda m: self.signals.log.emit(str(m)),
                             )
                             try:
@@ -16264,6 +16285,8 @@ class PipelineWorker(QThread):
                                 rec["multi_angle"] = bool(do_multi and bool(multi_lora))
                                 rec["qwen2511_backend"] = "int4"
                                 rec["qwen2511_int4_model"] = str(_int4_profile.get("key") or '')
+                                rec["seed_int"] = int(_QWEN2511_INT4_PLANNER_FIXED_SEED)
+                                rec["seed"] = int(_QWEN2511_INT4_PLANNER_FIXED_SEED)
                                 shot_map[sid] = rec
                             except Exception:
                                 pass
