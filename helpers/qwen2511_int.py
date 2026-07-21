@@ -2052,7 +2052,6 @@ class Qwen2511IntWidget(QWidget):
             self.progress.setValue(1)
             self.progress.setFormat("Queued")
             self.append_log(f"Added Qwen 2511 edit to FrameVision queue: {job_id}")
-            QMessageBox.information(self, APP_NAME, "The edit was added to the FrameVision queue.")
         except Exception as exc:
             self.status_label.setText("Queue failed")
             self.progress.setRange(0, 1)

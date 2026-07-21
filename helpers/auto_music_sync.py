@@ -470,7 +470,11 @@ def _musicclip_generate_krea2_start_image(payload: dict) -> dict:
     cfg = float(s.get("cfg", 1.0 if is_turbo else 3.0) or (1.0 if is_turbo else 3.0))
     guidance = float(s.get("guidance", 3.5) or 3.5)
     cmd = [str(paths["sd_cli"]), "--diffusion-model", str(paths["model"]), "--llm", str(paths["llm"]), "--vae", str(paths["vae"]), "-p", prompt, "--steps", str(steps), "--cfg-scale", str(cfg), "--guidance", str(guidance), "--width", str(w), "--height", str(h), "--seed", str(seed), "--batch-count", "1", "--output", str(output_path)]
-    neg = str(s.get("negative") or "").strip()
+    exact_passthrough = _musicclip_bool_value(
+        payload.get("exact_prompt_passthrough", payload.get("prompt_passthrough", payload.get("own_prompts_enabled", False))),
+        False,
+    )
+    neg = "" if exact_passthrough else str(s.get("negative") or "").strip()
     if neg: cmd += ["--negative-prompt", neg]
     try:
         flow = float(s.get("flow_shift", 1.15))
@@ -546,7 +550,7 @@ def _musicclip_prepare_krea2_full_run_payload(payload: dict) -> dict:
         if not (start_path and os.path.isfile(start_path)):
             emit(f"Krea 2: generating start image {idx+1}/{len(shots)} ({sid})...")
             stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", sid).strip("._") or f"LTX{idx+1:02d}"
-            result = _musicclip_generate_krea2_start_image({"root_dir": payload.get("root_dir") or _musicclip_project_root(), "ltx_director_plan_path": plan_path, "shot_id": sid, "image_model": "krea2", "image_prompt_override": _musicclip_krea2_prompt(shot), "seed": item.get("image_seed", payload.get("seed", -1)), "output_dir": review_dir, "start_image_name": f"{stem}_krea2_start.png", "start_image_payload_name": f"{stem}_krea2_start_image_payload.json", "start_image_log_name": f"{stem}_krea2_imagegen.log.txt", "progress_callback": progress, "resolution": payload.get("resolution") or payload.get("ltx_resolution") or ""})
+            result = _musicclip_generate_krea2_start_image({"root_dir": payload.get("root_dir") or _musicclip_project_root(), "ltx_director_plan_path": plan_path, "shot_id": sid, "image_model": "krea2", "image_prompt_override": _musicclip_krea2_prompt(shot), "seed": item.get("image_seed", payload.get("seed", -1)), "output_dir": review_dir, "start_image_name": f"{stem}_krea2_start.png", "start_image_payload_name": f"{stem}_krea2_start_image_payload.json", "start_image_log_name": f"{stem}_krea2_imagegen.log.txt", "progress_callback": progress, "resolution": payload.get("resolution") or payload.get("ltx_resolution") or "", "own_prompts_enabled": payload.get("own_prompts_enabled", False), "exact_prompt_passthrough": payload.get("exact_prompt_passthrough", payload.get("prompt_passthrough", False)), "disable_negative_prompt": payload.get("disable_negative_prompt", False)})
             if not isinstance(result, dict) or not result.get("ok"):
                 return {"ok": False, "message": str(result.get("message") if isinstance(result, dict) else f"Krea 2 start image failed for {sid}")}
             start_path = str(result.get("start_image_path") or "")
@@ -588,7 +592,7 @@ def _musicclip_prepare_krea2_single_payload(payload: dict) -> dict:
         except Exception: pass
     review_dir, _state = _musicclip_krea2_review_paths(plan_path)
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", shot_id).strip("._") or "LTX"
-    res = _musicclip_generate_krea2_start_image({"root_dir": payload.get("root_dir") or _musicclip_project_root(), "ltx_director_plan_path": plan_path, "shot_id": shot_id, "image_model": "krea2", "image_prompt_override": prompt, "seed": payload.get("seed", -1), "output_dir": review_dir, "start_image_name": f"{stem}_krea2_start.png", "start_image_log_name": f"{stem}_krea2_imagegen.log.txt", "progress_callback": payload.get("progress_callback"), "resolution": payload.get("resolution") or payload.get("ltx_resolution") or ""})
+    res = _musicclip_generate_krea2_start_image({"root_dir": payload.get("root_dir") or _musicclip_project_root(), "ltx_director_plan_path": plan_path, "shot_id": shot_id, "image_model": "krea2", "image_prompt_override": prompt, "seed": payload.get("seed", -1), "output_dir": review_dir, "start_image_name": f"{stem}_krea2_start.png", "start_image_log_name": f"{stem}_krea2_imagegen.log.txt", "progress_callback": payload.get("progress_callback"), "resolution": payload.get("resolution") or payload.get("ltx_resolution") or "", "own_prompts_enabled": payload.get("own_prompts_enabled", False), "exact_prompt_passthrough": payload.get("exact_prompt_passthrough", payload.get("prompt_passthrough", False)), "disable_negative_prompt": payload.get("disable_negative_prompt", False)})
     if not isinstance(res, dict) or not res.get("ok"):
         return {"ok": False, "message": str(res.get("message") if isinstance(res, dict) else "Krea 2 start image failed.")}
     new_payload = dict(payload)
@@ -729,6 +733,351 @@ def _musicclip_ltx_write_timing(shot: dict, start: float, end: float) -> None:
     shot["target_fps"] = int(target_fps)
     shot["target_frames"] = int(target_frames)
 
+
+
+def _musicclip_split_own_prompt_blocks(value: Any) -> list[str]:
+    """Split one prompt list on one or more completely blank lines.
+
+    Internal line breaks inside a prompt are preserved. Only outer whitespace of
+    each prompt block is removed, so the text sent to the model stays exactly as
+    the user wrote it.
+    """
+    try:
+        raw = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    except Exception:
+        raw = ""
+    if not raw.strip():
+        return []
+    parts = re.split(r"\n[ \t]*\n+", raw)
+    return [part.strip() for part in parts if str(part or "").strip()]
+
+
+def _musicclip_bool_value(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    try:
+        return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    except Exception:
+        return bool(default)
+
+
+def _musicclip_own_prompt_plan_path(payload: dict) -> str:
+    try:
+        src = dict(payload or {})
+    except Exception:
+        src = {}
+    for key in ("ltx_director_plan_path", "director_plan_path", "ltx_shot_plan_path", "shot_plan_path", "prompt_plan_path", "plan_path"):
+        try:
+            candidate = str(src.get(key) or "").strip()
+        except Exception:
+            candidate = ""
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def _musicclip_own_prompt_config(payload: dict | None = None, plan_data: dict | None = None) -> dict:
+    """Return normalized own-prompt settings from UI payload, settings, or plan."""
+    try:
+        src = dict(payload or {})
+    except Exception:
+        src = {}
+    settings = src.get("bridge_generation_settings")
+    if not isinstance(settings, dict):
+        settings = {}
+    meta = plan_data.get("own_prompts") if isinstance(plan_data, dict) else {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    enabled = _musicclip_bool_value(
+        src.get("own_prompts_enabled", settings.get("own_prompts_enabled", meta.get("enabled", False))),
+        False,
+    )
+
+    def _list_value(*keys: str) -> list[str]:
+        for container in (src, settings, meta):
+            if not isinstance(container, dict):
+                continue
+            for key in keys:
+                value = container.get(key)
+                if isinstance(value, list):
+                    cleaned = [str(item or "").strip() for item in value if str(item or "").strip()]
+                    if cleaned:
+                        return cleaned
+                if isinstance(value, str) and value.strip():
+                    cleaned = _musicclip_split_own_prompt_blocks(value)
+                    if cleaned:
+                        return cleaned
+        return []
+
+    image_prompts = _list_value("own_image_prompts", "image_prompts", "ltx_own_image_prompts")
+    video_prompts = _list_value("own_video_prompts", "video_prompts", "ltx_own_video_prompts", "own_i2v_prompts")
+
+    if enabled and isinstance(plan_data, dict) and (not image_prompts or not video_prompts):
+        shots, _key = _musicclip_ltx_shot_list_ref(plan_data)
+        if isinstance(shots, list):
+            if not image_prompts:
+                image_prompts = [
+                    str((shot or {}).get("own_image_prompt") or (shot or {}).get("image_prompt_override") or (shot or {}).get("director_image_prompt") or (shot or {}).get("image_prompt") or "").strip()
+                    for shot in shots if isinstance(shot, dict)
+                ]
+                image_prompts = [p for p in image_prompts if p]
+            if not video_prompts:
+                video_prompts = [
+                    str((shot or {}).get("own_video_prompt") or (shot or {}).get("clip_prompt_override") or (shot or {}).get("director_timestamped_video_prompt") or (shot or {}).get("director_video_prompt") or (shot or {}).get("video_prompt") or "").strip()
+                    for shot in shots if isinstance(shot, dict)
+                ]
+                video_prompts = [p for p in video_prompts if p]
+
+    signature_source = json.dumps(
+        {"enabled": bool(enabled), "image": image_prompts, "video": video_prompts},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    signature = hashlib.sha256(signature_source.encode("utf-8", errors="replace")).hexdigest()
+    return {
+        "enabled": bool(enabled),
+        "image_prompts": image_prompts,
+        "video_prompts": video_prompts,
+        "count": min(len(image_prompts), len(video_prompts)),
+        "signature": signature,
+    }
+
+
+def _musicclip_apply_exact_prompt_fields(shot: dict, image_prompt: str, video_prompt: str) -> None:
+    """Replace every known positive-prompt field with the exact user strings."""
+    if not isinstance(shot, dict):
+        return
+    image_prompt = str(image_prompt or "").strip()
+    video_prompt = str(video_prompt or "").strip()
+
+    for key in (
+        "director_image_prompt", "image_prompt", "start_image_prompt", "visual_prompt",
+        "director_visual_prompt", "scene_image_prompt", "image_prompt_override", "own_image_prompt",
+    ):
+        shot[key] = image_prompt
+    # Some image backends use the generic prompt as their final fallback.
+    shot["prompt"] = image_prompt
+
+    for key in (
+        "director_timestamped_video_prompt", "timestamped_video_prompt", "director_video_prompt",
+        "video_prompt", "motion_prompt", "clip_prompt", "clip_prompt_override",
+        "video_prompt_override", "own_video_prompt",
+    ):
+        shot[key] = video_prompt
+
+    for key in (
+        "prompt_prefix", "prompt_suffix", "image_prompt_prefix", "image_prompt_suffix",
+        "video_prompt_prefix", "video_prompt_suffix", "prompt_additions", "prompt_append",
+        "director_prompt_additions", "style_prompt_addition", "camera_prompt_addition",
+        "negative_prompt", "negative_prompt_override", "image_negative_prompt",
+        "video_negative_prompt", "default_negative_prompt", "auto_negative_prompt",
+    ):
+        shot[key] = ""
+
+    shot["own_prompts_enabled"] = True
+    shot["exact_prompt_passthrough"] = True
+    shot["prompt_passthrough"] = True
+    shot["disable_prompt_rewrite"] = True
+    shot["disable_prompt_enhancement"] = True
+    shot["disable_negative_prompt"] = True
+    shot["disable_default_negative_prompt"] = True
+    shot["disable_automatic_negative_prompt"] = True
+
+
+def _musicclip_apply_own_prompts_to_plan_file(plan_path: str, payload: dict | None = None, label: str = "LTX director plan") -> dict:
+    """Make the user's prompt pairs authoritative in a saved LTX plan.
+
+    The prompt-pair count becomes the final shot count. Existing beat-aware cut
+    points are reused when possible, but no text is added to either prompt.
+    """
+    path = str(plan_path or "").strip()
+    if not path or not os.path.isfile(path):
+        return {"ok": False, "changed": False, "message": f"{label}: plan not found"}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            plan = json.load(f)
+    except Exception as exc:
+        return {"ok": False, "changed": False, "message": f"{label}: could not read plan ({exc})"}
+    if not isinstance(plan, dict):
+        return {"ok": False, "changed": False, "message": f"{label}: plan is not an object"}
+
+    config = _musicclip_own_prompt_config(payload, plan)
+    if not config.get("enabled"):
+        return {"ok": True, "changed": False, "enabled": False, "message": "own prompts disabled"}
+
+    image_prompts = list(config.get("image_prompts") or [])
+    video_prompts = list(config.get("video_prompts") or [])
+    if not image_prompts or not video_prompts:
+        return {"ok": False, "changed": False, "message": "Use own prompts is enabled, but one or both prompt boxes are empty."}
+    if len(image_prompts) != len(video_prompts):
+        return {
+            "ok": False,
+            "changed": False,
+            "message": f"Own prompt count mismatch: {len(image_prompts)} image prompt(s) and {len(video_prompts)} image-to-video prompt(s).",
+        }
+
+    shots, key = _musicclip_ltx_shot_list_ref(plan)
+    if not isinstance(shots, list) or not shots:
+        return {"ok": False, "changed": False, "message": f"{label}: no shots were found"}
+
+    target_count = len(image_prompts)
+    timed: list[tuple[dict, float, float, float]] = []
+    for shot in shots:
+        if not isinstance(shot, dict):
+            continue
+        start, end, duration = _musicclip_ltx_read_timing(shot)
+        if end > start + 0.03 and duration > 0.03:
+            timed.append((shot, start, end, duration))
+
+    timing_changed = False
+    final_shots: list[dict]
+    if len(shots) != target_count:
+        if not timed:
+            return {
+                "ok": False,
+                "changed": False,
+                "message": f"Own prompts define {target_count} shots, but the plan has {len(shots)} untimed shots and cannot be repartitioned safely.",
+            }
+        block_start = min(item[1] for item in timed)
+        block_end = max(item[2] for item in timed)
+        total = max(0.0, block_end - block_start)
+        _guard_enabled, min_len, max_len, hard_cap, _mode = _musicclip_ltx_duration_bounds_from_payload(dict(payload or {}))
+        min_len = max(_MUSICCLIP_LTX_MIN_SHOT_SECONDS, float(min_len or 0.0))
+        if max_len <= 0.05 and hard_cap > 0.05:
+            max_len = float(hard_cap)
+        if total + 0.06 < target_count * min_len:
+            max_count = max(1, int(math.floor((total + 0.06) / min_len)))
+            return {
+                "ok": False,
+                "changed": False,
+                "message": f"{target_count} own prompt pairs would create clips shorter than {min_len:.1f}s. This track section supports at most {max_count} prompt pairs with the current LTX minimum.",
+            }
+        if max_len > 0.05 and total - 0.06 > target_count * max_len:
+            min_count = max(1, int(math.ceil((total - 0.06) / max_len)))
+            return {
+                "ok": False,
+                "changed": False,
+                "message": f"{target_count} own prompt pairs would create clips longer than {max_len:.1f}s. Use at least {min_count} prompt pairs for this track with the current LTX maximum.",
+            }
+
+        original_boundaries = sorted({item[2] for item in timed[:-1]})
+        boundaries = _musicclip_ltx_partition_boundaries(
+            block_start,
+            block_end,
+            target_count,
+            min_len,
+            max_len,
+            original_boundaries,
+        )
+        final_shots = []
+        for idx in range(target_count):
+            start = float(boundaries[idx])
+            end = float(boundaries[idx + 1])
+            representative, source_ids = _musicclip_ltx_representative_shot(timed, start, end)
+            _musicclip_ltx_write_timing(representative, start, end)
+            sid = f"LTX{idx + 1:02d}"
+            representative["id"] = sid
+            if "shot_id" in representative:
+                representative["shot_id"] = sid
+            if source_ids:
+                representative["own_prompts_source_shot_ids"] = source_ids
+            representative["retimed_for_own_prompts"] = True
+            final_shots.append(representative)
+        plan[key] = final_shots
+        timing_changed = True
+    else:
+        final_shots = [shot for shot in shots if isinstance(shot, dict)]
+        if len(final_shots) != target_count:
+            return {"ok": False, "changed": False, "message": f"{label}: invalid shot entries prevented exact prompt pairing"}
+
+    for idx, shot in enumerate(final_shots):
+        sid = f"LTX{idx + 1:02d}"
+        shot["id"] = sid
+        if "shot_id" in shot:
+            shot["shot_id"] = sid
+        _musicclip_apply_exact_prompt_fields(shot, image_prompts[idx], video_prompts[idx])
+
+    for count_key in ("ltx_shot_count", "shot_count", "director_shot_count"):
+        if count_key in plan:
+            plan[count_key] = int(target_count)
+    plan["own_prompts"] = {
+        "enabled": True,
+        "exact_passthrough": True,
+        "image_prompt_count": len(image_prompts),
+        "video_prompt_count": len(video_prompts),
+        "own_image_prompts": image_prompts,
+        "own_video_prompts": video_prompts,
+        "signature": str(config.get("signature") or ""),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    plan["prompt_backend"] = "user_exact_passthrough"
+    plan["director_backend"] = "user_exact_passthrough"
+    plan["own_prompts_enabled"] = True
+    plan["exact_prompt_passthrough"] = True
+    plan["prompt_passthrough"] = True
+    plan["disable_prompt_rewrite"] = True
+    plan["disable_prompt_enhancement"] = True
+    plan["disable_negative_prompt"] = True
+    for key_name in (
+        "prompt_prefix", "prompt_suffix", "image_prompt_prefix", "image_prompt_suffix",
+        "video_prompt_prefix", "video_prompt_suffix", "prompt_additions", "prompt_append",
+        "negative_prompt", "negative_prompt_override", "default_negative_prompt",
+    ):
+        plan[key_name] = ""
+
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(plan, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as exc:
+        return {"ok": False, "changed": False, "message": f"{label}: could not save own prompts ({exc})"}
+
+    audio_report = {"ok": True, "changed": False, "message": "timing unchanged"}
+    if timing_changed:
+        try:
+            audio_report = _musicclip_ltx_regenerate_audio_chunks_for_plan(path, dict(payload or {}), label)
+        except Exception as exc:
+            audio_report = {"ok": False, "changed": False, "message": str(exc)}
+
+    return {
+        "ok": True,
+        "changed": True,
+        "enabled": True,
+        "timing_changed": bool(timing_changed),
+        "shot_count": int(target_count),
+        "signature": str(config.get("signature") or ""),
+        "audio_chunk_report": audio_report,
+        "message": f"Applied {target_count} exact image/video prompt pair(s) with no prompt additions.",
+    }
+
+
+def _musicclip_own_prompt_for_shot(plan_path: str, shot_id: str, kind: str) -> tuple[bool, str]:
+    path = str(plan_path or "").strip()
+    if not path or not os.path.isfile(path):
+        return False, ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            plan = json.load(f)
+        meta = plan.get("own_prompts") if isinstance(plan, dict) else {}
+        if not isinstance(meta, dict) or not _musicclip_bool_value(meta.get("enabled"), False):
+            return False, ""
+        shots, _key = _musicclip_ltx_shot_list_ref(plan)
+        for shot in shots or []:
+            if not isinstance(shot, dict):
+                continue
+            sid = str(shot.get("id") or shot.get("shot_id") or "").strip()
+            if sid != str(shot_id or "").strip():
+                continue
+            if str(kind or "").lower().startswith("image"):
+                return True, str(shot.get("own_image_prompt") or shot.get("image_prompt_override") or shot.get("director_image_prompt") or shot.get("image_prompt") or "").strip()
+            return True, str(shot.get("own_video_prompt") or shot.get("clip_prompt_override") or shot.get("director_timestamped_video_prompt") or shot.get("director_video_prompt") or shot.get("video_prompt") or "").strip()
+    except Exception:
+        pass
+    return False, ""
 
 def _musicclip_ltx_raw_padding_settings_from_payload(payload: dict) -> tuple[float, int, float]:
     """Return raw render breathing-room settings for LTX-VRAMLab.
@@ -1687,6 +2036,148 @@ def _musicclip_patch_krea2_bridge(mod):
 
 
 
+def _musicclip_patch_own_prompts_bridge(mod):
+    """Force exact own prompts through planning, image generation, and I2V."""
+    if mod is None or bool(getattr(mod, "_framevision_own_prompts_patched", False)):
+        return mod
+    try:
+        original_create_director = getattr(mod, "create_ltx_director_plan", None)
+        if callable(original_create_director):
+            def _create_director_with_own_prompts(payload):
+                payload = dict(payload or {})
+                result = original_create_director(payload)
+                if not isinstance(result, dict) or not bool(result.get("ok")):
+                    return result
+                config = _musicclip_own_prompt_config(payload)
+                if not config.get("enabled"):
+                    return result
+                plan_path = ""
+                for key in ("ltx_director_plan_path", "director_plan_path", "plan_path"):
+                    plan_path = str(result.get(key) or "").strip()
+                    if plan_path:
+                        break
+                report = _musicclip_apply_own_prompts_to_plan_file(plan_path, payload, "LTX director plan")
+                result["own_prompts_report"] = report
+                if not bool(report.get("ok")):
+                    failed = dict(result)
+                    failed["ok"] = False
+                    failed["message"] = str(report.get("message") or "Could not apply own prompts.")
+                    return failed
+                result["ltx_shot_count"] = int(report.get("shot_count") or result.get("ltx_shot_count") or 0)
+                warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+                warnings.append(str(report.get("message") or "Own prompts applied."))
+                result["warnings"] = warnings
+                return result
+            setattr(mod, "create_ltx_director_plan", _create_director_with_own_prompts)
+
+        original_gen = getattr(mod, "generate_ltx_start_image_for_shot", None)
+        if callable(original_gen):
+            def _generate_with_exact_image_prompt(payload):
+                p = dict(payload or {})
+                plan_path = _musicclip_own_prompt_plan_path(p)
+                shot_id = str(p.get("shot_id") or "").strip()
+                enabled, exact = _musicclip_own_prompt_for_shot(plan_path, shot_id, "image")
+                if enabled:
+                    if not exact:
+                        return {"ok": False, "message": f"Exact own image prompt was not found for {shot_id}."}
+                    p["image_prompt_override"] = exact
+                    p["image_prompt"] = exact
+                    p["prompt"] = exact
+                    for key_name in (
+                        "prompt_prefix", "prompt_suffix", "image_prompt_prefix", "image_prompt_suffix",
+                        "prompt_additions", "prompt_append", "style_prompt", "style_theme",
+                        "camera_prompt", "camera_choreography", "negative_prompt",
+                        "negative_prompt_override", "image_negative_prompt", "default_negative_prompt",
+                    ):
+                        p[key_name] = ""
+                    p["creative_brief"] = {}
+                    p["exact_prompt_passthrough"] = True
+                    p["prompt_passthrough"] = True
+                    p["disable_prompt_rewrite"] = True
+                    p["disable_prompt_enhancement"] = True
+                    p["disable_negative_prompt"] = True
+                    p["disable_default_negative_prompt"] = True
+                    p["disable_automatic_negative_prompt"] = True
+                    p["own_prompts_enabled"] = True
+                return original_gen(p)
+            setattr(mod, "generate_ltx_start_image_for_shot", _generate_with_exact_image_prompt)
+
+        original_single = getattr(mod, "run_single_ltx_shot_test", None)
+        if callable(original_single):
+            def _single_with_exact_video_prompt(payload):
+                p = dict(payload or {})
+                plan_path = _musicclip_own_prompt_plan_path(p)
+                shot_id = str(p.get("shot_id") or "").strip()
+                enabled, exact = _musicclip_own_prompt_for_shot(plan_path, shot_id, "video")
+                if enabled:
+                    if not exact:
+                        return {"ok": False, "message": f"Exact own image-to-video prompt was not found for {shot_id}."}
+                    p["clip_prompt_override"] = exact
+                    p["video_prompt_override"] = exact
+                    p["video_prompt"] = exact
+                    p["clip_prompt"] = exact
+                    p["motion_prompt"] = exact
+                    p["prompt"] = exact
+                    for key_name in (
+                        "prompt_prefix", "prompt_suffix", "video_prompt_prefix", "video_prompt_suffix",
+                        "prompt_additions", "prompt_append", "style_prompt", "style_theme",
+                        "camera_prompt", "camera_choreography", "negative_prompt",
+                        "negative_prompt_override", "video_negative_prompt", "default_negative_prompt",
+                    ):
+                        p[key_name] = ""
+                    p["creative_brief"] = {}
+                    p["exact_prompt_passthrough"] = True
+                    p["prompt_passthrough"] = True
+                    p["disable_prompt_rewrite"] = True
+                    p["disable_prompt_enhancement"] = True
+                    p["disable_negative_prompt"] = True
+                    p["disable_default_negative_prompt"] = True
+                    p["disable_automatic_negative_prompt"] = True
+                    p["own_prompts_enabled"] = True
+                return original_single(p)
+            setattr(mod, "run_single_ltx_shot_test", _single_with_exact_video_prompt)
+
+        original_run_all = getattr(mod, "run_all_ltx_director_shots", None)
+        if callable(original_run_all):
+            def _run_all_with_exact_prompts(payload):
+                p = dict(payload or {})
+                plan_path = _musicclip_own_prompt_plan_path(p)
+                if plan_path:
+                    try:
+                        with open(plan_path, "r", encoding="utf-8") as f:
+                            plan_data = json.load(f)
+                    except Exception:
+                        plan_data = {}
+                    config = _musicclip_own_prompt_config(p, plan_data if isinstance(plan_data, dict) else {})
+                    if config.get("enabled"):
+                        report = _musicclip_apply_own_prompts_to_plan_file(plan_path, p, "LTX full-run plan")
+                        if not bool(report.get("ok")):
+                            return {"ok": False, "message": str(report.get("message") or "Could not apply own prompts before generation.")}
+                        p["own_prompts_enabled"] = True
+                        p["exact_prompt_passthrough"] = True
+                        p["prompt_passthrough"] = True
+                        p["disable_prompt_rewrite"] = True
+                        p["disable_prompt_enhancement"] = True
+                        p["disable_negative_prompt"] = True
+                        p["disable_default_negative_prompt"] = True
+                        p["disable_automatic_negative_prompt"] = True
+                        p["negative_prompt"] = ""
+                        p["negative_prompt_override"] = ""
+                return original_run_all(p)
+            setattr(mod, "run_all_ltx_director_shots", _run_all_with_exact_prompts)
+
+        setattr(mod, "_framevision_own_prompts_patched", True)
+        # INT4 adapters can delegate their full-run loop to a loaded base bridge.
+        # Patch that module too so internal per-shot calls receive the same exact
+        # prompt overrides instead of only relying on the rewritten JSON fields.
+        base_bridge = getattr(mod, "_BASE", None)
+        if base_bridge is not None and base_bridge is not mod:
+            _musicclip_patch_own_prompts_bridge(base_bridge)
+    except Exception:
+        pass
+    return mod
+
+
 _MUSICCLIP_INT4_AUTO_VRAM_THRESHOLD_GB = 23.0
 _MUSICCLIP_CUDA_VRAM_GB_CACHE: Optional[float] = None
 _MUSICCLIP_CUDA_VRAM_PROBED = False
@@ -1867,13 +2358,13 @@ def _musicclip_patch_int4_vram_policy(mod):
 def _load_musicclip_planner_bridge():
     # Original/Wan2GP bridge. Keep this separate so the option can hide again
     # when this file is removed.
-    return _musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("musicclip_planner_bridge.py", "_framevision_musicclip_planner_bridge"))
+    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("musicclip_planner_bridge.py", "_framevision_musicclip_planner_bridge")))
 
 
 def _load_clip2ltx_bridge():
     # Own LTX-VRAMLab FP16/FP8 bridge. This is the copy of the original bridge
     # that calls helpers/ltx23_vram_lab_cli.py directly.
-    return _musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("clip2ltx_cli.py", "_framevision_clip2ltx_bridge"))
+    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("clip2ltx_cli.py", "_framevision_clip2ltx_bridge")))
 
 
 def _load_music_ltx_int4_bridge():
@@ -1881,7 +2372,7 @@ def _load_music_ltx_int4_bridge():
     # routes only the generation command to helpers/ltx_int4_cli.py.
     bridge = _load_musicclip_bridge_file("music_ltx_int4.py", "_framevision_music_ltx_int4_bridge")
     bridge = _musicclip_patch_int4_vram_policy(bridge)
-    return _musicclip_patch_krea2_bridge(bridge)
+    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_krea2_bridge(bridge))
 
 
 def _musicclip_default_llama_runner() -> str:
@@ -4299,7 +4790,7 @@ def _musicclip_load_ltx_bridge_module_for_queue(root_dir: str, backend: str = ""
                 continue
             if filename == "music_ltx_int4.py":
                 module = _musicclip_patch_int4_vram_policy(module)
-            return _musicclip_patch_krea2_bridge(module)
+            return _musicclip_patch_own_prompts_bridge(_musicclip_patch_krea2_bridge(module))
         except BaseException as exc:
             errors.append(f"{filename}: {type(exc).__name__}: {exc}")
 
@@ -11934,6 +12425,11 @@ class AutoMusicSyncWidget(QWidget):
         # helper exists and imports cleanly, so public builds can omit the file.
         self.box_planner_bridge = None
         self.edit_bridge_main_idea = None
+        self.check_ltx_use_own_prompts = None
+        self.box_ltx_own_prompts = None
+        self.edit_ltx_own_image_prompts = None
+        self.edit_ltx_own_video_prompts = None
+        self.label_ltx_own_prompt_counts = None
         self.edit_bridge_style_theme = None
         self.edit_bridge_characters_subjects = None
         self.edit_bridge_locations_world = None
@@ -12235,6 +12731,58 @@ class AutoMusicSyncWidget(QWidget):
             bridge_form.addRow("Start image mode:", self.combo_ltx_single_image_mode)
 
             ltx_idea_lay.addLayout(bridge_form)
+
+            self.check_ltx_use_own_prompts = QCheckBox("Use own prompts", self.ltx_section_idea)
+            self.check_ltx_use_own_prompts.setChecked(False)
+            self.check_ltx_use_own_prompts.setToolTip(
+                "Use your own exact prompt pairs instead of generated prompt text. "
+                "Nothing from Main idea, Style, Characters, Locations, Camera, Director brain or the LLM is added to the prompts sent to the image and image-to-video models."
+            )
+            ltx_idea_lay.addWidget(self.check_ltx_use_own_prompts)
+
+            self.box_ltx_own_prompts = QGroupBox("Own prompt lists", self.ltx_section_idea)
+            own_prompts_lay = QVBoxLayout(self.box_ltx_own_prompts)
+            own_prompts_lay.setContentsMargins(10, 8, 10, 8)
+            own_prompts_lay.setSpacing(6)
+            own_prompts_hint = QLabel(
+                "Enter matching image and image-to-video prompts. Press Enter twice (leave one full empty line) to start the next prompt. "
+                "Prompt pair 1 creates shot 1, pair 2 creates shot 2, and so on. The entered text is passed through exactly without additions.",
+                self.box_ltx_own_prompts,
+            )
+            own_prompts_hint.setWordWrap(True)
+            own_prompts_lay.addWidget(own_prompts_hint)
+
+            own_prompts_form = QFormLayout()
+            own_prompts_form.setContentsMargins(0, 0, 0, 0)
+            own_prompts_form.setSpacing(6)
+            self.edit_ltx_own_image_prompts = QTextEdit(self.box_ltx_own_prompts)
+            self.edit_ltx_own_image_prompts.setMinimumHeight(170)
+            self.edit_ltx_own_image_prompts.setPlaceholderText(
+                "Image prompt 1\n\nImage prompt 2\n\nImage prompt 3"
+            )
+            self.edit_ltx_own_image_prompts.setToolTip(
+                "Exact prompts for the selected start-image model. One completely blank line separates prompts."
+            )
+            own_prompts_form.addRow("Image model prompts:", self.edit_ltx_own_image_prompts)
+
+            self.edit_ltx_own_video_prompts = QTextEdit(self.box_ltx_own_prompts)
+            self.edit_ltx_own_video_prompts.setMinimumHeight(170)
+            self.edit_ltx_own_video_prompts.setPlaceholderText(
+                "Image-to-video prompt 1\n\nImage-to-video prompt 2\n\nImage-to-video prompt 3"
+            )
+            self.edit_ltx_own_video_prompts.setToolTip(
+                "Exact movement/action prompts for LTX image-to-video. One completely blank line separates prompts."
+            )
+            own_prompts_form.addRow("Image-to-video prompts:", self.edit_ltx_own_video_prompts)
+            own_prompts_lay.addLayout(own_prompts_form)
+
+            self.label_ltx_own_prompt_counts = QLabel("Image prompts: 0 | Image-to-video prompts: 0", self.box_ltx_own_prompts)
+            self.label_ltx_own_prompt_counts.setWordWrap(True)
+            self.label_ltx_own_prompt_counts.setStyleSheet("color: #8a8a8a;")
+            own_prompts_lay.addWidget(self.label_ltx_own_prompt_counts)
+            self.box_ltx_own_prompts.setVisible(False)
+            ltx_idea_lay.addWidget(self.box_ltx_own_prompts)
+
             bridge_lay.addWidget(self.ltx_section_idea)
 
             row_bridge_roles = QHBoxLayout()
@@ -14414,6 +14962,17 @@ class AutoMusicSyncWidget(QWidget):
             ):
                 if _w is not None:
                     _w.editingFinished.connect(self._save_settings)
+            if getattr(self, "check_ltx_use_own_prompts", None) is not None:
+                self.check_ltx_use_own_prompts.toggled.connect(lambda _v: self._update_ltx_own_prompts_ui())
+                self.check_ltx_use_own_prompts.toggled.connect(self._queue_settings_save)
+            for _own_edit in (
+                getattr(self, "edit_ltx_own_image_prompts", None),
+                getattr(self, "edit_ltx_own_video_prompts", None),
+            ):
+                if _own_edit is not None:
+                    _own_edit.textChanged.connect(self._update_ltx_own_prompts_ui)
+                    _own_edit.textChanged.connect(self._queue_settings_save)
+            self._update_ltx_own_prompts_ui()
             if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
                 self.check_bridge_use_vocal_roles.toggled.connect(self._save_settings)
                 self.check_bridge_use_vocal_roles.toggled.connect(lambda _v: self._update_ltx_lipsync_trim_lock())
@@ -15729,6 +16288,17 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             ltx_portrait = False
 
+        try:
+            own_prompts = self._ltx_own_prompts_payload()
+        except Exception:
+            own_prompts = {
+                "own_prompts_enabled": False,
+                "own_image_prompts": [],
+                "own_video_prompts": [],
+                "own_prompt_count": 0,
+                "own_prompts_signature": "",
+            }
+
         return {
             "preset": preset,
             "director_preset": preset,
@@ -15770,9 +16340,129 @@ class AutoMusicSyncWidget(QWidget):
             "avoid_effects_in_first_clip": bool((getattr(self, "check_bridge_avoid_effects_first_clip", None) is None) or self.check_bridge_avoid_effects_first_clip.isChecked()),
             "avoid_effects_in_last_clip": bool((getattr(self, "check_bridge_avoid_effects_last_clip", None) is None) or self.check_bridge_avoid_effects_last_clip.isChecked()),
             "avoid_short_start_end_clips": bool((getattr(self, "check_ltx_avoid_short_start_end", None) is None) or self.check_ltx_avoid_short_start_end.isChecked()),
+            "own_prompts_enabled": bool(own_prompts.get("own_prompts_enabled")),
+            "own_image_prompts": list(own_prompts.get("own_image_prompts") or []),
+            "own_video_prompts": list(own_prompts.get("own_video_prompts") or []),
+            "own_prompt_count": int(own_prompts.get("own_prompt_count") or 0),
+            "own_prompts_signature": str(own_prompts.get("own_prompts_signature") or ""),
+            "prompt_passthrough": bool(own_prompts.get("own_prompts_enabled")),
+            "disable_prompt_rewrite": bool(own_prompts.get("own_prompts_enabled")),
+            "disable_prompt_enhancement": bool(own_prompts.get("own_prompts_enabled")),
         }
 
+    def _ltx_own_prompts_enabled(self) -> bool:
+        try:
+            return bool(getattr(self, "check_ltx_use_own_prompts", None) and self.check_ltx_use_own_prompts.isChecked())
+        except Exception:
+            return False
+
+    def _ltx_own_prompts_payload(self) -> dict:
+        enabled = self._ltx_own_prompts_enabled()
+        try:
+            image_text = str(self.edit_ltx_own_image_prompts.toPlainText() or "") if getattr(self, "edit_ltx_own_image_prompts", None) is not None else ""
+        except Exception:
+            image_text = ""
+        try:
+            video_text = str(self.edit_ltx_own_video_prompts.toPlainText() or "") if getattr(self, "edit_ltx_own_video_prompts", None) is not None else ""
+        except Exception:
+            video_text = ""
+        image_prompts = _musicclip_split_own_prompt_blocks(image_text)
+        video_prompts = _musicclip_split_own_prompt_blocks(video_text)
+        signature_source = json.dumps(
+            {"enabled": bool(enabled), "image": image_prompts, "video": video_prompts},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return {
+            "own_prompts_enabled": bool(enabled),
+            "own_image_prompts": image_prompts,
+            "own_video_prompts": video_prompts,
+            "own_prompt_count": min(len(image_prompts), len(video_prompts)),
+            "own_prompts_signature": hashlib.sha256(signature_source.encode("utf-8", errors="replace")).hexdigest(),
+        }
+
+    def _update_ltx_own_prompts_ui(self) -> None:
+        enabled = self._ltx_own_prompts_enabled()
+        try:
+            box = getattr(self, "box_ltx_own_prompts", None)
+            if box is not None:
+                box.setVisible(bool(enabled))
+        except Exception:
+            pass
+        own = self._ltx_own_prompts_payload()
+        image_count = len(own.get("own_image_prompts") or [])
+        video_count = len(own.get("own_video_prompts") or [])
+        try:
+            label = getattr(self, "label_ltx_own_prompt_counts", None)
+            if label is not None:
+                if image_count == video_count and image_count > 0:
+                    label.setText(f"Prompt pairs: {image_count} | These {image_count} pairs define the final shot count.")
+                    label.setStyleSheet("color: #7fbf7f;")
+                elif image_count or video_count:
+                    label.setText(f"Image prompts: {image_count} | Image-to-video prompts: {video_count} | Counts must match.")
+                    label.setStyleSheet("color: #d79a5b;")
+                else:
+                    label.setText("Image prompts: 0 | Image-to-video prompts: 0")
+                    label.setStyleSheet("color: #8a8a8a;")
+        except Exception:
+            pass
+
+        # These controls only create automatic prompt text. Keep timing, reference
+        # images, lipsync, effects, grouping, model selection and LoRAs available.
+        for attr in (
+            "edit_bridge_main_idea",
+            "edit_bridge_style_theme",
+            "edit_bridge_characters_subjects",
+            "edit_bridge_locations_world",
+            "edit_bridge_camera_choreography",
+            "combo_bridge_director_backend",
+            "check_bridge_own_llama",
+            "bridge_own_llama_block",
+        ):
+            try:
+                widget = getattr(self, attr, None)
+                if widget is not None:
+                    widget.setEnabled(not bool(enabled))
+            except Exception:
+                pass
+
+    def _validate_ltx_own_prompts(self, *, show_dialog: bool = True) -> bool:
+        if not self._ltx_own_prompts_enabled():
+            return True
+        own = self._ltx_own_prompts_payload()
+        image_count = len(own.get("own_image_prompts") or [])
+        video_count = len(own.get("own_video_prompts") or [])
+        message = ""
+        if image_count <= 0 or video_count <= 0:
+            message = "Use own prompts is enabled. Add at least one image prompt and one matching image-to-video prompt."
+        elif image_count != video_count:
+            message = f"Own prompt count mismatch: {image_count} image prompt(s) and {video_count} image-to-video prompt(s)."
+        if not message:
+            return True
+        self._set_planner_bridge_status(f"Planner Bridge: {message}")
+        if show_dialog:
+            try:
+                QMessageBox.warning(self, "Own prompts", message, QMessageBox.Ok)
+            except Exception:
+                pass
+        return False
+
     def _planner_bridge_creative_brief(self) -> dict:
+        if self._ltx_own_prompts_enabled():
+            own = self._ltx_own_prompts_payload()
+            image_prompts = list(own.get("own_image_prompts") or [])
+            return {
+                # The bridge still needs a non-empty brief to build timing files.
+                # Use only user text here; the final plan is replaced by the exact
+                # image/video prompt pairs before any model is called.
+                "main_idea": image_prompts[0] if image_prompts else "",
+                "style_theme": "",
+                "characters_subjects": "",
+                "locations_world": "",
+                "camera_choreography": "",
+                "own_prompts_enabled": True,
+                "own_prompts_signature": str(own.get("own_prompts_signature") or ""),
+            }
         return {
             "main_idea": self._planner_bridge_text("edit_bridge_main_idea"),
             "style_theme": self._planner_bridge_text("edit_bridge_style_theme"),
@@ -15795,7 +16485,7 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             src = {}
         parts = []
-        for key in ("main_idea", "style_theme", "characters_subjects", "locations_world", "camera_choreography"):
+        for key in ("main_idea", "style_theme", "characters_subjects", "locations_world", "camera_choreography", "own_prompts_signature"):
             try:
                 value = str((src or {}).get(key, "") or "").strip().lower()
             except Exception:
@@ -15811,6 +16501,22 @@ class AutoMusicSyncWidget(QWidget):
             return False
         try:
             data = _musicclip_read_json_file(p)
+            if isinstance(data, dict):
+                plan_own = data.get("own_prompts")
+                if not isinstance(plan_own, dict):
+                    plan_own = {}
+                current_own = self._ltx_own_prompts_payload() if hasattr(self, "_ltx_own_prompts_payload") else {}
+                plan_enabled = _musicclip_bool_value(plan_own.get("enabled"), False)
+                current_enabled = bool(current_own.get("own_prompts_enabled"))
+                if plan_enabled != current_enabled:
+                    self._set_planner_bridge_status("Planner Bridge: cached plan uses a different Own prompts mode. Rebuild the plan.")
+                    return False
+                if current_enabled:
+                    old_own_sig = str(plan_own.get("signature") or "").strip()
+                    new_own_sig = str(current_own.get("own_prompts_signature") or "").strip()
+                    if old_own_sig and new_own_sig and old_own_sig != new_own_sig:
+                        self._set_planner_bridge_status("Planner Bridge: own prompt lists changed. Rebuild the LTX director plan.")
+                        return False
             plan_brief = data.get("creative_brief") if isinstance(data, dict) else {}
             if not isinstance(plan_brief, dict):
                 return True
@@ -16534,12 +17240,22 @@ class AutoMusicSyncWidget(QWidget):
             "root_dir": _musicclip_project_root(),
             "ltx_shot_plan_path": ltx_shot_plan_path,
             "creative_brief": self._planner_bridge_creative_brief(),
-            "director_backend": director_backend,
+            "director_backend": "Template cleanup" if self._ltx_own_prompts_enabled() else director_backend,
             "bridge_generation_settings": self._planner_bridge_generation_settings(),
             "character_reference": self._planner_bridge_character_reference_payload(),
         }
         try:
-            llama_settings = self._bridge_own_llama_payload_if_enabled()
+            payload.update(self._ltx_own_prompts_payload())
+            if payload.get("own_prompts_enabled"):
+                payload["exact_prompt_passthrough"] = True
+                payload["prompt_passthrough"] = True
+                payload["disable_prompt_rewrite"] = True
+                payload["disable_prompt_enhancement"] = True
+                payload["disable_negative_prompt"] = True
+        except Exception:
+            pass
+        try:
+            llama_settings = None if payload.get("own_prompts_enabled") else self._bridge_own_llama_payload_if_enabled()
             if llama_settings:
                 payload["llama_settings"] = llama_settings
         except Exception:
@@ -16779,8 +17495,10 @@ class AutoMusicSyncWidget(QWidget):
                 except Exception:
                     pass
                 return False
+            if not self._validate_ltx_own_prompts(show_dialog=True):
+                return False
             idea = str(getattr(self, "edit_bridge_main_idea", None).text() if getattr(self, "edit_bridge_main_idea", None) is not None else "").strip()
-            if not idea:
+            if not idea and not self._ltx_own_prompts_enabled():
                 msg = "Type a main idea/prompt before generating an LTX videoclip."
                 self._set_planner_bridge_status(f"Planner Bridge: {msg}")
                 try:
@@ -16874,7 +17592,22 @@ class AutoMusicSyncWidget(QWidget):
             "director_backend": director_backend,
         }
         try:
-            llama_settings = self._bridge_own_llama_payload_if_enabled()
+            payload.update(self._ltx_own_prompts_payload())
+            if payload.get("own_prompts_enabled"):
+                # The existing bridge still creates timing/shot files first. Keep
+                # its supported lightweight template modes, then replace every
+                # final model prompt in the own-prompts wrapper.
+                payload["prompt_backend"] = "template_rule_based"
+                payload["director_backend"] = "Template cleanup"
+                payload["exact_prompt_passthrough"] = True
+                payload["prompt_passthrough"] = True
+                payload["disable_prompt_rewrite"] = True
+                payload["disable_prompt_enhancement"] = True
+                payload["disable_negative_prompt"] = True
+        except Exception:
+            pass
+        try:
+            llama_settings = None if payload.get("own_prompts_enabled") else self._bridge_own_llama_payload_if_enabled()
             if llama_settings:
                 payload["llama_settings"] = llama_settings
         except Exception:
@@ -16923,6 +17656,18 @@ class AutoMusicSyncWidget(QWidget):
             "character_reference": self._planner_bridge_character_reference_payload(),
             "assemble_after": bool(assemble_after),
         }
+        try:
+            payload.update(self._ltx_own_prompts_payload())
+            if payload.get("own_prompts_enabled"):
+                payload["exact_prompt_passthrough"] = True
+                payload["prompt_passthrough"] = True
+                payload["disable_prompt_rewrite"] = True
+                payload["disable_prompt_enhancement"] = True
+                payload["disable_negative_prompt"] = True
+                payload["negative_prompt"] = ""
+                payload["negative_prompt_override"] = ""
+        except Exception:
+            pass
         try:
             if str(payload.get("ltx_backend") or "").strip().lower() == "vramlab":
                 payload["ltx_raw_generation_seconds"] = 11.0
@@ -18252,6 +18997,19 @@ class AutoMusicSyncWidget(QWidget):
             "ltx_avoid_short_start_end": bool((getattr(self, "check_ltx_avoid_short_start_end", None) is None) or self.check_ltx_avoid_short_start_end.isChecked()),
             "character_reference": self._planner_bridge_character_reference_payload(),
         }
+        try:
+            payload.update(self._ltx_own_prompts_payload())
+            if payload.get("own_prompts_enabled"):
+                payload["exact_prompt_passthrough"] = True
+                payload["prompt_passthrough"] = True
+                payload["disable_prompt_rewrite"] = True
+                payload["disable_prompt_enhancement"] = True
+                payload["disable_negative_prompt"] = True
+                payload["negative_prompt"] = ""
+                payload["negative_prompt_override"] = ""
+        except Exception:
+            pass
+
         if use_lora:
             payload["ltx_lora_file"] = str(getattr(self, "edit_ltx_single_lora_file", None).text() if getattr(self, "edit_ltx_single_lora_file", None) is not None else "").strip()
             payload["ltx_lora_json"] = str(getattr(self, "edit_ltx_single_lora_json", None).text() if getattr(self, "edit_ltx_single_lora_json", None) is not None else "").strip()
@@ -21288,6 +22046,28 @@ class AutoMusicSyncWidget(QWidget):
                 self.edit_bridge_locations_world.setText(self._settings_bridge_text_value("planner_bridge_locations_world"))
             if getattr(self, "edit_bridge_camera_choreography", None) is not None:
                 self.edit_bridge_camera_choreography.setText(self._settings_bridge_text_value("planner_bridge_camera_choreography"))
+            if getattr(self, "check_ltx_use_own_prompts", None) is not None:
+                try:
+                    self.check_ltx_use_own_prompts.blockSignals(True)
+                    self.check_ltx_use_own_prompts.setChecked(bool(int(s.get("ltx/use_own_prompts", 0))))
+                finally:
+                    self.check_ltx_use_own_prompts.blockSignals(False)
+            if getattr(self, "edit_ltx_own_image_prompts", None) is not None:
+                try:
+                    self.edit_ltx_own_image_prompts.blockSignals(True)
+                    self.edit_ltx_own_image_prompts.setPlainText(str(s.get("ltx/own_image_prompts", "", str) or ""))
+                finally:
+                    self.edit_ltx_own_image_prompts.blockSignals(False)
+            if getattr(self, "edit_ltx_own_video_prompts", None) is not None:
+                try:
+                    self.edit_ltx_own_video_prompts.blockSignals(True)
+                    self.edit_ltx_own_video_prompts.setPlainText(str(s.get("ltx/own_video_prompts", "", str) or ""))
+                finally:
+                    self.edit_ltx_own_video_prompts.blockSignals(False)
+            try:
+                self._update_ltx_own_prompts_ui()
+            except Exception:
+                pass
             if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
                 try:
                     self.check_bridge_use_vocal_roles.blockSignals(True)
@@ -21895,6 +22675,12 @@ class AutoMusicSyncWidget(QWidget):
         _set("planner_bridge_characters_subjects", self._settings_clean_bridge_text("edit_bridge_characters_subjects"))
         _set("planner_bridge_locations_world", self._settings_clean_bridge_text("edit_bridge_locations_world"))
         _set("planner_bridge_camera_choreography", self._settings_clean_bridge_text("edit_bridge_camera_choreography"))
+        _set("ltx/use_own_prompts", _checked("check_ltx_use_own_prompts", 0))
+        try:
+            _set("ltx/own_image_prompts", str(self.edit_ltx_own_image_prompts.toPlainText() or "") if getattr(self, "edit_ltx_own_image_prompts", None) is not None else "")
+            _set("ltx/own_video_prompts", str(self.edit_ltx_own_video_prompts.toPlainText() or "") if getattr(self, "edit_ltx_own_video_prompts", None) is not None else "")
+        except Exception:
+            pass
         _set("planner_bridge_use_vocal_roles", _checked("check_bridge_use_vocal_roles", 1))
         _set("planner_bridge_director_backend", _combo_text("combo_bridge_director_backend", "Template cleanup"))
         _llama_payload = self._bridge_own_llama_ui_payload() if hasattr(self, "_bridge_own_llama_ui_payload") else {}
@@ -22007,6 +22793,12 @@ class AutoMusicSyncWidget(QWidget):
                 s.set("planner_bridge_locations_world", self._settings_clean_bridge_text("edit_bridge_locations_world"))
             if getattr(self, "edit_bridge_camera_choreography", None) is not None:
                 s.set("planner_bridge_camera_choreography", self._settings_clean_bridge_text("edit_bridge_camera_choreography"))
+            if getattr(self, "check_ltx_use_own_prompts", None) is not None:
+                s.set("ltx/use_own_prompts", int(self.check_ltx_use_own_prompts.isChecked()))
+            if getattr(self, "edit_ltx_own_image_prompts", None) is not None:
+                s.set("ltx/own_image_prompts", str(self.edit_ltx_own_image_prompts.toPlainText() or ""))
+            if getattr(self, "edit_ltx_own_video_prompts", None) is not None:
+                s.set("ltx/own_video_prompts", str(self.edit_ltx_own_video_prompts.toPlainText() or ""))
             if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
                 s.set("planner_bridge_use_vocal_roles", int(self.check_bridge_use_vocal_roles.isChecked()))
             if getattr(self, "combo_bridge_director_backend", None) is not None:
