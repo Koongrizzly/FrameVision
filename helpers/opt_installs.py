@@ -639,6 +639,39 @@ def _run_boogu_gguf_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return _run_boogu_gguf(root, "Q8")
 
 
+def _run_boogu_edit_turbo_gguf(root: Path, quant: str) -> Optional[Tuple[str, List[str], Path]]:
+    """Download one Boogu Edit-Turbo GGUF plus the shared runtime files."""
+    script = _find_boogu_downloader_script(root)
+    if script is None:
+        return None
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+    args = [
+        "-u",
+        str(script),
+        "--install-sd-cli",
+        "--model",
+        "edit-turbo",
+        "--gguf-quant",
+        str(quant),
+        "--yes",
+    ]
+    return (str(py), args, root)
+
+
+def _run_boogu_edit_turbo_gguf_q4(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_boogu_edit_turbo_gguf(root, "Q4")
+
+
+def _run_boogu_edit_turbo_gguf_q5(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_boogu_edit_turbo_gguf(root, "Q5")
+
+
+def _run_boogu_edit_turbo_gguf_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_boogu_edit_turbo_gguf(root, "Q8")
+
+
 def _run_ace(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     script = root / "presets" / "extra_env" / "ace_setup.bat"
     if not script.exists():
@@ -1586,6 +1619,24 @@ OptionalInstall(
             runner=_run_boogu_gguf_q8,
         ),
         OptionalInstall(
+            key="boogu_edit_turbo_gguf_q4",
+            title="Boogu Edit Turbo GGUF (Q4 good default)",
+            description="Fast 4-step Boogu image editing model. Downloads the Edit-Turbo Q4_1 GGUF plus newest sd-cli, VAE, text encoder and mmproj without extra prompts.",
+            runner=_run_boogu_edit_turbo_gguf_q4,
+        ),
+        OptionalInstall(
+            key="boogu_edit_turbo_gguf_q5",
+            title="Boogu Edit Turbo GGUF (Q5)",
+            description="Fast 4-step Boogu image editing model. Higher quality / larger than Q4. Downloads the Edit-Turbo Q5_1 GGUF plus newest sd-cli, VAE, text encoder and mmproj without extra prompts.",
+            runner=_run_boogu_edit_turbo_gguf_q5,
+        ),
+        OptionalInstall(
+            key="boogu_edit_turbo_gguf_q8",
+            title="Boogu Edit Turbo GGUF (Q8)",
+            description="Fast 4-step Boogu image editing model. Best quality / largest. Downloads the Edit-Turbo Q8_0 GGUF plus newest sd-cli, VAE, text encoder and mmproj without extra prompts.",
+            runner=_run_boogu_edit_turbo_gguf_q8,
+        ),
+        OptionalInstall(
             key="hidream_edit_base",
             title="HiDream BF16 (Base / Full)",
             description="HiDream model. Installs/reuses environments/.hidream_dev, the official repo, and downloads only the Base / Full BF16 model when missing.",
@@ -2401,7 +2452,7 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             is_hunyuan15_extra = opt.key.startswith("hunyuan15_") and opt.key != "hunyuan15"
             is_hidream_extra = opt.key.startswith("hidream_edit_")
             is_ideogram4_extra = opt.key.startswith("ideogram4_") and opt.key != "ideogram4_runtime"
-            is_boogu_extra = opt.key.startswith("boogu_gguf_")
+            is_boogu_extra = opt.key.startswith("boogu_gguf_") or opt.key.startswith("boogu_edit_turbo_gguf_")
             is_krea2_extra = opt.key.startswith("krea2_gguf_")
 
             row = _OptionRow(
@@ -2423,7 +2474,7 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                 row.toggled.connect(lambda checked, k=opt.key: self._on_ideogram4_model_toggled(k, checked))
             if opt.key.startswith("hidream_edit_"):
                 row.toggled.connect(lambda checked, k=opt.key: self._on_hidream_edit_model_toggled(k, checked))
-            if opt.key.startswith("boogu_gguf_"):
+            if opt.key.startswith("boogu_gguf_") or opt.key.startswith("boogu_edit_turbo_gguf_"):
                 row.toggled.connect(lambda checked, k=opt.key: self._on_boogu_gguf_toggled(k, checked))
             if opt.key.startswith("krea2_gguf_"):
                 row.toggled.connect(lambda checked, k=opt.key: self._on_krea2_gguf_toggled(k, checked))
@@ -2510,6 +2561,12 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
 
         _add_group_label("Turbo V2 + Edit GGUF models (choose one)", boogu_lay)
         for k in ("boogu_gguf_q4", "boogu_gguf_q5", "boogu_gguf_q8"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, boogu_lay)
+
+        _add_group_label("Edit-Turbo GGUF model (choose one)", boogu_lay)
+        for k in ("boogu_edit_turbo_gguf_q4", "boogu_edit_turbo_gguf_q5", "boogu_edit_turbo_gguf_q8"):
             opt = by_key.get(k)
             if opt:
                 _add_opt(opt, boogu_lay)
@@ -3336,8 +3393,10 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             return
 
         try:
+            selected_group = "edit_turbo" if key.startswith("boogu_edit_turbo_gguf_") else "standard"
             for k, row in getattr(self, "_row_by_key", {}).items():
-                if k.startswith("boogu_gguf_") and k != key and row.is_checked():
+                row_group = "edit_turbo" if k.startswith("boogu_edit_turbo_gguf_") else ("standard" if k.startswith("boogu_gguf_") else "other")
+                if row_group == selected_group and k != key and row.is_checked():
                     row.set_checked(False)
         except Exception:
             pass
@@ -3352,7 +3411,7 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             self._toast("Python .venv not found. Run the main installer first so FrameVision creates .venv.")
             return
 
-        self._toast("Boogu will download Turbo V2 + Edit GGUF files and shared runtime files when you press Start.")
+        self._toast("Boogu will download the selected GGUF model files and shared runtime files when you press Start.")
 
 
     def _on_ideogram4_model_toggled(self, key: str, checked: bool) -> None:

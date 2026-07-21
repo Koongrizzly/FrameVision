@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    from PySide6.QtCore import Qt, QSize, QProcess, QTimer, Signal
+    from PySide6.QtCore import Qt, QSize, QProcess, QTimer, Signal, QPropertyAnimation, QEasingCurve
     from PySide6.QtGui import QPixmap, QIcon, QTextCursor
     from PySide6.QtWidgets import (
         QApplication,
@@ -37,6 +37,7 @@ try:
         QFormLayout,
         QFrame,
         QGridLayout,
+        QGraphicsOpacityEffect,
         QGroupBox,
         QHBoxLayout,
         QLabel,
@@ -173,12 +174,72 @@ class BooguUI(QWidget):
         self.reference_images: List[str] = []
         self._loading = False
         self._aspect_sync_active = False
+        self._toast_label: Optional[QLabel] = None
+        self._toast_animation: Optional[QPropertyAnimation] = None
         self.config = self.default_config()
         self.load_config()
         self.build_ui()
         self.apply_config_to_ui()
         self.connect_auto_save()
         self.log("Boogu UI ready.")
+
+    def show_toast(self, message: str, duration_ms: int = 2200) -> None:
+        """Show a small non-blocking notification bubble that fades away."""
+        if self._toast_animation is not None:
+            self._toast_animation.stop()
+            self._toast_animation = None
+        if self._toast_label is not None:
+            self._toast_label.deleteLater()
+
+        toast = QLabel(message, self)
+        toast.setObjectName("BooguToast")
+        toast.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        toast.setAlignment(Qt.AlignCenter)
+        toast.setStyleSheet(
+            "QLabel#BooguToast {"
+            " background: rgba(22, 26, 36, 235);"
+            " color: white;"
+            " border: 1px solid rgba(120, 220, 255, 180);"
+            " border-radius: 10px;"
+            " padding: 10px 16px;"
+            " font-weight: 600;"
+            "}"
+        )
+        toast.adjustSize()
+        margin = 18
+        x = max(margin, self.width() - toast.width() - margin)
+        y = max(margin, self.height() - toast.height() - margin)
+        toast.move(x, y)
+        toast.raise_()
+
+        opacity = QGraphicsOpacityEffect(toast)
+        toast.setGraphicsEffect(opacity)
+        opacity.setOpacity(1.0)
+        toast.show()
+
+        self._toast_label = toast
+
+        def fade_out() -> None:
+            if self._toast_label is not toast:
+                return
+            animation = QPropertyAnimation(opacity, b"opacity", toast)
+            animation.setDuration(500)
+            animation.setStartValue(1.0)
+            animation.setEndValue(0.0)
+            animation.setEasingCurve(QEasingCurve.InOutQuad)
+
+            def cleanup() -> None:
+                if self._toast_label is toast:
+                    self._toast_label = None
+                if self._toast_animation is animation:
+                    self._toast_animation = None
+                toast.deleteLater()
+
+            animation.finished.connect(cleanup)
+            self._toast_animation = animation
+            animation.start()
+
+        QTimer.singleShot(max(0, duration_ms), fade_out)
 
     # ------------------------------------------------------------------
     # Config
@@ -1016,10 +1077,7 @@ class BooguUI(QWidget):
                     "label": "Boogu Image " + ("edit" if mode == "edit" else "create"),
                 })
                 self.log("Added Boogu Image job to FrameVision queue.")
-                try:
-                    QMessageBox.information(self, "Boogu Image", "Added to FrameVision queue.")
-                except Exception:
-                    pass
+                self.show_toast("Added to FrameVision queue")
                 self.generated.emit(str(APP_ROOT))
                 return
             except Exception as exc:
