@@ -442,6 +442,58 @@ def _make_jet_icon(size: int = 18) -> QtGui.QIcon:
 
 
 
+def _make_newspaper_icon(size: int = 18) -> QtGui.QIcon:
+    pm = QtGui.QPixmap(size, size); pm.fill(Qt.transparent)
+    painter = QtGui.QPainter(pm)
+    try:
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setPen(QtGui.QPen(QtGui.QColor('#EAF8FF'), 1))
+        painter.setBrush(QtGui.QColor('#173B5C'))
+        painter.drawRoundedRect(2, 2, size-4, size-4, 2, 2)
+        painter.fillRect(4, 4, size-8, 3, QtGui.QColor('#4CC9F0'))
+        painter.fillRect(4, 9, size//3, size-13, QtGui.QColor('#FFD166'))
+        painter.fillRect(size//2, 9, size//2-4, 2, QtGui.QColor('#EAF8FF'))
+        painter.fillRect(size//2, 13, size//2-4, 2, QtGui.QColor('#EAF8FF'))
+    finally:
+        painter.end()
+    return QtGui.QIcon(pm)
+
+
+def _make_ascii_icon(size: int = 18) -> QtGui.QIcon:
+    pm = QtGui.QPixmap(size, size); pm.fill(Qt.transparent)
+    painter = QtGui.QPainter(pm)
+    try:
+        painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
+        painter.setPen(QtGui.QColor('#8AFF80'))
+        font = QtGui.QFont('Consolas')
+        font.setBold(True); font.setPixelSize(max(8, size-5))
+        painter.setFont(font)
+        painter.drawText(pm.rect(), Qt.AlignCenter, '>_')
+    finally:
+        painter.end()
+    return QtGui.QIcon(pm)
+
+
+def _make_visualizer_icon(size: int = 18) -> QtGui.QIcon:
+    pm = QtGui.QPixmap(size, size); pm.fill(Qt.transparent)
+    painter = QtGui.QPainter(pm)
+    try:
+        painter.setPen(Qt.NoPen)
+        heights = [5, 11, 16, 9, 14]
+        colors = ['#4CC9F0', '#4361EE', '#B5179E', '#F72585', '#FFD166']
+        width = max(2, size // 8)
+        gap = 1
+        total = len(heights) * width + (len(heights)-1) * gap
+        x = max(0, (size-total)//2)
+        for h, color in zip(heights, colors):
+            h = min(size-2, h)
+            painter.fillRect(x, size-h, width, h-1, QtGui.QColor(color))
+            x += width + gap
+    finally:
+        painter.end()
+    return QtGui.QIcon(pm)
+
+
 # ---------------------------- Dad jokes logic ---------------------------------------------
 _DAD_FILE_REL = os.path.join("assets", "dad_jokes.txt")
 _DAD_BAG_KEY = "dad_jokes_bag"
@@ -564,7 +616,7 @@ def _dad_joke_popup(parent: Optional[QtWidgets.QWidget] = None) -> None:
 # ---------------------------- Helpers ------------------------------------------------------
 def _spawn_helper_script(rel_path: Union[str, Sequence[str]]) -> None:
     """
-    Launch a helper .py file in a detached process.
+    Launch a Python helper or open a local HTML easter egg.
     Accepts a single relative path or a list/tuple of candidate relative paths; uses the first that exists.
     """
     try:
@@ -573,15 +625,23 @@ def _spawn_helper_script(rel_path: Union[str, Sequence[str]]) -> None:
         for pth in candidates:
             norm = pth.replace("\\", os.sep).replace("/", os.sep)
             abs_path = os.path.join(root, norm)
-            if os.path.isfile(abs_path):
+            if not os.path.isfile(abs_path):
+                continue
+
+            if abs_path.lower().endswith((".html", ".htm")):
+                if not QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(abs_path)):
+                    raise RuntimeError(f"The default browser could not open: {abs_path}")
+            else:
                 py = sys.executable or "python"
-                QtCore.QProcess.startDetached(py, [abs_path])
-                return
+                if not QtCore.QProcess.startDetached(py, [abs_path]):
+                    raise RuntimeError(f"Could not start: {abs_path}")
+            return
+
         short_list = ", ".join(candidates)
         QtWidgets.QMessageBox.information(
             None,
             "Easter egg not found",
-            f"Could not locate: {short_list}\nLooked in /helpers/.",
+            f"Could not locate: {short_list}\nLooked from the FrameVision root folder.",
         )
     except Exception as exc:
         QtWidgets.QMessageBox.warning(None, "Easter egg launch failed", str(exc))
@@ -589,6 +649,38 @@ def _spawn_helper_script(rel_path: Union[str, Sequence[str]]) -> None:
 
 # ----------------------------- Easter Eggs registry ---------------------------------------
 EASTER_EGGS: List[Dict] = [
+    {
+        "id": "huggingface_newspaper",
+        "label": "Hugging Face Newspaper",
+        "icon_fn": lambda: _make_newspaper_icon(18),
+        "script": r"assets\huggingface_newspaper.html",
+        "unlock_seconds": 60 * 60 * 2,  # 2 hours
+        "message": "Hugging Face Newspaper unlocked, check the Easter Eggs menu in Settings!",
+    },
+    {
+        "id": "github_newspaper",
+        "label": "GitHub Newspaper",
+        "icon_fn": lambda: _make_newspaper_icon(18),
+        "script": r"assets\github_newspaper.html",
+        "unlock_seconds": 60 * 60 * 2,  # 2 hours
+        "message": "GitHub Newspaper unlocked, check the Easter Eggs menu in Settings!",
+    },
+    {
+        "id": "framevision_audio_visualizer",
+        "label": "FrameVision Audio Visualizer",
+        "icon_fn": lambda: _make_visualizer_icon(18),
+        "script": r"assets\FrameVision_Audio_Visualizer.html",
+        "unlock_seconds": 60 * 60 * 7,  # 7 hours
+        "message": "FrameVision Audio Visualizer unlocked, check the Easter Eggs menu in Settings!",
+    },
+    {
+        "id": "ascii_forge",
+        "label": "ASCII Forge",
+        "icon_fn": lambda: _make_ascii_icon(18),
+        "script": r"assets\ascii_forge.html",
+        "unlock_seconds": 60 * 60 * 15,  # 15 hours
+        "message": "ASCII Forge unlocked, check the Easter Eggs menu in Settings!",
+    },
     {
         "id": "tetris",
         "label": "Play Tetris",

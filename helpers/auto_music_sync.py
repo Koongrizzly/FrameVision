@@ -600,6 +600,345 @@ def _musicclip_prepare_krea2_single_payload(payload: dict) -> dict:
     return {"ok": True, "payload": new_payload, "image_result": res}
 
 
+# ---------------------------- Qwen 2511 INT4 LTX start-image bridge ----------
+_MUSICCLIP_QWEN2511_CREATION_SEED = 582027446
+_MUSICCLIP_QWEN2511_WIDTH = 1920
+_MUSICCLIP_QWEN2511_HEIGHT = 1088
+
+def _musicclip_qwen2511_is_mode(payload: dict) -> bool:
+    model = str((payload or {}).get("image_model") or (payload or {}).get("image_mode") or "").strip().lower()
+    return model in ("qwen2511_int4", "qwen_2511_int4", "qwen2511", "qwen-2511-int4")
+
+def _musicclip_qwen2511_reference_paths(payload: dict) -> list[str]:
+    ref = (payload or {}).get("character_reference")
+    ref = ref if isinstance(ref, dict) else {}
+    candidates = []
+    sheets = ref.get("character_reference_sheets")
+    if isinstance(sheets, dict):
+        candidates.extend(sheets.get(f"char_{idx:02d}") for idx in range(1, 4))
+    candidates.extend((ref.get("reference_sheet_path"), ref.get("global_reference_sheet_path")))
+    out = []
+    for value in candidates:
+        path = str(value or "").strip().strip('"').strip("'")
+        if path and os.path.isfile(path) and path not in out:
+            out.append(path)
+        if len(out) >= 3:
+            break
+    return out
+
+def _musicclip_qwen2511_best_model_key(root_dir: str) -> tuple[str, int, str]:
+    root = Path(str(root_dir or _musicclip_project_root())).resolve()
+    helper = root / "helpers" / "qwen2511_int.py"
+    if not helper.is_file():
+        return "", 0, f"Qwen helper was not found: {helper}"
+    try:
+        spec = importlib.util.spec_from_file_location("_framevision_musicclip_qwen2511", str(helper))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        profiles = mod._load_profiles(root).get("models", {})
+    except BaseException as exc:
+        return "", 0, f"Could not inspect Qwen 2511 INT4 models: {exc}"
+    ranked = []
+    for key, profile in profiles.items() if isinstance(profiles, dict) else []:
+        if not isinstance(profile, dict) or str(profile.get("precision", "int4")).lower() != "int4":
+            continue
+        text = (str(key) + " " + str(profile.get("relative_path", "")) + " " + str(profile.get("label", ""))).lower()
+        steps = int(profile.get("steps") or 4)
+        score = (100 if "quality" in text else 0) + (100 if "r128" in text else 0) + (40 if "b15" in text else 0)
+        if steps == 8 or any(t in text for t in ("8step", "8-step", "lightning8")):
+            score += 150
+        ranked.append((score, steps, str(key), str(profile.get("label") or key)))
+    if not ranked:
+        return "", 0, f"No compatible Qwen 2511 INT4 checkpoint was found under {root / 'models' / 'qwen2511_int'}."
+    ranked.sort(reverse=True)
+    _score, steps, key, label = ranked[0]
+    return key, steps, label
+
+def _musicclip_generate_qwen2511_start_image(payload: dict) -> dict:
+    payload = dict(payload or {})
+    root = Path(str(payload.get("root_dir") or _musicclip_project_root())).resolve()
+    refs = _musicclip_qwen2511_reference_paths(payload)
+    if not refs:
+        return {"ok": False, "message": "Qwen 2511 INT4 needs at least one valid reference image (maximum three)."}
+    key, profile_steps, label = _musicclip_qwen2511_best_model_key(str(root))
+    if not key:
+        return {"ok": False, "message": label}
+    env_python = root / "environments" / ".qwen2511_int" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    helper = root / "helpers" / "qwen2511_int.py"
+    if not env_python.is_file():
+        return {"ok": False, "message": f"Qwen 2511 INT4 environment Python was not found: {env_python}"}
+    prompt = str(payload.get("image_prompt_override") or payload.get("image_prompt") or "cinematic music video start image, sharp, detailed").strip()
+    custom_seed = bool(payload.get("qwen2511_allow_custom_seed", False))
+    seed = payload.get("seed", _MUSICCLIP_QWEN2511_CREATION_SEED) if custom_seed else _MUSICCLIP_QWEN2511_CREATION_SEED
+    try:
+        seed = int(seed) if seed not in (None, "") else (-1 if custom_seed else _MUSICCLIP_QWEN2511_CREATION_SEED)
+    except Exception:
+        seed = -1 if custom_seed else _MUSICCLIP_QWEN2511_CREATION_SEED
+    out_dir = Path(str(payload.get("output_dir") or (root / "output" / "edits")))
+    if not out_dir.is_absolute():
+        out_dir = root / out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shot_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(payload.get("shot_id") or "ltx")).strip("._") or "ltx"
+    output_name = str(payload.get("start_image_name") or f"{shot_id}_qwen2511_start.png")
+    request = {"command": "generate", "prompt": prompt, "negative_prompt": "", "references": refs[:3], "loras": [],
+        "model": key, "width": _MUSICCLIP_QWEN2511_WIDTH, "height": _MUSICCLIP_QWEN2511_HEIGHT,
+        "seed": seed, "count": 1, "true_cfg_scale": 1.25, "steps": int(profile_steps or 8), "max_sequence_length": 1024,
+        "offload": "auto", "blocks_on_gpu": 1, "pin_memory": False, "cleanup_between": True,
+        "output": {"folder": str(out_dir), "format": "png", "jpeg_quality": 95, "auto_name": False, "manual_name": Path(output_name).stem}}
+    req_path = out_dir / f"{shot_id}_qwen2511_request.json"
+    req_path.write_text(json.dumps(request, indent=2, ensure_ascii=False), encoding="utf-8")
+    cb = payload.get("progress_callback")
+    def emit(msg):
+        if callable(cb):
+            try: cb(str(msg))
+            except Exception: pass
+    emit(f"Qwen 2511 INT4: {label} · {profile_steps} steps · 1920x1088 · {len(refs[:3])} reference(s)")
+    cmd = [str(env_python), "-u", str(helper), "--queue-job", str(req_path), "--root", str(root)]
+    log_path = out_dir / str(payload.get("start_image_log_name") or f"{shot_id}_qwen2511_imagegen.log.txt")
+    result_event = None
+    try:
+        with open(log_path, "w", encoding="utf-8", errors="ignore") as logf:
+            proc = subprocess.Popen(cmd, cwd=str(root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                logf.write(line)
+                clean = line.strip()
+                if clean.startswith("FVQWEN_EVENT "):
+                    try:
+                        event = json.loads(clean[len("FVQWEN_EVENT "):])
+                        if event.get("event") == "result": result_event = event
+                        elif event.get("event") == "status": emit("Qwen 2511 INT4: " + str(event.get("message") or "working"))
+                        elif event.get("event") == "progress": emit(f"Qwen 2511 INT4: step {event.get('current')}/{event.get('total')}")
+                    except Exception: pass
+            code = proc.wait()
+        if code != 0:
+            return {"ok": False, "message": f"Qwen 2511 INT4 failed with exit code {code}. Log: {log_path}"}
+    except Exception as exc:
+        return {"ok": False, "message": f"Qwen 2511 INT4 image generation failed: {exc}"}
+    outputs = result_event.get("outputs", []) if isinstance(result_event, dict) else []
+    start_path = str(outputs[0]) if outputs else str(out_dir / output_name)
+    if not os.path.isfile(start_path):
+        return {"ok": False, "message": f"Qwen 2511 INT4 finished but no output image was found. Log: {log_path}"}
+    meta = {"image_model": "qwen2511_int4", "model": key, "model_label": label, "prompt": prompt, "seed": seed,
+            "width": _MUSICCLIP_QWEN2511_WIDTH, "height": _MUSICCLIP_QWEN2511_HEIGHT, "steps": profile_steps,
+            "references": refs[:3], "start_image_path": start_path}
+    return {"ok": True, **meta, "message": "Qwen 2511 INT4 start image ready."}
+
+def _musicclip_build_qwen2511_request(payload: dict) -> dict:
+    payload = dict(payload or {})
+    root = Path(str(payload.get("root_dir") or _musicclip_project_root())).resolve()
+    refs = _musicclip_qwen2511_reference_paths(payload)
+    if not refs:
+        raise ValueError("Qwen 2511 INT4 needs at least one valid reference image (maximum three).")
+    key, profile_steps, label = _musicclip_qwen2511_best_model_key(str(root))
+    if not key:
+        raise RuntimeError(label)
+    prompt = str(payload.get("image_prompt_override") or payload.get("image_prompt") or "cinematic music video start image, sharp, detailed").strip()
+    custom_seed = bool(payload.get("qwen2511_allow_custom_seed", False))
+    seed = payload.get("seed", _MUSICCLIP_QWEN2511_CREATION_SEED) if custom_seed else _MUSICCLIP_QWEN2511_CREATION_SEED
+    try:
+        seed = int(seed) if seed not in (None, "") else (-1 if custom_seed else _MUSICCLIP_QWEN2511_CREATION_SEED)
+    except Exception:
+        seed = -1 if custom_seed else _MUSICCLIP_QWEN2511_CREATION_SEED
+    out_dir = Path(str(payload.get("output_dir") or (root / "output" / "edits")))
+    if not out_dir.is_absolute():
+        out_dir = root / out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shot_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(payload.get("shot_id") or "ltx")).strip("._") or "ltx"
+    output_name = str(payload.get("start_image_name") or f"{shot_id}_qwen2511_start.png")
+    request = {"command": "generate", "prompt": prompt, "negative_prompt": "", "references": refs[:3], "loras": [],
+        "model": key, "width": _MUSICCLIP_QWEN2511_WIDTH, "height": _MUSICCLIP_QWEN2511_HEIGHT,
+        "seed": seed, "count": 1, "true_cfg_scale": 1.25, "steps": int(profile_steps or 8), "max_sequence_length": 1024,
+        "offload": "auto", "blocks_on_gpu": 1, "pin_memory": False, "keep_loaded": True, "cleanup_between": True,
+        "output": {"folder": str(out_dir), "format": "png", "jpeg_quality": 95, "auto_name": False, "manual_name": Path(output_name).stem}}
+    meta = {"image_model": "qwen2511_int4", "model": key, "model_label": label, "prompt": prompt, "seed": seed,
+            "width": _MUSICCLIP_QWEN2511_WIDTH, "height": _MUSICCLIP_QWEN2511_HEIGHT, "steps": int(profile_steps or 8),
+            "references": refs[:3], "output_dir": str(out_dir), "output_name": output_name, "shot_id": shot_id}
+    return {"request": request, "meta": meta}
+
+
+def _musicclip_generate_qwen2511_start_images_keep_warm(payload: dict, jobs: list[dict]) -> dict:
+    payload = dict(payload or {})
+    if not jobs:
+        return {"ok": True, "results": {}, "message": "No Qwen 2511 INT4 start images needed."}
+    root = Path(str(payload.get("root_dir") or _musicclip_project_root())).resolve()
+    env_python = root / "environments" / ".qwen2511_int" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    helper = root / "helpers" / "qwen2511_int.py"
+    if not env_python.is_file():
+        return {"ok": False, "message": f"Qwen 2511 INT4 environment Python was not found: {env_python}"}
+    cb = payload.get("progress_callback")
+    def emit(msg):
+        if callable(cb):
+            try: cb(str(msg))
+            except Exception: pass
+    cmd = [str(env_python), "-u", str(helper), "--server", "--root", str(root)]
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(root), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
+    except Exception as exc:
+        return {"ok": False, "message": f"Could not start Qwen 2511 INT4 backend: {exc}"}
+    assert proc.stdout is not None
+    assert proc.stdin is not None
+    log_path = Path(jobs[0]["meta"].get("output_dir") or (root / "output" / "edits")) / "musicclip_qwen2511_batch_imagegen.log.txt"
+    results: dict[str, dict] = {}
+    try:
+        with open(log_path, "w", encoding="utf-8", errors="ignore") as logf:
+            ready = False
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                logf.write(line)
+                clean = line.strip()
+                if clean.startswith("FVQWEN_EVENT "):
+                    try:
+                        event = json.loads(clean[len("FVQWEN_EVENT "):])
+                    except Exception:
+                        event = {}
+                    if event.get("event") == "ready":
+                        ready = True
+                        break
+            if not ready:
+                code = proc.poll()
+                return {"ok": False, "message": f"Qwen 2511 INT4 backend did not become ready. Exit code: {code}. Log: {log_path}"}
+            total_jobs = len(jobs)
+            for job_index, job in enumerate(jobs, 1):
+                meta = dict(job.get("meta") or {})
+                shot_id = str(meta.get("shot_id") or f"shot_{job_index}")
+                model_label = str(meta.get("model_label") or "Qwen 2511 INT4")
+                refs = meta.get("references") or []
+                emit(f"Qwen 2511 INT4: {model_label} · {meta.get('steps', 8)} steps · 1920x1088 · {len(refs)} reference(s) · warm run {job_index}/{total_jobs}")
+                proc.stdin.write(json.dumps(job["request"], ensure_ascii=False) + "\n")
+                proc.stdin.flush()
+                result_event = None
+                while True:
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    logf.write(line)
+                    clean = line.strip()
+                    if clean.startswith("FVQWEN_EVENT "):
+                        try:
+                            event = json.loads(clean[len("FVQWEN_EVENT "):])
+                        except Exception:
+                            event = {}
+                        etype = event.get("event")
+                        if etype == "result":
+                            result_event = event
+                            break
+                        elif etype == "error":
+                            return {"ok": False, "message": f"Qwen 2511 INT4 failed during warm batch generation. Log: {log_path}", "detail": str(event.get('message') or '')}
+                        elif etype == "status":
+                            emit("Qwen 2511 INT4: " + str(event.get("message") or f"working {job_index}/{total_jobs}"))
+                        elif etype == "progress":
+                            emit(f"Qwen 2511 INT4: image {job_index}/{total_jobs} · step {event.get('current')}/{event.get('total')}")
+                if not isinstance(result_event, dict):
+                    code = proc.poll()
+                    return {"ok": False, "message": f"Qwen 2511 INT4 stopped before finishing all warm-run images. Exit code: {code}. Log: {log_path}"}
+                outputs = result_event.get("outputs", []) if isinstance(result_event, dict) else []
+                start_path = str(outputs[0]) if outputs else str(Path(meta.get("output_dir") or "") / meta.get("output_name", f"{shot_id}_qwen2511_start.png"))
+                if not os.path.isfile(start_path):
+                    return {"ok": False, "message": f"Qwen 2511 INT4 finished warm batch image {job_index}/{total_jobs} but no output image was found. Log: {log_path}"}
+                results[shot_id] = {"ok": True, **meta, "start_image_path": start_path, "message": "Qwen 2511 INT4 start image ready."}
+            try:
+                proc.stdin.write(json.dumps({"command": "quit"}) + "\n")
+                proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=30)
+            except Exception:
+                try: proc.kill()
+                except Exception: pass
+        return {"ok": True, "results": results, "message": f"Qwen 2511 INT4 created {len(results)} start image(s) in one warm run."}
+    except Exception as exc:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return {"ok": False, "message": f"Qwen 2511 INT4 warm batch generation failed: {exc}"}
+
+
+def _musicclip_prepare_qwen2511_full_run_payload(payload: dict) -> dict:
+    payload = dict(payload or {})
+    plan_path = str(payload.get("ltx_director_plan_path") or "").strip()
+    if not plan_path or not os.path.isfile(plan_path):
+        return {"ok": False, "message": f"LTX director plan was not found: {plan_path or '[empty]'}"}
+    try:
+        plan_data = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"ok": False, "message": f"Could not read LTX director plan for Qwen 2511 INT4: {exc}"}
+    shots = _musicclip_krea2_shots(plan_data)
+    review_dir, state_path = _musicclip_krea2_review_paths(plan_path)
+    state = _musicclip_krea2_read_state(plan_path)
+    shots_state = state.setdefault("shots", {})
+    generated = 0
+    warm_jobs: list[dict] = []
+    pending_order: list[tuple[int, dict, dict]] = []
+    for idx, shot in enumerate(shots):
+        sid = _musicclip_krea2_shot_id(shot, idx)
+        item = shots_state.setdefault(sid, {})
+        start_path = str(item.get("current_start_image_path") or "").strip()
+        if not (start_path and os.path.isfile(start_path)):
+            try:
+                built = _musicclip_build_qwen2511_request({**payload, "shot_id": sid, "image_model": "qwen2511_int4", "image_prompt_override": _musicclip_krea2_prompt(shot), "output_dir": review_dir, "start_image_name": f"{sid}_qwen2511_start.png"})
+            except Exception as exc:
+                return {"ok": False, "message": f"Could not prepare Qwen 2511 INT4 request for {sid}: {exc}"}
+            warm_jobs.append(built)
+            pending_order.append((idx, shot, item))
+    if warm_jobs:
+        batch_result = _musicclip_generate_qwen2511_start_images_keep_warm(payload, warm_jobs)
+        if not batch_result.get("ok"):
+            return batch_result
+        generated_map = dict(batch_result.get("results") or {})
+    else:
+        generated_map = {}
+    for idx, shot in enumerate(shots):
+        sid = _musicclip_krea2_shot_id(shot, idx)
+        item = shots_state.setdefault(sid, {})
+        start_path = str(item.get("current_start_image_path") or "").strip()
+        if not (start_path and os.path.isfile(start_path)):
+            result = generated_map.get(sid) or {}
+            start_path = str(result.get("start_image_path") or "")
+            item["last_image_result"] = result
+            if start_path:
+                generated += 1
+        item.update({"status": "Image ready - clip needs recreate", "image_prompt": _musicclip_krea2_prompt(shot), "image_seed": _MUSICCLIP_QWEN2511_CREATION_SEED, "image_model": "qwen2511_int4", "current_start_image_path": start_path, "clip_invalidated_by_new_image": True})
+        shot.update({"start_image_path": start_path, "current_start_image_path": start_path, "existing_start_image_path": start_path, "image_mode": "existing", "source_image_model": "qwen2511_int4"})
+    state["image_model"] = "qwen2511_int4"
+    state["character_reference"] = payload.get("character_reference", {})
+    _musicclip_krea2_write_state(plan_path, state)
+    plan_data["image_model"] = "qwen2511_int4"
+    plan_data["character_reference"] = payload.get("character_reference", {})
+    temp_path = Path(plan_path).resolve().parent / "musicclip_ltx_director_plan_qwen2511_prepared.json"
+    temp_path.write_text(json.dumps(plan_data, indent=2, ensure_ascii=False), encoding="utf-8")
+    new_payload = dict(payload)
+    new_payload.update({"image_mode": "existing", "image_model": "existing", "ltx_director_plan_path": str(temp_path), "qwen2511_prepared_from_plan": plan_path, "source_image_model": "qwen2511_int4", "review_state_path": state_path})
+    return {"ok": True, "payload": new_payload, "message": f"Qwen 2511 INT4 prepared {len(shots)} start image(s), generated {generated} in one warm run."}
+
+def _musicclip_patch_qwen2511_bridge(mod):
+    if mod is None or bool(getattr(mod, "_framevision_qwen2511_ltx_patched", False)): return mod
+    try:
+        original_gen = getattr(mod, "generate_ltx_start_image_for_shot", None)
+        if callable(original_gen):
+            def _gen(payload):
+                if _musicclip_qwen2511_is_mode(payload or {}): return _musicclip_generate_qwen2511_start_image(dict(payload or {}))
+                return original_gen(payload)
+            setattr(mod, "generate_ltx_start_image_for_shot", _gen)
+        original_all = getattr(mod, "run_all_ltx_director_shots", None)
+        if callable(original_all):
+            def _all(payload):
+                payload = dict(payload or {})
+                if _musicclip_qwen2511_is_mode(payload):
+                    prep = _musicclip_prepare_qwen2511_full_run_payload(payload)
+                    if not prep.get("ok"): return prep
+                    payload = dict(prep.get("payload") or {})
+                return original_all(payload)
+            setattr(mod, "run_all_ltx_director_shots", _all)
+        setattr(mod, "_framevision_qwen2511_ltx_patched", True)
+    except Exception:
+        pass
+    return mod
+
 
 
 # ---------------------------- LTX hard duration guard -----------------------
@@ -2358,13 +2697,13 @@ def _musicclip_patch_int4_vram_policy(mod):
 def _load_musicclip_planner_bridge():
     # Original/Wan2GP bridge. Keep this separate so the option can hide again
     # when this file is removed.
-    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("musicclip_planner_bridge.py", "_framevision_musicclip_planner_bridge")))
+    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("musicclip_planner_bridge.py", "_framevision_musicclip_planner_bridge"))))
 
 
 def _load_clip2ltx_bridge():
     # Own LTX-VRAMLab FP16/FP8 bridge. This is the copy of the original bridge
     # that calls helpers/ltx23_vram_lab_cli.py directly.
-    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("clip2ltx_cli.py", "_framevision_clip2ltx_bridge")))
+    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("clip2ltx_cli.py", "_framevision_clip2ltx_bridge"))))
 
 
 def _load_music_ltx_int4_bridge():
@@ -2372,7 +2711,7 @@ def _load_music_ltx_int4_bridge():
     # routes only the generation command to helpers/ltx_int4_cli.py.
     bridge = _load_musicclip_bridge_file("music_ltx_int4.py", "_framevision_music_ltx_int4_bridge")
     bridge = _musicclip_patch_int4_vram_policy(bridge)
-    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_krea2_bridge(bridge))
+    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(bridge)))
 
 
 def _musicclip_default_llama_runner() -> str:
@@ -4790,7 +5129,7 @@ def _musicclip_load_ltx_bridge_module_for_queue(root_dir: str, backend: str = ""
                 continue
             if filename == "music_ltx_int4.py":
                 module = _musicclip_patch_int4_vram_policy(module)
-            return _musicclip_patch_own_prompts_bridge(_musicclip_patch_krea2_bridge(module))
+            return _musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(module)))
         except BaseException as exc:
             errors.append(f"{filename}: {type(exc).__name__}: {exc}")
 
@@ -12706,7 +13045,7 @@ class AutoMusicSyncWidget(QWidget):
             self.combo_bridge_character_source.addItem("Reference images", "reference_images")
             self.combo_bridge_character_source.setToolTip(
                 "Built-in character bible uses the typed character/subject description with the selected image model. "
-                "Reference images switches to the HiDream reference/edit workflow and shows the reference sheet section."
+                "Reference images shows the reference sheet section and limits the image model to HiDream or Qwen 2511 INT4."
             )
             bridge_form.addRow("Character source:", self.combo_bridge_character_source)
             self.label_bridge_character_source_note = QLabel(
@@ -12723,10 +13062,11 @@ class AutoMusicSyncWidget(QWidget):
             self.combo_ltx_single_image_mode.addItem("Krea 2", "krea2")
             self.combo_ltx_single_image_mode.addItem("Flux Klein 9B", "flux_klein_9b")
             self.combo_ltx_single_image_mode.addItem("HiDream", "hidream")
+            self.combo_ltx_single_image_mode.addItem("Qwen 2511 INT4", "qwen2511_int4")
             self.combo_ltx_single_image_mode.setCurrentIndex(1)
             self.combo_ltx_single_image_mode.setToolTip(
                 "Choose whether to use a ready-made start image or generate one with an image model. "
-                "When Reference images is selected, this is locked to HiDream."
+                "When Reference images is selected, only HiDream and Qwen 2511 INT4 are shown."
             )
             bridge_form.addRow("Start image mode:", self.combo_ltx_single_image_mode)
 
@@ -15045,6 +15385,7 @@ class AutoMusicSyncWidget(QWidget):
                 self.btn_generate_ltx_start_image.clicked.connect(self._on_generate_ltx_start_image_clicked)
             if getattr(self, "combo_ltx_single_image_mode", None) is not None:
                 self.combo_ltx_single_image_mode.currentIndexChanged.connect(lambda _v: self._update_ltx_single_image_mode_ui())
+                self.combo_ltx_single_image_mode.currentIndexChanged.connect(lambda _v: self._update_ltx_character_source_ui())
                 self.combo_ltx_single_image_mode.currentIndexChanged.connect(lambda _v: self._save_settings())
                 self._update_ltx_character_source_ui()
                 self._update_ltx_lipsync_trim_lock()
@@ -16066,6 +16407,13 @@ class AutoMusicSyncWidget(QWidget):
         if any_valid and not ref_mode:
             warnings.append("Reference image paths are saved, but Built-in character bible mode is active, so the reference-image workflow is not used.")
 
+        try:
+            image_combo = getattr(self, "combo_ltx_single_image_mode", None)
+            selected_image_model = str(image_combo.currentData() if image_combo is not None else "hidream")
+        except Exception:
+            selected_image_model = "hidream"
+        max_slots = 3 if selected_image_model == "qwen2511_int4" else 5
+        active_sheets = {k: v for k, v in sheets.items() if int(k[-2:]) <= max_slots} if active else {}
         return {
             "enabled": active,
             "reference_mode": bool(ref_mode),
@@ -16078,8 +16426,9 @@ class AutoMusicSyncWidget(QWidget):
             "hidream_multi_reference_policy": "slots_1_to_5_are_direct_subject_references",
             "future_hidream_group_image_workflow": "hidream_image_edit",
             "source": "user_loaded_image" if active else "none",
-            "max_character_reference_slots": 5,
-            "character_reference_sheets": sheets if active else {},
+            "max_character_reference_slots": max_slots,
+            "selected_image_model": selected_image_model,
+            "character_reference_sheets": active_sheets,
             "warnings": warnings,
         }
 
@@ -18299,7 +18648,7 @@ class AutoMusicSyncWidget(QWidget):
             if note is not None:
                 try:
                     note.setText(
-                        "Reference image mode — HiDream reference/edit workflow is used."
+                        "Reference image mode — choose HiDream or Qwen 2511 INT4."
                         if ref_mode
                         else "Built-in character bible mode — reference image section auto-hidden."
                     )
@@ -18307,18 +18656,28 @@ class AutoMusicSyncWidget(QWidget):
                     pass
             image_combo = getattr(self, "combo_ltx_single_image_mode", None)
             if image_combo is not None:
-                if ref_mode:
-                    image_combo.blockSignals(True)
-                    self._ltx_combo_set_data(image_combo, "hidream")
-                    image_combo.blockSignals(False)
-                    image_combo.setEnabled(False)
-                    image_combo.setToolTip("Reference images are active, so the start-image workflow is locked to HiDream reference/edit mode.")
-                else:
-                    image_combo.setEnabled(True)
-                    image_combo.setToolTip(
-                        "Choose whether to use a ready-made start image or generate one with an image model. "
-                        "When Reference images is selected, this is locked to HiDream."
-                    )
+                current = str(image_combo.currentData() or "hidream")
+                wanted = [("HiDream", "hidream"), ("Qwen 2511 INT4", "qwen2511_int4")] if ref_mode else [
+                    ("Use existing start image", "existing"), ("Z-Image Turbo", "z_image"), ("Krea 2", "krea2"),
+                    ("Flux Klein 9B", "flux_klein_9b"), ("HiDream", "hidream"), ("Qwen 2511 INT4", "qwen2511_int4")]
+                image_combo.blockSignals(True)
+                image_combo.clear()
+                for label, data in wanted:
+                    image_combo.addItem(label, data)
+                if not self._ltx_combo_set_data(image_combo, current):
+                    self._ltx_combo_set_data(image_combo, "hidream" if ref_mode else "z_image")
+                image_combo.blockSignals(False)
+                image_combo.setEnabled(True)
+                image_combo.setToolTip("Reference images are active: choose HiDream or Qwen 2511 INT4." if ref_mode else "Choose a ready-made start image or an installed image model.")
+            selected_ref_model = str(image_combo.currentData() or "hidream") if image_combo is not None else "hidream"
+            max_slots = 3 if (ref_mode and selected_ref_model == "qwen2511_int4") else 5
+            for idx in range(1, 6):
+                widgets = (getattr(self, "_planner_bridge_character_reference_widgets", {}) or {}).get(f"char_{idx:02d}", {})
+                for widget in widgets.values() if isinstance(widgets, dict) else []:
+                    try:
+                        widget.setVisible(idx <= max_slots)
+                    except Exception:
+                        pass
             self._update_ltx_single_image_mode_ui()
         except Exception:
             pass
@@ -18348,7 +18707,7 @@ class AutoMusicSyncWidget(QWidget):
             source_combo = getattr(self, "combo_bridge_character_source", None)
             if source_combo is not None and str(source_combo.currentData() or "") == "reference_images":
                 combo = getattr(self, "combo_ltx_single_image_mode", None)
-                if combo is not None and str(combo.currentData() or "") != "hidream":
+                if combo is not None and str(combo.currentData() or "") not in ("hidream", "qwen2511_int4"):
                     combo.blockSignals(True)
                     self._ltx_combo_set_data(combo, "hidream")
                     combo.blockSignals(False)
@@ -20421,12 +20780,23 @@ class AutoMusicSyncWidget(QWidget):
         payload = self._ltx_review_character_reference_payload()
         refs_enabled = self._ltx_review_has_real_character_refs(payload)
         if refs_enabled:
-            ok, label = self._find_hidream_reference_dev_model_for_ltx()
+            saved_model = str(payload.get("selected_image_model") or "").strip()
+            plan_path = self._ltx_review_current_plan_path()
+            try:
+                state = self._ltx_review_read_state(plan_path) if plan_path else {}
+                saved_model = str(state.get("image_model") or saved_model or "").strip()
+                if not saved_model and plan_path:
+                    data = _musicclip_read_json_file(plan_path)
+                    saved_model = str(data.get("image_model") or data.get("source_image_model") or "").strip()
+            except Exception:
+                pass
+            if saved_model == "qwen2511_int4":
+                key, _steps, label = _musicclip_qwen2511_best_model_key(_musicclip_project_root())
+                return ("qwen2511_int4", f"Using the job's Qwen 2511 INT4 model ({label}) for review.") if key else ("", label)
+            ok, _label = self._find_hidream_reference_dev_model_for_ltx()
             if ok:
-                if "FP8" in label.upper():
-                    return "hidream", "Falling back to HiDream Dev FP8 for reference-image review."
-                return "hidream", "Using HiDream BF16 Dev for reference-image review."
-            return "", "Required HiDream reference/edit model not available. The check now accepts renamed/newer Dev folders too; verify HiDream Dev BF16 or Dev FP8 is under the FrameVision models folder."
+                return "hidream", "Using the job's HiDream reference/edit model for review."
+            return "", "Required HiDream reference/edit model not available."
         combo = getattr(self, "combo_ltx_single_image_mode", None)
         mode = str(combo.currentData() if combo is not None else "z_image")
         if mode == "existing":
@@ -20812,6 +21182,7 @@ class AutoMusicSyncWidget(QWidget):
                     "start_image_payload_name": f"{stem}_review_start_image_payload.json",
                     "start_image_log_name": f"{stem}_review_imagegen.log.txt",
                     "character_reference": character_reference,
+                    "qwen2511_allow_custom_seed": image_model == "qwen2511_int4",
                     "progress_callback": progress_callback,
                 })
                 if not isinstance(image_result, dict) or not bool(image_result.get("ok")):
