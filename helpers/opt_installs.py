@@ -1457,6 +1457,38 @@ def _run_firered_q8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
 
 
 
+
+def _run_mage_models(root: Path, models: str) -> Optional[Tuple[str, List[str], Path]]:
+    """Install/repair the shared Mage environment and selected official checkpoint(s)."""
+    script = root / "presets" / "extra_env" / "Mage_edit.py"
+    if not script.exists():
+        return None
+    py = _venv_python(root)
+    if py is None or (not py.exists()):
+        return None
+    args = [
+        "-u",
+        str(script),
+        "--root",
+        str(root),
+        "--repair",
+        "--models",
+        str(models),
+    ]
+    return (str(py), args, root)
+
+
+def _run_mage_flow_turbo(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_mage_models(root, "turbo")
+
+
+def _run_mage_flow_edit_turbo(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_mage_models(root, "edit-turbo")
+
+
+def _run_mage_flow_edit(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_mage_models(root, "edit")
+
 def _default_installs() -> List[OptionalInstall]:
     # Titles/descriptions copied from install_menu.bat "extra options" page.
     return [
@@ -1550,6 +1582,36 @@ OptionalInstall(
             title="Hiar wan 2.1 long format Video",
             description="Experimental model for long consistency, about 20 gigabyte for model + repo. Enabling this optional install checks existing files and installs/downloads everything needed to get started.",
             runner=_run_hiar,
+        ),
+        OptionalInstall(
+            key="mage_flow_turbo",
+            title="Mage-Flow Turbo · Text to Image · 4 steps",
+            description=(
+                "Fast 4B BF16 text-to-image model. Installs or reuses the shared "
+                "environments/.mage_edit runtime and official Mage repository, then downloads "
+                "microsoft/Mage-Flow-Turbo into models/mage_edit/Mage-Flow-Turbo."
+            ),
+            runner=_run_mage_flow_turbo,
+        ),
+        OptionalInstall(
+            key="mage_flow_edit_turbo",
+            title="Mage-Flow Edit Turbo · Image Edit · 4 steps",
+            description=(
+                "Fast 4B BF16 image-editing model using the official four-step Turbo preset. "
+                "Installs or reuses environments/.mage_edit and stores the checkpoint in "
+                "models/mage_edit/Mage-Flow-Edit-Turbo."
+            ),
+            runner=_run_mage_flow_edit_turbo,
+        ),
+        OptionalInstall(
+            key="mage_flow_edit",
+            title="Mage-Flow Edit · Image Edit · 30 steps · higher quality",
+            description=(
+                "RL-aligned 4B BF16 image editor. Slower than Edit Turbo but intended for "
+                "higher-quality edits at 30 steps / CFG 5. Shares environments/.mage_edit and "
+                "downloads into models/mage_edit/Mage-Flow-Edit."
+            ),
+            runner=_run_mage_flow_edit,
         ),
         OptionalInstall(
             key="lens_turbo_u4",
@@ -2158,6 +2220,10 @@ _ENV_DIR_BY_KEY = {
     "wan22_turbo": Path("environments") / ".wan22_i2v",
     "zimage": Path("environments") / ".images_models",
     "chroma": Path("environments") / ".images_models",
+    "mage_flow_turbo": Path("environments") / ".mage_edit",
+    "mage_flow_edit_turbo": Path("environments") / ".mage_edit",
+    "mage_flow_edit": Path("environments") / ".mage_edit",
+    "mage_models": Path("environments") / ".mage_edit",
     "hidream_edit_base": Path("environments") / ".hidream_dev",
     "hidream_edit_dev": Path("environments") / ".hidream_dev",
     "hidream_edit_dev_2604_bf16": Path("environments") / ".hidream_dev",
@@ -2454,10 +2520,11 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             is_ideogram4_extra = opt.key.startswith("ideogram4_") and opt.key != "ideogram4_runtime"
             is_boogu_extra = opt.key.startswith("boogu_gguf_") or opt.key.startswith("boogu_edit_turbo_gguf_")
             is_krea2_extra = opt.key.startswith("krea2_gguf_")
+            is_mage_extra = opt.key.startswith("mage_flow_")
 
             row = _OptionRow(
                 opt,
-                indent=(26 if (is_zimage_extra or is_qwen_extra or is_qwen3tts_extra or is_seedvr2_extra or is_hunyuan15_extra or is_hidream_extra or is_ideogram4_extra or is_boogu_extra or is_krea2_extra) else 0),
+                indent=(26 if (is_zimage_extra or is_qwen_extra or is_qwen3tts_extra or is_seedvr2_extra or is_hunyuan15_extra or is_hidream_extra or is_ideogram4_extra or is_boogu_extra or is_krea2_extra or is_mage_extra) else 0),
             )
 
             if is_zimage_extra:
@@ -2478,6 +2545,8 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                 row.toggled.connect(lambda checked, k=opt.key: self._on_boogu_gguf_toggled(k, checked))
             if opt.key.startswith("krea2_gguf_"):
                 row.toggled.connect(lambda checked, k=opt.key: self._on_krea2_gguf_toggled(k, checked))
+            if opt.key.startswith("mage_flow_"):
+                row.toggled.connect(lambda checked, k=opt.key: self._on_mage_model_toggled(k, checked))
 
             if is_seedvr2_extra:
                 row.toggled.connect(lambda checked, k=opt.key: self._on_seedvr2_model_toggled(k, checked))
@@ -2542,6 +2611,18 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                 _add_opt(opt, chroma_lay)
 
         opts_lay.addWidget(chroma_sec)
+
+        # Microsoft Mage-Flow group (collapsible)
+        mage_sec = _CollapsibleSection("Microsoft Mage-Flow Text to Image / Image Edit", start_collapsed=True)
+        mage_lay = mage_sec.layout_content()
+
+        _add_group_label("BF16 models sharing one Mage environment (select one or more)", mage_lay)
+        for k in ("mage_flow_turbo", "mage_flow_edit_turbo", "mage_flow_edit"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, mage_lay)
+
+        opts_lay.addWidget(mage_sec)
 
         # Krea 2 Turbo GGUF group (collapsible)
         krea2_sec = _CollapsibleSection("Krea 2 Turbo GGUF Text to Image", start_collapsed=True)
@@ -3446,6 +3527,28 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
             self._toast("Ideogram 4 unconditional GGUF will download when you press Start.")
 
 
+    def _on_mage_model_toggled(self, key: str, checked: bool) -> None:
+        """Check the shared Mage installer/env while allowing multiple model selections."""
+        if not checked:
+            return
+
+        script = self.root_dir / "presets" / "extra_env" / "Mage_edit.py"
+        if not script.exists():
+            self._toast("Mage installer missing: presets/extra_env/Mage_edit.py")
+            return
+
+        py = _venv_python(self.root_dir)
+        if py is None or (not py.exists()):
+            self._toast("Python .venv not found. Run the main installer first so FrameVision creates .venv.")
+            return
+
+        env_dir = (self.root_dir / "environments" / ".mage_edit").resolve()
+        if not env_dir.exists():
+            self._toast("Mage environment not found — it will be installed first.")
+        else:
+            self._toast("Mage will reuse the existing environment/repository and download only missing selected models.")
+
+
     def _on_hidream_edit_model_toggled(self, key: str, checked: bool) -> None:
         """Keep HiDream model selections sane and warn when the installer is missing."""
         if not checked:
@@ -3525,6 +3628,39 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
                         "Installs or repairs the shared .ltx23 runtime and downloads both complete OzzyGT SDNQ repositories."
                     ),
                     runner=_run_ltx23_sdnq_both,
+                ),
+            )
+
+        # Mage model rows share one environment and source repository. Combine all
+        # selected checkpoints into one installer run so the existing-environment
+        # keep/delete prompt appears once and dependencies are not repaired repeatedly.
+        mage_key_to_token = {
+            "mage_flow_turbo": "turbo",
+            "mage_flow_edit_turbo": "edit-turbo",
+            "mage_flow_edit": "edit",
+        }
+        selected_mage_keys = [key for key in mage_key_to_token if key in checked_set]
+        if selected_mage_keys:
+            first_index = min(
+                i for i, opt in enumerate(ordered) if opt.key in selected_mage_keys
+            )
+            ordered = [opt for opt in ordered if opt.key not in selected_mage_keys]
+            model_tokens = tuple(mage_key_to_token[key] for key in selected_mage_keys)
+            labels = {
+                "turbo": "Text to Image Turbo",
+                "edit-turbo": "Edit Turbo",
+                "edit": "Edit 30-step",
+            }
+            ordered.insert(
+                first_index,
+                OptionalInstall(
+                    key="mage_models",
+                    title="Mage-Flow · " + " + ".join(labels[token] for token in model_tokens),
+                    description=(
+                        "Installs or reuses the shared .mage_edit environment and official Mage "
+                        "repository, then downloads every selected checkpoint in one pass."
+                    ),
+                    runner=lambda root, tokens=model_tokens: _run_mage_models(root, ",".join(tokens)),
                 ),
             )
 

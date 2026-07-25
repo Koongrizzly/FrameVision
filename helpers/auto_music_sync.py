@@ -1444,9 +1444,9 @@ def _musicclip_ltx_raw_padding_settings_from_payload(payload: dict) -> tuple[flo
     except Exception:
         raw_frames = 265
     try:
-        pad_seconds = float(settings.get("ltx_generation_tail_padding_seconds") or payload.get("ltx_generation_tail_padding_seconds") or 1.0)
+        pad_seconds = float(settings.get("ltx_generation_tail_padding_seconds") or payload.get("ltx_generation_tail_padding_seconds") or 0.5)
     except Exception:
-        pad_seconds = 1.0
+        pad_seconds = 0.5
     raw_seconds = max(0.0, min(11.0, raw_seconds))
     raw_frames = max(0, min(265, raw_frames))
     pad_seconds = max(0.0, min(2.0, pad_seconds))
@@ -1509,7 +1509,7 @@ def _musicclip_ltx_apply_raw_padding_to_plan_file(plan_path: str, payload: dict,
             # Add up to one second of raw tail, capped at 11s/265f. For a 10s
             # planned shot this becomes 11s/265f, but assembly/audio still see 10s.
             render_seconds = min(float(raw_seconds), max(float(dur), float(dur) + float(pad_seconds)))
-            render_frames = min(int(raw_frames), max(1, int(round(render_seconds * max(1, fps))) + 1))
+            render_frames = min(int(raw_frames), _musicclip_ltx_frames_for_duration(render_seconds, max(1, fps)))
             old = (
                 shot.get("ltx_planned_duration_seconds"),
                 shot.get("ltx_raw_generation_seconds"),
@@ -14959,11 +14959,16 @@ class AutoMusicSyncWidget(QWidget):
         footer_outer.setContentsMargins(0, 0, 0, 0)
         footer_outer.setSpacing(4)
 
-        footer_row_top = QHBoxLayout()
+        # Keep each workflow row in its own widget so the complete row can be
+        # hidden without leaving empty layout spacing. The progress/logger stays
+        # directly in footer_outer and therefore remains visible on every tab.
+        self.footer_normal_row_widget = QWidget(self.footer_bar)
+        footer_row_top = QHBoxLayout(self.footer_normal_row_widget)
         footer_row_top.setContentsMargins(0, 0, 0, 0)
         footer_row_top.setSpacing(6)
 
-        footer_row_bottom = QHBoxLayout()
+        self.footer_ltx_row_widget = QWidget(self.footer_bar)
+        footer_row_bottom = QHBoxLayout(self.footer_ltx_row_widget)
         footer_row_bottom.setContentsMargins(0, 0, 0, 0)
         footer_row_bottom.setSpacing(6)
 
@@ -15092,10 +15097,10 @@ class AutoMusicSyncWidget(QWidget):
             footer_row_bottom.addWidget(self.btn_footer_cancel_ltx_generation)
         footer_row_bottom.addStretch(1)
 
-        footer_outer.addLayout(footer_row_top)
-        footer_outer.addLayout(footer_row_bottom)
+        footer_outer.addWidget(self.footer_normal_row_widget)
+        footer_outer.addWidget(self.footer_ltx_row_widget)
         # Keep render/queue progress attached to the sticky footer so it stays
-        # visible while the user is on Normal, LTX workflow, LTX Review, or Settings.
+        # visible on every Music Clip Creator tab, even when both action rows are hidden.
         try:
             footer_outer.addWidget(self.progress)
         except Exception:
@@ -15169,6 +15174,14 @@ class AutoMusicSyncWidget(QWidget):
             # action bar, so do not wrap the whole tab in another scroll area.
             self.tabs.addTab(page_ltx_review, "LTX Review")
         self.tabs.addTab(_scroll_tab_page(page_settings), "Settings")
+
+        # The sticky footer follows the active sub-tab. Review keeps only the
+        # logger/progress bar; Settings deliberately exposes both workflow rows.
+        try:
+            self.tabs.currentChanged.connect(self._update_footer_for_active_tab)
+            self._update_footer_for_active_tab(self.tabs.currentIndex())
+        except Exception:
+            pass
 
         # Preset manager safety: the UI is now split across Generation + Settings,
         # so capture all setting roots instead of only the old Options/Advanced boxes.
@@ -16682,7 +16695,7 @@ class AutoMusicSyncWidget(QWidget):
             "hard_max_ltx_shot_seconds": 9.9 if backend in {"int4", "vramlab"} else None,
             "ltx_raw_generation_seconds": 11.0 if backend in {"int4", "vramlab"} else None,
             "ltx_raw_generation_frames": 265 if backend in {"int4", "vramlab"} else None,
-            "ltx_generation_tail_padding_seconds": 1.0 if backend in {"int4", "vramlab"} else None,
+            "ltx_generation_tail_padding_seconds": 0.5 if backend in {"int4", "vramlab"} else None,
             "ltx_trim_to_planned_shot_seconds": True if backend in {"int4", "vramlab"} else None,
             "timestamped_microclips_enabled": bool(getattr(self, "check_bridge_timestamped_microclips", None) and self.check_bridge_timestamped_microclips.isChecked()),
             "collage_effect_enabled": bool(getattr(self, "check_bridge_collage_effect", None) and self.check_bridge_collage_effect.isChecked()),
@@ -18006,6 +18019,24 @@ class AutoMusicSyncWidget(QWidget):
             "assemble_after": bool(assemble_after),
         }
         try:
+            settings = self._planner_bridge_generation_settings()
+            if isinstance(settings, dict) and settings:
+                payload["bridge_generation_settings"] = settings
+                for _key in (
+                    "ltx_raw_generation_seconds",
+                    "ltx_raw_generation_frames",
+                    "ltx_generation_tail_padding_seconds",
+                    "ltx_trim_to_planned_shot_seconds",
+                    "ltx_max_generation_seconds",
+                    "ltx_max_generation_frames",
+                    "hard_max_ltx_shot_seconds",
+                ):
+                    _val = settings.get(_key)
+                    if _val not in (None, ""):
+                        payload[_key] = _val
+        except Exception:
+            pass
+        try:
             payload.update(self._ltx_own_prompts_payload())
             if payload.get("own_prompts_enabled"):
                 payload["exact_prompt_passthrough"] = True
@@ -18018,10 +18049,10 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
         try:
-            if str(payload.get("ltx_backend") or "").strip().lower() == "vramlab":
+            if str(payload.get("ltx_backend") or "").strip().lower() in {"int4", "vramlab"}:
                 payload["ltx_raw_generation_seconds"] = 11.0
                 payload["ltx_raw_generation_frames"] = 265
-                payload["ltx_generation_tail_padding_seconds"] = 1.0
+                payload["ltx_generation_tail_padding_seconds"] = 0.5
                 payload["ltx_trim_to_planned_shot_seconds"] = True
         except Exception:
             pass
@@ -19534,6 +19565,67 @@ class AutoMusicSyncWidget(QWidget):
             fixed.append(self._ltx_review_reconcile_row_assets(row, state_item, str(plan_path or "")))
         return fixed
 
+    def _ltx_review_sync_reconciled_rows_to_state(self, plan_path: str, rows: list) -> None:
+        """Persist disk-reconciled review assets before resume/assembly.
+
+        Older review states can still mark every clip invalid after the initial
+        image pass, even though the review loader has found valid clips on disk.
+        The UI then shows Ready while the bridge reads stale state and starts
+        generation again at LTX01.  Make the persisted state match the rows that
+        were actually verified on disk.
+        """
+        if not plan_path or not isinstance(rows, list):
+            return
+        try:
+            state = self._ltx_review_read_state(plan_path)
+            if not isinstance(state, dict):
+                state = {}
+            shots_state = state.setdefault("shots", {})
+            if not isinstance(shots_state, dict):
+                shots_state = {}
+                state["shots"] = shots_state
+            changed = False
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                sid = str(row.get("shot_id") or row.get("id") or "").strip()
+                if not sid:
+                    continue
+                item = shots_state.get(sid)
+                if not isinstance(item, dict):
+                    item = {}
+                    shots_state[sid] = item
+                image_path = self._ltx_review_safe_existing_path(
+                    row.get("current_start_image_path") or row.get("start_image_path")
+                )
+                clip_path = self._ltx_review_safe_existing_path(
+                    row.get("current_clip_path") or row.get("clip_path")
+                )
+                if image_path and item.get("current_start_image_path") != image_path:
+                    item["current_start_image_path"] = image_path
+                    changed = True
+                if clip_path:
+                    if item.get("current_clip_path") != clip_path:
+                        item["current_clip_path"] = clip_path
+                        changed = True
+                    # A clip physically verified by the review reconciliation is
+                    # complete, regardless of a stale invalidation flag left by
+                    # the earlier image-generation pass.
+                    if item.get("clip_invalidated_by_new_image") is not False:
+                        item["clip_invalidated_by_new_image"] = False
+                        changed = True
+                    if item.get("status") != "Ready":
+                        item["status"] = "Ready"
+                        changed = True
+                elif image_path and item.get("status") != "Image ready - clip needs recreate":
+                    item["status"] = "Image ready - clip needs recreate"
+                    changed = True
+            if changed:
+                state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                self._ltx_review_write_state(plan_path, state)
+        except Exception:
+            pass
+
     def _on_ltx_review_continue_reassemble_clicked(self) -> None:
         """Rebuild the final LTX video from the active review job's latest clips only."""
         if bool(getattr(self, "_ltx_assembly_running", False)):
@@ -19574,6 +19666,10 @@ class AutoMusicSyncWidget(QWidget):
             pass
         try:
             rows = self._ltx_review_load_rows_for_reassembly(plan_path)
+            # The review list may discover valid original/recreated clips that
+            # are missing from an older stale JSON state. Persist those findings
+            # before either the resume worker or assembly bridge reads the state.
+            self._ltx_review_sync_reconciled_rows_to_state(plan_path, rows)
         except Exception as exc:
             msg = f"Could not check reviewed clips: {exc}"
             self._set_planner_bridge_status(f"Planner Bridge: {msg}")
@@ -21236,7 +21332,7 @@ class AutoMusicSyncWidget(QWidget):
                     override_plan_path = os.path.join(review_dir, f"{stem}_review_director_plan_override.json")
                     with open(override_plan_path, "w", encoding="utf-8") as f:
                         json.dump(temp_plan, f, indent=2, ensure_ascii=False)
-                clip_result = run_fn({
+                single_payload = {
                     "root_dir": _musicclip_project_root(),
                     "ltx_backend": self._current_ltx_generation_backend(),
                     "ltx_generation_backend": self._current_ltx_generation_backend(),
@@ -21260,7 +21356,26 @@ class AutoMusicSyncWidget(QWidget):
                     "log_name": f"{stem}_review_ltx23.log.txt",
                     "duration_report_name": f"{stem}_review_duration_report.json",
                     "progress_callback": progress_callback,
-                })
+                }
+                try:
+                    settings = self._planner_bridge_generation_settings()
+                    if isinstance(settings, dict) and settings:
+                        single_payload["bridge_generation_settings"] = settings
+                        for _key in (
+                            "ltx_raw_generation_seconds",
+                            "ltx_raw_generation_frames",
+                            "ltx_generation_tail_padding_seconds",
+                            "ltx_trim_to_planned_shot_seconds",
+                            "ltx_max_generation_seconds",
+                            "ltx_max_generation_frames",
+                            "hard_max_ltx_shot_seconds",
+                        ):
+                            _val = settings.get(_key)
+                            if _val not in (None, ""):
+                                single_payload[_key] = _val
+                except Exception:
+                    pass
+                clip_result = run_fn(single_payload)
                 if not isinstance(clip_result, dict) or not bool(clip_result.get("ok")):
                     return {"ok": False, "message": str(clip_result.get("message") if isinstance(clip_result, dict) else "Clip recreate failed.")}
                 current_clip = str(clip_result.get("sync_clip_path") or clip_result.get("ltx_clip_path") or "").strip()
@@ -21281,6 +21396,47 @@ class AutoMusicSyncWidget(QWidget):
             return {"ok": True, "message": f"Review shot updated: {shot_id}", "shot_id": shot_id, "review_state_path": self._ltx_review_state_path_for_plan(plan_path), "review_dir": review_dir, "start_image_path": str(item_state.get("current_start_image_path") or ""), "clip_path": str(item_state.get("current_clip_path") or ""), "image_result": image_result, "clip_result": clip_result}
         except Exception as exc:
             return {"ok": False, "message": f"LTX review recreate failed: {exc}"}
+
+    def _update_footer_for_active_tab(self, index: int = -1) -> None:
+        """Show only the workflow actions relevant to the active sub-tab.
+
+        Normal and Timeline belong to the normal workflow, LTX workflow gets only
+        the LTX actions, Review intentionally gets no workflow actions, and
+        Settings keeps the old combined footer. The progress/logger is not touched.
+        """
+        try:
+            if index is None or int(index) < 0:
+                index = self.tabs.currentIndex()
+            title = str(self.tabs.tabText(int(index)) or "").strip().lower()
+        except Exception:
+            title = "normal"
+
+        if title == "settings":
+            show_normal = True
+            show_ltx = True
+        elif title == "ltx workflow":
+            show_normal = False
+            show_ltx = True
+        elif title == "ltx review":
+            show_normal = False
+            show_ltx = False
+        else:
+            # Normal and its optional Timeline page use the normal workflow row.
+            show_normal = True
+            show_ltx = False
+
+        try:
+            row = getattr(self, "footer_normal_row_widget", None)
+            if row is not None:
+                row.setVisible(bool(show_normal))
+        except Exception:
+            pass
+        try:
+            row = getattr(self, "footer_ltx_row_widget", None)
+            if row is not None:
+                row.setVisible(bool(show_ltx))
+        except Exception:
+            pass
 
     def _update_smart_director_visibility(self) -> None:
         """Keep Smart Director controls and the classic FX Level row in sync."""
