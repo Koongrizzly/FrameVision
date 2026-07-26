@@ -431,7 +431,28 @@ def _apply_ltx_cli_auto_workflow_profile(
         profile["main_hot_window_override_gb"] = hotset
     if getattr(args, "stage2_block_size_limit_gb", None) is None and stage2 > 0.0:
         profile["stage2_hot_window_gb"] = stage2
-    profile.setdefault("stage1_stable_hotset_fraction", 1.15)
+
+    # Auto must carry its calculated hotset through to the residency manager.
+    # Previously Auto updated only the profile's block limits while leaving the
+    # fixed stable-hotset budget at the argparse default of 0.0.  On a 24 GB
+    # card that made planned_hotset derive a different layout and doubled the
+    # steady-state block churn (about 50 moves instead of 25 per step).
+    # Preserve an explicit caller override, but otherwise use Auto's own hotset.
+    try:
+        requested_budget = float(getattr(args, "stable_hotset_budget_gb", 0.0) or 0.0)
+    except Exception:
+        requested_budget = 0.0
+    if requested_budget <= 0.0 and hotset > 0.0:
+        args.stable_hotset_budget_gb = hotset
+
+    # Match the proven explicit 24 GB profile's Stage-1 residency tuning when
+    # Auto detects a 24 GB card. Explicit CLI/UI stage-fraction overrides still
+    # win because main() reads args first. Other VRAM profiles keep their own
+    # existing defaults.
+    if int(profile_gb) >= 24 and getattr(args, "stage1_stable_hotset_fraction", None) is None:
+        profile["stage1_stable_hotset_fraction"] = 1.12
+    else:
+        profile.setdefault("stage1_stable_hotset_fraction", 1.15)
     profile.setdefault("stage2_stable_hotset_fraction", 0.9)
     profile["note"] = (
         str(profile.get("note", "selected LTX VRAM profile"))

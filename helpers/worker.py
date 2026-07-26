@@ -7004,6 +7004,12 @@ def handle_job(jpath: Path):
         elif t in ('boogu_generate','boogu','boogu_image'):
             # Boogu Image is launched through sd-cli and streamed like the other external tool jobs.
             code = tools_ffmpeg(job, cfg, mani)
+        elif t in ('mage_generate','mage','mage_image'):
+            # Mage Image queue jobs launch the Mage helper headlessly and stream logs like other external tools.
+            code = tools_ffmpeg(job, cfg, mani)
+        elif t in ('mage_edit_generate','mage_edit','mage_flow_edit'):
+            # Mage Edit queue jobs launch the dedicated Mage helper headlessly.
+            code = tools_ffmpeg(job, cfg, mani)
         elif t in ("qwen2511_int4_image_edit", "qwen2511_int4_edit", "qwen2511_nunchaku_int4"):
             code = qwen2511_int4_image_edit(job, cfg, mani)
         elif t in ("qwen2511_image_edit","qwen2511_edit","qwen2511"):

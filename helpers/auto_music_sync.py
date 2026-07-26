@@ -2700,10 +2700,69 @@ def _load_musicclip_planner_bridge():
     return _musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("musicclip_planner_bridge.py", "_framevision_musicclip_planner_bridge"))))
 
 
+def _musicclip_patch_vramlab_fp16_checkpoint_guard(mod):
+    """Prevent the normal FP16/FP8 VRAM-Lab bridge from using INT4 paths.
+
+    Only repairs an invalid checkpoint selection. Valid existing FP16/FP8
+    checkpoint files remain untouched, and the INT4 bridge is not modified.
+    """
+    if mod is None or bool(getattr(mod, "_framevision_fp16_checkpoint_guard_patched", False)):
+        return mod
+
+    def _patch_target(target):
+        if target is None or bool(getattr(target, "_framevision_fp16_checkpoint_guard_target", False)):
+            return
+        original = getattr(target, "_ltx23_vramlab_ui_settings", None)
+        if not callable(original):
+            return
+
+        def _guarded_settings(*args, **kwargs):
+            settings = original(*args, **kwargs)
+            if not isinstance(settings, dict):
+                return settings
+            result = dict(settings)
+            root = Path(_musicclip_project_root())
+            fallback = root / "models" / "ltx23" / "distilled-1.1" / "ltx-2.3-22b-distilled-1.1.safetensors"
+            raw = str(result.get("checkpoint_path") or "").strip().strip('"')
+            invalid = not raw
+            if raw:
+                try:
+                    candidate = Path(raw)
+                    if not candidate.is_absolute():
+                        candidate = root / candidate
+                    candidate = candidate.resolve()
+                    low = str(candidate).replace("\\", "/").lower()
+                    invalid = (
+                        "models/ltx23_int4" in low
+                        or candidate.is_dir()
+                        or not candidate.is_file()
+                    )
+                except Exception:
+                    invalid = True
+            if invalid:
+                result["checkpoint_path"] = str(fallback)
+            return result
+
+        setattr(target, "_ltx23_vramlab_ui_settings", _guarded_settings)
+        setattr(target, "_framevision_fp16_checkpoint_guard_target", True)
+
+    try:
+        _patch_target(mod)
+        base = getattr(mod, "_BASE", None)
+        if base is not None and base is not mod:
+            _patch_target(base)
+        setattr(mod, "_framevision_fp16_checkpoint_guard_patched", True)
+    except Exception:
+        pass
+    return mod
+
+
 def _load_clip2ltx_bridge():
     # Own LTX-VRAMLab FP16/FP8 bridge. This is the copy of the original bridge
     # that calls helpers/ltx23_vram_lab_cli.py directly.
-    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("clip2ltx_cli.py", "_framevision_clip2ltx_bridge"))))
+    bridge = _load_musicclip_bridge_file("clip2ltx_cli.py", "_framevision_clip2ltx_bridge")
+    bridge = _musicclip_patch_vramlab_fp16_checkpoint_guard(bridge)
+    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(bridge)))
 
 
 def _load_music_ltx_int4_bridge():

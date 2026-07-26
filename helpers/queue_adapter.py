@@ -661,6 +661,56 @@ def enqueue_boogu_generate(settings: dict, priority: int = 610):
     return enqueue_tool_job('boogu_generate', '', str(out_dir), args, priority=int(priority))
 
 
+def default_mage_outdir():
+    base = _base_root()
+    d = base / 'output' / 'images' / 'mage'
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def enqueue_mage_generate(settings: dict, priority: int = 610):
+    """Queue one Mage Image helper generation job for the FrameVision worker."""
+    root = _base_root()
+    data = dict(settings or {})
+
+    def _text(key: str, default: str = '') -> str:
+        try:
+            return str(data.get(key, default) or '')
+        except Exception:
+            return default
+
+    def _int(key: str, default: int) -> int:
+        try:
+            return int(data.get(key, default))
+        except Exception:
+            try:
+                return int(float(data.get(key, default)))
+            except Exception:
+                return int(default)
+
+    prompt = _text('prompt').strip()
+    out_dir = Path(_text('output_dir') or default_mage_outdir())
+    if not out_dir.is_absolute():
+        out_dir = root / out_dir
+    out_dir = out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = data.get('cmd') or data.get('ffmpeg_cmd')
+    if not cmd:
+        raise RuntimeError('Mage queue job is missing cmd/ffmpeg_cmd.')
+    preview = prompt.replace('\n', ' ').strip()[:80] or 'Mage Image'
+    label = _text('label') or ('Mage Image: ' + preview)
+    args = {
+        'label': label, 'engine': 'mage_image', 'queue_family': 'mage', 'progress_owner': 'Mage Image',
+        'ffmpeg_cmd': list(cmd) if isinstance(cmd, (list, tuple)) else cmd,
+        'cmd': list(cmd) if isinstance(cmd, (list, tuple)) else cmd,
+        'cwd': _text('cwd') or str(root), 'env': data.get('env') if isinstance(data.get('env'), dict) else {},
+        'scan_dir': _text('scan_dir') or str(out_dir), 'scan_ext': _text('scan_ext') or '.png',
+        'prompt': prompt, 'width': _int('width', 1024), 'height': _int('height', 1024),
+        'steps': _int('steps', 4), 'seed': _int('seed', -1), 'request_path': _text('request_path'),
+    }
+    return enqueue_tool_job('mage_generate', '', str(out_dir), args, priority=int(priority))
+
+
 def enqueue_ace_step15(cfg_path: str, out_dir: str, env_python: str, cli_py: str, project_root: str, label: str="Ace-Step 1.5", hide_console: bool=True, priority: int=620):
     """Convenience wrapper to enqueue an Ace-Step 1.5 job.
     The Ace-Step 1.5 UI writes a TOML config first, then enqueues the job so it is
@@ -2378,3 +2428,50 @@ def enqueue_qwen2511_int4_from_widget(inner):
         raise RuntimeError("Qwen 2511 widget is unavailable.")
     return enqueue_qwen2511_int4_request(inner.build_request(), root=getattr(inner, "root", None))
 
+
+
+# --- Mage Edit queue integration ---------------------------------------------
+def enqueue_mage_edit_request(request: dict, root=None, priority: int = 610):
+    import json as _json
+    import uuid as _uuid
+    root_path = Path(root).resolve() if root else _base_root()
+    request_dir = root_path / "temp" / "mage_edit_queue"
+    request_dir.mkdir(parents=True, exist_ok=True)
+    request_path = request_dir / ("request_" + _uuid.uuid4().hex + ".json")
+    request_path.write_text(_json.dumps(dict(request), indent=2, ensure_ascii=False), encoding="utf-8")
+    env_dir = root_path / "environments" / ".mage_edit"
+    py = env_dir / "python.exe"
+    if not py.exists():
+        py = env_dir / "Scripts" / "python.exe"
+    helper = root_path / "helpers" / "mage_edit.py"
+    out_cfg = dict(request.get("output") or {})
+    out_dir = str(out_cfg.get("folder") or (root_path / "output" / "edits"))
+    refs = list(request.get("references") or [])
+    prompt = str(request.get("prompt") or "").strip()
+    cmd = [str(py), "-u", str(helper), "--queue-request", str(request_path), "--root", str(root_path)]
+    env = {
+        "PYTHONNOUSERSITE": "1", "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1",
+        "VF_HF_ATTN_IMPL": "flash_attention_2",
+        "HF_HOME": str(root_path / "temp" / "mage_edit" / "cache" / "huggingface"),
+        "TORCH_HOME": str(root_path / "temp" / "mage_edit" / "cache" / "torch"),
+        "TEMP": str(root_path / "temp" / "mage_edit"),
+        "TMP": str(root_path / "temp" / "mage_edit"),
+    }
+    job = {
+        "cmd": cmd, "cwd": str(root_path), "env": env, "out_dir": out_dir,
+        "outfile": out_dir, "prompt": prompt,
+        "label": "Mage Edit: " + (prompt.replace("\n", " ")[:80] or "image edit"),
+        "engine": "mage_edit", "backend": "mage_edit",
+        "references": refs, "ref_images": refs, "request_file": str(request_path),
+    }
+    path = enqueue_external(job)
+    try:
+        data = _json.loads(Path(path).read_text(encoding="utf-8"))
+        data["type"] = "mage_edit_generate"
+        data["engine"] = "mage_edit"
+        data["backend"] = "mage_edit"
+        Path(path).write_text(_json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    return path
+# -----------------------------------------------------------------------------

@@ -163,6 +163,22 @@ def _fv_startup_lazy_load_tools_enabled() -> bool:
 
 
 
+def _load_mage_edit_ui_class():
+    global _LAST_MAGE_EDIT_IMPORT_ERROR
+    _LAST_MAGE_EDIT_IMPORT_ERROR = ""
+    try:
+        from helpers.mage_edit import MageEditUI  # type: ignore
+        return MageEditUI
+    except Exception as exc:
+        _LAST_MAGE_EDIT_IMPORT_ERROR = repr(exc)
+        try:
+            from mage_edit import MageEditUI  # type: ignore
+            return MageEditUI
+        except Exception as exc2:
+            _LAST_MAGE_EDIT_IMPORT_ERROR = repr(exc2)
+            return None
+
+
 class ClickableLabel(QtWidgets.QLabel):
     """Tiny clickable thumbnail label."""
     clicked = QtCore.Signal()
@@ -2299,6 +2315,19 @@ class Qwen2511Pane(QtWidgets.QWidget):
                     ),
                     "HiDream Image Edit",
                 )
+        try:
+            _mage_edit_page = self._build_mage_edit_tab()
+            self.tabs.addTab(_mage_edit_page, "Mage Edit")
+            self._lazy_tab_loaded.add("Mage Edit")
+        except Exception as exc:
+            detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+            self.tabs.addTab(
+                self._make_tool_error_page(
+                    "Mage Edit",
+                    "Mage Edit failed to load during startup.\n\nReason:\n" + detail,
+                ),
+                "Mage Edit",
+            )
         if not _firered_hidden_by_remove_hide():
             self.tabs.addTab(
                 self._make_lazy_placeholder(
@@ -2672,7 +2701,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         try:
             if self._find_tab_index_by_title(title) >= 0:
                 return
-            order = ["Qwen Edit", "Flux Klein", "HiDream Image Edit", "Firered 1.1"]
+            order = ["Qwen Edit", "Flux Klein", "HiDream Image Edit", "Mage Edit", "Firered 1.1"]
             wanted_pos = order.index(title) if title in order else len(order)
             insert_at = self.tabs.count()
             for i in range(self.tabs.count()):
@@ -3042,6 +3071,26 @@ class Qwen2511Pane(QtWidgets.QWidget):
             self.hidream_pane = None
             return self._make_tool_error_page("HiDream Image Edit", str(exc))
 
+    def _build_mage_edit_tab(self) -> QtWidgets.QWidget:
+        cls = _load_mage_edit_ui_class()
+        if cls is None:
+            self.mage_edit_pane = None
+            detail = globals().get("_LAST_MAGE_EDIT_IMPORT_ERROR", "") or "No Python exception was reported."
+            return self._make_tool_error_page(
+                "Mage Edit",
+                "mage_edit.py could not be imported.\n\nReason:\n" + str(detail),
+            )
+        try:
+            self.mage_edit_pane = cls(self, root=APP_ROOT)
+            try:
+                self.mage_edit_pane.setWindowTitle("")
+            except Exception:
+                pass
+            return self.mage_edit_pane
+        except Exception as exc:
+            self.mage_edit_pane = None
+            return self._make_tool_error_page("Mage Edit", str(exc))
+
     def _build_firered_tab(self) -> QtWidgets.QWidget:
         if _firered_hidden_by_remove_hide():
             # Safety guard: this should normally never be reached because the
@@ -3160,6 +3209,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
             banner_map = {
                 "Flux Klein": "FLUX Klein 2 Create + Edit (4B & 9B gguf loader)",
                 "HiDream Image Edit": "HiDream Image Edit (BF16 Base / Dev)",
+                "Mage Edit": "Mage Flow Edit",
                 "Firered 1.1": "Firered 1.1 edit (gguf loader)",
             }
             self.banner.setText(banner_map.get(tab_text, tab_text or "Qwen Edit 2511"))

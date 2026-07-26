@@ -119,6 +119,122 @@ def unique_path(path: Path) -> Path:
     raise RuntimeError(f"Could not choose a unique output path for {path}")
 
 
+def scaled_source_resolution(path: Path, maximum: int) -> tuple[int, int]:
+    """Return a source-proportional size rounded to multiples of 16."""
+    from PIL import Image
+
+    with Image.open(path) as opened:
+        width, height = opened.size
+    maximum = max(256, min(2048, int(maximum)))
+    scale = min(1.0, maximum / max(width, height))
+    width = max(256, int(round((width * scale) / 16) * 16))
+    height = max(256, int(round((height * scale) / 16) * 16))
+    return min(width, 2048), min(height, 2048)
+
+
+def protect_original_area(
+    source_image: Any,
+    generated_image: Any,
+    blend_width: int = 64,
+    color_match_enabled: bool = False,
+    color_match_strength: int = 70,
+) -> Any:
+    """Protect the source with a feathered mask and optional tone matching.
+
+    The source is placed at the same centered fit used for outpainting. Its inner
+    area remains unchanged, while a narrow edge strip gradually blends into the
+    generated image so exposure and colour differences do not form a hard seam.
+
+    When colour/brightness matching is enabled, the generated canvas is first
+    gently adjusted so the area under the protected center better matches the
+    original source image. This reduces visible seams before the soft blend.
+    """
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageStat
+
+    source = source_image.convert("RGB") if hasattr(source_image, "convert") else source_image
+    generated = generated_image.convert("RGB") if hasattr(generated_image, "convert") else generated_image
+    source_width, source_height = source.size
+    canvas_width, canvas_height = generated.size
+    if source_width <= 0 or source_height <= 0 or canvas_width <= 0 or canvas_height <= 0:
+        return generated
+
+    scale = min(canvas_width / source_width, canvas_height / source_height)
+    pasted_width = max(1, int(round(source_width * scale)))
+    pasted_height = max(1, int(round(source_height * scale)))
+    resized_source = source.resize((pasted_width, pasted_height), Image.Resampling.LANCZOS)
+
+    left = max(0, (canvas_width - pasted_width) // 2)
+    top = max(0, (canvas_height - pasted_height) // 2)
+    right = min(canvas_width, left + pasted_width)
+    bottom = min(canvas_height, top + pasted_height)
+
+    source_canvas = Image.new("RGB", generated.size)
+    source_canvas.paste(resized_source, (left, top))
+
+    generated_matched = generated
+    if color_match_enabled:
+        strength = max(0.0, min(1.0, float(color_match_strength) / 100.0))
+        if strength > 0.0:
+            try:
+                generated_crop = generated.crop((left, top, right, bottom))
+                source_stat = ImageStat.Stat(resized_source)
+                generated_stat = ImageStat.Stat(generated_crop)
+                mean_source = source_stat.mean[:3]
+                mean_generated = generated_stat.mean[:3]
+                std_source = [max(1e-3, value) for value in source_stat.stddev[:3]]
+                std_generated = [max(1e-3, value) for value in generated_stat.stddev[:3]]
+
+                adjusted_bands = []
+                for channel_index, band in enumerate(generated.split()[:3]):
+                    target_scale = max(0.8, min(1.25, std_source[channel_index] / std_generated[channel_index]))
+                    scale_value = 1.0 + (target_scale - 1.0) * strength
+                    target_offset = mean_source[channel_index] - (mean_generated[channel_index] * scale_value)
+                    offset_value = max(-28.0, min(28.0, target_offset * strength))
+                    adjusted_bands.append(
+                        band.point(lambda px, s=scale_value, o=offset_value: int(max(0, min(255, round(px * s + o)))))
+                    )
+                generated_matched = Image.merge("RGB", tuple(adjusted_bands))
+            except Exception:
+                generated_matched = generated
+
+    blend_width = max(0, min(512, int(blend_width)))
+    mask = Image.new("L", generated.size, 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rectangle((left, top, max(left, right - 1), max(top, bottom - 1)), fill=255)
+
+    # Only feather edges that border newly generated canvas. Edges that already
+    # touch the canvas remain fully protected, avoiding unnecessary softening.
+    feather_left = left > 0
+    feather_right = right < canvas_width
+    feather_top = top > 0
+    feather_bottom = bottom < canvas_height
+    if blend_width > 0 and any((feather_left, feather_right, feather_top, feather_bottom)):
+        ramp_x = Image.new("L", generated.size, 255)
+        ramp_y = Image.new("L", generated.size, 255)
+        px = ramp_x.load()
+        py = ramp_y.load()
+        for x in range(left, right):
+            value = 255
+            if feather_left:
+                value = min(value, int(255 * min(1.0, max(0.0, (x - left) / blend_width))))
+            if feather_right:
+                value = min(value, int(255 * min(1.0, max(0.0, (right - 1 - x) / blend_width))))
+            for y in range(top, bottom):
+                px[x, y] = value
+        for y in range(top, bottom):
+            value = 255
+            if feather_top:
+                value = min(value, int(255 * min(1.0, max(0.0, (y - top) / blend_width))))
+            if feather_bottom:
+                value = min(value, int(255 * min(1.0, max(0.0, (bottom - 1 - y) / blend_width))))
+            for x in range(left, right):
+                py[x, y] = value
+        mask = ImageChops.multiply(mask, ImageChops.multiply(ramp_x, ramp_y))
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=max(1.0, blend_width / 6.0)))
+
+    return Image.composite(source_canvas, generated_matched, mask)
+
+
 def worker_event(event: str, **payload: Any) -> None:
     message = {"event": event, **payload}
     print(EVENT_PREFIX + json.dumps(message, ensure_ascii=False), flush=True)
@@ -593,23 +709,22 @@ class PipelineServer:
             if not path.exists():
                 raise FileNotFoundError(f"Reference image not found: {path}")
 
+        batch_mode = bool(request.get("batch_mode", False))
+        protect_original = batch_mode and bool(request.get("protect_original_area", False))
+        source_groups = [[path] for path in references] if batch_mode else [references]
+
         prompt = str(request.get("prompt", "")).strip()
         if not prompt:
             raise ValueError("The edit prompt is empty.")
 
         pipeline, runtime = self.ensure_pipeline(request)
-        images = []
-        for path in references:
-            with Image.open(path) as opened:
-                images.append(opened.convert("RGB"))
-
         width = request.get("width")
         height = request.get("height")
+        resolution_mode = str(request.get("resolution_mode", "fixed"))
+        source_max_side = int(request.get("source_max_side", 1024))
         steps = int(request.get("steps") or runtime["profile_steps"])
         count = max(1, min(8, int(request.get("count", 1))))
-        seed_value = int(request.get("seed", -1))
-        if seed_value < 0:
-            seed_value = int.from_bytes(os.urandom(8), "little") % (2**31 - 1)
+        requested_seed = int(request.get("seed", -1))
 
         output = request.get("output", {})
         output_folder = Path(str(output.get("folder", self.root / "output" / "edits"))).expanduser().resolve()
@@ -628,94 +743,141 @@ class PipelineServer:
         outputs: list[str] = []
         seeds: list[int] = []
         batch_started = time.time()
+        total_generations = len(source_groups) * count
+        generation_number = 0
 
-        for image_index in range(count):
-            actual_seed = seed_value + image_index
-            seeds.append(actual_seed)
-            worker_event(
-                "status",
-                message=f"Generating image {image_index + 1}/{count} · seed {actual_seed}",
-            )
+        for source_index, source_paths in enumerate(source_groups):
+            images = []
+            for path in source_paths:
+                with Image.open(path) as opened:
+                    images.append(opened.convert("RGB"))
 
-            def callback(_pipe: Any, step_index: int, _timestep: Any, callback_kwargs: dict[str, Any]):
+            source_path = source_paths[0]
+            source_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", source_path.stem).strip("._") or "source"
+            source_width, source_height = width, height
+            if resolution_mode == "source":
+                source_width, source_height = scaled_source_resolution(source_path, source_max_side)
+
+            for image_index in range(count):
+                generation_number += 1
+                if requested_seed < 0:
+                    actual_seed = int.from_bytes(os.urandom(8), "little") % (2**31 - 1)
+                else:
+                    actual_seed = requested_seed + image_index
+                seeds.append(actual_seed)
+
+                if batch_mode:
+                    status = (
+                        f"Source {source_index + 1}/{len(source_groups)} · "
+                        f"output {image_index + 1}/{count} · seed {actual_seed}"
+                    )
+                else:
+                    status = f"Generating image {image_index + 1}/{count} · seed {actual_seed}"
+                worker_event("status", message=status)
+
+                def callback(_pipe: Any, step_index: int, _timestep: Any, callback_kwargs: dict[str, Any]):
+                    worker_event(
+                        "progress",
+                        current=step_index + 1,
+                        total=steps,
+                        image=generation_number,
+                        image_total=total_generations,
+                        source=source_index + 1,
+                        source_total=len(source_groups),
+                        output=image_index + 1,
+                        output_total=count,
+                    )
+                    return callback_kwargs
+
+                kwargs: dict[str, Any] = {
+                    "image": images if len(images) > 1 else images[0],
+                    "prompt": prompt,
+                    "num_inference_steps": steps,
+                    "true_cfg_scale": true_cfg,
+                    "generator": torch.Generator(device="cpu").manual_seed(actual_seed),
+                    "max_sequence_length": max_sequence_length,
+                    "callback_on_step_end": callback,
+                }
+                if true_cfg > 1.0:
+                    kwargs["negative_prompt"] = negative_prompt or " "
+                if source_width:
+                    kwargs["width"] = int(source_width)
+                if source_height:
+                    kwargs["height"] = int(source_height)
+
+                started = time.time()
+                result = pipeline(**kwargs)
+                generated = result.images[0]
+                if protect_original:
+                    generated = protect_original_area(
+                        images[0],
+                        generated,
+                        int(request.get("protect_blend_width", 64)),
+                        bool(request.get("protect_color_match", True)),
+                        int(request.get("protect_color_match_strength", 70)),
+                    )
+
+                now = datetime.now()
+                if auto_name or not manual_name:
+                    source_part = f"{source_stem}_" if batch_mode else ""
+                    stem = (
+                        f"qwen2511_{source_part}{safe_slug_words(prompt)}_{actual_seed}_"
+                        f"{now:%Y%m%d}_{now:%H%M%S}"
+                    )
+                else:
+                    base = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(manual_name).stem).strip("._")
+                    base = base or "qwen2511_edit"
+                    stem = f"{base}_{source_stem}" if batch_mode else base
+                    if count > 1:
+                        stem += f"_{image_index + 1:02d}"
+
+                output_path = unique_path(output_folder / f"{stem}{extension}")
+                metadata = {
+                    "prompt": prompt,
+                    "negative_prompt": negative_prompt,
+                    "seed": actual_seed,
+                    "steps": steps,
+                    "true_cfg_scale": true_cfg,
+                    "model": runtime["model"],
+                    "checkpoint": runtime["checkpoint"],
+                    "offload": runtime["offload"],
+                    "references": [str(path) for path in source_paths],
+                    "batch_mode": batch_mode,
+                    "protect_original_area": protect_original,
+                    "protect_blend_width": int(request.get("protect_blend_width", 64)) if protect_original else None,
+                    "protect_color_match": bool(request.get("protect_color_match", True)) if protect_original else None,
+                    "protect_color_match_strength": int(request.get("protect_color_match_strength", 70)) if protect_original else None,
+                    "batch_source_index": source_index + 1 if batch_mode else None,
+                    "batch_source_total": len(source_groups) if batch_mode else None,
+                    "loras": request.get("loras", []),
+                }
+                if extension == ".png":
+                    png_info = PngImagePlugin.PngInfo()
+                    png_info.add_text("FrameVision Qwen2511", json.dumps(metadata, ensure_ascii=False))
+                    generated.save(output_path, pnginfo=png_info, compress_level=4)
+                else:
+                    generated.convert("RGB").save(
+                        output_path,
+                        quality=jpeg_quality,
+                        optimize=True,
+                        subsampling=0,
+                        comment=json.dumps(metadata, ensure_ascii=False).encode("utf-8")[:65000],
+                    )
+
+                elapsed = time.time() - started
+                outputs.append(str(output_path))
                 worker_event(
-                    "progress",
-                    current=step_index + 1,
-                    total=steps,
-                    image=image_index + 1,
-                    image_total=count,
-                )
-                return callback_kwargs
-
-            kwargs: dict[str, Any] = {
-                "image": images if len(images) > 1 else images[0],
-                "prompt": prompt,
-                "num_inference_steps": steps,
-                "true_cfg_scale": true_cfg,
-                "generator": torch.Generator(device="cpu").manual_seed(actual_seed),
-                "max_sequence_length": max_sequence_length,
-                "callback_on_step_end": callback,
-            }
-            if true_cfg > 1.0:
-                kwargs["negative_prompt"] = negative_prompt or " "
-            if width:
-                kwargs["width"] = int(width)
-            if height:
-                kwargs["height"] = int(height)
-
-            started = time.time()
-            result = pipeline(**kwargs)
-            generated = result.images[0]
-
-            now = datetime.now()
-            if auto_name or not manual_name:
-                stem = (
-                    f"qwen2511_{safe_slug_words(prompt)}_{actual_seed}_"
-                    f"{now:%Y%m%d}_{now:%H%M%S}"
-                )
-            else:
-                stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(manual_name).stem).strip("._")
-                stem = stem or "qwen2511_edit"
-                if count > 1:
-                    stem += f"_{image_index + 1:02d}"
-
-            output_path = unique_path(output_folder / f"{stem}{extension}")
-            metadata = {
-                "prompt": prompt,
-                "negative_prompt": negative_prompt,
-                "seed": actual_seed,
-                "steps": steps,
-                "true_cfg_scale": true_cfg,
-                "model": runtime["model"],
-                "checkpoint": runtime["checkpoint"],
-                "offload": runtime["offload"],
-                "references": [str(path) for path in references],
-                "loras": request.get("loras", []),
-            }
-            if extension == ".png":
-                png_info = PngImagePlugin.PngInfo()
-                png_info.add_text("FrameVision Qwen2511", json.dumps(metadata, ensure_ascii=False))
-                generated.save(output_path, pnginfo=png_info, compress_level=4)
-            else:
-                generated.convert("RGB").save(
-                    output_path,
-                    quality=jpeg_quality,
-                    optimize=True,
-                    subsampling=0,
-                    comment=json.dumps(metadata, ensure_ascii=False).encode("utf-8")[:65000],
+                    "image_saved",
+                    path=str(output_path),
+                    seed=actual_seed,
+                    seconds=round(elapsed, 2),
+                    source=str(source_path),
+                    source_index=source_index + 1,
+                    source_total=len(source_groups),
                 )
 
-            elapsed = time.time() - started
-            outputs.append(str(output_path))
-            worker_event(
-                "image_saved",
-                path=str(output_path),
-                seed=actual_seed,
-                seconds=round(elapsed, 2),
-            )
-
-            if cleanup_between and torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                if cleanup_between and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         worker_event(
             "result",
@@ -723,6 +885,11 @@ class PipelineServer:
             seeds=seeds,
             seconds=round(time.time() - batch_started, 2),
             runtime=runtime,
+            batch_mode=batch_mode,
+            protect_original_area=protect_original,
+            protect_color_match=bool(request.get("protect_color_match", True)) if protect_original else False,
+            source_count=len(source_groups),
+            output_count=len(outputs),
         )
 
 
@@ -1062,11 +1229,66 @@ class Qwen2511IntWidget(QWidget):
 
         references_group = QGroupBox("Reference images")
         references_layout = QVBoxLayout(references_group)
-        hint = QLabel(
+        self.batch_mode_check = QCheckBox("Batch mode · edit every selected image separately")
+        self.batch_mode_check.setToolTip(
+            "Uses the same prompt and generation settings for every selected image or every image in a folder. "
+            "The model stays loaded for the complete batch. Disable this for normal multi-reference editing."
+        )
+        self.batch_mode_check.toggled.connect(self.batch_mode_changed)
+        references_layout.addWidget(self.batch_mode_check)
+        self.protect_original_check = QCheckBox("Protect original image area")
+        self.protect_original_check.setChecked(True)
+        self.protect_original_check.setVisible(False)
+        self.protect_original_check.setToolTip(
+            "Batch outpainting helper: protects the original image with a feathered mask. Most original pixels remain unchanged, while a narrow border blends into Qwen's generated surroundings."
+        )
+        self.protect_original_check.toggled.connect(self.protect_original_changed)
+        references_layout.addWidget(self.protect_original_check)
+        self.protect_blend_row = QWidget()
+        protect_blend_layout = QHBoxLayout(self.protect_blend_row)
+        protect_blend_layout.setContentsMargins(22, 0, 0, 0)
+        protect_blend_layout.addWidget(QLabel("Protection edge blend"))
+        self.protect_blend_spin = NoWheelSpinBox()
+        self.protect_blend_spin.setRange(0, 512)
+        self.protect_blend_spin.setSingleStep(8)
+        self.protect_blend_spin.setValue(64)
+        self.protect_blend_spin.setSuffix(" px")
+        self.protect_blend_spin.setToolTip(
+            "Width of the soft transition between the untouched original and the generated outpaint. 48–96 px normally hides colour and exposure differences well."
+        )
+        protect_blend_layout.addWidget(self.protect_blend_spin)
+        protect_blend_layout.addStretch(1)
+        self.protect_blend_row.setVisible(False)
+        references_layout.addWidget(self.protect_blend_row)
+        self.protect_color_match_check = QCheckBox("Auto color / brightness match")
+        self.protect_color_match_check.setChecked(True)
+        self.protect_color_match_check.setVisible(False)
+        self.protect_color_match_check.setToolTip(
+            "Tries to match the generated canvas to the original image before the soft seam blend. This reduces visible exposure and colour shifts at the join."
+        )
+        self.protect_color_match_check.toggled.connect(self.protect_color_match_changed)
+        references_layout.addWidget(self.protect_color_match_check)
+        self.protect_color_match_row = QWidget()
+        protect_color_layout = QHBoxLayout(self.protect_color_match_row)
+        protect_color_layout.setContentsMargins(22, 0, 0, 0)
+        protect_color_layout.addWidget(QLabel("Color-match strength"))
+        self.protect_color_match_strength_spin = NoWheelSpinBox()
+        self.protect_color_match_strength_spin.setRange(0, 100)
+        self.protect_color_match_strength_spin.setSingleStep(5)
+        self.protect_color_match_strength_spin.setValue(70)
+        self.protect_color_match_strength_spin.setSuffix(" %")
+        self.protect_color_match_strength_spin.setToolTip(
+            "0 disables the adjustment. Higher values more strongly align brightness and colour of the generated canvas to the original center. Start around 60–75%."
+        )
+        protect_color_layout.addWidget(self.protect_color_match_strength_spin)
+        protect_color_layout.addStretch(1)
+        self.protect_color_match_row.setVisible(False)
+        references_layout.addWidget(self.protect_color_match_row)
+        self.reference_hint = QLabel(
             "Order matters: the prompt can identify these as image 1, image 2, etc. Drag thumbnails to reorder them."
         )
-        hint.setObjectName("Hint")
-        references_layout.addWidget(hint)
+        self.reference_hint.setObjectName("Hint")
+        references_layout.addWidget(self.reference_hint)
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         left = QWidget()
@@ -1087,6 +1309,9 @@ class Qwen2511IntWidget(QWidget):
         ref_buttons = QHBoxLayout()
         add_ref = QPushButton("Add images")
         add_ref.clicked.connect(self.browse_references)
+        add_folder = QPushButton("Add folder")
+        add_folder.setToolTip("Add all supported images from one folder. This automatically enables batch mode.")
+        add_folder.clicked.connect(self.browse_reference_folder)
         paste_ref = QPushButton("Paste")
         paste_ref.setToolTip("Save the clipboard image under FrameVision's temp folder and add it as a reference.")
         paste_ref.clicked.connect(self.paste_reference)
@@ -1095,6 +1320,7 @@ class Qwen2511IntWidget(QWidget):
         clear_ref = QPushButton("Clear")
         clear_ref.clicked.connect(self.clear_references)
         ref_buttons.addWidget(add_ref)
+        ref_buttons.addWidget(add_folder)
         ref_buttons.addWidget(paste_ref)
         ref_buttons.addStretch(1)
         ref_buttons.addWidget(remove_ref)
@@ -1537,6 +1763,11 @@ class Qwen2511IntWidget(QWidget):
 
         self.prompt_edit.setPlainText(str(data.get("prompt", "")))
         self.negative_edit.setText(str(data.get("negative_prompt", "")))
+        self.batch_mode_check.setChecked(bool(data.get("batch_mode", False)))
+        self.protect_original_check.setChecked(bool(data.get("protect_original_area", True)))
+        self.protect_blend_spin.setValue(int(data.get("protect_blend_width", 64)))
+        self.protect_color_match_check.setChecked(bool(data.get("protect_color_match", True)))
+        self.protect_color_match_strength_spin.setValue(int(data.get("protect_color_match_strength", 70)))
 
         model_key = data.get("model", "recommended")
         index = self.model_combo.findData(model_key)
@@ -1584,6 +1815,7 @@ class Qwen2511IntWidget(QWidget):
         self.output_format_changed()
         self.offload_changed()
         self.queue_mode_changed(self.queue_check.isChecked())
+        self.batch_mode_changed(self.batch_mode_check.isChecked())
 
     def _set_combo_data(self, combo: QComboBox, value: Any) -> None:
         index = combo.findData(value)
@@ -1597,6 +1829,11 @@ class Qwen2511IntWidget(QWidget):
             "schema_version": SETTINGS_SCHEMA,
             "prompt": self.prompt_edit.toPlainText(),
             "negative_prompt": self.negative_edit.text(),
+            "batch_mode": self.batch_mode_check.isChecked(),
+            "protect_original_area": self.batch_mode_check.isChecked() and self.protect_original_check.isChecked(),
+            "protect_blend_width": self.protect_blend_spin.value(),
+            "protect_color_match": self.batch_mode_check.isChecked() and self.protect_original_check.isChecked() and self.protect_color_match_check.isChecked(),
+            "protect_color_match_strength": self.protect_color_match_strength_spin.value(),
             "references": self.reference_paths,
             "loras": self.lora_rows,
             "model": self.model_combo.currentData(),
@@ -1640,6 +1877,11 @@ class Qwen2511IntWidget(QWidget):
         widgets = [
             self.prompt_edit,
             self.negative_edit,
+            self.batch_mode_check,
+            self.protect_original_check,
+            self.protect_blend_spin,
+            self.protect_color_match_check,
+            self.protect_color_match_strength_spin,
             self.model_combo,
             self.resolution_combo,
             self.width_spin,
@@ -1676,6 +1918,71 @@ class Qwen2511IntWidget(QWidget):
                 widget.toggled.connect(self.schedule_save)
 
     # ----------------------------- reference images -----------------------------
+    def batch_mode_changed(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if not enabled and self.reference_list.count() > 8:
+            self.batch_mode_check.blockSignals(True)
+            self.batch_mode_check.setChecked(True)
+            self.batch_mode_check.blockSignals(False)
+            QMessageBox.information(
+                self,
+                APP_NAME,
+                "Normal multi-reference mode supports at most eight images. Remove images before disabling batch mode.",
+            )
+            return
+        self.reference_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+            if enabled
+            else QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.protect_original_check.setVisible(enabled)
+        self.protect_blend_row.setVisible(enabled and self.protect_original_check.isChecked())
+        self.protect_color_match_check.setVisible(enabled and self.protect_original_check.isChecked())
+        self.protect_color_match_row.setVisible(
+            enabled and self.protect_original_check.isChecked() and self.protect_color_match_check.isChecked()
+        )
+        self.reference_hint.setText(
+            "Each image is edited independently with the same prompt and settings. The model remains loaded for the full batch."
+            if enabled
+            else "Order matters: the prompt can identify these as image 1, image 2, etc. Drag thumbnails to reorder them."
+        )
+        self.prompt_edit.setPlaceholderText(
+            "One instruction for every selected image, for example: outpaint the left and right sides to create a natural landscape version while preserving the original subject."
+            if enabled
+            else "Describe the change. With multiple references, refer to them as image 1, image 2, and so on."
+        )
+        self.schedule_save()
+        self.update_generate_enabled()
+
+    def protect_original_changed(self, enabled: bool) -> None:
+        visible = self.batch_mode_check.isChecked() and bool(enabled)
+        self.protect_blend_row.setVisible(visible)
+        self.protect_color_match_check.setVisible(visible)
+        self.protect_color_match_row.setVisible(visible and self.protect_color_match_check.isChecked())
+        self.schedule_save()
+
+    def protect_color_match_changed(self, enabled: bool) -> None:
+        self.protect_color_match_row.setVisible(
+            self.batch_mode_check.isChecked() and self.protect_original_check.isChecked() and bool(enabled)
+        )
+        self.schedule_save()
+
+    def browse_reference_folder(self) -> None:
+        start = str(Path(self.reference_paths[-1]).parent) if self.reference_paths else str(self.root)
+        folder = QFileDialog.getExistingDirectory(self, "Select folder containing images", start)
+        if not folder:
+            return
+        paths = [
+            str(path)
+            for path in sorted(Path(folder).iterdir(), key=lambda item: item.name.lower())
+            if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGES
+        ]
+        if not paths:
+            QMessageBox.information(self, APP_NAME, "No supported images were found in that folder.")
+            return
+        self.batch_mode_check.setChecked(True)
+        self.add_reference_paths(paths)
+
     def browse_references(self) -> None:
         start = str(Path(self.reference_paths[-1]).parent) if self.reference_paths else str(self.root)
         files, _ = QFileDialog.getOpenFileNames(
@@ -1693,8 +2000,15 @@ class Qwen2511IntWidget(QWidget):
                 continue
             if str(path) in self.reference_paths:
                 continue
-            if len(self.reference_paths) >= 8:
-                QMessageBox.information(self, APP_NAME, "A maximum of eight reference images is supported by this helper.")
+            maximum = 1000 if self.batch_mode_check.isChecked() else 8
+            if len(self.reference_paths) >= maximum:
+                QMessageBox.information(
+                    self,
+                    APP_NAME,
+                    "Batch mode supports up to 1000 source images."
+                    if self.batch_mode_check.isChecked()
+                    else "Normal multi-reference editing supports a maximum of eight images.",
+                )
                 break
             pixmap = QPixmap(str(path))
             if pixmap.isNull():
@@ -1897,6 +2211,7 @@ class Qwen2511IntWidget(QWidget):
                 self.height_spin.setValue(size[1])
 
     def source_resolution(self) -> Optional[tuple[int, int]]:
+        self.sync_reference_paths()
         if not self.reference_paths:
             return None
         image = QImage(self.reference_paths[0])
@@ -1971,16 +2286,24 @@ class Qwen2511IntWidget(QWidget):
     def build_request(self) -> dict[str, Any]:
         self.sync_reference_paths()
         self.sync_lora_rows()
+        resolution_mode = self.resolution_combo.currentData()
         width, height = self.effective_resolution()
         return {
             "command": "generate",
             "prompt": self.prompt_edit.toPlainText().strip(),
             "negative_prompt": self.negative_edit.text(),
+            "batch_mode": self.batch_mode_check.isChecked(),
+            "protect_original_area": self.batch_mode_check.isChecked() and self.protect_original_check.isChecked(),
+            "protect_blend_width": self.protect_blend_spin.value(),
+            "protect_color_match": self.batch_mode_check.isChecked() and self.protect_original_check.isChecked() and self.protect_color_match_check.isChecked(),
+            "protect_color_match_strength": self.protect_color_match_strength_spin.value(),
             "references": self.reference_paths,
             "loras": self.lora_rows,
             "model": self.model_combo.currentData(),
-            "width": width,
-            "height": height,
+            "width": None if resolution_mode == "source" else width,
+            "height": None if resolution_mode == "source" else height,
+            "resolution_mode": resolution_mode,
+            "source_max_side": self.source_max_spin.value(),
             "seed": self.seed_spin.value(),
             "count": self.count_spin.value(),
             "true_cfg_scale": self.cfg_spin.value(),
@@ -2003,7 +2326,7 @@ class Qwen2511IntWidget(QWidget):
         if not request["prompt"]:
             return "Enter an edit instruction."
         if not request["references"]:
-            return "Add at least one reference image."
+            return "Add at least one source or reference image."
         if not request["model"]:
             return "No installed model is selected."
         if not self.env_python.exists():
@@ -2029,7 +2352,8 @@ class Qwen2511IntWidget(QWidget):
         self.update_generate_enabled()
         self.cancel_button.setVisible(True)
         self.cancel_button.setEnabled(True)
-        self.progress.setRange(0, max(1, request["steps"] * request["count"]))
+        source_count = len(request["references"]) if request.get("batch_mode") else 1
+        self.progress.setRange(0, max(1, request["steps"] * request["count"] * source_count))
         self.progress.setValue(0)
         self.progress.setFormat("Starting backend…")
         self.status_label.setText("Starting")
@@ -2151,7 +2475,16 @@ class Qwen2511IntWidget(QWidget):
             overall = (image - 1) * total + current
             self.progress.setRange(0, total * image_total)
             self.progress.setValue(overall)
-            self.progress.setFormat(f"Image {image}/{image_total} · step {current}/{total}")
+            source_total = int(event.get("source_total", 1))
+            if source_total > 1:
+                source = int(event.get("source", 1))
+                output = int(event.get("output", 1))
+                output_total = int(event.get("output_total", 1))
+                self.progress.setFormat(
+                    f"Source {source}/{source_total} · output {output}/{output_total} · step {current}/{total}"
+                )
+            else:
+                self.progress.setFormat(f"Image {image}/{image_total} · step {current}/{total}")
         elif event_name == "image_saved":
             self.append_log(
                 f"Saved {event.get('path')} · seed {event.get('seed')} · {event.get('seconds')} seconds"
@@ -2179,8 +2512,15 @@ class Qwen2511IntWidget(QWidget):
         self.status_label.setText("Finished")
         self.progress.setValue(self.progress.maximum())
         self.progress.setFormat(f"Finished · {event.get('seconds', 0)} seconds")
+        source_text = (
+            f" from {event.get('source_count')} sources"
+            if event.get("batch_mode")
+            else ""
+        )
+        protected_text = " · protected original area" if event.get("protect_original_area") else ""
+        color_match_text = " · auto tone matched" if event.get("protect_color_match") else ""
         self.result_info.setText(
-            f"{len(outputs)} output{'s' if len(outputs) != 1 else ''} · seeds {event.get('seeds')} · total {event.get('seconds')} seconds"
+            f"{len(outputs)} output{'s' if len(outputs) != 1 else ''}{source_text}{protected_text}{color_match_text} · seeds {event.get('seeds')} · total {event.get('seconds')} seconds"
         )
         self.append_log(f"Generation complete in {event.get('seconds')} seconds.")
         if not self.keep_loaded_check.isChecked():

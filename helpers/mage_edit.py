@@ -580,14 +580,36 @@ def server_main(root: Path) -> int:
 def parse_early_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--server", action="store_true")
+    parser.add_argument("--queue-request")
     parser.add_argument("--root")
     parsed, _ = parser.parse_known_args()
     return parsed
 
 
+def queue_request_main(root: Path, request_file: str) -> int:
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    os.environ["VF_HF_ATTN_IMPL"] = "flash_attention_2"
+    request_path = Path(request_file).expanduser().resolve()
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    server = MagePipelineServer(root)
+    try:
+        server.generate(request)
+        return 0
+    except Exception as exc:
+        worker_event("error", message=str(exc), traceback=traceback.format_exc())
+        return 1
+    finally:
+        try:
+            request_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 _EARLY_ARGS = parse_early_args()
 if _EARLY_ARGS.server:
     raise SystemExit(server_main(detect_root(_EARLY_ARGS.root)))
+if _EARLY_ARGS.queue_request:
+    raise SystemExit(queue_request_main(detect_root(_EARLY_ARGS.root), _EARLY_ARGS.queue_request))
 
 
 # =============================================================================
@@ -860,6 +882,7 @@ class MageEditUI(QWidget):
                 "write_generation_report": True,
                 "save_session_log": True,
                 "auto_scroll_log": True,
+                "framevision_queue": False,
             },
             "output": {
                 "name_template": DEFAULT_NAME_TEMPLATE,
@@ -944,6 +967,7 @@ class MageEditUI(QWidget):
                 "write_generation_report": self.report_check.isChecked(),
                 "save_session_log": self.session_log_check.isChecked(),
                 "auto_scroll_log": self.auto_scroll_check.isChecked(),
+                "framevision_queue": self.framevision_queue_check.isChecked(),
             },
             "output": {
                 "name_template": self.name_template_edit.text().strip()
@@ -1005,6 +1029,8 @@ class MageEditUI(QWidget):
             self.report_check.setChecked(bool(runtime["write_generation_report"]))
             self.session_log_check.setChecked(bool(runtime["save_session_log"]))
             self.auto_scroll_check.setChecked(bool(runtime["auto_scroll_log"]))
+            self.framevision_queue_check.setChecked(bool(runtime.get("framevision_queue", False)))
+            self.update_queue_button_text()
 
             self.name_template_edit.setText(str(output["name_template"]))
             self.select_combo_data(self.format_combo, output["format"])
@@ -1337,6 +1363,13 @@ class MageEditUI(QWidget):
         self.auto_scroll_check = QCheckBox("Auto-scroll the log")
         runtime_form.addRow("", self.auto_scroll_check)
 
+        self.framevision_queue_check = QCheckBox("Use FrameVision queue")
+        self.framevision_queue_check.setToolTip(
+            "When enabled, Generate adds Mage Edit jobs to the main FrameVision queue instead of running directly."
+        )
+        self.framevision_queue_check.toggled.connect(self.update_queue_button_text)
+        runtime_form.addRow("Queue backend", self.framevision_queue_check)
+
         unload_button = QPushButton("Unload model now")
         unload_button.clicked.connect(self.request_unload)
         runtime_form.addRow("", unload_button)
@@ -1514,6 +1547,7 @@ class MageEditUI(QWidget):
             self.report_check,
             self.session_log_check,
             self.auto_scroll_check,
+            self.framevision_queue_check,
             self.metadata_check,
             self.sidecar_check,
         )
@@ -1735,6 +1769,28 @@ class MageEditUI(QWidget):
     # ------------------------------------------------------------------
     # Backend command and generation request
     # ------------------------------------------------------------------
+    def using_framevision_queue(self) -> bool:
+        return bool(getattr(self, "framevision_queue_check", None) and self.framevision_queue_check.isChecked())
+
+    def update_queue_button_text(self, *_args: Any) -> None:
+        use_queue = self.using_framevision_queue()
+        if hasattr(self, "generate_button"):
+            self.generate_button.setText("Add to queue" if use_queue else "Generate")
+        if hasattr(self, "batch_button"):
+            self.batch_button.setText("Queue batch" if use_queue else "Batch")
+        if not self._loading_settings:
+            self.schedule_save()
+
+    def enqueue_framevision_request(self, request: dict[str, Any]) -> Path:
+        try:
+            from helpers.queue_adapter import enqueue_mage_edit_request
+        except Exception:
+            from queue_adapter import enqueue_mage_edit_request
+        job_path = enqueue_mage_edit_request(request, root=self.root)
+        self.append_log(f"Added Mage Edit job to FrameVision queue: {Path(job_path).name}")
+        self.status_label.setText("Added to FrameVision queue")
+        return Path(job_path)
+
     def build_request(self) -> dict[str, Any]:
         size_mode = self.size_mode_combo.currentData()
         return {
@@ -1850,6 +1906,12 @@ class MageEditUI(QWidget):
             return
 
         self.save_settings()
+        if self.using_framevision_queue():
+            try:
+                self.enqueue_framevision_request(request)
+            except Exception as exc:
+                QMessageBox.critical(self, APP_NAME, "Could not add Mage Edit job to the FrameVision queue:\n" + str(exc))
+            return
         self.pending_request = request
         self.set_busy(True, "Starting Mage backend…")
         self.ensure_backend()
@@ -1869,6 +1931,19 @@ class MageEditUI(QWidget):
             return
 
         self.save_settings()
+        if self.using_framevision_queue():
+            total = self.batch_count_spin.value()
+            try:
+                for _index in range(total):
+                    queued = dict(request)
+                    queued["seed"] = -1
+                    queued["count"] = 1
+                    self.enqueue_framevision_request(queued)
+                self.append_log(f"Queued {total} separate Mage Edit jobs with random seeds.")
+                self.status_label.setText(f"Queued {total} Mage Edit jobs")
+            except Exception as exc:
+                QMessageBox.critical(self, APP_NAME, "Could not queue Mage Edit batch:\n" + str(exc))
+            return
         self.batch_active = True
         self.batch_total = self.batch_count_spin.value()
         self.batch_completed = 0

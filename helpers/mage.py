@@ -37,11 +37,13 @@ import re
 import sys
 import time
 import traceback
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 APP_NAME = "Mage"
+HELPER_REVISION = "1.3-queue-max-size-guard"
 SETTINGS_SCHEMA = 1
 EVENT_PREFIX = "FVMAGE_EVENT "
 DEFAULT_MODEL_DIRNAME = "Mage-Flow-Turbo"
@@ -362,7 +364,7 @@ class MagePipelineServer:
             "batch_cfg": bool(request.get("batch_cfg", True)),
         }
 
-        size_mode = str(request.get("size_mode", "square"))
+        size_mode = str(request.get("size_mode", "max_side"))
         if size_mode == "explicit":
             width = max(16, int(request.get("width", 1024)))
             height = max(16, int(request.get("height", 1024)))
@@ -391,6 +393,11 @@ class MagePipelineServer:
             phase="generating",
         )
         worker_event("progress", current=0, total=0, indeterminate=True)
+
+        # generate_images() does not accept max_size. Width and height were
+        # resolved above, but remove the key defensively in case a future UI,
+        # queue payload, or migrated request accidentally places it in kwargs.
+        kwargs.pop("max_size", None)
 
         started = time.time()
         # Official Mage text-to-image path.
@@ -528,7 +535,7 @@ def server_main(root: Path) -> int:
     os.environ["VF_HF_ATTN_IMPL"] = "flash_attention_2"
 
     server = MagePipelineServer(root)
-    worker_event("ready", root=str(root), pid=os.getpid())
+    worker_event("ready", root=str(root), pid=os.getpid(), revision=HELPER_REVISION)
 
     for raw_line in sys.stdin:
         line = raw_line.strip()
@@ -558,9 +565,35 @@ def server_main(root: Path) -> int:
     return 0
 
 
+def queue_request_main(root: Path, request_path: str) -> int:
+    """Run one Mage request headlessly for the FrameVision queue worker."""
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    os.environ["VF_HF_ATTN_IMPL"] = "flash_attention_2"
+
+    request_file = Path(str(request_path or "")).expanduser()
+    if not request_file.is_absolute():
+        request_file = (root / request_file).resolve()
+
+    try:
+        request = read_json(request_file, None)
+        if not isinstance(request, dict):
+            raise ValueError(f"Invalid Mage queue request JSON: {request_file}")
+        server = MagePipelineServer(root)
+        server.generate(request)
+        return 0
+    except Exception:
+        worker_event(
+            "error",
+            message="Mage queue request failed.",
+            traceback=traceback.format_exc(),
+        )
+        return 1
+
+
 def parse_early_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--server", action="store_true")
+    parser.add_argument("--queue-request")
     parser.add_argument("--root")
     parsed, _ = parser.parse_known_args()
     return parsed
@@ -569,6 +602,8 @@ def parse_early_args() -> argparse.Namespace:
 _EARLY_ARGS = parse_early_args()
 if _EARLY_ARGS.server:
     raise SystemExit(server_main(detect_root(_EARLY_ARGS.root)))
+if _EARLY_ARGS.queue_request:
+    raise SystemExit(queue_request_main(detect_root(_EARLY_ARGS.root), _EARLY_ARGS.queue_request))
 
 
 # =============================================================================
@@ -757,8 +792,9 @@ class MageUI(QWidget):
         self.apply_settings()
         self.connect_persistence()
         self.update_size_controls()
+        self.update_queue_button_text()
         self.update_command_preview()
-        self.append_log("Mage text-to-image UI ready.")
+        self.append_log(f"Mage text-to-image UI ready · revision {HELPER_REVISION}.")
 
     # ------------------------------------------------------------------
     # Defaults and persistence
@@ -794,6 +830,7 @@ class MageUI(QWidget):
             },
             "runtime": {
                 "residency": "gpu",
+                "framevision_queue": False,
                 "write_generation_report": True,
                 "save_session_log": True,
                 "auto_scroll_log": True,
@@ -862,6 +899,7 @@ class MageUI(QWidget):
             },
             "runtime": {
                 "residency": self.residency_combo.currentData(),
+                "framevision_queue": self.queue_check.isChecked(),
                 "write_generation_report": self.report_check.isChecked(),
                 "save_session_log": self.session_log_check.isChecked(),
                 "auto_scroll_log": self.auto_scroll_check.isChecked(),
@@ -915,9 +953,11 @@ class MageUI(QWidget):
             )
 
             self.select_combo_data(self.residency_combo, runtime["residency"])
+            self.queue_check.setChecked(bool(runtime.get("framevision_queue", False)))
             self.report_check.setChecked(bool(runtime["write_generation_report"]))
             self.session_log_check.setChecked(bool(runtime["save_session_log"]))
             self.auto_scroll_check.setChecked(bool(runtime["auto_scroll_log"]))
+            self.update_queue_button_text()
 
             self.name_template_edit.setText(str(output["name_template"]))
             self.select_combo_data(self.format_combo, output["format"])
@@ -1058,21 +1098,19 @@ class MageUI(QWidget):
 
         self.size_mode_combo = NoWheelComboBox()
         self.size_mode_combo.addItem("Square", "square")
-        self.size_mode_combo.addItem("Square · legacy max-side setting", "max_side")
+        self.size_mode_combo.addItem("Max side", "max_side")
         self.size_mode_combo.addItem("Explicit width and height", "explicit")
         self.size_mode_combo.currentIndexChanged.connect(self.update_size_controls)
         self.size_mode_combo.setToolTip(
             "Square is the simplest and safest mode for Mage-Flow-Turbo. "
-            "The legacy Max side option is treated as square because text-to-image has "
-            "no reference aspect ratio. Explicit size gives full control and "
-            "must be a multiple of 16."
+            "Max side preserves more flexible proportions. Explicit size gives "
+            "full control and must be a multiple of 16."
         )
 
         self.max_size_spin = self.spin(512, 2048, 16)
         self.max_size_spin.setToolTip(
-            "Square side length. The legacy Max side setting uses this as both width and "
-            "height. 1024 matches Microsoft's main examples; 2048 uses substantially "
-            "more VRAM."
+            "Longest edge for Max side mode, or the side length for Square mode. "
+            "1024 matches Microsoft's main examples; 2048 uses substantially more VRAM."
         )
         self.width_spin = self.spin(512, 2048, 16)
         self.width_spin.setToolTip(
@@ -1223,6 +1261,14 @@ class MageUI(QWidget):
             "frees the most memory."
         )
         runtime_form.addRow("Model residency", self.residency_combo)
+
+        self.queue_check = QCheckBox("Use FrameVision queue")
+        self.queue_check.setToolTip(
+            "When enabled, the footer buttons add Mage jobs to the FrameVision "
+            "queue instead of running the dedicated Mage backend directly in this tab."
+        )
+        self.queue_check.toggled.connect(self.update_queue_button_text)
+        runtime_form.addRow("", self.queue_check)
 
         self.report_check = QCheckBox("Write a JSON generation report")
         runtime_form.addRow("", self.report_check)
@@ -1412,6 +1458,7 @@ class MageUI(QWidget):
         checks = (
             self.renormalize_check,
             self.batch_cfg_check,
+            self.queue_check,
             self.report_check,
             self.session_log_check,
             self.auto_scroll_check,
@@ -1591,6 +1638,106 @@ class MageUI(QWidget):
             },
         }
 
+    def using_framevision_queue(self) -> bool:
+        try:
+            return bool(self.queue_check.isChecked())
+        except Exception:
+            try:
+                return bool(self.settings.get("runtime", {}).get("framevision_queue", False))
+            except Exception:
+                return False
+
+    def update_queue_button_text(self, *_args: Any) -> None:
+        use_queue = self.using_framevision_queue()
+        try:
+            self.generate_button.setText("Add to queue" if use_queue else "Generate")
+        except Exception:
+            pass
+        try:
+            self.batch_button.setText("Queue batch" if use_queue else "Batch")
+        except Exception:
+            pass
+
+    @staticmethod
+    def queue_image_extension(output_format: str) -> str:
+        normalized = str(output_format or "png").lower()
+        if normalized in {"jpg", "jpeg"}:
+            return ".jpg"
+        if normalized == "webp":
+            return ".webp"
+        return ".png"
+
+    def queue_request_payload_path(self, request: dict[str, Any]) -> Path:
+        folder = self.root / "temp" / "mage_queue"
+        folder.mkdir(parents=True, exist_ok=True)
+        prompt_part = prompt_slug(str(request.get("prompt", "")) or "mage")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique = uuid.uuid4().hex[:8]
+        return folder / f"mage_queue_{stamp}_{prompt_part}_{unique}.json"
+
+    def queue_command(self, request_path: Path) -> tuple[list[str], dict[str, str]]:
+        python_path = str(resolve_path(self.root, self.environment_edit.text()))
+        script_path = str(Path(__file__).resolve())
+        cmd = [python_path, "-u", script_path, "--queue-request", str(request_path), "--root", str(self.root)]
+        env = {
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONUTF8": "1",
+            "PYTHONUNBUFFERED": "1",
+            "VF_HF_ATTN_IMPL": "flash_attention_2",
+            "HF_HOME": str(self.root / "temp" / "mage_edit" / "cache" / "huggingface"),
+            "TORCH_HOME": str(self.root / "temp" / "mage_edit" / "cache" / "torch"),
+            "TEMP": str(self.root / "temp" / "mage_edit"),
+            "TMP": str(self.root / "temp" / "mage_edit"),
+        }
+        return cmd, env
+
+    def enqueue_request(self, request: dict[str, Any], *, batch_index: Optional[int] = None, batch_total: Optional[int] = None) -> bool:
+        payload = json.loads(json.dumps(request))
+        output_cfg = dict(payload.get("output") or {})
+        output_dir = Path(str(output_cfg.get("folder") or resolve_path(self.root, self.output_folder_edit.text()))).expanduser()
+        if not output_dir.is_absolute():
+            output_dir = (self.root / output_dir).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        payload_path = self.queue_request_payload_path(payload)
+        atomic_write_json(payload_path, payload)
+        cmd, env = self.queue_command(payload_path)
+        prompt_text = str(payload.get("prompt", "")).strip()
+        prompt_preview = prompt_text.replace("\n", " ").strip()[:80] or "Mage Image"
+        label = "Mage Image"
+        if batch_index is not None and batch_total is not None:
+            label += f" batch {batch_index}/{batch_total}"
+        label += ": " + prompt_preview
+        size_mode = str(payload.get("size_mode", "square"))
+        if size_mode == "explicit":
+            width = max(16, int(payload.get("width", 1024)))
+            height = max(16, int(payload.get("height", 1024)))
+        else:
+            width = max(16, int(payload.get("max_size", 1024)))
+            height = width
+        try:
+            from helpers import queue_adapter as _qa  # type: ignore
+        except Exception:
+            import queue_adapter as _qa  # type: ignore
+        settings = {
+            "cmd": cmd, "ffmpeg_cmd": cmd, "cwd": str(self.root), "env": env,
+            "output_dir": str(output_dir), "scan_dir": str(output_dir),
+            "scan_ext": self.queue_image_extension(output_cfg.get("format", "png")),
+            "prompt": prompt_text, "width": width, "height": height,
+            "steps": int(payload.get("steps", 4)), "seed": int(payload.get("seed", -1)),
+            "label": label, "request_path": str(payload_path),
+        }
+        enqueue = getattr(_qa, "enqueue_mage_generate", None)
+        if callable(enqueue):
+            enqueue(settings)
+        else:
+            args = dict(settings)
+            args.setdefault("engine", "mage_image")
+            args.setdefault("queue_family", "mage")
+            args.setdefault("progress_owner", "Mage Image")
+            _qa.enqueue_tool_job("tools_ffmpeg", "", str(output_dir), args, priority=610)
+        self.append_log(f"Added Mage Image job to FrameVision queue: {label}")
+        return True
+
     def backend_command(self) -> tuple[str, list[str]]:
         python_path = str(resolve_path(self.root, self.environment_edit.text()))
         arguments = [
@@ -1663,6 +1810,12 @@ class MageUI(QWidget):
             return
 
         self.save_settings()
+        if self.using_framevision_queue():
+            if self.enqueue_request(request):
+                self.status_label.setText("Added to queue")
+                self.progress.setRange(0, 100)
+                self.progress.setValue(0)
+            return
         self.pending_request = request
         self.set_busy(True, "Starting Mage backend…")
         self.ensure_backend()
@@ -1682,6 +1835,20 @@ class MageUI(QWidget):
             return
 
         self.save_settings()
+        if self.using_framevision_queue():
+            total = self.batch_count_spin.value()
+            queued = 0
+            for index in range(total):
+                if self.enqueue_request(request, batch_index=index + 1, batch_total=total):
+                    queued += 1
+                else:
+                    break
+            if queued:
+                self.status_label.setText(f"Queued batch · {queued} jobs")
+                self.progress.setRange(0, 100)
+                self.progress.setValue(0)
+                self.append_log(f"Queued {queued} Mage batch job(s) to the FrameVision queue.")
+            return
         self.batch_active = True
         self.batch_total = self.batch_count_spin.value()
         self.batch_completed = 0
@@ -1855,7 +2022,7 @@ class MageUI(QWidget):
         name = event.get("event")
         if name == "ready":
             self.backend_ready = True
-            self.append_log(f"Backend ready (PID {event.get('pid')}).")
+            self.append_log(f"Backend ready (PID {event.get('pid')}) · revision {event.get('revision', 'unknown')}.")
             self.send_pending_request()
         elif name == "log":
             self.append_log(

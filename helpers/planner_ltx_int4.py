@@ -9,6 +9,7 @@ surface used by the working LTX UI and helpers/ltx_int4_cli.py.
 
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -119,6 +120,63 @@ def int4_install_status(root: Optional[Path] = None) -> Dict[str, Any]:
 def _timestamped_report(root: Path, prefix: str = "ltx_int4_planner_report") -> str:
     stamp = time.strftime("%Y%m%d_%H%M%S")
     return str(root / "tools" / "vram_lab" / f"{prefix}_{stamp}.txt")
+
+
+def _detect_total_vram_gb() -> Optional[float]:
+    """Return the largest detected NVIDIA card's total VRAM in GiB.
+
+    Planner normally runs on Windows where nvidia-smi is available with the
+    driver. Torch is only a fallback because importing it can be expensive or
+    unavailable in the main UI environment.
+    """
+    override = str(os.environ.get("FRAMEVISION_TOTAL_VRAM_GB", "") or "").strip()
+    if override:
+        try:
+            value = float(override)
+            if value > 0:
+                return value
+        except Exception:
+            pass
+
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        values = []
+        for line in str(result.stdout or "").splitlines():
+            try:
+                mib = float(line.strip().split()[0])
+                if mib > 0:
+                    values.append(mib / 1024.0)
+            except Exception:
+                continue
+        if values:
+            return max(values)
+    except Exception:
+        pass
+
+    try:
+        import torch  # type: ignore
+
+        if bool(torch.cuda.is_available()):
+            values = [
+                float(torch.cuda.get_device_properties(index).total_memory) / (1024.0 ** 3)
+                for index in range(int(torch.cuda.device_count()))
+            ]
+            if values:
+                return max(values)
+    except Exception:
+        pass
+    return None
 
 def _load_ltx_ui_runtime_settings(root: Path) -> Dict[str, Any]:
     """Read the settings used by the working helpers/ltx23_ui.py direct route.
@@ -256,7 +314,19 @@ def build_auto_planner_command(
     pipeline_name = "a2vid_two_stage" if audio_text else "two_stages"
     ui_settings = _load_ltx_ui_runtime_settings(root)
     ui_vram_lab = str(ui_settings.get("vram_lab") or "OFF").strip().upper()
-    int4_vram_flag = "--no-int4-auto-vram" if ui_vram_lab == "OFF" else "--int4-auto-vram"
+    detected_vram_gb = _detect_total_vram_gb()
+    if detected_vram_gb is not None:
+        # Full 24 GB cards commonly report about 23.x GiB after unit conversion.
+        # They are faster on the original INT4 path and do not need Auto VRAM Lab.
+        int4_vram_flag = (
+            "--no-int4-auto-vram" if detected_vram_gb >= 23.0 else "--int4-auto-vram"
+        )
+        int4_vram_source = f"detected {detected_vram_gb:.2f} GiB"
+    else:
+        # Preserve the previous UI-linked behavior only when hardware detection
+        # is unavailable, rather than unexpectedly changing unknown systems.
+        int4_vram_flag = "--no-int4-auto-vram" if ui_vram_lab == "OFF" else "--int4-auto-vram"
+        int4_vram_source = f"VRAM detection unavailable; ltx_ui vram_lab={ui_vram_lab}"
 
     command: List[str] = [
         str(status["python_exe"]),
@@ -367,7 +437,7 @@ def build_auto_planner_command(
             f"complete INT4 install detected; pipeline={pipeline_name}; "
             f"condition_route={'dedicated_i2v' if simple_start_i2v else 'positioned_images'}; "
             f"ltx_ui_settings={'loaded' if ui_settings.get('settings_loaded') else 'proven defaults'}; "
-            f"int4_vram={int4_vram_flag}"
+            f"int4_vram={int4_vram_flag} ({int4_vram_source})"
         ),
         "ltx_ui_runtime_settings": ui_settings,
     }
