@@ -28,7 +28,7 @@ from pathlib import Path
 from dataclasses import dataclass, replace, field
 from typing import List, Optional, Tuple, Dict, Any
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPropertyAnimation, QEasingCurve, QUrl
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPropertyAnimation, QEasingCurve, QUrl, QSize
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -1249,20 +1249,40 @@ def _musicclip_apply_own_prompts_to_plan_file(plan_path: str, payload: dict | No
 
     image_prompts = list(config.get("image_prompts") or [])
     video_prompts = list(config.get("video_prompts") or [])
-    if not image_prompts or not video_prompts:
-        return {"ok": False, "changed": False, "message": "Use own prompts is enabled, but one or both prompt boxes are empty."}
-    if len(image_prompts) != len(video_prompts):
-        return {
-            "ok": False,
-            "changed": False,
-            "message": f"Own prompt count mismatch: {len(image_prompts)} image prompt(s) and {len(video_prompts)} image-to-video prompt(s).",
-        }
+    own_images_active = bool(_musicclip_own_images_config(payload, plan).get("enabled"))
 
     shots, key = _musicclip_ltx_shot_list_ref(plan)
     if not isinstance(shots, list) or not shots:
         return {"ok": False, "changed": False, "message": f"{label}: no shots were found"}
 
-    target_count = len(image_prompts)
+    if own_images_active:
+        # The audio/shot plan is authoritative when supplied images are used.
+        # Prompt count must never create, remove or repartition shots.
+        target_count = len([shot for shot in shots if isinstance(shot, dict)])
+        if not video_prompts:
+            return {"ok": False, "changed": False, "message": "Use own prompts is enabled with own images, but the image-to-video prompt box is empty."}
+        if len(video_prompts) < target_count:
+            return {
+                "ok": False,
+                "changed": False,
+                "message": f"This shot list needs {target_count} image-to-video prompts, but only {len(video_prompts)} were supplied.",
+            }
+        # Ignore surplus prompts rather than turning them into extra shots.
+        video_prompts = video_prompts[:target_count]
+        # The image-model stage is bypassed. Mirror exact I2V text into the
+        # otherwise-unused image prompt fields so generic bridge fallbacks never
+        # replace the user's movement prompt with generated text.
+        image_prompts = list(video_prompts)
+    else:
+        if not image_prompts or not video_prompts:
+            return {"ok": False, "changed": False, "message": "Use own prompts is enabled, but one or both prompt boxes are empty."}
+        if len(image_prompts) != len(video_prompts):
+            return {
+                "ok": False,
+                "changed": False,
+                "message": f"Own prompt count mismatch: {len(image_prompts)} image prompt(s) and {len(video_prompts)} image-to-video prompt(s).",
+            }
+        target_count = len(image_prompts)
     timed: list[tuple[dict, float, float, float]] = []
     for shot in shots:
         if not isinstance(shot, dict):
@@ -1350,6 +1370,7 @@ def _musicclip_apply_own_prompts_to_plan_file(plan_path: str, payload: dict | No
         "own_image_prompts": image_prompts,
         "own_video_prompts": video_prompts,
         "signature": str(config.get("signature") or ""),
+        "own_images_active": bool(own_images_active),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
     plan["prompt_backend"] = "user_exact_passthrough"
@@ -2448,15 +2469,29 @@ def _musicclip_patch_own_prompts_bridge(mod):
                 plan_path = _musicclip_own_prompt_plan_path(p)
                 shot_id = str(p.get("shot_id") or "").strip()
                 enabled, exact = _musicclip_own_prompt_for_shot(plan_path, shot_id, "video")
+                # Review/recreate is allowed to replace the saved own prompt for
+                # this one render.  Previously this wrapper always restored the
+                # original exact prompt after the review UI had supplied a new
+                # clip_prompt_override, producing the same clip for every edit
+                # when the seed stayed fixed.
+                explicit_override = str(
+                    p.get("clip_prompt_override")
+                    or p.get("video_prompt_override")
+                    or p.get("director_timestamped_video_prompt_override")
+                    or p.get("timestamped_video_prompt_override")
+                    or p.get("clip_prompt")
+                    or ""
+                ).strip()
                 if enabled:
-                    if not exact:
+                    selected_prompt = explicit_override or exact
+                    if not selected_prompt:
                         return {"ok": False, "message": f"Exact own image-to-video prompt was not found for {shot_id}."}
-                    p["clip_prompt_override"] = exact
-                    p["video_prompt_override"] = exact
-                    p["video_prompt"] = exact
-                    p["clip_prompt"] = exact
-                    p["motion_prompt"] = exact
-                    p["prompt"] = exact
+                    p["clip_prompt_override"] = selected_prompt
+                    p["video_prompt_override"] = selected_prompt
+                    p["video_prompt"] = selected_prompt
+                    p["clip_prompt"] = selected_prompt
+                    p["motion_prompt"] = selected_prompt
+                    p["prompt"] = selected_prompt
                     for key_name in (
                         "prompt_prefix", "prompt_suffix", "video_prompt_prefix", "video_prompt_suffix",
                         "prompt_additions", "prompt_append", "style_prompt", "style_theme",
@@ -2512,6 +2547,935 @@ def _musicclip_patch_own_prompts_bridge(mod):
         base_bridge = getattr(mod, "_BASE", None)
         if base_bridge is not None and base_bridge is not mod:
             _musicclip_patch_own_prompts_bridge(base_bridge)
+    except Exception:
+        pass
+    return mod
+
+
+_MUSICCLIP_OWN_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def _musicclip_valid_own_image_path(value: Any) -> str:
+    try:
+        candidate = os.path.abspath(os.path.expanduser(str(value or "").strip().strip('"')))
+    except Exception:
+        return ""
+    if not candidate or not os.path.isfile(candidate):
+        return ""
+    try:
+        if Path(candidate).suffix.lower() not in _MUSICCLIP_OWN_IMAGE_EXTENSIONS:
+            return ""
+        if os.path.getsize(candidate) <= 0:
+            return ""
+    except Exception:
+        return ""
+    return candidate
+
+
+def _musicclip_own_images_config(payload: dict | None = None, plan_data: dict | None = None) -> dict:
+    try:
+        src = dict(payload or {})
+    except Exception:
+        src = {}
+    settings = src.get("bridge_generation_settings")
+    if not isinstance(settings, dict):
+        settings = {}
+    meta = plan_data.get("own_images") if isinstance(plan_data, dict) else {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    selected_value = src.get(
+        "own_images_selected",
+        src.get("own_images_enabled", settings.get("own_images_selected", settings.get("own_images_enabled", meta.get("enabled", False)))),
+    )
+    selected = _musicclip_bool_value(selected_value, False)
+
+    raw_paths = []
+    # A fresh UI payload is authoritative, including an intentionally empty list.
+    # Do not merge it with a previous plan, saved settings, or a folder scan.
+    if bool(src.get("own_image_paths_authoritative")) or "own_image_paths" in src:
+        value = src.get("own_image_paths")
+        raw_paths = list(value) if isinstance(value, list) else []
+    else:
+        for container in (settings, meta):
+            if not isinstance(container, dict):
+                continue
+            for key in ("own_image_paths", "source_paths", "images", "paths"):
+                value = container.get(key)
+                if isinstance(value, list) and value:
+                    raw_paths = list(value)
+                    break
+            if raw_paths:
+                break
+
+    valid_paths = []
+    seen = set()
+    for value in raw_paths:
+        candidate = _musicclip_valid_own_image_path(value)
+        if not candidate:
+            continue
+        norm = os.path.normcase(candidate)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        valid_paths.append(candidate)
+
+    signature_parts = []
+    for candidate in valid_paths:
+        try:
+            st = os.stat(candidate)
+            signature_parts.append([os.path.normcase(candidate), int(st.st_size), int(st.st_mtime_ns)])
+        except Exception:
+            signature_parts.append([os.path.normcase(candidate), 0, 0])
+    signature_source = json.dumps(signature_parts, ensure_ascii=False, sort_keys=True)
+    signature = hashlib.sha256(signature_source.encode("utf-8", errors="replace")).hexdigest()
+    return {
+        "enabled": bool(selected and valid_paths),
+        "selected": bool(selected),
+        "paths": valid_paths,
+        "count": len(valid_paths),
+        "signature": signature,
+    }
+
+
+def _musicclip_plan_uses_own_images(plan_path: str) -> bool:
+    path = str(plan_path or "").strip()
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            plan = json.load(f)
+        meta = plan.get("own_images") if isinstance(plan, dict) else {}
+        return bool(isinstance(meta, dict) and _musicclip_bool_value(meta.get("enabled"), False))
+    except Exception:
+        return False
+
+
+def _musicclip_safe_own_image_shot_stem(shot_id: Any, fallback_index: int = 1) -> str:
+    sid = str(shot_id or f"LTX{fallback_index:02d}").strip() or f"LTX{fallback_index:02d}"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", sid).strip("._") or f"LTX{fallback_index:02d}"
+
+
+def _musicclip_latest_ltx_full_run_dir(plan_path: str, preferred_output_dir: str = "") -> str:
+    preferred = str(preferred_output_dir or "").strip()
+    if preferred:
+        try:
+            pp = Path(preferred).expanduser().resolve()
+            if pp.is_dir():
+                return str(pp)
+        except Exception:
+            pass
+    try:
+        root = Path(str(plan_path or "")).expanduser().resolve().parent / "ltx_full_run"
+        if not root.is_dir():
+            return ""
+        dirs = [item for item in root.iterdir() if item.is_dir()]
+        if not dirs:
+            return ""
+        dirs.sort(key=lambda item: (item.stat().st_mtime_ns, item.name), reverse=True)
+        return str(dirs[0].resolve())
+    except Exception:
+        return ""
+
+
+def _musicclip_full_run_start_image_for_shot(plan_path: str, shot_id: str, preferred_output_dir: str = "") -> str:
+    run_dir = _musicclip_latest_ltx_full_run_dir(plan_path, preferred_output_dir)
+    if not run_dir:
+        return ""
+    stem = _musicclip_safe_own_image_shot_stem(shot_id)
+    candidate = Path(run_dir) / f"{stem}_start.png"
+    try:
+        return str(candidate.resolve()) if candidate.is_file() and candidate.stat().st_size > 0 else ""
+    except Exception:
+        return ""
+
+
+def _musicclip_plan_start_image_for_shot(plan_path: str, shot_id: str, preferred_output_dir: str = "") -> str:
+    path = str(plan_path or "").strip()
+    sid = str(shot_id or "").strip()
+    if not path or not sid or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            plan = json.load(f)
+        shots, _key = _musicclip_ltx_shot_list_ref(plan)
+        for shot in shots or []:
+            if not isinstance(shot, dict):
+                continue
+            current_id = str(shot.get("id") or shot.get("shot_id") or "").strip()
+            if current_id != sid:
+                continue
+            # Current/review replacements remain authoritative. A successful full
+            # run rewrites these fields to its exact LTXxx_start.png file.
+            for key in ("current_start_image_path", "start_image_path", "existing_start_image_path", "image_path", "own_image_source_path"):
+                candidate = _musicclip_valid_own_image_path(shot.get(key))
+                if candidate:
+                    return candidate
+            break
+        meta = plan.get("own_images") if isinstance(plan.get("own_images"), dict) else {}
+        for assignment in meta.get("assignments") or []:
+            if not isinstance(assignment, dict) or str(assignment.get("shot_id") or "").strip() != sid:
+                continue
+            for key in ("full_run_start_path", "assigned_path", "source_path"):
+                candidate = _musicclip_valid_own_image_path(assignment.get(key))
+                if candidate:
+                    return candidate
+    except Exception:
+        pass
+    return _musicclip_full_run_start_image_for_shot(path, sid, preferred_output_dir)
+
+
+def _musicclip_write_json_atomic(path: str | Path, data: dict) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(target.name + ".tmp")
+    temp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(str(temp), str(target))
+
+
+def _musicclip_update_existing_own_image_review_state(plan_path: str, assignments: list[dict]) -> None:
+    """Repair an existing review state without creating review files/folders."""
+    try:
+        pp = Path(str(plan_path or "")).expanduser().resolve()
+    except Exception:
+        return
+    state_candidates = [pp.parent / "musicclip_ltx_review_state.json", pp.parent / "ltx_review_current" / "ltx_review_state.json"]
+    normalized = []
+    for item in assignments or []:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("shot_id") or "").strip()
+        assigned = _musicclip_valid_own_image_path(item.get("assigned_path") or item.get("full_run_start_path") or item.get("source_path"))
+        if sid and assigned:
+            normalized.append((sid, assigned, item))
+    if not normalized:
+        return
+    for state_path in state_candidates:
+        try:
+            if not state_path.is_file():
+                continue
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                continue
+            rows = state.get("shots")
+            if not isinstance(rows, dict):
+                continue
+            for sid, assigned, assignment in normalized:
+                row = rows.setdefault(sid, {})
+                if not isinstance(row, dict):
+                    row = {}
+                    rows[sid] = row
+                clip_ready = False
+                for clip_key in ("current_clip_path", "clip_path", "sync_clip_path", "ltx_clip_path", "current_raw_clip_path"):
+                    clip_path = str(row.get(clip_key) or "").strip()
+                    if clip_path and os.path.isfile(clip_path):
+                        clip_ready = True
+                        break
+                row.update({
+                    "current_start_image_path": assigned,
+                    "start_image_path": assigned,
+                    "existing_start_image_path": assigned,
+                    "image_path": assigned,
+                    "image_ready": True,
+                    "clip_ready": clip_ready,
+                    "image_mode": "existing",
+                    "image_model": "existing",
+                    "source_image_model": "own_images",
+                    "own_image_source_path": str(assignment.get("source_path") or ""),
+                    "own_image_source_index": int(assignment.get("source_index") or 0),
+                    "status": "Ready" if clip_ready else "Needs clip",
+                })
+                for bad_key in ("skip_image_generation", "skip_start_image_generation", "use_existing_start_images", "use_review_current_images"):
+                    row.pop(bad_key, None)
+            state["shots"] = rows
+            state["own_images_enabled"] = True
+            state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            _musicclip_write_json_atomic(state_path, state)
+        except Exception:
+            pass
+
+
+def _musicclip_sync_own_images_to_full_run(plan_path: str, output_dir: str = "") -> dict:
+    """Point the plan/review state at the normal full-run LTXxx_start.png files."""
+    path = str(plan_path or "").strip()
+    if not path or not os.path.isfile(path):
+        return {"ok": False, "changed": False, "message": "Own-image plan was not found."}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            plan = json.load(f)
+    except Exception as exc:
+        return {"ok": False, "changed": False, "message": f"Could not read own-image plan: {exc}"}
+    meta = plan.get("own_images") if isinstance(plan, dict) and isinstance(plan.get("own_images"), dict) else {}
+    if not _musicclip_bool_value(meta.get("enabled"), False):
+        return {"ok": True, "changed": False, "enabled": False, "message": "Own images are disabled."}
+
+    run_dir = _musicclip_latest_ltx_full_run_dir(path, output_dir)
+    if not run_dir:
+        return {"ok": True, "changed": False, "enabled": True, "message": "No full-run folder exists yet."}
+
+    shots, key = _musicclip_ltx_shot_list_ref(plan)
+    shots = [shot for shot in (shots or []) if isinstance(shot, dict)]
+    assignment_by_id = {
+        str(item.get("shot_id") or "").strip(): item
+        for item in (meta.get("assignments") or [])
+        if isinstance(item, dict) and str(item.get("shot_id") or "").strip()
+    }
+    synced = []
+    for idx, shot in enumerate(shots, start=1):
+        sid = str(shot.get("id") or shot.get("shot_id") or f"LTX{idx:02d}").strip() or f"LTX{idx:02d}"
+        normal_start = _musicclip_full_run_start_image_for_shot(path, sid, run_dir)
+        if not normal_start:
+            continue
+        shot.update({
+            "start_image_path": normal_start,
+            "current_start_image_path": normal_start,
+            "existing_start_image_path": normal_start,
+            "image_path": normal_start,
+            "image_ready": True,
+            "image_mode": "existing",
+            "image_model": "existing",
+            "source_image_model": "own_images",
+            "own_images_enabled": True,
+        })
+        for bad_key in ("skip_image_generation", "skip_start_image_generation", "use_existing_start_images", "use_review_current_images"):
+            shot.pop(bad_key, None)
+        assignment = assignment_by_id.get(sid)
+        if assignment is not None:
+            assignment["full_run_start_path"] = normal_start
+            assignment["assigned_path"] = normal_start
+        synced.append((sid, normal_start))
+
+    if not synced:
+        return {"ok": True, "changed": False, "enabled": True, "output_dir": run_dir, "message": "The full-run folder exists, but no normal start images are present yet."}
+
+    plan[key] = shots
+    meta["latest_full_run_dir"] = run_dir
+    meta["full_run_synced_count"] = len(synced)
+    meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    plan["own_images"] = meta
+    for bad_key in ("skip_image_generation", "skip_start_image_generation", "use_existing_start_images", "use_review_current_images"):
+        plan.pop(bad_key, None)
+    try:
+        _musicclip_write_json_atomic(path, plan)
+    except Exception as exc:
+        return {"ok": False, "changed": False, "message": f"Could not save normal full-run start-image paths: {exc}"}
+
+    # Only update review state if it already exists. Plan preparation must never
+    # manufacture ltx_review_current or review-style filenames.
+    pp = Path(path).expanduser().resolve()
+    state_candidates = [pp.parent / "musicclip_ltx_review_state.json", pp.parent / "ltx_review_current" / "ltx_review_state.json"]
+    for state_path in state_candidates:
+        try:
+            if not state_path.is_file():
+                continue
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                continue
+            rows = state.get("shots")
+            if not isinstance(rows, dict):
+                continue
+            for sid, normal_start in synced:
+                row = rows.setdefault(sid, {})
+                if not isinstance(row, dict):
+                    row = {}
+                    rows[sid] = row
+                clip_ready = False
+                for clip_key in ("current_clip_path", "clip_path", "sync_clip_path", "ltx_clip_path", "current_raw_clip_path"):
+                    clip_path = str(row.get(clip_key) or "").strip()
+                    if clip_path and os.path.isfile(clip_path):
+                        clip_ready = True
+                        break
+                row.update({
+                    "current_start_image_path": normal_start,
+                    "start_image_path": normal_start,
+                    "existing_start_image_path": normal_start,
+                    "image_path": normal_start,
+                    "image_ready": True,
+                    "image_mode": "existing",
+                    "image_model": "existing",
+                    "source_image_model": "own_images",
+                    "status": "Ready" if clip_ready else "Needs clip",
+                })
+            state["shots"] = rows
+            state["own_images_enabled"] = True
+            state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            _musicclip_write_json_atomic(state_path, state)
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "changed": True,
+        "enabled": True,
+        "output_dir": run_dir,
+        "synced_count": len(synced),
+        "message": f"Linked {len(synced)} shot(s) to normal full-run start images.",
+    }
+
+
+def _musicclip_apply_own_images_to_plan_file(plan_path: str, payload: dict | None = None, label: str = "LTX director plan") -> dict:
+    """Assign supplied images as existing starts; the real LTX run copies them.
+
+    This deliberately does not create ltx_review_current. The regular bridge is
+    left in charge of creating <job>/ltx_full_run/<timestamp>/LTXxx_start.png.
+    """
+    path = str(plan_path or "").strip()
+    if not path or not os.path.isfile(path):
+        return {"ok": False, "changed": False, "message": f"{label}: plan not found"}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            plan = json.load(f)
+    except Exception as exc:
+        return {"ok": False, "changed": False, "message": f"{label}: could not read plan ({exc})"}
+    if not isinstance(plan, dict):
+        return {"ok": False, "changed": False, "message": f"{label}: plan is not an object"}
+
+    config = _musicclip_own_images_config(payload, plan)
+    old_meta = plan.get("own_images") if isinstance(plan.get("own_images"), dict) else {}
+    was_enabled = _musicclip_bool_value(old_meta.get("enabled"), False)
+    if not config.get("selected") and not was_enabled:
+        return {"ok": True, "changed": False, "enabled": False, "message": "own images disabled"}
+
+    shots, key = _musicclip_ltx_shot_list_ref(plan)
+    shots = [shot for shot in (shots or []) if isinstance(shot, dict)]
+    if not shots:
+        return {"ok": False, "changed": False, "message": f"{label}: no shots were found"}
+
+    source_paths = list(config.get("paths") or [])
+    if not source_paths:
+        # Resumes remain valid after a successful full run, because the plan is
+        # synced to its normal LTXxx_start.png copies. Do not demand the originals.
+        existing_assignments = []
+        for idx, shot in enumerate(shots, start=1):
+            sid = str(shot.get("id") or shot.get("shot_id") or f"LTX{idx:02d}").strip() or f"LTX{idx:02d}"
+            existing = ""
+            for path_key in ("current_start_image_path", "start_image_path", "existing_start_image_path", "image_path", "own_image_source_path"):
+                existing = _musicclip_valid_own_image_path(shot.get(path_key))
+                if existing:
+                    break
+            if not existing:
+                existing = _musicclip_full_run_start_image_for_shot(path, sid)
+            if not existing:
+                return {
+                    "ok": False,
+                    "changed": False,
+                    "enabled": True,
+                    "message": "Use own images is enabled, but a supplied/full-run start image is missing. Re-add the original images or restore the job's full-run folder.",
+                }
+            existing_assignments.append({
+                "shot_id": sid,
+                "source_index": int(shot.get("own_image_source_index") or 0),
+                "source_path": str(shot.get("own_image_source_path") or existing),
+                "assigned_path": existing,
+            })
+        if was_enabled:
+            return {
+                "ok": True,
+                "changed": False,
+                "enabled": True,
+                "shot_count": len(shots),
+                "source_count": int(old_meta.get("source_count") or 0),
+                "assignments": existing_assignments,
+                "message": "Using the existing supplied/full-run start images stored by this job.",
+            }
+        return {"ok": False, "changed": False, "message": "Use own images is selected, but no readable images were supplied."}
+
+    source_count = len(source_paths)
+    shot_count = len(shots)
+    same_mapping = (
+        str(old_meta.get("signature") or "") == str(config.get("signature") or "")
+        and int(old_meta.get("shot_count") or 0) == shot_count
+        and isinstance(old_meta.get("assignments"), list)
+        and len(old_meta.get("assignments") or []) == shot_count
+    )
+    assignment_indices = []
+    if same_mapping:
+        try:
+            assignment_indices = [int(item.get("source_index")) for item in old_meta.get("assignments")]
+            if any(index < 0 or index >= source_count for index in assignment_indices):
+                same_mapping = False
+        except Exception:
+            same_mapping = False
+    if not same_mapping:
+        seed = random.SystemRandom().randrange(1, 2**31 - 1)
+        rng = random.Random(seed)
+        if source_count == shot_count:
+            assignment_indices = list(range(source_count))
+        elif source_count > shot_count:
+            # Randomly skip extras, but keep the selected survivors in list order.
+            assignment_indices = sorted(rng.sample(range(source_count), shot_count))
+        else:
+            # Use each supplied image once in list order, then randomly reuse.
+            assignment_indices = list(range(source_count))
+            assignment_indices.extend(rng.randrange(source_count) for _ in range(shot_count - source_count))
+    else:
+        seed = int(old_meta.get("assignment_seed") or 0)
+
+    assignments = []
+    for idx, shot in enumerate(shots, start=1):
+        sid = str(shot.get("id") or shot.get("shot_id") or f"LTX{idx:02d}").strip() or f"LTX{idx:02d}"
+        shot["id"] = sid
+        if "shot_id" in shot:
+            shot["shot_id"] = sid
+        source_index = int(assignment_indices[idx - 1])
+        source_path = source_paths[source_index]
+        normal_full_run_path = _musicclip_full_run_start_image_for_shot(path, sid) if same_mapping else ""
+        assigned_path = normal_full_run_path or source_path
+        shot.update({
+            "start_image_path": assigned_path,
+            "current_start_image_path": assigned_path,
+            "existing_start_image_path": assigned_path,
+            "image_path": assigned_path,
+            "image_ready": True,
+            "image_mode": "existing",
+            "image_model": "existing",
+            "source_image_model": "own_images",
+            "own_images_enabled": True,
+            "own_image_source_path": source_path,
+            "own_image_source_index": source_index,
+        })
+        for bad_key in ("skip_image_generation", "skip_start_image_generation", "use_existing_start_images", "use_review_current_images", "use_existing_start_image"):
+            shot.pop(bad_key, None)
+        assignments.append({
+            "shot_id": sid,
+            "source_index": source_index,
+            "source_path": source_path,
+            "assigned_path": assigned_path,
+            "full_run_start_path": normal_full_run_path,
+        })
+
+    plan[key] = shots
+    plan["own_images"] = {
+        "enabled": True,
+        "source_paths": source_paths,
+        "source_count": source_count,
+        "shot_count": shot_count,
+        "signature": str(config.get("signature") or ""),
+        "assignment_seed": int(seed),
+        "assignments": assignments,
+        "full_run_naming": "ltx_full_run/<timestamp>/LTXxx_start.png",
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    plan["own_images_enabled"] = True
+    plan["image_mode"] = "existing"
+    plan["image_model"] = "existing"
+    for bad_key in ("skip_image_generation", "skip_start_image_generation", "use_existing_start_images", "use_review_current_images"):
+        plan.pop(bad_key, None)
+
+    try:
+        _musicclip_write_json_atomic(path, plan)
+    except Exception as exc:
+        return {"ok": False, "changed": False, "message": f"{label}: could not save own-image assignments ({exc})"}
+
+    _musicclip_update_existing_own_image_review_state(path, assignments)
+
+    skipped = max(0, source_count - shot_count)
+    reused = max(0, shot_count - source_count)
+    detail = []
+    if skipped:
+        detail.append(f"randomly skipped {skipped} extra image(s)")
+    if reused:
+        detail.append(f"randomly reused images for {reused} additional shot(s)")
+    suffix_text = f"; {', '.join(detail)}" if detail else ""
+    return {
+        "ok": True,
+        "changed": True,
+        "enabled": True,
+        "shot_count": shot_count,
+        "source_count": source_count,
+        "assignments": assignments,
+        "message": f"Assigned {source_count} supplied image(s) to {shot_count} LTX shot(s){suffix_text}. The normal full run will copy them to LTXxx_start.png.",
+    }
+
+
+def _musicclip_copy_own_image_for_requested_output(source_path: str, output_dir: str, start_image_name: str) -> str:
+    source = _musicclip_valid_own_image_path(source_path)
+    if not source:
+        return ""
+    out_dir = str(output_dir or "").strip()
+    name = str(start_image_name or "").strip()
+    if not out_dir or not name:
+        return source
+    try:
+        target = (Path(out_dir).expanduser().resolve() / os.path.basename(name)).resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if target.exists() and os.path.samefile(source, target):
+                return str(target)
+        except Exception:
+            pass
+        if target.suffix.lower() == Path(source).suffix.lower():
+            shutil.copy2(source, target)
+        else:
+            pixmap = QPixmap(source)
+            if pixmap.isNull() or not pixmap.save(str(target), "PNG"):
+                shutil.copy2(source, target)
+        return str(target) if target.is_file() and target.stat().st_size > 0 else ""
+    except Exception:
+        return ""
+
+
+
+def _musicclip_prepare_own_images_full_run(plan_path: str, payload: dict | None = None) -> dict:
+    """Materialize supplied images as the normal LTXxx_start.png job assets.
+
+    The first run creates one dated full-run folder. Every later call reuses that
+    exact folder and only restores files that are genuinely missing. This makes
+    own images indistinguishable from successfully generated start images to all
+    LTX backends without creating duplicate run folders on resume/review.
+    """
+    path = str(plan_path or "").strip()
+    if not path or not os.path.isfile(path):
+        return {"ok": False, "message": "Own-images full run: director plan not found."}
+    try:
+        plan = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"ok": False, "message": f"Own-images full run: could not read director plan ({exc})."}
+    if not isinstance(plan, dict):
+        return {"ok": False, "message": "Own-images full run: invalid director plan."}
+
+    shots, key = _musicclip_ltx_shot_list_ref(plan)
+    shots = [shot for shot in (shots or []) if isinstance(shot, dict)]
+    if not shots:
+        return {"ok": False, "message": "Own-images full run: no shots found."}
+
+    payload = dict(payload or {})
+    meta = plan.get("own_images") if isinstance(plan.get("own_images"), dict) else {}
+    run_root = (Path(path).expanduser().resolve().parent / "ltx_full_run").resolve()
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    # Reuse only a real child of this job's ltx_full_run folder. Never accept the
+    # review folder or an arbitrary output base as the permanent start-image dir.
+    candidates = []
+    for raw in (
+        payload.get("output_dir"),
+        meta.get("prepared_full_run_dir"),
+        meta.get("full_run_dir"),
+    ):
+        try:
+            candidate = Path(str(raw or "")).expanduser().resolve()
+        except Exception:
+            continue
+        if candidate.parent == run_root and candidate.is_dir():
+            candidates.append(candidate)
+    run_dir = candidates[0] if candidates else None
+
+    if run_dir is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = run_root / stamp
+        suffix = 1
+        while run_dir.exists():
+            run_dir = run_root / f"{stamp}_{suffix:02d}"
+            suffix += 1
+        try:
+            run_dir.mkdir(parents=True, exist_ok=False)
+        except Exception as exc:
+            return {"ok": False, "message": f"Own-images full run: could not create {run_dir} ({exc})."}
+
+    copied = []
+    reused = 0
+    try:
+        assignments = meta.get("assignments") if isinstance(meta.get("assignments"), list) else []
+        assignment_by_id = {str(item.get("shot_id") or ""): item for item in assignments if isinstance(item, dict)}
+        for idx, shot in enumerate(shots, start=1):
+            sid = str(shot.get("id") or shot.get("shot_id") or f"LTX{idx:02d}").strip() or f"LTX{idx:02d}"
+            stem = _musicclip_safe_own_image_shot_stem(sid, idx)
+            target = (run_dir / f"{stem}_start.png").resolve()
+
+            # Existing normal start images are permanent job assets. Never copy
+            # over them merely because Start/Resume/Review was clicked again.
+            if target.is_file() and target.stat().st_size > 0:
+                target_s = str(target)
+                reused += 1
+                source = str((assignment_by_id.get(sid) or {}).get("source_path") or shot.get("own_image_source_path") or target_s)
+            else:
+                source = ""
+                assignment = assignment_by_id.get(sid) or {}
+                for value in (
+                    assignment.get("source_path"),
+                    shot.get("own_image_source_path"),
+                    shot.get("existing_start_image_path"),
+                    shot.get("current_start_image_path"),
+                    shot.get("start_image_path"),
+                    shot.get("image_path"),
+                ):
+                    candidate = _musicclip_valid_own_image_path(value)
+                    if candidate and os.path.normcase(candidate) != os.path.normcase(str(target)):
+                        source = candidate
+                        break
+                if not source:
+                    raise RuntimeError(f"No readable supplied image is assigned to {sid}.")
+                # LTX/Pillow detects the real image format from file contents;
+                # a byte-for-byte copy is safer here than constructing QPixmap in
+                # a worker/headless queue thread. The normal LTXxx_start.png name
+                # is retained as the workflow contract.
+                shutil.copy2(source, target)
+                if not target.is_file() or target.stat().st_size <= 0:
+                    raise RuntimeError(f"The prepared start image is empty: {target.name}")
+                target_s = str(target)
+
+            shot.update({
+                "start_image_path": target_s,
+                "current_start_image_path": target_s,
+                "existing_start_image_path": target_s,
+                "image_path": target_s,
+                "image_ready": True,
+                "image_mode": "existing",
+                "image_model": "existing",
+                "source_image_model": "own_images",
+                "own_images_enabled": True,
+            })
+            copied.append({"shot_id": sid, "source_path": source, "start_image_path": target_s})
+
+            assignment = assignment_by_id.get(sid)
+            if assignment is not None:
+                assignment["assigned_path"] = target_s
+                assignment["full_run_start_path"] = target_s
+
+        plan[key] = shots
+        meta["enabled"] = True
+        meta["prepared_full_run_dir"] = str(run_dir)
+        meta["full_run_dir"] = str(run_dir)
+        meta["prepared_at"] = datetime.now().isoformat(timespec="seconds")
+        meta["prepared_images"] = copied
+        meta["assignments"] = assignments
+        plan["own_images"] = meta
+        plan["own_images_enabled"] = True
+        plan["image_mode"] = "existing"
+        plan["image_model"] = "existing"
+        _musicclip_write_json_atomic(path, plan)
+    except Exception as exc:
+        return {"ok": False, "message": f"Own-images full run preparation failed: {exc}"}
+
+    return {
+        "ok": True,
+        "output_dir": str(run_dir),
+        "copied_count": max(0, len(copied) - reused),
+        "reused_count": reused,
+        "images": copied,
+        "message": f"Own images ready: {len(copied)} normal LTX start image(s) in the active full-run folder.",
+    }
+
+def _musicclip_patch_own_images_bridge(mod):
+    """Route supplied images through the bridge's normal existing-image path."""
+    if mod is None or bool(getattr(mod, "_framevision_own_images_patched", False)):
+        return mod
+    try:
+        original_create_director = getattr(mod, "create_ltx_director_plan", None)
+        if callable(original_create_director):
+            def _create_director_with_own_images(payload):
+                p = dict(payload or {})
+                result = original_create_director(p)
+                if not isinstance(result, dict) or not bool(result.get("ok")):
+                    return result
+                plan_path = ""
+                for name in ("ltx_director_plan_path", "director_plan_path", "plan_path"):
+                    plan_path = str(result.get(name) or "").strip()
+                    if plan_path:
+                        break
+                report = _musicclip_apply_own_images_to_plan_file(plan_path, p, "LTX director plan")
+                result["own_images_report"] = report
+                if _musicclip_own_images_config(p).get("selected") and not bool(report.get("ok")):
+                    failed = dict(result)
+                    failed["ok"] = False
+                    failed["message"] = str(report.get("message") or "Could not assign supplied images.")
+                    return failed
+                if report.get("enabled"):
+                    warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+                    warnings.append(str(report.get("message") or "Supplied images assigned."))
+                    result["warnings"] = warnings
+                return result
+            setattr(mod, "create_ltx_director_plan", _create_director_with_own_images)
+
+        original_generate = getattr(mod, "generate_ltx_start_image_for_shot", None)
+        if callable(original_generate):
+            def _reuse_supplied_start_image(payload):
+                p = dict(payload or {})
+                plan_path = _musicclip_own_prompt_plan_path(p)
+                if plan_path and _musicclip_plan_uses_own_images(plan_path):
+                    shot_id = str(p.get("shot_id") or "").strip()
+                    # Never re-run/randomize own-image assignment during a shot or
+                    # review action. The caller's explicit current image is
+                    # authoritative; otherwise resolve the already-saved mapping.
+                    source_path = _musicclip_valid_own_image_path(
+                        p.get("existing_start_image_path")
+                        or p.get("current_start_image_path")
+                        or p.get("start_image_path")
+                    ) or _musicclip_plan_start_image_for_shot(plan_path, shot_id)
+                    if source_path:
+                        final_path = _musicclip_copy_own_image_for_requested_output(
+                            source_path,
+                            str(p.get("output_dir") or ""),
+                            str(p.get("start_image_name") or ""),
+                        ) or source_path
+                        return {
+                            "ok": True,
+                            "shot_id": shot_id,
+                            "start_image_path": final_path,
+                            "image_model": "existing",
+                            "source_image_model": "own_images",
+                            "message": "Using the saved shot-specific image; text-to-image generation was skipped.",
+                        }
+                return original_generate(p)
+            setattr(mod, "generate_ltx_start_image_for_shot", _reuse_supplied_start_image)
+
+        original_single = getattr(mod, "run_single_ltx_shot_test", None)
+        if callable(original_single):
+            def _single_with_own_image(payload):
+                p = dict(payload or {})
+                plan_path = _musicclip_own_prompt_plan_path(p)
+                if plan_path and _musicclip_plan_uses_own_images(plan_path):
+                    shot_id = str(p.get("shot_id") or "").strip()
+                    # The review/full-run caller already knows the exact image for
+                    # this shot. Preserve it instead of reapplying the complete
+                    # random assignment table on every single-shot call.
+                    start_path = _musicclip_valid_own_image_path(
+                        p.get("existing_start_image_path")
+                        or p.get("current_start_image_path")
+                        or p.get("start_image_path")
+                    ) or _musicclip_plan_start_image_for_shot(plan_path, shot_id)
+                    if not start_path:
+                        return {"ok": False, "message": f"Saved start image was not found for {shot_id}."}
+                    p.update({
+                        "image_mode": "existing",
+                        "image_model": "existing",
+                        "existing_start_image_path": start_path,
+                        "own_images_enabled": True,
+                        "character_reference": {"enabled": False, "mode": "disabled", "reason": "own_images"},
+                    })
+                    for bad_key in ("skip_image_generation", "skip_start_image_generation", "use_existing_start_images"):
+                        p.pop(bad_key, None)
+                return original_single(p)
+            setattr(mod, "run_single_ltx_shot_test", _single_with_own_image)
+
+        original_run_all = getattr(mod, "run_all_ltx_director_shots", None)
+        if callable(original_run_all):
+            def _run_all_with_own_images(payload):
+                p = dict(payload or {})
+                plan_path = _musicclip_own_prompt_plan_path(p)
+                own_enabled = False
+                if plan_path:
+                    report = _musicclip_apply_own_images_to_plan_file(plan_path, p, "LTX full-run plan")
+                    selected_now = bool(_musicclip_own_images_config(p).get("selected"))
+                    if selected_now and not bool(report.get("ok")):
+                        return {"ok": False, "message": str(report.get("message") or "Could not assign supplied images before generation.")}
+                    own_enabled = bool(report.get("enabled") or _musicclip_plan_uses_own_images(plan_path))
+                    if own_enabled:
+                        p["image_mode"] = "existing"
+                        p["image_model"] = "existing"
+                        p["own_images_enabled"] = True
+                        p["own_images_selected"] = True
+                        p["character_reference"] = {"enabled": False, "mode": "disabled", "reason": "own_images"}
+                        p.pop("skip_image_generation", None)
+                        p.pop("skip_start_image_generation", None)
+
+                        # This is the missing hand-off: create the exact files a
+                        # normal image-generation phase would have produced, then
+                        # point the selected LTX backend at that one active folder.
+                        # Review continuation already has its own routing and must
+                        # not create/copy a full-run folder again.
+                        is_review_continue = bool(
+                            _musicclip_bool_value(p.get("review_continue_missing_only"), False)
+                            or _musicclip_bool_value(p.get("use_review_current_images"), False)
+                        )
+                        if not is_review_continue:
+                            prepared_dir = str(p.get("output_dir") or "").strip()
+                            already_prepared = bool(
+                                _musicclip_bool_value(p.get("own_images_prepared"), False)
+                                and prepared_dir
+                                and os.path.isdir(prepared_dir)
+                                and Path(prepared_dir).resolve().parent.name.lower() == "ltx_full_run"
+                            )
+                            if not already_prepared:
+                                prepared = _musicclip_prepare_own_images_full_run(plan_path, p)
+                                if not bool(prepared.get("ok")):
+                                    return {"ok": False, "message": str(prepared.get("message") or "Could not prepare supplied images for LTX.")}
+                                p["output_dir"] = str(prepared.get("output_dir") or "")
+                                p["own_images_prepared"] = True
+                                p["own_images_prepared_count"] = int(len(prepared.get("images") or []))
+                result = original_run_all(p)
+                if own_enabled and plan_path:
+                    result_dict = result if isinstance(result, dict) else {}
+                    sync_report = _musicclip_sync_own_images_to_full_run(plan_path, str(result_dict.get("output_dir") or p.get("output_dir") or ""))
+                    if isinstance(result, dict):
+                        result["own_images_full_run_sync"] = sync_report
+                return result
+            setattr(mod, "run_all_ltx_director_shots", _run_all_with_own_images)
+
+        original_load_review = getattr(mod, "load_ltx_review_state", None)
+        if callable(original_load_review):
+            def _load_review_with_own_images(payload):
+                p = dict(payload or {})
+                plan_path = _musicclip_own_prompt_plan_path(p)
+                if plan_path and _musicclip_plan_uses_own_images(plan_path):
+                    _musicclip_sync_own_images_to_full_run(plan_path)
+                    _musicclip_apply_own_images_to_plan_file(plan_path, p, "LTX review plan")
+                result = original_load_review(p)
+                if not isinstance(result, dict) or not plan_path or not _musicclip_plan_uses_own_images(plan_path):
+                    return result
+                try:
+                    with open(plan_path, "r", encoding="utf-8") as f:
+                        plan = json.load(f)
+                    by_id = {}
+                    shots, _key = _musicclip_ltx_shot_list_ref(plan)
+                    for shot in shots or []:
+                        if not isinstance(shot, dict):
+                            continue
+                        sid = str(shot.get("id") or shot.get("shot_id") or "").strip()
+                        if sid:
+                            by_id[sid] = shot
+
+                    rows_value = result.get("shots")
+                    if isinstance(rows_value, dict):
+                        iterable = [(str(sid), row) for sid, row in rows_value.items() if isinstance(row, dict)]
+                    else:
+                        iterable = []
+                        for row in (rows_value or []):
+                            if isinstance(row, dict):
+                                iterable.append((str(row.get("shot_id") or row.get("id") or "").strip(), row))
+                    for sid, row in iterable:
+                        if not sid:
+                            continue
+                        shot = by_id.get(sid, {})
+                        row_start = ""
+                        for path_key in ("current_start_image_path", "start_image_path", "existing_start_image_path", "image_path"):
+                            row_start = _musicclip_valid_own_image_path(row.get(path_key))
+                            if row_start:
+                                break
+                        start_path = row_start or _musicclip_plan_start_image_for_shot(plan_path, sid)
+                        if not start_path:
+                            continue
+                        clip_ready = bool(row.get("clip_ready"))
+                        if not clip_ready:
+                            for clip_key in ("current_clip_path", "clip_path", "sync_clip_path", "ltx_clip_path", "current_raw_clip_path"):
+                                clip_path = str(row.get(clip_key) or "").strip()
+                                if clip_path and os.path.isfile(clip_path):
+                                    clip_ready = True
+                                    break
+                        row.update({
+                            "start_image_path": start_path,
+                            "current_start_image_path": start_path,
+                            "existing_start_image_path": start_path,
+                            "image_path": start_path,
+                            "image_ready": True,
+                            "clip_ready": clip_ready,
+                            "image_mode": "existing",
+                            "image_model": "existing",
+                            "source_image_model": "own_images",
+                            "status": "Ready" if clip_ready else "Needs clip",
+                        })
+                        if not row.get("image_prompt"):
+                            row["image_prompt"] = str(shot.get("director_image_prompt") or shot.get("image_prompt") or "Supplied image")
+                    result["own_images_enabled"] = True
+                except Exception:
+                    pass
+                return result
+            setattr(mod, "load_ltx_review_state", _load_review_with_own_images)
+
+        setattr(mod, "_framevision_own_images_patched", True)
+        base_bridge = getattr(mod, "_BASE", None)
+        if base_bridge is not None and base_bridge is not mod:
+            _musicclip_patch_own_images_bridge(base_bridge)
     except Exception:
         pass
     return mod
@@ -2697,7 +3661,7 @@ def _musicclip_patch_int4_vram_policy(mod):
 def _load_musicclip_planner_bridge():
     # Original/Wan2GP bridge. Keep this separate so the option can hide again
     # when this file is removed.
-    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("musicclip_planner_bridge.py", "_framevision_musicclip_planner_bridge"))))
+    return _musicclip_patch_own_images_bridge(_musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("musicclip_planner_bridge.py", "_framevision_musicclip_planner_bridge")))))
 
 
 def _musicclip_patch_vramlab_fp16_checkpoint_guard(mod):
@@ -2762,7 +3726,7 @@ def _load_clip2ltx_bridge():
     # that calls helpers/ltx23_vram_lab_cli.py directly.
     bridge = _load_musicclip_bridge_file("clip2ltx_cli.py", "_framevision_clip2ltx_bridge")
     bridge = _musicclip_patch_vramlab_fp16_checkpoint_guard(bridge)
-    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(bridge)))
+    return _musicclip_patch_own_images_bridge(_musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(bridge))))
 
 
 def _load_music_ltx_int4_bridge():
@@ -2770,7 +3734,7 @@ def _load_music_ltx_int4_bridge():
     # routes only the generation command to helpers/ltx_int4_cli.py.
     bridge = _load_musicclip_bridge_file("music_ltx_int4.py", "_framevision_music_ltx_int4_bridge")
     bridge = _musicclip_patch_int4_vram_policy(bridge)
-    return _musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(bridge)))
+    return _musicclip_patch_own_images_bridge(_musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(bridge))))
 
 
 def _musicclip_default_llama_runner() -> str:
@@ -5188,7 +6152,7 @@ def _musicclip_load_ltx_bridge_module_for_queue(root_dir: str, backend: str = ""
                 continue
             if filename == "music_ltx_int4.py":
                 module = _musicclip_patch_int4_vram_policy(module)
-            return _musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(module)))
+            return _musicclip_patch_own_images_bridge(_musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(module))))
         except BaseException as exc:
             errors.append(f"{filename}: {type(exc).__name__}: {exc}")
 
@@ -12828,6 +13792,18 @@ class AutoMusicSyncWidget(QWidget):
         self.edit_ltx_own_image_prompts = None
         self.edit_ltx_own_video_prompts = None
         self.label_ltx_own_prompt_counts = None
+        self.label_ltx_own_prompts_hint = None
+        self.check_ltx_use_own_images = None
+        self.list_ltx_own_images = None
+        self.btn_ltx_add_own_images = None
+        self.btn_ltx_remove_own_image = None
+        self.btn_ltx_move_own_image_up = None
+        self.btn_ltx_move_own_image_down = None
+        self.btn_ltx_clear_own_images = None
+        self.label_ltx_own_images_status = None
+        self.label_bridge_character_source_field = None
+        self.label_ltx_single_image_mode_field = None
+        self.label_ltx_own_image_prompts_field = None
         self.edit_bridge_style_theme = None
         self.edit_bridge_characters_subjects = None
         self.edit_bridge_locations_world = None
@@ -12993,6 +13969,7 @@ class AutoMusicSyncWidget(QWidget):
 
             self.ltx_section_music_track, ltx_music_lay = _make_ltx_section("Music track", expanded=True)
             self.ltx_section_idea, ltx_idea_lay = _make_ltx_section("Idea / project setup", expanded=True)
+            self.ltx_section_own_images, ltx_own_images_lay = _make_ltx_section("Use own images", expanded=False)
             self.ltx_section_reference_images, ltx_ref_lay = _make_ltx_section("Reference image section", expanded=False)
             self.ltx_section_videoclip_settings, ltx_video_lay = _make_ltx_section("Effects and Loras", expanded=False)
             self.ltx_section_lyrics_lipsync, ltx_lipsync_lay = _make_ltx_section("Lyrics / lipsync", expanded=False)
@@ -13107,6 +14084,7 @@ class AutoMusicSyncWidget(QWidget):
                 "Reference images shows the reference sheet section and limits the image model to HiDream or Qwen 2511 INT4."
             )
             bridge_form.addRow("Character source:", self.combo_bridge_character_source)
+            self.label_bridge_character_source_field = bridge_form.labelForField(self.combo_bridge_character_source)
             self.label_bridge_character_source_note = QLabel(
                 "Built-in character bible mode — reference image section auto-hidden.",
                 self.box_planner_bridge,
@@ -13128,6 +14106,7 @@ class AutoMusicSyncWidget(QWidget):
                 "When Reference images is selected, only HiDream and Qwen 2511 INT4 are shown."
             )
             bridge_form.addRow("Start image mode:", self.combo_ltx_single_image_mode)
+            self.label_ltx_single_image_mode_field = bridge_form.labelForField(self.combo_ltx_single_image_mode)
 
             ltx_idea_lay.addLayout(bridge_form)
 
@@ -13148,6 +14127,7 @@ class AutoMusicSyncWidget(QWidget):
                 "Prompt pair 1 creates shot 1, pair 2 creates shot 2, and so on. The entered text is passed through exactly without additions.",
                 self.box_ltx_own_prompts,
             )
+            self.label_ltx_own_prompts_hint = own_prompts_hint
             own_prompts_hint.setWordWrap(True)
             own_prompts_lay.addWidget(own_prompts_hint)
 
@@ -13163,6 +14143,7 @@ class AutoMusicSyncWidget(QWidget):
                 "Exact prompts for the selected start-image model. One completely blank line separates prompts."
             )
             own_prompts_form.addRow("Image model prompts:", self.edit_ltx_own_image_prompts)
+            self.label_ltx_own_image_prompts_field = own_prompts_form.labelForField(self.edit_ltx_own_image_prompts)
 
             self.edit_ltx_own_video_prompts = QTextEdit(self.box_ltx_own_prompts)
             self.edit_ltx_own_video_prompts.setMinimumHeight(170)
@@ -13183,6 +14164,53 @@ class AutoMusicSyncWidget(QWidget):
             ltx_idea_lay.addWidget(self.box_ltx_own_prompts)
 
             bridge_lay.addWidget(self.ltx_section_idea)
+
+            own_images_hint = QLabel(
+                "Use finished images instead of running the text-to-image stage. The selected files are copied into the LTX job folder, assigned to the final shot list, and reused by the review workflow.",
+                self.ltx_section_own_images,
+            )
+            own_images_hint.setWordWrap(True)
+            ltx_own_images_lay.addWidget(own_images_hint)
+
+            self.check_ltx_use_own_images = QCheckBox("Use own images and skip text-to-image generation", self.ltx_section_own_images)
+            self.check_ltx_use_own_images.setChecked(False)
+            self.check_ltx_use_own_images.setToolTip(
+                "Activates only when at least one readable image is in the list. With an empty list the normal image-generation workflow stays unchanged."
+            )
+            ltx_own_images_lay.addWidget(self.check_ltx_use_own_images)
+
+            self.list_ltx_own_images = QListWidget(self.ltx_section_own_images)
+            try:
+                self.list_ltx_own_images.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            except Exception:
+                pass
+            self.list_ltx_own_images.setIconSize(QSize(112, 72))
+            self.list_ltx_own_images.setMinimumHeight(190)
+            self.list_ltx_own_images.setAlternatingRowColors(True)
+            self.list_ltx_own_images.setToolTip("Double-click an image to open it. Use Up and Down to control the normal one-to-one shot order.")
+            ltx_own_images_lay.addWidget(self.list_ltx_own_images)
+
+            own_images_buttons = QHBoxLayout()
+            own_images_buttons.setContentsMargins(0, 0, 0, 0)
+            own_images_buttons.setSpacing(6)
+            self.btn_ltx_add_own_images = QPushButton("Add images...", self.ltx_section_own_images)
+            self.btn_ltx_move_own_image_up = QPushButton("Up", self.ltx_section_own_images)
+            self.btn_ltx_move_own_image_down = QPushButton("Down", self.ltx_section_own_images)
+            self.btn_ltx_remove_own_image = QPushButton("Remove", self.ltx_section_own_images)
+            self.btn_ltx_clear_own_images = QPushButton("Clear list", self.ltx_section_own_images)
+            own_images_buttons.addWidget(self.btn_ltx_add_own_images)
+            own_images_buttons.addWidget(self.btn_ltx_move_own_image_up)
+            own_images_buttons.addWidget(self.btn_ltx_move_own_image_down)
+            own_images_buttons.addWidget(self.btn_ltx_remove_own_image)
+            own_images_buttons.addWidget(self.btn_ltx_clear_own_images)
+            own_images_buttons.addStretch(1)
+            ltx_own_images_lay.addLayout(own_images_buttons)
+
+            self.label_ltx_own_images_status = QLabel("No own images added. Normal text-to-image workflow is active.", self.ltx_section_own_images)
+            self.label_ltx_own_images_status.setWordWrap(True)
+            self.label_ltx_own_images_status.setStyleSheet("color: #8a8a8a;")
+            ltx_own_images_lay.addWidget(self.label_ltx_own_images_status)
+            bridge_lay.addWidget(self.ltx_section_own_images)
 
             row_bridge_roles = QHBoxLayout()
             self.check_bridge_use_vocal_roles = QCheckBox("Use vocal/non-vocal scene roles", self.box_planner_bridge)
@@ -15385,6 +16413,22 @@ class AutoMusicSyncWidget(QWidget):
                     _own_edit.textChanged.connect(self._update_ltx_own_prompts_ui)
                     _own_edit.textChanged.connect(self._queue_settings_save)
             self._update_ltx_own_prompts_ui()
+            if getattr(self, "check_ltx_use_own_images", None) is not None:
+                self.check_ltx_use_own_images.toggled.connect(lambda _v: self._update_ltx_own_images_ui())
+                self.check_ltx_use_own_images.toggled.connect(self._queue_settings_save)
+            if getattr(self, "btn_ltx_add_own_images", None) is not None:
+                self.btn_ltx_add_own_images.clicked.connect(self._on_add_ltx_own_images_clicked)
+            if getattr(self, "btn_ltx_remove_own_image", None) is not None:
+                self.btn_ltx_remove_own_image.clicked.connect(self._on_remove_ltx_own_image_clicked)
+            if getattr(self, "btn_ltx_move_own_image_up", None) is not None:
+                self.btn_ltx_move_own_image_up.clicked.connect(lambda _checked=False: self._on_move_ltx_own_image(-1))
+            if getattr(self, "btn_ltx_move_own_image_down", None) is not None:
+                self.btn_ltx_move_own_image_down.clicked.connect(lambda _checked=False: self._on_move_ltx_own_image(1))
+            if getattr(self, "btn_ltx_clear_own_images", None) is not None:
+                self.btn_ltx_clear_own_images.clicked.connect(self._on_clear_ltx_own_images_clicked)
+            if getattr(self, "list_ltx_own_images", None) is not None:
+                self.list_ltx_own_images.itemDoubleClicked.connect(lambda item: self._on_open_ltx_own_image_item(item))
+            self._update_ltx_own_images_ui()
             if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
                 self.check_bridge_use_vocal_roles.toggled.connect(self._save_settings)
                 self.check_bridge_use_vocal_roles.toggled.connect(lambda _v: self._update_ltx_lipsync_trim_lock())
@@ -16442,6 +17486,21 @@ class AutoMusicSyncWidget(QWidget):
         workflow or block Generate LTX Videoclip.
         """
         try:
+            if hasattr(self, "_ltx_own_images_active") and self._ltx_own_images_active():
+                return {
+                    "enabled": False,
+                    "reference_mode": False,
+                    "saved_references_present": False,
+                    "reference_sheet_path": "",
+                    "global_reference_sheet_path": "",
+                    "source": "none",
+                    "selected_image_model": "existing",
+                    "character_reference_sheets": {},
+                    "warnings": ["Own images are active; character-reference image generation is bypassed."],
+                }
+        except Exception:
+            pass
+        try:
             source_combo = getattr(self, "combo_bridge_character_source", None)
             source = str(source_combo.currentData() if source_combo is not None else "built_in")
         except Exception:
@@ -16719,6 +17778,16 @@ class AutoMusicSyncWidget(QWidget):
                 "own_prompt_count": 0,
                 "own_prompts_signature": "",
             }
+        try:
+            own_images = self._ltx_own_images_payload()
+        except Exception:
+            own_images = {
+                "own_images_enabled": False,
+                "own_images_selected": False,
+                "own_image_paths": [],
+                "own_image_count": 0,
+                "own_images_signature": "",
+            }
 
         return {
             "preset": preset,
@@ -16769,7 +17838,253 @@ class AutoMusicSyncWidget(QWidget):
             "prompt_passthrough": bool(own_prompts.get("own_prompts_enabled")),
             "disable_prompt_rewrite": bool(own_prompts.get("own_prompts_enabled")),
             "disable_prompt_enhancement": bool(own_prompts.get("own_prompts_enabled")),
+            "own_images_enabled": bool(own_images.get("own_images_enabled")),
+            "own_images_selected": bool(own_images.get("own_images_selected")),
+            "own_image_paths": list(own_images.get("own_image_paths") or []),
+            "own_image_count": int(own_images.get("own_image_count") or 0),
+            "own_images_signature": str(own_images.get("own_images_signature") or ""),
         }
+
+    def _ltx_own_image_paths(self) -> list[str]:
+        paths = []
+        seen = set()
+        lw = getattr(self, "list_ltx_own_images", None)
+        if lw is None:
+            return paths
+        try:
+            for row in range(lw.count()):
+                item = lw.item(row)
+                candidate = _musicclip_valid_own_image_path(item.data(Qt.UserRole) if item is not None else "")
+                if not candidate:
+                    continue
+                key = os.path.normcase(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                paths.append(candidate)
+        except Exception:
+            pass
+        return paths
+
+    def _ltx_own_images_selected(self) -> bool:
+        try:
+            return bool(getattr(self, "check_ltx_use_own_images", None) and self.check_ltx_use_own_images.isChecked())
+        except Exception:
+            return False
+
+    def _ltx_own_images_active(self) -> bool:
+        return bool(self._ltx_own_images_selected() and self._ltx_own_image_paths())
+
+    def _ltx_own_images_payload(self) -> dict:
+        paths = self._ltx_own_image_paths()
+        selected = self._ltx_own_images_selected()
+        signature_parts = []
+        for candidate in paths:
+            try:
+                st = os.stat(candidate)
+                signature_parts.append([os.path.normcase(candidate), int(st.st_size), int(st.st_mtime_ns)])
+            except Exception:
+                signature_parts.append([os.path.normcase(candidate), 0, 0])
+        signature = hashlib.sha256(json.dumps(signature_parts, ensure_ascii=False, sort_keys=True).encode("utf-8", errors="replace")).hexdigest()
+        return {
+            "own_images_enabled": bool(selected and paths),
+            "own_images_selected": bool(selected),
+            "own_image_paths": paths,
+            "own_image_count": len(paths),
+            "own_images_signature": signature,
+            "own_image_paths_authoritative": True,
+            "own_image_source": "visible_ui_list",
+        }
+
+    def _ltx_add_own_image_item(self, path: str, *, select: bool = False) -> bool:
+        candidate = _musicclip_valid_own_image_path(path)
+        lw = getattr(self, "list_ltx_own_images", None)
+        if not candidate or lw is None:
+            return False
+        norm = os.path.normcase(candidate)
+        try:
+            for row in range(lw.count()):
+                item = lw.item(row)
+                existing = str(item.data(Qt.UserRole) or "") if item is not None else ""
+                if os.path.normcase(os.path.abspath(existing)) == norm:
+                    if select:
+                        lw.setCurrentRow(row)
+                    return False
+        except Exception:
+            pass
+        item = QListWidgetItem(os.path.basename(candidate))
+        item.setData(Qt.UserRole, candidate)
+        item.setToolTip(candidate)
+        try:
+            pm = QPixmap(candidate)
+            if not pm.isNull():
+                item.setIcon(QIcon(pm.scaled(112, 72, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
+        except Exception:
+            pass
+        lw.addItem(item)
+        if select:
+            lw.setCurrentItem(item)
+        return True
+
+    def _on_add_ltx_own_images_clicked(self) -> None:
+        start_dir = ""
+        current_paths = self._ltx_own_image_paths()
+        if current_paths:
+            start_dir = os.path.dirname(current_paths[-1])
+        try:
+            paths, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Add finished images for LTX shots",
+                start_dir,
+                "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff);;All files (*.*)",
+            )
+        except Exception:
+            paths = []
+        added = 0
+        for candidate in paths or []:
+            if self._ltx_add_own_image_item(candidate, select=True):
+                added += 1
+        if added:
+            try:
+                self.check_ltx_use_own_images.setChecked(True)
+            except Exception:
+                pass
+        self._update_ltx_own_images_ui()
+        self._queue_settings_save()
+
+    def _on_remove_ltx_own_image_clicked(self) -> None:
+        """Remove exactly the rows selected in the visible own-image list.
+
+        The list is authoritative. Never rescan the source folder and never leave
+        selected rows behind because only currentRow() was removed.
+        """
+        lw = getattr(self, "list_ltx_own_images", None)
+        if lw is None:
+            return
+        try:
+            rows = sorted({int(index.row()) for index in lw.selectedIndexes()}, reverse=True)
+        except Exception:
+            rows = []
+        if not rows:
+            row = int(lw.currentRow())
+            rows = [row] if row >= 0 else []
+        next_row = min(rows) if rows else -1
+        for row in rows:
+            if 0 <= row < lw.count():
+                lw.takeItem(row)
+        if lw.count() > 0 and next_row >= 0:
+            lw.setCurrentRow(min(next_row, lw.count() - 1))
+        if lw.count() <= 0 and getattr(self, "check_ltx_use_own_images", None) is not None:
+            self.check_ltx_use_own_images.setChecked(False)
+        self._update_ltx_own_images_ui()
+        self._queue_settings_save()
+
+    def _on_move_ltx_own_image(self, direction: int) -> None:
+        lw = getattr(self, "list_ltx_own_images", None)
+        if lw is None:
+            return
+        row = lw.currentRow()
+        target = row + int(direction)
+        if row < 0 or target < 0 or target >= lw.count():
+            return
+        item = lw.takeItem(row)
+        lw.insertItem(target, item)
+        lw.setCurrentRow(target)
+        self._update_ltx_own_images_ui()
+        self._queue_settings_save()
+
+    def _on_clear_ltx_own_images_clicked(self) -> None:
+        lw = getattr(self, "list_ltx_own_images", None)
+        if lw is not None:
+            lw.clear()
+        try:
+            if getattr(self, "check_ltx_use_own_images", None) is not None:
+                self.check_ltx_use_own_images.setChecked(False)
+        except Exception:
+            pass
+        self._update_ltx_own_images_ui()
+        self._queue_settings_save()
+
+    def _on_open_ltx_own_image_item(self, item=None) -> None:
+        try:
+            if item is None and getattr(self, "list_ltx_own_images", None) is not None:
+                item = self.list_ltx_own_images.currentItem()
+            path = _musicclip_valid_own_image_path(item.data(Qt.UserRole) if item is not None else "")
+            if path:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        except Exception:
+            pass
+
+    def _update_ltx_own_images_ui(self) -> None:
+        paths = self._ltx_own_image_paths()
+        selected = self._ltx_own_images_selected()
+        active = bool(selected and paths)
+        count = len(paths)
+        try:
+            label = getattr(self, "label_ltx_own_images_status", None)
+            if label is not None:
+                if active:
+                    label.setText(f"Own images active: {count} image(s). Text-to-image generation will be skipped; the normal full run will create LTXxx_start.png copies.")
+                    label.setStyleSheet("color: #7fbf7f;")
+                elif selected:
+                    label.setText("Use own images is selected, but the list is empty. Normal text-to-image workflow remains active.")
+                    label.setStyleSheet("color: #d79a5b;")
+                else:
+                    label.setText(f"{count} image(s) loaded but not selected. Normal text-to-image workflow is active." if count else "No own images added. Normal text-to-image workflow is active.")
+                    label.setStyleSheet("color: #8a8a8a;")
+        except Exception:
+            pass
+
+        # These controls only choose or feed the text-to-image stage. Keep all
+        # prompt planning, clip prompts, timing, LTX settings, LoRAs and review tools.
+        for attr in (
+            "combo_bridge_character_source",
+            "label_bridge_character_source_field",
+            "label_bridge_character_source_note",
+            "combo_ltx_single_image_mode",
+            "label_ltx_single_image_mode_field",
+        ):
+            try:
+                widget = getattr(self, attr, None)
+                if widget is not None:
+                    widget.setVisible(not active)
+            except Exception:
+                pass
+        try:
+            ref_section = getattr(self, "ltx_section_reference_images", None)
+            if ref_section is not None:
+                if active:
+                    ref_section.setVisible(False)
+                else:
+                    source = str(self.combo_bridge_character_source.currentData() if getattr(self, "combo_bridge_character_source", None) is not None else "built_in")
+                    ref_section.setVisible(source == "reference_images")
+        except Exception:
+            pass
+        for attr in ("btn_generate_ltx_start_image", "check_ltx_use_generated_start_image"):
+            try:
+                widget = getattr(self, attr, None)
+                if widget is not None:
+                    widget.setVisible(not active)
+            except Exception:
+                pass
+
+        # Own prompts still control the image-to-video movement prompts, but the
+        # image-model prompt box is irrelevant while supplied images are active.
+        for attr in ("edit_ltx_own_image_prompts", "label_ltx_own_image_prompts_field"):
+            try:
+                widget = getattr(self, attr, None)
+                if widget is not None:
+                    widget.setVisible(not active)
+            except Exception:
+                pass
+        try:
+            self._update_ltx_own_prompts_ui()
+        except Exception:
+            pass
+        try:
+            self._update_ltx_single_image_mode_ui()
+        except Exception:
+            pass
 
     def _ltx_own_prompts_enabled(self) -> bool:
         try:
@@ -16789,8 +18104,13 @@ class AutoMusicSyncWidget(QWidget):
             video_text = ""
         image_prompts = _musicclip_split_own_prompt_blocks(image_text)
         video_prompts = _musicclip_split_own_prompt_blocks(video_text)
+        own_images_active = self._ltx_own_images_active() if hasattr(self, "_ltx_own_images_active") else False
+        if own_images_active:
+            # No text-to-image model runs in this mode. Mirror the exact I2V text
+            # into image fields only as a harmless bridge fallback.
+            image_prompts = list(video_prompts)
         signature_source = json.dumps(
-            {"enabled": bool(enabled), "image": image_prompts, "video": video_prompts},
+            {"enabled": bool(enabled), "image": image_prompts, "video": video_prompts, "own_images": bool(own_images_active)},
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -16798,12 +18118,14 @@ class AutoMusicSyncWidget(QWidget):
             "own_prompts_enabled": bool(enabled),
             "own_image_prompts": image_prompts,
             "own_video_prompts": video_prompts,
-            "own_prompt_count": min(len(image_prompts), len(video_prompts)),
+            "own_prompt_count": len(video_prompts) if own_images_active else min(len(image_prompts), len(video_prompts)),
             "own_prompts_signature": hashlib.sha256(signature_source.encode("utf-8", errors="replace")).hexdigest(),
+            "own_prompts_with_own_images": bool(own_images_active),
         }
 
     def _update_ltx_own_prompts_ui(self) -> None:
         enabled = self._ltx_own_prompts_enabled()
+        own_images_active = self._ltx_own_images_active() if hasattr(self, "_ltx_own_images_active") else False
         try:
             box = getattr(self, "box_ltx_own_prompts", None)
             if box is not None:
@@ -16814,9 +18136,33 @@ class AutoMusicSyncWidget(QWidget):
         image_count = len(own.get("own_image_prompts") or [])
         video_count = len(own.get("own_video_prompts") or [])
         try:
+            hint = getattr(self, "label_ltx_own_prompts_hint", None)
+            if hint is not None:
+                hint.setText(
+                    "Enter exact image-to-video movement prompts. Press Enter twice (leave one full empty line) to start the next prompt. Supplied images replace the image-model stage."
+                    if own_images_active
+                    else "Enter matching image and image-to-video prompts. Press Enter twice (leave one full empty line) to start the next prompt. Prompt pair 1 creates shot 1, pair 2 creates shot 2, and so on. The entered text is passed through exactly without additions."
+                )
+        except Exception:
+            pass
+        try:
+            for attr in ("edit_ltx_own_image_prompts", "label_ltx_own_image_prompts_field"):
+                widget = getattr(self, attr, None)
+                if widget is not None:
+                    widget.setVisible(not own_images_active)
+        except Exception:
+            pass
+        try:
             label = getattr(self, "label_ltx_own_prompt_counts", None)
             if label is not None:
-                if image_count == video_count and image_count > 0:
+                if own_images_active:
+                    if video_count > 0:
+                        label.setText(f"Image-to-video prompts: {video_count} | These {video_count} prompts define the final shot count.")
+                        label.setStyleSheet("color: #7fbf7f;")
+                    else:
+                        label.setText("Image-to-video prompts: 0")
+                        label.setStyleSheet("color: #8a8a8a;")
+                elif image_count == video_count and image_count > 0:
                     label.setText(f"Prompt pairs: {image_count} | These {image_count} pairs define the final shot count.")
                     label.setStyleSheet("color: #7fbf7f;")
                 elif image_count or video_count:
@@ -16828,8 +18174,8 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
 
-        # These controls only create automatic prompt text. Keep timing, reference
-        # images, lipsync, effects, grouping, model selection and LoRAs available.
+        # These controls only create automatic prompt text. Keep timing, image
+        # assignment, lipsync, effects, grouping, model selection and LoRAs available.
         for attr in (
             "edit_bridge_main_idea",
             "edit_bridge_style_theme",
@@ -16853,8 +18199,12 @@ class AutoMusicSyncWidget(QWidget):
         own = self._ltx_own_prompts_payload()
         image_count = len(own.get("own_image_prompts") or [])
         video_count = len(own.get("own_video_prompts") or [])
+        own_images_active = self._ltx_own_images_active() if hasattr(self, "_ltx_own_images_active") else False
         message = ""
-        if image_count <= 0 or video_count <= 0:
+        if own_images_active:
+            if video_count <= 0:
+                message = "Use own prompts is enabled. Add at least one image-to-video prompt."
+        elif image_count <= 0 or video_count <= 0:
             message = "Use own prompts is enabled. Add at least one image prompt and one matching image-to-video prompt."
         elif image_count != video_count:
             message = f"Own prompt count mismatch: {image_count} image prompt(s) and {video_count} image-to-video prompt(s)."
@@ -16937,6 +18287,27 @@ class AutoMusicSyncWidget(QWidget):
                     new_own_sig = str(current_own.get("own_prompts_signature") or "").strip()
                     if old_own_sig and new_own_sig and old_own_sig != new_own_sig:
                         self._set_planner_bridge_status("Planner Bridge: own prompt lists changed. Rebuild the LTX director plan.")
+                        return False
+
+                plan_images = data.get("own_images")
+                if not isinstance(plan_images, dict):
+                    plan_images = {}
+                current_images = self._ltx_own_images_payload() if hasattr(self, "_ltx_own_images_payload") else {}
+                plan_images_enabled = _musicclip_bool_value(plan_images.get("enabled"), False)
+                current_images_enabled = bool(current_images.get("own_images_enabled"))
+                current_images_selected = bool(current_images.get("own_images_selected"))
+                if plan_images_enabled and current_images_selected and not current_images_enabled and _musicclip_plan_has_complete_own_image_copies(p):
+                    # The original files may have moved since the job was made.
+                    # Keep the cached job usable from its durable copied images.
+                    current_images_enabled = True
+                if plan_images_enabled != current_images_enabled:
+                    self._set_planner_bridge_status("Planner Bridge: cached plan uses a different Own images mode. Rebuild the plan.")
+                    return False
+                if current_images_enabled:
+                    old_images_sig = str(plan_images.get("signature") or "").strip()
+                    new_images_sig = str(current_images.get("own_images_signature") or "").strip()
+                    if old_images_sig and new_images_sig and old_images_sig != new_images_sig:
+                        self._set_planner_bridge_status("Planner Bridge: own image list or order changed. Rebuild the LTX director plan.")
                         return False
             plan_brief = data.get("creative_brief") if isinstance(data, dict) else {}
             if not isinstance(plan_brief, dict):
@@ -17392,6 +18763,51 @@ class AutoMusicSyncWidget(QWidget):
             return
 
         prompt_plan_path = self._planner_bridge_existing_prompt_plan_path()
+        if not prompt_plan_path and bool(getattr(self, "_ltx_own_prompts_enabled", lambda: False)()):
+            # Exact own prompts do not need an AI-generated prompt plan. Build a
+            # timing-only compatibility plan from the current scene plan so the
+            # manual shot-list test button remains useful for counting shots.
+            try:
+                scene_plan_path = str(getattr(self, "_planner_bridge_last_scene_plan_path", "") or "").strip()
+                if not scene_plan_path or not os.path.isfile(scene_plan_path):
+                    exported = self._planner_bridge_export_scene_plan(show_dialogs=True, show_success=False)
+                    scene_plan_path = str((exported or {}).get("plan_path") or "").strip()
+                if scene_plan_path and os.path.isfile(scene_plan_path):
+                    with open(scene_plan_path, "r", encoding="utf-8") as _f:
+                        _scene_plan = json.load(_f)
+                    _scenes = []
+                    for _idx, _scene in enumerate((_scene_plan.get("scenes") or []), start=1):
+                        if not isinstance(_scene, dict):
+                            continue
+                        _row = dict(_scene)
+                        _start = float(_row.get("song_start", _row.get("start", 0.0)) or 0.0)
+                        _end = float(_row.get("song_end", _row.get("end", _start + float(_row.get("duration") or 0.0))) or 0.0)
+                        _row["id"] = str(_row.get("id") or f"S{_idx:02d}")
+                        _row["index"] = _idx
+                        _row["song_start"] = _start
+                        _row["song_end"] = _end
+                        _row["duration"] = max(0.05, _end - _start)
+                        _row.setdefault("image_prompt", "Own image supplied")
+                        _row.setdefault("video_prompt", "Own image-to-video prompt supplied later")
+                        _row.setdefault("timestamped_video_prompt", _row.get("video_prompt") or "Own image-to-video prompt supplied later")
+                        _scenes.append(_row)
+                    if _scenes:
+                        _prompt_plan = dict(_scene_plan)
+                        _prompt_plan.update({
+                            "version": "musicclip-prompt-plan-own-prompts-compat-v1",
+                            "source": "own_prompts_timing_only",
+                            "scene_plan_path": scene_plan_path,
+                            "scene_count": len(_scenes),
+                            "scenes": _scenes,
+                            "prompt_backend": "user_exact_passthrough",
+                            "own_prompts_enabled": True,
+                        })
+                        prompt_plan_path = os.path.join(os.path.dirname(scene_plan_path), "musicclip_prompt_plan.json")
+                        with open(prompt_plan_path, "w", encoding="utf-8") as _f:
+                            json.dump(_prompt_plan, _f, indent=2, ensure_ascii=False)
+                        self._planner_bridge_last_prompt_plan_path = prompt_plan_path
+            except Exception as _compat_exc:
+                self._set_planner_bridge_status(f"Planner Bridge: Could not create timing-only own-prompt plan: {_compat_exc}")
         if not prompt_plan_path:
             msg = "Create a prompt plan first."
             self._set_planner_bridge_status(f"Planner Bridge: {msg}")
@@ -17488,7 +18904,10 @@ class AutoMusicSyncWidget(QWidget):
         """
         try:
             path = str(getattr(self, "_planner_bridge_last_ltx_shot_plan_path", "") or "").strip()
-            if path and os.path.isfile(path) and self._planner_bridge_plan_matches_current_brief(path):
+            # A path stored by the just-finished shot-plan action is authoritative.
+            # Do not reject it because own-prompt/own-image compatibility plans use
+            # a different brief/signature shape than AI-generated prompt plans.
+            if path and os.path.isfile(path):
                 return path
         except Exception:
             pass
@@ -17561,6 +18980,18 @@ class AutoMusicSyncWidget(QWidget):
             result = {"ok": False, "message": "LTX director plan creation returned an invalid result."}
 
         director_plan_path = str(result.get("ltx_director_plan_path") or "")
+        try:
+            if director_plan_path and hasattr(self, "_ltx_own_images_payload"):
+                own_report = _musicclip_apply_own_images_to_plan_file(
+                    director_plan_path,
+                    self._ltx_own_images_payload(),
+                    "LTX director plan",
+                )
+                if own_report.get("enabled"):
+                    result["own_images_report"] = own_report
+                    result["ltx_shot_count"] = int(own_report.get("shot_count") or result.get("ltx_shot_count") or 0)
+        except Exception:
+            pass
         try:
             self._planner_bridge_last_ltx_director_plan_path = director_plan_path
             if director_plan_path:
@@ -17673,6 +19104,14 @@ class AutoMusicSyncWidget(QWidget):
                 payload["disable_prompt_rewrite"] = True
                 payload["disable_prompt_enhancement"] = True
                 payload["disable_negative_prompt"] = True
+        except Exception:
+            pass
+        try:
+            payload.update(self._ltx_own_images_payload())
+            if payload.get("own_images_enabled"):
+                payload["image_mode"] = "existing"
+                payload["image_model"] = "existing"
+                payload["character_reference"] = {"enabled": False, "reference_mode": False, "character_reference_sheets": {}}
         except Exception:
             pass
         try:
@@ -18028,6 +19467,13 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
         try:
+            payload.update(self._ltx_own_images_payload())
+            if payload.get("own_images_enabled"):
+                payload["image_mode"] = "existing"
+                payload["image_model"] = "existing"
+        except Exception:
+            pass
+        try:
             llama_settings = None if payload.get("own_prompts_enabled") else self._bridge_own_llama_payload_if_enabled()
             if llama_settings:
                 payload["llama_settings"] = llama_settings
@@ -18064,6 +19510,8 @@ class AutoMusicSyncWidget(QWidget):
         """Build a reproducible full-run payload for direct or queued MusicClip-LTX."""
         image_combo = getattr(self, "combo_ltx_single_image_mode", None)
         image_mode = str(image_combo.currentData() if image_combo is not None else "flux_klein_9b")
+        if hasattr(self, "_ltx_own_images_active") and self._ltx_own_images_active():
+            image_mode = "existing"
         payload = {
             "root_dir": _musicclip_project_root(),
             "ltx_backend": self._current_ltx_generation_backend(),
@@ -18108,6 +19556,14 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
         try:
+            payload.update(self._ltx_own_images_payload())
+            if payload.get("own_images_enabled"):
+                payload["image_mode"] = "existing"
+                payload["image_model"] = "existing"
+                payload["character_reference"] = {"enabled": False, "reference_mode": False, "character_reference_sheets": {}}
+        except Exception:
+            pass
+        try:
             if str(payload.get("ltx_backend") or "").strip().lower() in {"int4", "vramlab"}:
                 payload["ltx_raw_generation_seconds"] = 11.0
                 payload["ltx_raw_generation_frames"] = 265
@@ -18131,6 +19587,23 @@ class AutoMusicSyncWidget(QWidget):
                 payload["ltx_lora_multiplier"] = float(getattr(self, "spin_ltx_single_lora_multiplier", None).value()) if getattr(self, "spin_ltx_single_lora_multiplier", None) is not None else 1.0
         except Exception:
             pass
+
+        # Own-images jobs are materialized before backend launch. Pass the exact
+        # dated full-run directory to queue/direct runners so they cannot create
+        # another folder and cannot look for a generated image that does not exist.
+        if payload.get("own_images_enabled"):
+            prepared_dir = str(getattr(self, "_ltx_prepared_own_images_run_dir", "") or "").strip()
+            if not prepared_dir:
+                try:
+                    with open(str(plan_path), "r", encoding="utf-8") as _f:
+                        _plan = json.load(_f)
+                    _meta = _plan.get("own_images") if isinstance(_plan, dict) and isinstance(_plan.get("own_images"), dict) else {}
+                    prepared_dir = str(_meta.get("prepared_full_run_dir") or _meta.get("full_run_dir") or "").strip()
+                except Exception:
+                    prepared_dir = ""
+            if prepared_dir and os.path.isdir(prepared_dir):
+                payload["output_dir"] = prepared_dir
+                payload["own_images_prepared"] = True
         return payload
 
     def _switch_to_queue_tab_after_enqueue(self) -> None:
@@ -18237,6 +19710,31 @@ class AutoMusicSyncWidget(QWidget):
         prompt_plan_path = str(result.get("prompt_plan_path") or "").strip()
         shot_plan_path = str(result.get("ltx_shot_plan_path") or "").strip()
         director_plan_path = str(result.get("ltx_director_plan_path") or "").strip()
+        try:
+            if director_plan_path and hasattr(self, "_ltx_own_images_payload"):
+                own_report = _musicclip_apply_own_images_to_plan_file(
+                    director_plan_path,
+                    self._ltx_own_images_payload(),
+                    "Prepared LTX director plan",
+                )
+                if self._ltx_own_images_active() and not bool(own_report.get("ok")):
+                    self._ltx_finish_videoclip_workflow(False, str(own_report.get("message") or "Could not assign own images."))
+                    return
+                if own_report.get("enabled"):
+                    result["own_images_report"] = own_report
+                    result["ltx_shot_count"] = int(own_report.get("shot_count") or result.get("ltx_shot_count") or 0)
+                    # Do not copy/convert dozens of images on the GUI thread.
+                    # The selected backend's full-run worker performs this stage,
+                    # then immediately starts LTX. This keeps the app responsive
+                    # and gives queue/direct runs one identical hand-off.
+                    self._ltx_prepared_own_images_run_dir = ""
+                    self._set_planner_bridge_status(
+                        "Planner Bridge: own images assigned. Starting the selected LTX backend..."
+                    )
+        except Exception as exc:
+            if hasattr(self, "_ltx_own_images_active") and self._ltx_own_images_active():
+                self._ltx_finish_videoclip_workflow(False, f"Could not prepare own images: {exc}")
+                return
         try:
             if scene_plan_path:
                 self._planner_bridge_last_scene_plan_path = scene_plan_path
@@ -18688,10 +20186,16 @@ class AutoMusicSyncWidget(QWidget):
                 pass
 
     def _planner_bridge_existing_ltx_director_plan_path(self) -> str:
-        """Return the latest known LTX director plan path if it exists."""
+        """Return the latest known LTX director plan path if it exists.
+
+        A director plan produced by the just-finished preparation worker is
+        authoritative. Own-images/own-prompts intentionally rewrite metadata and
+        signatures, so re-validating it against the current creative-brief hash
+        here can reject the valid file that was created only milliseconds ago.
+        """
         try:
             path = str(getattr(self, "_planner_bridge_last_ltx_director_plan_path", "") or "").strip()
-            if path and os.path.isfile(path) and self._planner_bridge_plan_matches_current_brief(path):
+            if path and os.path.isfile(path):
                 return path
         except Exception:
             pass
@@ -18700,7 +20204,7 @@ class AutoMusicSyncWidget(QWidget):
                 base = str(getattr(self, attr, "") or "").strip()
                 if base:
                     cand = os.path.join(os.path.dirname(base), "musicclip_ltx_director_plan.json")
-                    if os.path.isfile(cand) and self._planner_bridge_plan_matches_current_brief(cand):
+                    if os.path.isfile(cand):
                         self._planner_bridge_last_ltx_director_plan_path = cand
                         return cand
             except Exception:
@@ -18721,31 +20225,46 @@ class AutoMusicSyncWidget(QWidget):
 
     def _update_ltx_character_source_ui(self) -> None:
         try:
+            own_images_active = bool(hasattr(self, "_ltx_own_images_active") and self._ltx_own_images_active())
             source_combo = getattr(self, "combo_bridge_character_source", None)
             source = str(source_combo.currentData() if source_combo is not None else "built_in")
             ref_mode = source == "reference_images"
+            for attr in (
+                "combo_bridge_character_source",
+                "label_bridge_character_source_field",
+                "label_bridge_character_source_note",
+                "combo_ltx_single_image_mode",
+                "label_ltx_single_image_mode_field",
+            ):
+                widget = getattr(self, attr, None)
+                if widget is not None:
+                    widget.setVisible(not own_images_active)
             ref_section = getattr(self, "ltx_section_reference_images", None)
             if ref_section is not None:
-                ref_section.setVisible(ref_mode)
+                ref_section.setVisible(bool(ref_mode and not own_images_active))
             chars = getattr(self, "edit_bridge_characters_subjects", None)
             if chars is not None:
                 chars.setPlaceholderText(
                     "Example: singers, dancers, creatures, objects"
-                    if ref_mode
+                    if ref_mode and not own_images_active
                     else "Example: a woman with wavy long black hair and a funny green alien"
                 )
             note = getattr(self, "label_bridge_character_source_note", None)
             if note is not None:
                 try:
                     note.setText(
-                        "Reference image mode — choose HiDream or Qwen 2511 INT4."
-                        if ref_mode
-                        else "Built-in character bible mode — reference image section auto-hidden."
+                        "Own images active — text-to-image and character-reference image generation are skipped."
+                        if own_images_active
+                        else (
+                            "Reference image mode — choose HiDream or Qwen 2511 INT4."
+                            if ref_mode
+                            else "Built-in character bible mode — reference image section auto-hidden."
+                        )
                     )
                 except Exception:
                     pass
             image_combo = getattr(self, "combo_ltx_single_image_mode", None)
-            if image_combo is not None:
+            if image_combo is not None and not own_images_active:
                 current = str(image_combo.currentData() or "hidream")
                 wanted = [("HiDream", "hidream"), ("Qwen 2511 INT4", "qwen2511_int4")] if ref_mode else [
                     ("Use existing start image", "existing"), ("Z-Image Turbo", "z_image"), ("Krea 2", "krea2"),
@@ -18765,7 +20284,7 @@ class AutoMusicSyncWidget(QWidget):
                 widgets = (getattr(self, "_planner_bridge_character_reference_widgets", {}) or {}).get(f"char_{idx:02d}", {})
                 for widget in widgets.values() if isinstance(widgets, dict) else []:
                     try:
-                        widget.setVisible(idx <= max_slots)
+                        widget.setVisible(bool(not own_images_active and idx <= max_slots))
                     except Exception:
                         pass
             self._update_ltx_single_image_mode_ui()
@@ -18803,7 +20322,8 @@ class AutoMusicSyncWidget(QWidget):
                     combo.blockSignals(False)
             combo = getattr(self, "combo_ltx_single_image_mode", None)
             mode = combo.currentData() if combo is not None else "existing"
-            visible = str(mode or "existing") == "existing"
+            own_images_active = bool(hasattr(self, "_ltx_own_images_active") and self._ltx_own_images_active())
+            visible = bool(not own_images_active and str(mode or "existing") == "existing")
             row = getattr(self, "row_ltx_single_start_image", None)
             if row is not None:
                 row.setVisible(visible)
@@ -18974,6 +20494,15 @@ class AutoMusicSyncWidget(QWidget):
                     self._set_planner_bridge_status(f"Planner Bridge: {str(report.get('message') or 'Duration guard applied.')}.{audio_note}")
             except Exception:
                 pass
+            try:
+                if hasattr(self, "_ltx_own_images_active") and self._ltx_own_images_active():
+                    own_report = _musicclip_apply_own_images_to_plan_file(path, self._ltx_own_images_payload(), "LTX director plan")
+                    if not bool(own_report.get("ok")):
+                        self._set_planner_bridge_status(f"Planner Bridge: {str(own_report.get('message') or 'Could not assign own images.')}")
+                        return
+            except Exception as exc:
+                self._set_planner_bridge_status(f"Planner Bridge: Could not assign own images: {exc}")
+                return
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             shots = [s for s in (data.get("shots") or []) if isinstance(s, dict)] if isinstance(data, dict) else []
@@ -19113,6 +20642,36 @@ class AutoMusicSyncWidget(QWidget):
             except Exception:
                 pass
             return
+
+        if hasattr(self, "_ltx_own_images_active") and self._ltx_own_images_active():
+            try:
+                try:
+                    self._apply_ltx_duration_guard_for_plan(plan_path, "LTX director plan")
+                except Exception:
+                    pass
+                report = _musicclip_apply_own_images_to_plan_file(plan_path, self._ltx_own_images_payload(), "LTX start-image plan")
+                if not bool(report.get("ok")):
+                    raise RuntimeError(str(report.get("message") or "Could not assign supplied images."))
+                combo = getattr(self, "combo_ltx_single_shot", None)
+                if combo is None or combo.count() <= 0:
+                    self._refresh_ltx_single_shots()
+                    combo = getattr(self, "combo_ltx_single_shot", None)
+                shot_id = str(combo.currentData() or combo.currentText() or "").split(" ")[0].strip() if combo is not None else ""
+                start_path = _musicclip_plan_start_image_for_shot(plan_path, shot_id)
+                if not start_path:
+                    raise RuntimeError(f"No supplied image assignment was found for {shot_id or 'the selected shot'}.")
+                self._on_ltx_start_image_finished({
+                    "ok": True,
+                    "shot_id": shot_id,
+                    "start_image_path": start_path,
+                    "image_model": "existing",
+                    "source_image_model": "own_images",
+                    "message": "Using supplied image; text-to-image generation was skipped.",
+                })
+                return
+            except Exception as exc:
+                self._set_planner_bridge_status(f"Planner Bridge: {exc}")
+                return
 
         try:
             report = self._apply_ltx_duration_guard_for_plan(plan_path, "LTX director plan")
@@ -19431,33 +20990,11 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
 
-        image_combo = getattr(self, "combo_ltx_single_image_mode", None)
-        image_mode = str(image_combo.currentData() if image_combo is not None else "flux_klein_9b")
+        # Queue and direct generation must use one identical payload contract.
+        # This preserves the already-prepared own-image full-run directory instead
+        # of silently creating a second folder or losing the existing-image mode.
+        payload = self._ltx_full_run_payload_from_current_settings(plan_path, assemble_after=False)
         use_lora = bool(getattr(self, "check_ltx_single_use_lora", None) and self.check_ltx_single_use_lora.isChecked())
-        payload = {
-            "root_dir": _musicclip_project_root(),
-            "ltx_backend": self._current_ltx_generation_backend(),
-            "ltx_director_plan_path": plan_path,
-            "image_mode": image_mode,
-            "steps": 8,
-            "resolution": self._planner_bridge_ltx_resolution(),
-            "skip_completed": bool(getattr(self, "check_ltx_full_skip_completed", None) is None or self.check_ltx_full_skip_completed.isChecked()),
-            "trim_clips": bool(getattr(self, "check_ltx_full_trim_clips", None) is None or self.check_ltx_full_trim_clips.isChecked()),
-            "ltx_avoid_short_start_end": bool((getattr(self, "check_ltx_avoid_short_start_end", None) is None) or self.check_ltx_avoid_short_start_end.isChecked()),
-            "character_reference": self._planner_bridge_character_reference_payload(),
-        }
-        try:
-            payload.update(self._ltx_own_prompts_payload())
-            if payload.get("own_prompts_enabled"):
-                payload["exact_prompt_passthrough"] = True
-                payload["prompt_passthrough"] = True
-                payload["disable_prompt_rewrite"] = True
-                payload["disable_prompt_enhancement"] = True
-                payload["disable_negative_prompt"] = True
-                payload["negative_prompt"] = ""
-                payload["negative_prompt_override"] = ""
-        except Exception:
-            pass
 
         if use_lora:
             payload["ltx_lora_file"] = str(getattr(self, "edit_ltx_single_lora_file", None).text() if getattr(self, "edit_ltx_single_lora_file", None) is not None else "").strip()
@@ -19762,11 +21299,14 @@ class AutoMusicSyncWidget(QWidget):
                     self.progress.setFormat("Continuing LTX generation for missing review clips...")
             except Exception:
                 pass
+            plan_uses_own_images = _musicclip_plan_uses_own_images(plan_path)
             try:
                 image_combo = getattr(self, "combo_ltx_single_image_mode", None)
                 image_mode = str(image_combo.currentData() if image_combo is not None else "flux_klein_9b")
             except Exception:
                 image_mode = "flux_klein_9b"
+            if plan_uses_own_images:
+                image_mode = "existing"
             full_run_dir = ""
             try:
                 latest_dir = self._ltx_review_find_latest_full_run_dir(Path(plan_path).resolve().parent)
@@ -19788,6 +21328,13 @@ class AutoMusicSyncWidget(QWidget):
                 "ltx_avoid_short_start_end": bool((getattr(self, "check_ltx_avoid_short_start_end", None) is None) or self.check_ltx_avoid_short_start_end.isChecked()),
                 "character_reference": self._planner_bridge_character_reference_payload(),
             }
+            if plan_uses_own_images:
+                run_payload.update({
+                    "image_mode": "existing",
+                    "image_model": "existing",
+                    "own_images_enabled": True,
+                    "character_reference": {"enabled": False, "mode": "disabled", "reason": "own_images"},
+                })
             if full_run_dir:
                 run_payload["output_dir"] = full_run_dir
             try:
@@ -20140,6 +21687,17 @@ class AutoMusicSyncWidget(QWidget):
         image_combo = getattr(self, "combo_ltx_single_image_mode", None)
         image_mode = str(image_combo.currentData() if image_combo is not None else "existing")
         existing_start = str(getattr(self, "edit_ltx_single_start_image", None).text() if getattr(self, "edit_ltx_single_start_image", None) is not None else "").strip()
+        own_images_active = bool(hasattr(self, "_ltx_own_images_active") and self._ltx_own_images_active())
+        if own_images_active:
+            try:
+                own_report = _musicclip_apply_own_images_to_plan_file(plan_path, self._ltx_own_images_payload(), "LTX single-shot plan")
+                if not bool(own_report.get("ok")):
+                    raise RuntimeError(str(own_report.get("message") or "Could not assign supplied images."))
+                image_mode = "existing"
+                existing_start = _musicclip_plan_start_image_for_shot(plan_path, shot_id)
+            except Exception as exc:
+                self._set_planner_bridge_status(f"Planner Bridge: {exc}")
+                return
         use_generated = bool(getattr(self, "check_ltx_use_generated_start_image", None) and self.check_ltx_use_generated_start_image.isChecked())
         generated_start = str(getattr(self, "edit_ltx_generated_start_image", None).text() if getattr(self, "edit_ltx_generated_start_image", None) is not None else "").strip()
         generated_shot_id = str(getattr(self, "_ltx_generated_start_image_shot_id", "") or "").strip()
@@ -20147,7 +21705,7 @@ class AutoMusicSyncWidget(QWidget):
             image_mode = "existing"
             existing_start = generated_start
         if image_mode == "existing" and not existing_start:
-            msg = "Select an existing start image first, or generate one for the selected shot."
+            msg = "No supplied image was assigned to this shot." if own_images_active else "Select an existing start image first, or generate one for the selected shot."
             self._set_planner_bridge_status(f"Planner Bridge: {msg}")
             try:
                 QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
@@ -20169,6 +21727,18 @@ class AutoMusicSyncWidget(QWidget):
             "ltx_avoid_short_start_end": bool((getattr(self, "check_ltx_avoid_short_start_end", None) is None) or self.check_ltx_avoid_short_start_end.isChecked()),
             "character_reference": self._planner_bridge_character_reference_payload(),
         }
+        try:
+            payload.update(self._ltx_own_images_payload())
+            if payload.get("own_images_enabled"):
+                payload["image_mode"] = "existing"
+                payload["image_model"] = "existing"
+                payload["existing_start_image_path"] = existing_start
+                payload["start_image_path"] = existing_start
+                payload["use_existing_start_image"] = True
+                payload["character_reference"] = {"enabled": False, "reference_mode": False, "character_reference_sheets": {}}
+        except Exception:
+            pass
+
         if use_lora:
             payload["ltx_lora_file"] = str(getattr(self, "edit_ltx_single_lora_file", None).text() if getattr(self, "edit_ltx_single_lora_file", None) is not None else "").strip()
             payload["ltx_lora_json"] = str(getattr(self, "edit_ltx_single_lora_json", None).text() if getattr(self, "edit_ltx_single_lora_json", None) is not None else "").strip()
@@ -20379,6 +21949,8 @@ class AutoMusicSyncWidget(QWidget):
             start_path = self._ltx_review_safe_existing_path(state_item.get(key) or row.get(key))
             if start_path:
                 break
+        if not start_path:
+            start_path = self._ltx_review_safe_existing_path(_musicclip_plan_start_image_for_shot(plan_path, sid))
         if not start_path:
             start_path = self._ltx_review_find_asset_for_shot(plan_path, sid, "image")
         clip_path = ""
@@ -20932,6 +22504,9 @@ class AutoMusicSyncWidget(QWidget):
         return payload if isinstance(payload, dict) else {}
 
     def _ltx_review_selected_image_model(self) -> tuple[str, str]:
+        plan_path = self._ltx_review_current_plan_path()
+        if plan_path and _musicclip_plan_uses_own_images(plan_path):
+            return "existing", "Using the supplied job image; text-to-image recreation is disabled for this job."
         payload = self._ltx_review_character_reference_payload()
         refs_enabled = self._ltx_review_has_real_character_refs(payload)
         if refs_enabled:
@@ -21298,12 +22873,20 @@ class AutoMusicSyncWidget(QWidget):
             clip_prompt = str(payload.get("clip_prompt") or shot.get("director_timestamped_video_prompt") or shot.get("director_video_prompt") or shot.get("video_prompt") or "").strip()
             image_seed = payload.get("image_seed")
             clip_seed = payload.get("clip_seed")
-            image_model = str(payload.get("image_model") or "z_image").strip() or "z_image"
+            plan_uses_own_images = _musicclip_plan_uses_own_images(plan_path)
+            image_model = "existing" if plan_uses_own_images else (str(payload.get("image_model") or "z_image").strip() or "z_image")
             review_resolution = str(payload.get("resolution") or payload.get("ltx_resolution") or "").strip()
             if not review_resolution:
                 review_resolution = self._planner_bridge_ltx_resolution_for_plan(plan_path)
             character_reference = payload.get("character_reference") if isinstance(payload.get("character_reference"), dict) else {}
             start_path = str(item_state.get("current_start_image_path") or payload.get("current_start_image_path") or "").strip()
+            if plan_uses_own_images:
+                assigned_path = _musicclip_plan_start_image_for_shot(plan_path, shot_id)
+                if assigned_path and os.path.isfile(assigned_path):
+                    start_path = assigned_path
+                    item_state["current_start_image_path"] = assigned_path
+                    item_state["start_image_path"] = assigned_path
+                    item_state["existing_start_image_path"] = assigned_path
             if image_prompt:
                 item_state["image_prompt"] = image_prompt
             if clip_prompt:
@@ -21317,36 +22900,49 @@ class AutoMusicSyncWidget(QWidget):
             image_result = {}
             clip_result = {}
             if action in {"image", "image_and_clip", "both", "image_then_clip"}:
-                _emit(f"Recreating image for {shot_id}...")
-                gen_fn = getattr(bridge, "generate_ltx_start_image_for_shot", None)
-                if not callable(gen_fn):
-                    return {"ok": False, "message": "Start-image generation is not available in this bridge file."}
-                image_result = gen_fn({
-                    "root_dir": _musicclip_project_root(),
-                    "ltx_backend": self._current_ltx_generation_backend(),
-                    "ltx_generation_backend": self._current_ltx_generation_backend(),
-                    "ltx_director_plan_path": plan_path,
-                    "shot_id": shot_id,
-                    "image_model": image_model,
-                    "image_prompt_override": image_prompt,
-                    "seed": image_seed,
-                    "resolution": review_resolution,
-                    "ltx_resolution": review_resolution,
-                    "output_dir": review_dir,
-                    "start_image_name": f"{stem}_review_start.png",
-                    "start_image_payload_name": f"{stem}_review_start_image_payload.json",
-                    "start_image_log_name": f"{stem}_review_imagegen.log.txt",
-                    "character_reference": character_reference,
-                    "qwen2511_allow_custom_seed": image_model == "qwen2511_int4",
-                    "progress_callback": progress_callback,
-                })
-                if not isinstance(image_result, dict) or not bool(image_result.get("ok")):
-                    return {"ok": False, "message": str(image_result.get("message") if isinstance(image_result, dict) else "Image recreate failed.")}
-                start_path = str(image_result.get("start_image_path") or "").strip()
+                if plan_uses_own_images:
+                    _emit(f"Restoring supplied image for {shot_id}...")
+                    if not start_path or not os.path.isfile(start_path):
+                        return {"ok": False, "message": f"The supplied job image for {shot_id} could not be found."}
+                    image_result = {
+                        "ok": True,
+                        "shot_id": shot_id,
+                        "start_image_path": start_path,
+                        "image_model": "existing",
+                        "source_image_model": "own_images",
+                        "message": "Supplied image restored; text-to-image generation was skipped.",
+                    }
+                else:
+                    _emit(f"Recreating image for {shot_id}...")
+                    gen_fn = getattr(bridge, "generate_ltx_start_image_for_shot", None)
+                    if not callable(gen_fn):
+                        return {"ok": False, "message": "Start-image generation is not available in this bridge file."}
+                    image_result = gen_fn({
+                        "root_dir": _musicclip_project_root(),
+                        "ltx_backend": self._current_ltx_generation_backend(),
+                        "ltx_generation_backend": self._current_ltx_generation_backend(),
+                        "ltx_director_plan_path": plan_path,
+                        "shot_id": shot_id,
+                        "image_model": image_model,
+                        "image_prompt_override": image_prompt,
+                        "seed": image_seed,
+                        "resolution": review_resolution,
+                        "ltx_resolution": review_resolution,
+                        "output_dir": review_dir,
+                        "start_image_name": f"{stem}_review_start.png",
+                        "start_image_payload_name": f"{stem}_review_start_image_payload.json",
+                        "start_image_log_name": f"{stem}_review_imagegen.log.txt",
+                        "character_reference": character_reference,
+                        "qwen2511_allow_custom_seed": image_model == "qwen2511_int4",
+                        "progress_callback": progress_callback,
+                    })
+                    if not isinstance(image_result, dict) or not bool(image_result.get("ok")):
+                        return {"ok": False, "message": str(image_result.get("message") if isinstance(image_result, dict) else "Image recreate failed.")}
+                    start_path = str(image_result.get("start_image_path") or "").strip()
                 item_state.update({
-                    "status": "Image ready - clip needs recreate",
+                    "status": "Supplied image ready - clip needs recreate" if plan_uses_own_images else "Image ready - clip needs recreate",
                     "image_prompt": image_prompt,
-                    "image_seed": image_seed if image_seed not in (None, "") else image_result.get("seed", ""),
+                    "image_seed": "" if plan_uses_own_images else (image_seed if image_seed not in (None, "") else image_result.get("seed", "")),
                     "current_start_image_path": start_path,
                     "current_raw_clip_path": "",
                     "current_clip_path": "",
@@ -21357,7 +22953,11 @@ class AutoMusicSyncWidget(QWidget):
                 if action == "image":
                     return {
                         "ok": True,
-                        "message": f"Review image recreated: {shot_id}. Review the image, then recreate the clip or Continue/Reassemble.",
+                        "message": (
+                            f"Supplied image restored: {shot_id}. Recreate the clip or use Continue/Reassemble."
+                            if plan_uses_own_images
+                            else f"Review image recreated: {shot_id}. Review the image, then recreate the clip or Continue/Reassemble."
+                        ),
                         "shot_id": shot_id,
                         "review_state_path": self._ltx_review_state_path_for_plan(plan_path),
                         "review_dir": review_dir,
@@ -21406,7 +23006,8 @@ class AutoMusicSyncWidget(QWidget):
                     "resolution": review_resolution,
                     "ltx_resolution": review_resolution,
                     "allow_no_audio": False,
-                    "character_reference": character_reference,
+                    "character_reference": ({"enabled": False, "mode": "disabled", "reason": "own_images"} if plan_uses_own_images else character_reference),
+                    "own_images_enabled": bool(plan_uses_own_images),
                     "output_dir": review_dir,
                     "start_image_name": f"{stem}_review_start_used.png",
                     "raw_clip_name": f"{stem}_review_ltx_raw.mp4",
@@ -22650,7 +24251,29 @@ class AutoMusicSyncWidget(QWidget):
                     self.edit_ltx_own_video_prompts.setPlainText(str(s.get("ltx/own_video_prompts", "", str) or ""))
                 finally:
                     self.edit_ltx_own_video_prompts.blockSignals(False)
+            if getattr(self, "list_ltx_own_images", None) is not None:
+                try:
+                    self.list_ltx_own_images.blockSignals(True)
+                    self.list_ltx_own_images.clear()
+                    raw_paths = s.get("ltx/own_image_paths", "[]", str)
+                    try:
+                        loaded_paths = json.loads(raw_paths) if isinstance(raw_paths, str) else list(raw_paths or [])
+                    except Exception:
+                        loaded_paths = []
+                    if not isinstance(loaded_paths, list):
+                        loaded_paths = []
+                    for candidate in loaded_paths:
+                        self._ltx_add_own_image_item(str(candidate or ""))
+                finally:
+                    self.list_ltx_own_images.blockSignals(False)
+            if getattr(self, "check_ltx_use_own_images", None) is not None:
+                try:
+                    self.check_ltx_use_own_images.blockSignals(True)
+                    self.check_ltx_use_own_images.setChecked(bool(int(s.get("ltx/use_own_images", 0))))
+                finally:
+                    self.check_ltx_use_own_images.blockSignals(False)
             try:
+                self._update_ltx_own_images_ui()
                 self._update_ltx_own_prompts_ui()
             except Exception:
                 pass
@@ -23385,6 +25008,10 @@ class AutoMusicSyncWidget(QWidget):
                 s.set("ltx/own_image_prompts", str(self.edit_ltx_own_image_prompts.toPlainText() or ""))
             if getattr(self, "edit_ltx_own_video_prompts", None) is not None:
                 s.set("ltx/own_video_prompts", str(self.edit_ltx_own_video_prompts.toPlainText() or ""))
+            if getattr(self, "check_ltx_use_own_images", None) is not None:
+                s.set("ltx/use_own_images", int(self.check_ltx_use_own_images.isChecked()))
+            if hasattr(self, "_ltx_own_image_paths"):
+                s.set("ltx/own_image_paths", json.dumps(self._ltx_own_image_paths(), ensure_ascii=False))
             if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
                 s.set("planner_bridge_use_vocal_roles", int(self.check_bridge_use_vocal_roles.isChecked()))
             if getattr(self, "combo_bridge_director_backend", None) is not None:

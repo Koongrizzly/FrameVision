@@ -3380,9 +3380,13 @@ def _normalize_input_image(args: Any, ctx: Dict[str, Any]) -> None:
     normalized: List[Dict[str, Any]] = []
     rendered: List[str] = []
     for path_text, frame, strength, crf in raw_conditions:
-        source = Path(path_text).expanduser().resolve()
+        clean_path = str(path_text or "").strip().strip('"')
+        source = Path(clean_path).expanduser().resolve()
         if not source.is_file():
             raise FileNotFoundError(f"INT4 condition image not found: {source}")
+        if source.stat().st_size <= 0:
+            raise RuntimeError(f"INT4 condition image is empty: {source}")
+        print(f"[ltx-int4] Using condition image: {source} (frame={int(frame)}, strength={float(strength):.3f}, crf={int(crf)})", flush=True)
         if int(crf) != 0:
             raise RuntimeError("The split INT4 Diffusers loader does not use image CRF; keep the official CRF field at 0.")
         final_path = source

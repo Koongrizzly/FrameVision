@@ -16,7 +16,6 @@ import json
 import math
 import os
 import re
-import shlex
 import shutil
 import socket
 import subprocess
@@ -852,15 +851,6 @@ def _normalize_bridge_generation_settings(*sources: Any) -> Dict[str, Any]:
     else:
         clip_mode = "auto"
 
-    ltx_backend = _clean_text(_bridge_first_value(
-        merged.get("ltx_backend"), merged.get("ltx_generation_backend"), merged.get("generation_backend")
-    )).lower()
-    ltx_resolution = _clean_text(_bridge_first_value(
-        merged.get("ltx_resolution"), merged.get("resolution"), merged.get("output_resolution")
-    ))
-    output_resolution = _clean_text(merged.get("output_resolution"))
-    ltx_aspect_mode = _clean_text(merged.get("ltx_aspect_mode"))
-
     cfg: Dict[str, Any] = {
         "preset": preset,
         "clip_length_mode": clip_mode,
@@ -868,14 +858,6 @@ def _normalize_bridge_generation_settings(*sources: Any) -> Dict[str, Any]:
         "scene_cut_style": scene_cut_style,
         "smart_max_scene_mode": max_mode,
         "beat_style": beat_style,
-        "ltx_backend": ltx_backend,
-        "ltx_resolution": ltx_resolution,
-        "resolution": ltx_resolution,
-        "output_resolution": output_resolution,
-        "ltx_aspect_mode": ltx_aspect_mode,
-        "ltx_max_generation_seconds": _safe_float(merged.get("ltx_max_generation_seconds"), 0.0) or None,
-        "ltx_max_generation_frames": _safe_int(merged.get("ltx_max_generation_frames"), 0) or None,
-        "hard_max_ltx_shot_seconds": _safe_float(merged.get("hard_max_ltx_shot_seconds"), 0.0) or None,
         "timestamped_microclips_enabled": _safe_bool(merged.get("timestamped_microclips_enabled"), False),
         "collage_effect_enabled": _safe_bool(merged.get("collage_effect_enabled"), False),
         "avoid_effects_in_first_clip": _safe_bool(merged.get("avoid_effects_in_first_clip"), True),
@@ -893,12 +875,6 @@ def _duration_profile_from_bridge_settings(settings: Optional[Dict[str, Any]] = 
     preset = _clean_text(settings.get("preset")) or "Balanced"
     mode = _clean_text(settings.get("clip_length_mode")).lower() or "auto"
     manual = _safe_float(settings.get("manual_max_clip_seconds"), 0.0)
-    explicit_target = _safe_float(settings.get("target_clip_seconds"), 0.0)
-    explicit_max = _safe_float(settings.get("max_ltx_shot_seconds"), 0.0)
-    explicit_hard = _safe_float(settings.get("hard_max_ltx_shot_seconds"), 0.0)
-    max_generation_seconds = _safe_float(settings.get("ltx_max_generation_seconds"), 0.0)
-    ltx_backend = _safe_str(settings.get("ltx_backend") or settings.get("ltx_generation_backend")).lower().replace("-", "_")
-    vramlab_strict_cap = bool(ltx_backend in {"vramlab", "vram_lab", "framevision_vramlab", "own_ltx"} or max_generation_seconds > 0.0 or _safe_int(settings.get("ltx_max_generation_frames"), 0) > 0)
     preset_low = preset.lower()
 
     # Small profile mapping only; no new UI/settings.
@@ -927,25 +903,11 @@ def _duration_profile_from_bridge_settings(settings: Optional[Dict[str, Any]] = 
     elif mode == "manual" and manual > 0.05:
         target, max_ltx, source = manual, manual, "manual"
 
-    if explicit_target > 0.05:
-        target = float(explicit_target)
-    if explicit_max > 0.05:
-        max_ltx = float(explicit_max)
-    if vramlab_strict_cap:
-        cap_seconds = max_generation_seconds if max_generation_seconds > 0.05 else 10.0
-        target = min(float(target), float(cap_seconds))
-        max_ltx = min(float(max_ltx), float(cap_seconds))
-
     hard = max_ltx + (0.6 if source == "manual" else 1.5)
     hard = max(hard, max_ltx)
     # Absolute fallback cap keeps old auto behavior compatible, but manual keeps control.
     if source != "manual":
         hard = max(hard, float(LTX_HARD_MAX_SHOT_SECONDS)) if mode == "auto" else hard
-    if explicit_hard > 0.05:
-        hard = float(explicit_hard)
-    if vramlab_strict_cap:
-        cap_seconds = max_generation_seconds if max_generation_seconds > 0.05 else 10.0
-        hard = min(float(hard), float(cap_seconds))
 
     return {
         "source": source,
@@ -956,9 +918,6 @@ def _duration_profile_from_bridge_settings(settings: Optional[Dict[str, Any]] = 
         "hard_max_ltx_shot_seconds": round(float(hard), 3),
         "min_lipsync_seconds": round(float(min_lip), 3),
         "prefer_fast_nonvocal_cuts": bool(fast),
-        "strict_generation_frame_cap": bool(vramlab_strict_cap),
-        "ltx_max_generation_seconds": round(float(max_generation_seconds), 3) if max_generation_seconds > 0.05 else None,
-        "ltx_max_generation_frames": _safe_int(settings.get("ltx_max_generation_frames"), 0) or None,
     }
 
 
@@ -4287,10 +4246,7 @@ def _group_prompt_scenes_for_ltx(scenes: List[Dict[str, Any]], grouping_mode: st
         next_impact = _scene_is_impact(scene)
 
         should_split = False
-        if _safe_bool(profile.get("strict_generation_frame_cap"), False):
-            lyric_overflow_limit = hard_max
-        else:
-            lyric_overflow_limit = hard_max + (0.35 if profile.get("source") == "manual" else 0.75)
+        lyric_overflow_limit = hard_max + (0.35 if profile.get("source") == "manual" else 0.75)
         if proposed > hard_max:
             if (boundary_splits_lyric or same_phrase) and proposed <= lyric_overflow_limit:
                 should_split = False
@@ -5043,93 +4999,6 @@ def _make_ltx_retry_audio_guide(
     return str(out_wav)
 
 
-def _ensure_ltx_audio_guide_covers_generation_duration(
-    *,
-    root: Path,
-    director_plan: Dict[str, Any],
-    shot: Dict[str, Any],
-    out_dir: Path,
-    stem: str,
-    attempt_index: int,
-    desired_generation_duration: float,
-    fallback_audio_path: str,
-) -> tuple[str, Dict[str, Any]]:
-    """Return an LTX audio guide that is at least as long as the requested frames.
-
-    The raw LTX clip intentionally gets extra generation frames so the Music Clip
-    Creator can trim/sync later.  The audio guide must follow that longer raw
-    generation duration; otherwise A2V can build a shorter audio latent and crash
-    with a latent-shape mismatch before denoise starts.  This function never
-    shortens the requested generation.  It only re-cuts/pads the guide WAV when
-    the existing guide is too short.
-    """
-    fallback_audio_path = _safe_str(fallback_audio_path)
-    desired = max(0.05, float(desired_generation_duration or 0.0))
-    info: Dict[str, Any] = {
-        "enabled": bool(fallback_audio_path),
-        "desired_generation_duration": round(float(desired), 6),
-        "original_audio_guide": fallback_audio_path,
-        "original_audio_guide_duration": 0.0,
-        "padded": False,
-        "reason": "",
-        "audio_start": None,
-        "audio_duration": None,
-        "final_audio_guide": fallback_audio_path,
-        "error": "",
-    }
-    if not fallback_audio_path or not os.path.isfile(fallback_audio_path):
-        info["enabled"] = False
-        info["reason"] = "no existing audio guide"
-        return fallback_audio_path, info
-
-    try:
-        current_duration = _probe_media_duration_seconds(root, Path(fallback_audio_path))
-    except Exception:
-        current_duration = 0.0
-    info["original_audio_guide_duration"] = round(float(current_duration), 6)
-
-    # Small tolerance avoids rebuilding for tiny encoder/probe rounding drift.
-    if current_duration > 0.0 and current_duration + max(float(DURATION_TOLERANCE_SECONDS), 0.04) >= desired:
-        info["reason"] = "existing guide already covers requested generation duration"
-        return fallback_audio_path, info
-
-    master_audio = _safe_str(_master_audio_from_plan(director_plan))
-    if not master_audio or not os.path.isfile(master_audio):
-        master_audio = fallback_audio_path
-    if not master_audio or not os.path.isfile(master_audio):
-        info["reason"] = "no master audio available for padded guide"
-        return fallback_audio_path, info
-
-    song_start = _safe_float(shot.get("song_start"), 0.0)
-    audio_start = max(0.0, song_start - float(LTX_GENERATION_PRE_PAD_SECONDS))
-    audio_duration = desired
-    try:
-        song_duration = _probe_media_duration_seconds(root, Path(master_audio))
-    except Exception:
-        song_duration = 0.0
-    if song_duration > 0.0 and audio_start + audio_duration > song_duration:
-        # Keep the guide long enough by pulling the window earlier near the end
-        # of the song.  Do not shorten the raw LTX generation request.
-        audio_start = max(0.0, song_duration - audio_duration)
-        audio_duration = max(0.05, min(audio_duration, song_duration - audio_start))
-
-    guide_dir = Path(out_dir).resolve() / "ltx_audio_guides_padded"
-    guide_dir.mkdir(parents=True, exist_ok=True)
-    out_wav = guide_dir / f"{_safe_stem(stem)}_attempt{int(attempt_index)}_{int(round(audio_duration * 1000.0))}ms.wav"
-    err = _export_ltx_audio_chunk(_find_bridge_ffmpeg(root), master_audio, out_wav, audio_start, audio_duration)
-    if err or not out_wav.is_file():
-        info["reason"] = "failed to create padded guide; using original guide"
-        info["error"] = _clean_text(err, 500) if err else "padded guide file was not created"
-        return fallback_audio_path, info
-
-    info["padded"] = True
-    info["reason"] = "existing guide was shorter than requested generation duration"
-    info["audio_start"] = round(float(audio_start), 6)
-    info["audio_duration"] = round(float(audio_duration), 6)
-    info["final_audio_guide"] = str(out_wav)
-    return str(out_wav), info
-
-
 
 
 LTX_EDGE_FIRST_MIN_SECONDS = 3.0
@@ -5178,45 +5047,6 @@ def _set_ltx_shot_timing_fields(shot: Dict[str, Any], start: float, end: float, 
     # Mark duration-sensitive generated assets as stale when a caller changes the
     # timeline after an older/shorter clip may already exist.
     shot["duration_contract_seconds"] = round(duration, 3)
-
-
-def _ltx_vramlab_frame_cap_for_fps(fps: Any) -> tuple[int, float]:
-    target_fps = max(1, int(round(_safe_float(fps, 24.0) or 24.0)))
-    max_frames = min(241, max(1, int(round(10.0 * float(target_fps)))))
-    return int(max_frames), float(max_frames) / float(target_fps)
-
-
-def _cap_ltx_shot_timing_to_generation_limit(shot: Dict[str, Any], fps: Any, *, reason: str = "vramlab") -> Dict[str, Any]:
-    """Clamp one shot's planned duration/frames to the own LTX-VRAMLab cap.
-
-    The previous code capped only the command frames. That could leave plan/debug
-    metadata saying 300+ planned frames while the command generated ~241 frames,
-    which later made sync/assembly think the clip was too short.
-    """
-    if not isinstance(shot, dict):
-        return {"changed": False, "max_frames": 241, "max_seconds": 10.0}
-    target_fps = max(1, int(round(_safe_float(fps, _safe_float(shot.get("target_fps"), 24.0)) or 24.0)))
-    max_frames, max_seconds = _ltx_vramlab_frame_cap_for_fps(target_fps)
-    start, end, duration = _ltx_shot_start_end(shot)
-    current_frames = max(1, int(round(max(0.001, duration) * float(target_fps))))
-    if current_frames <= max_frames and duration <= max_seconds + 0.002:
-        shot["ltx_generation_frame_cap"] = int(max_frames)
-        shot["ltx_generation_seconds_cap"] = round(float(max_seconds), 6)
-        return {"changed": False, "max_frames": int(max_frames), "max_seconds": float(max_seconds)}
-    old = {
-        "song_start": round(float(start), 6),
-        "song_end": round(float(end), 6),
-        "duration": round(float(duration), 6),
-        "target_frames": int(current_frames),
-    }
-    new_end = float(start) + float(max_seconds)
-    _set_ltx_shot_timing_fields(shot, start, new_end, target_fps)
-    shot["ltx_generation_frame_cap_applied"] = True
-    shot["ltx_generation_frame_cap_reason"] = str(reason or "vramlab")
-    shot["ltx_generation_frame_cap"] = int(max_frames)
-    shot["ltx_generation_seconds_cap"] = round(float(max_seconds), 6)
-    shot["ltx_generation_frame_cap_previous"] = old
-    return {"changed": True, "max_frames": int(max_frames), "max_seconds": float(max_seconds), "previous": old}
 
 
 def _reduce_duration_pool(durations: List[float], amount: float, indexes: List[int], minimums: List[float]) -> float:
@@ -5798,9 +5628,6 @@ def create_ltx_shot_plan(payload: dict) -> dict:
             "character_reference": {k: v for k, v in character_reference.items() if k != "warnings"},
             "character_reference_warnings": _plan_character_reference_warnings(character_reference, passed_to_model=False),
             "fps": fps,
-            "resolution": _safe_str(bridge_generation_settings.get("ltx_resolution") or bridge_generation_settings.get("resolution"), "1280x704"),
-            "ltx_resolution": _safe_str(bridge_generation_settings.get("ltx_resolution") or bridge_generation_settings.get("resolution"), "1280x704"),
-            "ltx_aspect_mode": _safe_str(bridge_generation_settings.get("ltx_aspect_mode")),
             "ltx_shot_count": len(shots),
             "source_scene_count": len(scenes),
             "shot_grouping_mode": grouping_mode,
@@ -8399,9 +8226,6 @@ def create_ltx_director_plan(payload: dict) -> dict:
             "character_reference": {k: v for k, v in character_reference.items() if k != "warnings"},
             "character_reference_warnings": _plan_character_reference_warnings(character_reference, passed_to_model=False),
             "fps": _safe_float(ltx_plan.get("fps"), 24.0),
-            "resolution": _safe_str(bridge_generation_settings.get("ltx_resolution") or ltx_plan.get("ltx_resolution") or ltx_plan.get("resolution"), "1280x704"),
-            "ltx_resolution": _safe_str(bridge_generation_settings.get("ltx_resolution") or ltx_plan.get("ltx_resolution") or ltx_plan.get("resolution"), "1280x704"),
-            "ltx_aspect_mode": _safe_str(bridge_generation_settings.get("ltx_aspect_mode") or ltx_plan.get("ltx_aspect_mode")),
             "bridge_generation_settings": bridge_generation_settings,
             "duration_profile": duration_profile,
             "microclip_profile": microclip_profile,
@@ -8476,25 +8300,6 @@ def _parse_resolution_value(value: Any, default: str = "1280x720") -> tuple[int,
     width = max(256, min(width, 4096))
     height = max(256, min(height, 4096))
     return width, height, f"{width}x{height}"
-
-
-def _normalize_ltx23_vramlab_resolution(value: Any, default: str = "1280x704") -> tuple[int, int, str]:
-    """Map normal video/image sizes to the tuned LTX 2.3 VRAMLab buckets."""
-    width, height, _ = _parse_resolution_value(value, default)
-    portrait = bool(height > width)
-    long_side = max(width, height)
-    short_side = min(width, height)
-    if portrait:
-        if long_side >= 1500 or short_side >= 1000:
-            return 1088, 1920, "1088x1920"
-        if long_side >= 1000 or short_side >= 700:
-            return 704, 1280, "704x1280"
-        return 512, 832, "512x832"
-    if long_side >= 1500 or short_side >= 1000:
-        return 1920, 1088, "1920x1088"
-    if long_side >= 1000 or short_side >= 700:
-        return 1280, 704, "1280x704"
-    return 832, 512, "832x512"
 
 
 def _make_ltx_test_dir(plan_path: Path, shot_id: str) -> Path:
@@ -8715,24 +8520,6 @@ def _run_flux_klein_start_image(root: Path, *, prompt: str, negative: str, outpu
 
 
 _HIDREAM_MODEL_INFO = {
-    "dev_2604_bf16": {
-        "label": "Dev 2604 BF16",
-        "folder": "HiDream-O1-Image-Dev-2604-BF16",
-        "steps": 28,
-        "guidance_scale": 0.0,
-        "shift": 1.0,
-        "scheduler_name": "flash",
-        "timesteps": "dev",
-    },
-    "dev_2604_fp8": {
-        "label": "Dev 2604 FP8",
-        "folder": "HiDream-O1-Image-Dev-2604-FP8",
-        "steps": 28,
-        "guidance_scale": 0.0,
-        "shift": 1.0,
-        "scheduler_name": "flash",
-        "timesteps": "dev",
-    },
     "dev_fp8": {
         "label": "Dev FP8",
         "folder": "HiDream-O1-Image-Dev-FP8",
@@ -8745,6 +8532,24 @@ _HIDREAM_MODEL_INFO = {
     "dev": {
         "label": "Dev BF16",
         "folder": "HiDream-O1-Image-Dev-BF16",
+        "steps": 28,
+        "guidance_scale": 0.0,
+        "shift": 1.0,
+        "scheduler_name": "flash",
+        "timesteps": "dev",
+    },
+    "dev_2604_bf16": {
+        "label": "Dev 2604 BF16",
+        "folder": "HiDream-O1-Image-Dev-2604-BF16",
+        "steps": 28,
+        "guidance_scale": 0.0,
+        "shift": 1.0,
+        "scheduler_name": "flash",
+        "timesteps": "dev",
+    },
+    "dev_2604_fp8": {
+        "label": "Dev 2604 FP8",
+        "folder": "HiDream-O1-Image-Dev-2604-FP8",
         "steps": 28,
         "guidance_scale": 0.0,
         "shift": 1.0,
@@ -9059,29 +8864,11 @@ def _hidream_model_installed(root: Path, model_key: str) -> bool:
         return False
 
 
-def _hidream_cli_supports_model_key(root: Path, model_key: str) -> bool:
-    """Avoid selecting a model key that the installed helpers/hidream_cli.py cannot parse."""
-    key = _safe_str(model_key)
-    if not key:
-        return False
-    cli = _hidream_cli_path(root)
-    if not cli:
-        # If the CLI cannot be inspected yet, keep legacy behavior and let the later path check fail clearly.
-        return True
-    try:
-        raw = Path(cli).read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return True
-    # Modern helpers expose MODEL_MAP / MODEL_DEFAULTS keys literally. This also
-    # keeps older helpers safe if they do not yet include dev_2604_* choices.
-    return bool(re.search(rf"[\"']{re.escape(key)}[\"']\s*:", raw) or re.search(rf"\b{re.escape(key)}\b", raw))
-
-
 def _pick_hidream_model_key(root: Path) -> str:
     """Pick the HiDream model for Character Sheet image creation/edit helpers.
 
     Character-sheet workflows should prefer Dev models only.
-    Preference order requested by the user:
+    Order requested by the user:
     1) Dev FP8
     2) Dev BF16
     3) Dev 2604 BF16
@@ -9090,7 +8877,7 @@ def _pick_hidream_model_key(root: Path) -> str:
     Base models are intentionally excluded from this picker.
     """
     for key in ("dev_fp8", "dev", "dev_2604_bf16", "dev_2604_fp8"):
-        if _hidream_model_installed(root, key) and _hidream_cli_supports_model_key(root, key):
+        if _hidream_model_installed(root, key):
             return key
     return ""
 
@@ -9110,271 +8897,6 @@ def _hidream_cli_path(root: Path) -> str:
         except Exception:
             continue
     return ""
-
-
-
-_QWEN2511_INT4_MUSIC_QUALITY_ORDER = (
-    "best-low-step",
-    "fidelity",
-    "recommended",
-    "fastest",
-)
-
-
-def _qwen2511_int4_install(root: Path) -> Dict[str, Any]:
-    model_root = (root / "models" / "qwen2511_int").resolve()
-    env_python = (root / "environments" / ".qwen2511_int" / "Scripts" / "python.exe").resolve()
-    helper = (root / "helpers" / "qwen2511_int.py").resolve()
-    profiles_path = (model_root / "model_profiles.json").resolve()
-    base = (model_root / "base" / "Qwen-Image-Edit-2511").resolve()
-
-    required = (
-        base / "model_index.json",
-        base / "vae" / "config.json",
-        base / "text_encoder" / "config.json",
-        base / "tokenizer" / "tokenizer_config.json",
-        base / "processor" / "preprocessor_config.json",
-    )
-    if not env_python.is_file() or not helper.is_file() or not profiles_path.is_file():
-        return {}
-    if not all(path.is_file() and path.stat().st_size > 0 for path in required):
-        return {}
-
-    try:
-        payload = _read_json_file(str(profiles_path))
-        models = payload.get("models") if isinstance(payload, dict) else {}
-    except Exception:
-        return {}
-    if not isinstance(models, dict):
-        return {}
-
-    for key in _QWEN2511_INT4_MUSIC_QUALITY_ORDER:
-        profile = models.get(key)
-        if not isinstance(profile, dict):
-            continue
-        rel = _safe_str(profile.get("relative_path"))
-        filename = _safe_str(profile.get("filename"))
-        checkpoint = model_root / (rel or ("int4/" + filename))
-        if checkpoint.is_file() and checkpoint.stat().st_size > 1024 * 1024:
-            return {
-                "env_python": str(env_python),
-                "helper": str(helper),
-                "model_root": str(model_root),
-                "profile_key": key,
-                "profile_label": _safe_str(profile.get("label"), key),
-                "steps": _safe_int(profile.get("steps"), 4),
-                "checkpoint": str(checkpoint),
-            }
-    return {}
-
-
-class _Qwen2511Int4BatchSession:
-    def __init__(self, root: Path, progress_callback: Optional[Callable[[str], None]] = None) -> None:
-        self.root = Path(root).resolve()
-        self.progress_callback = progress_callback
-        self.proc: Optional[subprocess.Popen] = None
-        self.install = _qwen2511_int4_install(self.root)
-
-    def _emit(self, message: str) -> None:
-        if callable(self.progress_callback):
-            try:
-                self.progress_callback(str(message or ""))
-            except Exception:
-                pass
-
-    def start(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            return
-        if not self.install:
-            raise RuntimeError("Qwen2511 INT4 is selected, but no usable INT4 installation was found.")
-        env = os.environ.copy()
-        env.update({
-            "PYTHONUNBUFFERED": "1",
-            "PYTHONUTF8": "1",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-            "FRAMEVISION_ROOT": str(self.root),
-        })
-        self.proc = subprocess.Popen(
-            [
-                self.install["env_python"],
-                "-u",
-                self.install["helper"],
-                "--server",
-                "--root",
-                str(self.root),
-            ],
-            cwd=str(self.root),
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        while True:
-            line = self.proc.stdout.readline() if self.proc.stdout is not None else ""
-            if line == "":
-                raise RuntimeError(
-                    f"Qwen2511 INT4 backend stopped during startup (exit code {self.proc.poll()})."
-                )
-            line = line.rstrip("\r\n")
-            if line.startswith("FVQWEN_EVENT "):
-                event = json.loads(line[len("FVQWEN_EVENT "):])
-                if _safe_str(event.get("event")) == "ready":
-                    return
-            elif line:
-                self._emit(line)
-
-    def generate(self, job: Dict[str, Any]) -> Dict[str, Any]:
-        self.start()
-        if self.proc is None or self.proc.stdin is None or self.proc.stdout is None:
-            raise RuntimeError("Qwen2511 INT4 backend is unavailable.")
-
-        refs = _existing_unique_reference_paths(job.get("reference_paths"), limit=5)
-        if not refs:
-            raise RuntimeError("Qwen2511 INT4 reference edit requires at least one valid reference image.")
-
-        output_path = Path(_safe_str(job.get("start_image_path"))).resolve()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        request = {
-            "command": "generate",
-            "prompt": _safe_str(job.get("prompt")),
-            "negative_prompt": _safe_str(job.get("negative_prompt")),
-            "references": refs,
-            "loras": [],
-            "model": self.install["profile_key"],
-            "width": _safe_int(job.get("width"), 1600),
-            "height": _safe_int(job.get("height"), 896),
-            "seed": _safe_int(job.get("seed"), -1),
-            "count": 1,
-            "true_cfg_scale": 1.0,
-            "steps": _safe_int(self.install.get("steps"), 4),
-            "max_sequence_length": 512,
-            "offload": "auto",
-            "blocks_on_gpu": 1,
-            "pin_memory": False,
-            "cleanup_between": False,
-            "output": {
-                "folder": str(output_path.parent),
-                "format": "png",
-                "jpeg_quality": 95,
-                "auto_name": False,
-                "manual_name": output_path.stem,
-            },
-        }
-        self.proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
-        self.proc.stdin.flush()
-
-        result = None
-        while True:
-            line = self.proc.stdout.readline()
-            if line == "":
-                raise RuntimeError(
-                    f"Qwen2511 INT4 backend stopped before returning an image (exit code {self.proc.poll()})."
-                )
-            line = line.rstrip("\r\n")
-            if not line.startswith("FVQWEN_EVENT "):
-                if line:
-                    self._emit(line)
-                continue
-            event = json.loads(line[len("FVQWEN_EVENT "):])
-            event_name = _safe_str(event.get("event"))
-            if event_name == "status":
-                self._emit(_safe_str(event.get("message")))
-            elif event_name == "model_loaded":
-                self._emit(
-                    f"Loaded {_safe_str(event.get('model_label'), self.install['profile_label'])} "
-                    f"· offload={_safe_str(event.get('offload'), 'auto')}"
-                )
-            elif event_name == "error":
-                raise RuntimeError(_safe_str(event.get("message"), "Qwen2511 INT4 generation failed."))
-            elif event_name == "result":
-                result = event
-                break
-
-        outputs = [Path(_safe_str(x)).resolve() for x in _as_list((result or {}).get("outputs")) if _safe_str(x)]
-        if not outputs or not outputs[0].is_file():
-            raise RuntimeError("Qwen2511 INT4 returned no output image.")
-        generated = outputs[0]
-        if generated != output_path:
-            if output_path.exists():
-                output_path.unlink()
-            try:
-                shutil.move(str(generated), str(output_path))
-            except Exception:
-                shutil.copy2(str(generated), str(output_path))
-                try:
-                    generated.unlink()
-                except Exception:
-                    pass
-        return {
-            "ok": True,
-            "shot_id": _safe_str(job.get("shot_id")),
-            "output_image": str(output_path),
-            "profile_key": self.install["profile_key"],
-            "profile_label": self.install["profile_label"],
-            "reference_paths_passed": refs,
-        }
-
-    def close(self) -> None:
-        proc = self.proc
-        self.proc = None
-        if proc is None:
-            return
-        try:
-            if proc.poll() is None and proc.stdin is not None:
-                proc.stdin.write(json.dumps({"command": "quit"}) + "\n")
-                proc.stdin.flush()
-                try:
-                    proc.wait(timeout=20)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    proc.kill()
-        except Exception:
-            pass
-
-
-def _run_qwen2511_int4_batch_start_images(
-    root: Path,
-    *,
-    jobs: List[Dict[str, Any]],
-    progress_callback: Optional[Callable[[str], None]] = None,
-) -> Dict[str, Any]:
-    session = _Qwen2511Int4BatchSession(root, progress_callback=progress_callback)
-    results: List[Dict[str, Any]] = []
-    try:
-        for index, job in enumerate(jobs, start=1):
-            if callable(progress_callback):
-                progress_callback(
-                    f"Qwen2511 INT4 image {index}/{len(jobs)}: {_safe_str(job.get('shot_id'))}"
-                )
-            try:
-                results.append(session.generate(job))
-            except Exception as exc:
-                results.append({
-                    "ok": False,
-                    "shot_id": _safe_str(job.get("shot_id")),
-                    "error": str(exc),
-                })
-    finally:
-        session.close()
-    ok_count = sum(1 for item in results if _safe_bool(item.get("ok"), False))
-    return {
-        "ok": ok_count == len(results),
-        "jobs": results,
-        "message": f"Qwen2511 INT4 batch finished: {ok_count}/{len(results)} image(s).",
-    }
 
 
 def _hidream_batch_cli_path(root: Path) -> str:
@@ -9422,12 +8944,8 @@ def _hidream_defaults_for_key(model_key: str) -> Dict[str, Any]:
 
 
 def _hidream_missing_message(root: Path) -> str:
-    searched = [str(_hidream_model_dir(root, key)) for key in ("dev_2604_bf16", "dev_2604_fp8", "dev", "dev_fp8")]
-    return (
-        "HiDream character-sheet workflow needs a supported Dev model, but none was found. "
-        "Preferred order is Dev 2604 BF16, Dev 2604 FP8, older Dev BF16, older Dev FP8. "
-        "Expected one of:\n" + "\n".join(searched)
-    )
+    searched = [str(_hidream_model_dir(root, key)) for key in ("dev", "dev_fp8")]
+    return "HiDream character-sheet workflow needs a Dev model, but none was found. Expected one of:\n" + "\n".join(searched)
 
 
 def _existing_unique_reference_paths(paths: Any, *, limit: int = 5) -> List[str]:
@@ -9620,8 +9138,6 @@ def _run_hidream_start_image(root: Path, *, prompt: str, negative: str, output_p
         raise RuntimeError("HiDream selected but helpers/hidream_cli.py was not found.")
     py = _hidream_python_path(root)
     defaults = _hidream_defaults_for_key(model_key)
-    _emit("HiDream priority order: Dev FP8 -> Dev BF16 -> Dev 2604 BF16 -> Dev 2604 FP8")
-    _emit(f"HiDream model selected: {defaults.get('label', model_key)} ({model_key})")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -9884,14 +9400,14 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
             brief,
             character_reference,
             image_prompt_keys=["director_image_prompt"],
-            passed_to_model=(image_model in {"hidream", "qwen2511_int4"}),
+            passed_to_model=(image_model == "hidream"),
         )
         character_reference = dict(shot.get("character_reference") or character_reference)
         shot_id = _safe_str(shot.get("id")) or shot_id
         _emit(f"Selected {shot_id}")
 
         if image_model in {"existing", "use existing start image", "existing_start_image"}:
-            return {"ok": False, "message": "Use existing start image does not need generation. Pick Flux Klein 9B, Z-Image Turbo, HiDream, or Qwen 2511 INT4."}
+            return {"ok": False, "message": "Use existing start image does not need generation. Pick Flux Klein 9B, Z-Image Turbo, or HiDream."}
 
         out_dir_raw = _safe_str(payload.get("output_dir"))
         if out_dir_raw:
@@ -9921,21 +9437,16 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
         )
         if not prompt:
             return {"ok": False, "message": f"{shot_id} image prompt became empty after safety cleanup."}
-        requested_resolution_source = payload.get("resolution") or shot.get("resolution") or director_plan.get("resolution")
-        _req_w, _req_h, _req_res = _parse_resolution_value(requested_resolution_source, "1280x704")
-        requested_portrait = bool(_req_h > _req_w)
-        hidream_reference_edit_resolution = "896x1600" if requested_portrait else "1600x896"
-        default_resolution = "1280x704"
-        resolution_source = requested_resolution_source
+        hidream_reference_edit_resolution = "1600x896"
+        default_resolution = "1280x720"
+        resolution_source = payload.get("resolution") or shot.get("resolution")
         if image_model == "z_image":
-            default_resolution = "768x1344" if requested_portrait else "1344x768"
+            default_resolution = "1344x768"
         elif image_model == "hidream":
-            # Keep normal HiDream start-image generation high quality, but obey
-            # the Music Clip Creator landscape/portrait choice. Reference/edit
+            # Keep normal HiDream start-image generation unchanged. Reference/edit
             # shots are lowered after reference routing below.
-            default_resolution = "1088x1920" if requested_portrait else "1920x1088"
-        elif image_model == "qwen2511_int4":
-            default_resolution = "896x1600" if requested_portrait else "1600x896"
+            default_resolution = "1920x1088"
+            resolution_source = default_resolution
         width, height, resolution = _parse_resolution_value(resolution_source, default_resolution)
         seed_raw = payload.get("seed", None)
         if seed_raw in (None, ""):
@@ -9954,34 +9465,27 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
         collapsed_to_single_ref_warning = bool(loaded_reference_count > 1 and wanted_reference_count > 1 and len(selected_reference_paths) == 1)
         shot_subject_mode = _safe_str(shot.get("shot_subject_mode"), "environment_only") or "environment_only"
         image_model_forced_to_hidream_for_reference = False
-        direct_reference_models = {"hidream", "qwen2511_int4"}
-        if selected_reference_paths and image_model in direct_reference_models:
-            width, height, resolution = _parse_resolution_value(
-                hidream_reference_edit_resolution,
-                hidream_reference_edit_resolution,
-            )
+        if selected_reference_paths and image_model == "hidream":
+            # HiDream reference/edit workflow test size: keep plain HiDream
+            # generation at its existing default, but use 1376x768 whenever
+            # direct reference images are actually selected for the shot.
+            width, height, resolution = _parse_resolution_value(hidream_reference_edit_resolution, hidream_reference_edit_resolution)
             shot["image_model_reference_resolution_override"] = hidream_reference_edit_resolution
-            model_label = "Qwen2511 INT4" if image_model == "qwen2511_int4" else "HiDream"
-            shot["reference_routing_reason"] = _join_parts([
-                shot.get("reference_routing_reason"),
-                f"{model_label} reference/edit resolution override: {hidream_reference_edit_resolution}",
-            ])
-        if selected_reference_paths and image_model not in direct_reference_models:
+            shot["reference_routing_reason"] = _join_parts([shot.get("reference_routing_reason"), f"HiDream reference/edit resolution override: {hidream_reference_edit_resolution}"])
+        if selected_reference_paths and image_model != "hidream":
+            # At this point references have already been selected by the prompt
+            # director / character-reference router.  Do not let a text-only image
+            # model generate random people when direct reference paths exist.
             image_model_forced_to_hidream_for_reference = True
             image_model = "hidream"
-            width, height, resolution = _parse_resolution_value(
-                hidream_reference_edit_resolution,
-                hidream_reference_edit_resolution,
-            )
+            # Match the HiDream reference/edit workflow size when refs force a
+            # text-only selection over to HiDream. Plain HiDream generation still
+            # keeps its existing default above.
+            width, height, resolution = _parse_resolution_value(hidream_reference_edit_resolution, hidream_reference_edit_resolution)
             shot["image_model_reference_resolution_override"] = hidream_reference_edit_resolution
             shot["image_model_reference_mode"] = "direct_reference_image"
-            shot["reference_routing_reason"] = _join_parts([
-                shot.get("reference_routing_reason"),
-                "start-image model forced to HiDream because selected reference paths are loaded",
-            ])
-        reference_paths_to_pass = (
-            selected_reference_paths if image_model in direct_reference_models else []
-        )
+            shot["reference_routing_reason"] = _join_parts([shot.get("reference_routing_reason"), "start-image model forced to HiDream because selected reference paths are loaded"])
+        reference_paths_to_pass = selected_reference_paths if image_model == "hidream" else []
         character_reference_passed = False
         image_model_reference_mode = "direct_reference_image_pending" if reference_paths_to_pass else ("environment_only" if shot_subject_mode == "environment_only" else (_safe_str(shot.get("image_model_reference_mode")) or "text_only"))
 
@@ -10032,7 +9536,7 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
                 "reference_handoff_supported": bool(reference_paths_to_pass),
                 "reference_handoff_reason": "prepare_only_pending_generation",
             },
-            "skipped_reference_reason": _safe_str("selected_reference_paths_not_added_to_image_command" if selected_reference_paths and image_model in {"hidream", "qwen2511_int4"} else "image_model_has_no_direct_reference_input" if selected_reference_paths and image_model not in {"hidream", "qwen2511_int4"} else shot.get("skipped_reference_reason") or ""),
+            "skipped_reference_reason": _safe_str("selected_reference_paths_not_added_to_hidream_command" if selected_reference_paths and image_model == "hidream" else "image_model_has_no_direct_reference_input" if selected_reference_paths and image_model != "hidream" else shot.get("skipped_reference_reason") or ""),
             "environment_prompt_omitted_subjects": bool(shot.get("environment_prompt_omitted_subjects")),
             "character_reference": {
                 "enabled": bool(_safe_bool(character_reference.get("enabled"), False)),
@@ -10080,13 +9584,7 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
                 "resolution": resolution,
                 "width": width,
                 "height": height,
-                "steps": (
-                    _safe_int(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("steps"), 28)
-                    if image_model == "hidream"
-                    else _safe_int((_qwen2511_int4_install(root) or {}).get("steps"), 4)
-                    if image_model == "qwen2511_int4"
-                    else 0
-                ),
+                "steps": _safe_int(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("steps"), 28) if image_model == "hidream" else 0,
                 "guidance_scale": _safe_float(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("guidance_scale"), 0.0) if image_model == "hidream" else 0.0,
                 "shift": _safe_float(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("shift"), 1.0) if image_model == "hidream" else 1.0,
                 "scheduler_name": _safe_str(_hidream_defaults_for_key(_pick_hidream_model_key(root) or "dev").get("scheduler_name"), "flash") if image_model == "hidream" else "",
@@ -10149,43 +9647,10 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
             model_files = result.get("model_files") if isinstance(result.get("model_files"), dict) else {}
             actual_image_model_reference_paths_passed = _existing_unique_reference_paths(result.get("actual_image_model_reference_paths_passed") or ((result.get("reference_handoff") or {}).get("reference_paths_passed") if isinstance(result.get("reference_handoff"), dict) else []), limit=5)
             reference_handoff = result.get("reference_handoff") if isinstance(result.get("reference_handoff"), dict) else {}
-        elif image_model == "qwen2511_int4":
-            session = _Qwen2511Int4BatchSession(root, progress_callback=progress_callback)
-            try:
-                qresult = session.generate({
-                    "shot_id": shot_id,
-                    "prompt": prompt,
-                    "negative_prompt": negative,
-                    "reference_paths": reference_paths_to_pass,
-                    "start_image_path": str(start_path),
-                    "width": width,
-                    "height": height,
-                    "seed": seed,
-                })
-            finally:
-                session.close()
-            result = qresult
-            command_summary = {
-                "type": "qwen2511_int4_server",
-                "profile_key": qresult.get("profile_key"),
-                "profile_label": qresult.get("profile_label"),
-            }
-            model_files = (_qwen2511_int4_install(root) or {})
-            actual_image_model_reference_paths_passed = _existing_unique_reference_paths(
-                qresult.get("reference_paths_passed"), limit=5
-            )
-            reference_handoff = {
-                "reference_paths_requested": list(reference_paths_to_pass),
-                "reference_paths_passed": list(actual_image_model_reference_paths_passed),
-                "reference_arg_name": "references",
-                "reference_arg_source": "qwen2511_int4_server",
-                "reference_handoff_supported": True,
-                "reference_handoff_reason": "direct_reference_paths_passed_to_qwen2511_int4",
-            }
         else:
             return {"ok": False, "message": f"Unknown start-image model: {image_model}"}
 
-        character_reference_passed = bool(image_model in {"hidream", "qwen2511_int4"} and actual_image_model_reference_paths_passed)
+        character_reference_passed = bool(image_model == "hidream" and actual_image_model_reference_paths_passed)
         image_model_reference_mode = "direct_reference_image" if character_reference_passed else ("environment_only" if not selected_reference_paths and shot_subject_mode == "environment_only" else "text_only_reference_not_passed")
         shot["available_reference_sheet_paths"] = available_reference_sheet_paths
         shot["loaded_reference_count"] = loaded_reference_count
@@ -10255,7 +9720,7 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
             "image_model_reference_mode": image_model_reference_mode,
             "actual_image_model_reference_paths_passed": actual_image_model_reference_paths_passed,
             "reference_handoff": reference_handoff,
-            "skipped_reference_reason": "" if character_reference_passed else _safe_str("selected_reference_paths_not_added_to_image_command" if selected_reference_paths and image_model in {"hidream", "qwen2511_int4"} else "image_model_has_no_direct_reference_input" if selected_reference_paths and image_model not in {"hidream", "qwen2511_int4"} else shot.get("skipped_reference_reason") or ""),
+            "skipped_reference_reason": "" if character_reference_passed else _safe_str("selected_reference_paths_not_added_to_hidream_command" if selected_reference_paths and image_model == "hidream" else "image_model_has_no_direct_reference_input" if selected_reference_paths and image_model != "hidream" else shot.get("skipped_reference_reason") or ""),
             "environment_prompt_omitted_subjects": bool(shot.get("environment_prompt_omitted_subjects")),
             "character_reference": {
                 "enabled": bool(_safe_bool(character_reference.get("enabled"), False)),
@@ -10383,203 +9848,6 @@ def _ltx23_bridge_config(root: Path) -> Dict[str, str]:
     }
 
 
-def _ltx23_vramlab_ui_settings(root: Path) -> Dict[str, Any]:
-    path = Path(root).resolve() / "presets" / "setsave" / "ltx23_ui.json"
-    data = _read_json_file(path)
-    if not isinstance(data, dict):
-        data = {}
-    data["__settings_path"] = str(path)
-    return data
-
-
-def _ltx23_path_from_settings(root: Path, raw: Any, fallback: Path) -> str:
-    text = _safe_str(raw)
-    if not text:
-        return str(fallback)
-    p = Path(text).expanduser()
-    if not p.is_absolute():
-        p = Path(root).resolve() / p
-    return str(p.resolve())
-
-
-def _ltx23_default_python(root: Path, settings: Dict[str, Any]) -> str:
-    raw = _safe_str(settings.get("python_exe"))
-    if raw and Path(raw).expanduser().exists():
-        return str(Path(raw).expanduser().resolve())
-    for cand in (
-        Path(root) / "environments" / ".ltx23" / "python.exe",
-        Path(root) / "environments" / ".ltx23" / "Scripts" / "python.exe",
-        Path(root) / "environments" / ".ltx23_native" / "Scripts" / "python.exe",
-    ):
-        if cand.is_file():
-            return str(cand.resolve())
-    return sys.executable
-
-
-def _ltx23_cache_mode(value: Any) -> str:
-    text = _safe_str(value, "read").lower()
-    if "rebuild" in text:
-        return "rebuild"
-    if "off" in text or "official" in text:
-        return "off"
-    if "auto" in text:
-        return "auto"
-    return "read"
-
-
-def _ltx23_append_existing(cmd: List[str], flag: str, path: str) -> None:
-    try:
-        p = Path(path).expanduser()
-        if path and p.exists():
-            cmd.extend([flag, str(p.resolve())])
-    except Exception:
-        pass
-
-
-def _ltx23_manual_vram_overrides_enabled(settings: Dict[str, Any]) -> bool:
-    """Only forward advanced VRAM override flags when explicitly enabled.
-
-    The native LTX/VRAM Lab CLI owns the modern profile defaults. Saved UI
-    values in presets/setsave/ltx23_ui.json are not treated as overrides unless
-    a future UI/test patch deliberately enables one of these flags.
-    """
-    try:
-        env_value = _safe_str(os.environ.get("FRAMEVISION_MUSICCLIP_LTX_MANUAL_VRAM_OVERRIDES")).lower()
-        if env_value in {"1", "true", "yes", "on"}:
-            return True
-    except Exception:
-        pass
-    for key in (
-        "manual_vram_overrides",
-        "use_manual_vram_overrides",
-        "ltx_manual_vram_overrides",
-        "enable_manual_vram_overrides",
-        "advanced_vram_overrides_enabled",
-    ):
-        if _safe_bool(settings.get(key), False):
-            return True
-    return False
-
-
-def _ltx23_build_vramlab_direct_args(
-    *,
-    root: Path,
-    prompt: str,
-    start_image_path: Path,
-    out_path: Path,
-    fps: int,
-    frame_count: int,
-    steps: int,
-    resolution: str,
-    audio_path: str,
-    seed: Optional[int],
-    lora_file: str = "",
-) -> List[str]:
-    """Build the real own-workflow command. No tiny wrapper CLI, no Wan2GP CLI dependency."""
-    root = Path(root).resolve()
-    settings = _ltx23_vramlab_ui_settings(root)
-    vram_cli = root / "helpers" / "ltx23_vram_lab_cli.py"
-    if not vram_cli.is_file():
-        raise FileNotFoundError(f"Missing own LTX VRAMLab CLI: {vram_cli}")
-    python_exe = _ltx23_default_python(root, settings)
-    width, height, normalized_resolution = _normalize_ltx23_vramlab_resolution(resolution, "1280x704")
-
-    checkpoint = _ltx23_path_from_settings(root, settings.get("checkpoint_path"), root / "models" / "ltx23" / "distilled-1.1" / "ltx-2.3-22b-distilled-1.1.safetensors")
-    gemma = _ltx23_path_from_settings(root, settings.get("gemma_root"), root / "models" / "ltx23" / "text_encoder" / "lightricks_gemma_original")
-    report = _ltx23_path_from_settings(root, settings.get("report_path"), root / "tools" / "vram_lab" / "ltx_vram_lab_integration_report.txt")
-    deep_log = _ltx23_path_from_settings(root, settings.get("deep_log_path"), root / "tools" / "vram_lab" / "ltx_deep_lifecycle_latest.txt")
-
-    profile = _safe_str(settings.get("vram_profile"), "24")
-    if profile not in {"auto", "24", "16", "12"}:
-        profile = "24"
-    vram_lab = _safe_str(settings.get("vram_lab"), "safe").lower()
-    if vram_lab not in {"off", "safe", "edge", "balanced", "aggressive"}:
-        vram_lab = "safe"
-
-    use_seed = int(seed if seed is not None else _safe_int(settings.get("seed"), 12345))
-    cmd: List[str] = [
-        python_exe,
-        str(vram_cli),
-        "--pipeline", "a2vid_two_stage",
-        "--vram-lab", vram_lab,
-        "--vram-profile", profile,
-        "--checkpoint-path", checkpoint,
-        "--gemma-root", gemma,
-        "--prompt", _safe_str(prompt),
-        "--output-path", str(out_path),
-        "--height", str(int(height)),
-        "--width", str(int(width)),
-        "--num-frames", str(int(frame_count)),
-        "--frame-rate", str(int(fps)),
-        "--num-inference-steps", str(int(steps)),
-        "--seed", str(int(use_seed)),
-        "--shift", str(_safe_float(settings.get("scheduler_shift"), 5.0)),
-        "--ltx-root", str(root),
-        "--report-path", report,
-        "--deep-log-interval", str(_safe_float(settings.get("deep_log_interval"), 2.0)),
-        "--deep-log-max-events", str(_safe_int(settings.get("deep_log_max_events"), 4100)),
-        "--deep-log-path", deep_log,
-        "--audio-path", str(audio_path),
-        "--audio-start-time", str(_safe_float(settings.get("audio_start_time"), 0.0)),
-    ]
-
-    if _ltx23_manual_vram_overrides_enabled(settings):
-        main_hot = _safe_float(settings.get("main_hot_window_gb"), 0.0)
-        if main_hot > 0:
-            cmd.extend(["--main-hot-window-gb", str(main_hot)])
-        stage2 = _safe_float(settings.get("stage2_block_size_limit_gb"), 0.0)
-        if stage2 > 0:
-            cmd.extend(["--stage2-block-size-limit-gb", str(stage2)])
-        emergency_floor = _safe_float(settings.get("emergency_free_vram_floor_gb"), 0.0)
-        if emergency_floor > 0:
-            cmd.extend(["--emergency-free-vram-floor-gb", str(emergency_floor)])
-        stage1_hotset = _safe_float(settings.get("stage1_stable_hotset_fraction"), 0.0)
-        if stage1_hotset > 0:
-            cmd.extend(["--stage1-stable-hotset-fraction", str(stage1_hotset)])
-        stage2_hotset = _safe_float(settings.get("stage2_stable_hotset_fraction"), 0.0)
-        if stage2_hotset > 0:
-            cmd.extend(["--stage2-stable-hotset-fraction", str(stage2_hotset)])
-
-    cmd.extend(["--attention-backend", "auto", "--no-boundary-echo"])
-
-    try:
-        image = Path(start_image_path).expanduser()
-        if image.is_file():
-            cmd.extend([
-                "--i2v-image", str(image.resolve()),
-                "--i2v-image-frame", "0",
-                "--i2v-image-strength", str(_safe_float(settings.get("start_image_strength"), 1.0)),
-                "--i2v-image-crf", "0",
-            ])
-    except Exception:
-        pass
-
-    spatial = _ltx23_path_from_settings(root, settings.get("spatial_upsampler_path"), root / "models" / "ltx23" / "spatial_upsampler" / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors")
-    _ltx23_append_existing(cmd, "--spatial-upsampler-path", spatial)
-
-    cmd.extend([
-        "--extra",
-        "--video-cfg-guidance-scale", str(_safe_float(settings.get("video_cfg_guidance_scale"), 3.0)),
-        "--video-stg-guidance-scale", str(_safe_float(settings.get("video_stg_guidance_scale"), 0.0)),
-        "--video-rescale-scale", str(_safe_float(settings.get("video_rescale_scale"), 0.7)),
-        "--audio-cfg-guidance-scale", str(_safe_float(settings.get("audio_cfg_guidance_scale"), 1.0)),
-        "--audio-stg-guidance-scale", str(_safe_float(settings.get("audio_stg_guidance_scale"), 0.0)),
-        "--audio-rescale-scale", str(_safe_float(settings.get("audio_rescale_scale"), 0.0)),
-        "--a2v-guidance-scale", str(_safe_float(settings.get("a2v_guidance_scale"), 1.0)),
-        "--v2a-guidance-scale", str(_safe_float(settings.get("v2a_guidance_scale"), 1.0)),
-        "--video-skip-step", str(_safe_int(settings.get("video_skip_step"), 0)),
-        "--audio-skip-step", str(_safe_int(settings.get("audio_skip_step"), 0)),
-        "--max-batch-size", str(_safe_int(settings.get("max_batch_size"), 2)),
-    ])
-    custom_extra = _safe_str(settings.get("custom_extra_args"))
-    if custom_extra:
-        try:
-            cmd.extend(shlex.split(custom_extra))
-        except Exception:
-            cmd.extend(custom_extra.split())
-    return cmd
-
-
 def _normalize_ltx_generation_backend(value: Any, root: Optional[Path] = None) -> str:
     text = _safe_str(value).lower().replace("_", "-").strip()
     r = Path(root).resolve() if root else _project_root()
@@ -10596,18 +9864,29 @@ def _normalize_ltx_generation_backend(value: Any, root: Optional[Path] = None) -
             return "wan2gp"
     except Exception:
         pass
-    # Default to the own FrameVision LTX workflow whenever its real bridge and raw VRAMLab CLI are present.
-    # Do not silently force Wan2GP just because helpers/ltx23_cli.py exists; that file can be offline-only.
-    if (helpers / "clip2ltx_cli.py").is_file() and (helpers / "ltx23_vram_lab_cli.py").is_file():
+    # When no explicit backend is passed, prefer the backend that can actually run.
+    # This file is the Planner/Wan2GP bridge and can launch WanGP directly through
+    # wgp.py, so it must not fall back to VRAMLab just because the older dedicated
+    # Wan2GP wrapper filename is missing. That showed up in Review/Recreate as:
+    # "Missing LTX-VRAMLab Music Clip CLI" while the user was using the hidden
+    # Wan2GP workflow.
+    try:
+        if _ltx23_guess_wangp_root(r):
+            return "wan2gp"
+    except Exception:
+        pass
+    if ((helpers / "ltx23_vramlab_musicclip_cli.py").is_file() or (helpers / "ltx23_musicclip_vramlab_cli.py").is_file()) and (helpers / "ltx23_vram_lab_cli.py").is_file():
         return "vramlab"
-    if (helpers / "musicclip_planner_bridge.py").is_file() and _ltx23_guess_wangp_root(r):
-        return "wan2gp"
-    return "vramlab"
+    return "wan2gp"
 
 
 def _ltx23_musicclip_vramlab_cli(root: Path) -> str:
-    candidate = (Path(root).resolve() / "helpers" / "ltx23_vram_lab_cli.py").resolve()
-    return str(candidate) if candidate.is_file() else ""
+    helpers = Path(root).resolve() / "helpers"
+    for name in ("ltx23_vramlab_musicclip_cli.py", "ltx23_musicclip_vramlab_cli.py"):
+        candidate = (helpers / name).resolve()
+        if candidate.is_file():
+            return str(candidate)
+    return ""
 
 
 def _ltx23_wan2gp_musicclip_cli(root: Path) -> str:
@@ -10619,6 +9898,173 @@ def _ltx23_wan2gp_musicclip_cli(root: Path) -> str:
         pass
     candidate = (Path(root).resolve() / "helpers" / "ltx23_wan2gp_musicclip_cli.py").resolve()
     return str(candidate) if candidate.is_file() else ""
+
+
+def _ltx23_wangp_active_python(wangp_root: str) -> tuple[str, str]:
+    """Return the active WanGP python.exe using WanGP's current envs.json/setup.py system."""
+    root = Path(_safe_str(wangp_root)).expanduser()
+    try:
+        root = root.resolve()
+    except Exception:
+        pass
+    setup_py = root / "setup.py"
+    if setup_py.is_file():
+        try:
+            cp = subprocess.run(
+                [sys.executable, str(setup_py), "get_env_info"],
+                cwd=str(root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            for line in _safe_str(cp.stdout).splitlines():
+                if line.startswith("ENV_INFO|"):
+                    parts = line.split("|", 2)
+                    if len(parts) >= 3:
+                        env_type = _safe_str(parts[1]).lower()
+                        env_path = _safe_str(parts[2])
+                        env_dir = Path(env_path)
+                        if not env_dir.is_absolute():
+                            env_dir = (root / env_dir).resolve()
+                        if env_type in {"venv", "uv"}:
+                            py = env_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+                        elif env_type == "conda":
+                            py = env_dir / ("python.exe" if os.name == "nt" else "bin/python")
+                        elif env_type == "none":
+                            py = Path(sys.executable)
+                        else:
+                            py = env_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+                        if py.is_file() or env_type == "none":
+                            return str(py), f"setup.py get_env_info: {env_type} {env_dir}"
+        except Exception:
+            pass
+    guesses = [
+        root / "env_venv" / "Scripts" / "python.exe",
+        root / "env" / "Scripts" / "python.exe",
+        root / "wan2gp" / "python.exe",
+        root / "venv" / "Scripts" / "python.exe",
+    ] if os.name == "nt" else [
+        root / "env_venv" / "bin" / "python",
+        root / "env" / "bin" / "python",
+        root / "venv" / "bin" / "python",
+    ]
+    for py in guesses:
+        try:
+            if py.is_file():
+                return str(py.resolve()), f"fallback: {py}"
+        except Exception:
+            continue
+    return "", "not found"
+
+
+def _ltx23_copy_lora_to_wangp(root: str, lora_path: str) -> tuple[str, str]:
+    src = Path(_safe_str(lora_path)).expanduser()
+    if not src.is_file():
+        return "", ""
+    lora_dir = Path(root) / "loras" / "ltx2"
+    try:
+        lora_dir.mkdir(parents=True, exist_ok=True)
+        dst = lora_dir / src.name
+        if src.resolve() != dst.resolve():
+            if (not dst.is_file()) or dst.stat().st_size != src.stat().st_size:
+                shutil.copy2(str(src), str(dst))
+        return dst.name, str(dst.resolve())
+    except Exception:
+        return src.name, str(src.resolve())
+
+
+def _ltx23_write_wangp_settings_json(
+    path: Path,
+    *,
+    wangp_root: str,
+    prompt: str,
+    negative: str,
+    start_image_path: Path,
+    output_path: Path,
+    fps: int,
+    frames: int,
+    steps: int,
+    resolution: str,
+    seed: Optional[int],
+    audio_path: str,
+    lora_file: str,
+    lora_json: str,
+    lora_multiplier: float,
+) -> Dict[str, Any]:
+    """Write a WanGP settings JSON directly from the bridge; no copied extra CLI needed."""
+    settings: Dict[str, Any] = {}
+    if lora_json and os.path.isfile(lora_json):
+        try:
+            candidate = _read_json_file(lora_json)
+            if isinstance(candidate, dict) and any(k in candidate for k in ("settings_version", "model_type", "activated_loras", "loras_multipliers")):
+                allowed = {
+                    "settings_version", "resolution", "flow_shift", "sliding_window_size", "sliding_window_overlap",
+                    "denoising_strength", "masking_strength", "audio_prompt_type", "perturbation_layers",
+                    "audio_scale", "guidance_phases", "num_inference_steps", "video_length", "negative_prompt",
+                    "activated_loras", "loras_multipliers", "lset_name", "force_fps", "seed", "image_mode",
+                    "image_prompt_type", "image_start", "image_end", "image_refs", "video_prompt_type",
+                    "video_source", "keep_frames_video_source", "input_video_strength", "output_filename",
+                    "audio_guide", "audio_guide2", "audio_source",
+                }
+                settings = {k: v for k, v in candidate.items() if k in allowed}
+        except Exception:
+            settings = {}
+    settings.update({
+        "settings_version": settings.get("settings_version", 2.61),
+        "model_type": _safe_str(settings.get("model_type") or "ltx2_22B_distilled_1_1"),
+        "prompt": _safe_str(prompt),
+        "negative_prompt": _safe_str(negative or settings.get("negative_prompt")),
+        "resolution": _safe_str(resolution or settings.get("resolution") or "1280x720"),
+        "num_inference_steps": int(steps),
+        "video_length": int(frames),
+        "force_fps": str(int(fps)),
+        "seed": int(seed) if seed is not None else -1,
+        "image_mode": 0,
+        "image_prompt_type": "S",
+        "image_start": [str(start_image_path)],
+        "image_end": None,
+        "image_refs": None,
+        "video_prompt_type": "",
+        "video_source": None,
+        "keep_frames_video_source": "",
+        "input_video_strength": 1.0,
+        "output_filename": Path(output_path).stem,
+        "flow_shift": float(settings.get("flow_shift", 5.0)),
+        "sliding_window_size": int(settings.get("sliding_window_size", 481)),
+        "sliding_window_overlap": int(settings.get("sliding_window_overlap", 17)),
+        "guidance_phases": int(settings.get("guidance_phases", 1)),
+        "denoising_strength": float(settings.get("denoising_strength", 1.0)),
+        "masking_strength": float(settings.get("masking_strength", 0.0)),
+        "audio_scale": float(settings.get("audio_scale", 1.0)),
+        "perturbation_layers": settings.get("perturbation_layers") if isinstance(settings.get("perturbation_layers"), list) else [28],
+    })
+    if audio_path and os.path.isfile(audio_path):
+        settings["audio_prompt_type"] = "A"
+        settings["audio_guide"] = audio_path
+        settings["audio_guide2"] = None
+        settings["audio_source"] = None
+        settings["MMAudio_setting"] = 0
+    else:
+        settings["audio_prompt_type"] = ""
+        settings["audio_guide"] = None
+        settings["audio_guide2"] = None
+        settings["audio_source"] = None
+        settings["MMAudio_setting"] = 0
+    if lora_file:
+        basename, used_path = _ltx23_copy_lora_to_wangp(wangp_root, lora_file)
+        if basename:
+            settings["activated_loras"] = [basename]
+            settings["loras_multipliers"] = f"{float(lora_multiplier):.4g}"
+            settings["ltx_lora_files"] = [used_path]
+            settings["ltx_transition_lora_file"] = used_path
+    if lora_json:
+        settings["ltx_transition_json"] = lora_json
+        settings["ltx_transition_json_name"] = os.path.basename(lora_json)
+    _write_json_file(path, settings)
+    return settings
 
 
 def _find_director_shot(plan: Dict[str, Any], shot_id: str) -> Optional[Dict[str, Any]]:
@@ -11469,20 +10915,11 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
             return {"ok": False, "message": f"{shot_id} has no director timestamped video prompt."}
 
         fps = max(1, _safe_int(shot.get("target_fps"), _safe_int(director_plan.get("fps"), 24)))
-        backend = _normalize_ltx_generation_backend(payload.get("ltx_backend") or payload.get("ltx_generation_backend"), root)
-        max_generation_frames = 0
-        if backend == "vramlab":
-            cap_info = _cap_ltx_shot_timing_to_generation_limit(shot, fps, reason="musicclip_ltx_vramlab")
-            max_generation_frames = _safe_int(cap_info.get("max_frames"), 241)
-            if bool(cap_info.get("changed")):
-                _emit(f"LTX-VRAMLab cap active: clamped {shot_id} plan to {cap_info.get('max_seconds'):.2f}s / {max_generation_frames} frames before building the command.")
         timing_plan = _ltx_generation_timing_plan(shot, fps)
         planned_frames = _safe_int(timing_plan.get("planned_target_frames"), max(1, _safe_int(shot.get("target_frames"), int(round(max(0.1, _safe_float(shot.get("duration"), 5.0)) * fps)))))
         frames = max(1, _safe_int(timing_plan.get("requested_generation_frames"), planned_frames))
-        if backend == "vramlab" and max_generation_frames > 0:
-            frames = min(int(frames), int(max_generation_frames))
         steps = max(1, _safe_int(payload.get("steps"), 8))
-        resolution = _safe_str(payload.get("resolution") or shot.get("resolution") or director_plan.get("resolution"), "1280x704") or "1280x704"
+        resolution = _safe_str(payload.get("resolution") or shot.get("resolution"), "1280x720") or "1280x720"
         seed_raw = payload.get("seed", None)
         seed = None
         if seed_raw not in (None, ""):
@@ -11498,23 +10935,30 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
             _emit(f"Warning: no WAV audio guide found for {shot_id}; running without audio guide.")
             audio_path = ""
 
+        backend = _normalize_ltx_generation_backend(payload.get("ltx_backend") or payload.get("ltx_generation_backend"), root)
         bridge_cfg = _ltx23_bridge_config(root)
         wangp_root = _safe_str(payload.get("wangp_root") or bridge_cfg.get("wangp_root"))
         wgp_py = _safe_str(payload.get("wgp_py") or bridge_cfg.get("wgp_py"))
+        wangp_python = ""
+        wangp_python_source = ""
         if backend == "vramlab":
             cli = Path(_ltx23_musicclip_vramlab_cli(root)).resolve()
             if not cli.is_file():
-                return {"ok": False, "message": f"Missing own LTX VRAMLab CLI: {cli}"}
+                return {"ok": False, "message": f"Missing LTX-VRAMLab Music Clip CLI: {cli}"}
         else:
-            cli_text = _ltx23_wan2gp_musicclip_cli(root)
-            cli = Path(cli_text).resolve() if cli_text else (root / "helpers" / "ltx23_wan2gp_musicclip_cli.py").resolve()
-            if not cli.is_file():
-                return {"ok": False, "message": f"Missing dedicated Wan2GP Music Clip CLI: {cli}. Copy/rename your offline Wan2GP CLI to this filename if you want this backend visible."}
+            # Wan2GP path: no extra copied FrameVision CLI file.
+            # Write WanGP's own process JSON and launch wgp.py using WanGP's active environment.
             if not wangp_root or not os.path.isdir(wangp_root):
                 return {
                     "ok": False,
                     "message": "WanGP root for LTX 2.3 was not found. Expected FRAMEVISION_LTX23_WANGP_ROOT, C:\\WanGP\\Wan2GP, or a nearby Wan2GP folder.",
                 }
+            cli = Path(_safe_str(wgp_py) or (Path(wangp_root) / "wgp.py")).resolve()
+            if not cli.is_file():
+                return {"ok": False, "message": f"WanGP runner was not found: {cli}"}
+            wangp_python, wangp_python_source = _ltx23_wangp_active_python(wangp_root)
+            if not wangp_python:
+                return {"ok": False, "message": f"Could not detect active WanGP python environment in: {wangp_root}"}
 
         lora_file = _safe_str(payload.get("ltx_lora_file"))
         lora_json = _safe_str(payload.get("ltx_lora_json"))
@@ -11526,49 +10970,47 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
 
         def _build_ltx_args(out_path: Path, frame_count: int, audio_override_path: str = "") -> List[str]:
             if backend == "vramlab":
+                built = [
+                    str(sys.executable), str(cli), "generate",
+                    "--ltx-root", str(root),
+                    "--prompt", prompt,
+                    "--negative", negative,
+                    "--image", str(start_image_path),
+                    "--output", str(out_path),
+                    "--fps", str(int(fps)),
+                    "--frames", str(int(frame_count)),
+                    "--steps", str(int(steps)),
+                    "--resolution", str(resolution),
+                ]
                 audio_for_args = _safe_str(audio_override_path) or audio_path
-                if not audio_for_args:
-                    raise ValueError("LTX-VRAMLab two-stage workflow needs an audio guide file.")
-                return _ltx23_build_vramlab_direct_args(
-                    root=root,
-                    prompt=prompt,
-                    start_image_path=start_image_path,
-                    out_path=out_path,
-                    fps=int(fps),
-                    frame_count=int(frame_count),
-                    steps=int(steps),
-                    resolution=str(resolution),
-                    audio_path=str(audio_for_args),
-                    seed=seed,
-                    lora_file=lora_file,
-                )
+                if audio_for_args:
+                    built += ["--audio", str(audio_for_args)]
+                if seed is not None:
+                    built += ["--seed", str(int(seed))]
+                if lora_file:
+                    built += ["--lora-file", lora_file]
+                return built
 
-            built = [
-                str(sys.executable), str(cli), "generate",
-                "--wangp-root", str(wangp_root),
-                "--prompt", prompt,
-                "--negative", negative,
-                "--image", str(start_image_path),
-                "--output", str(out_path),
-                "--fps", str(int(fps)),
-                "--frames", str(int(frame_count)),
-                "--steps", str(int(steps)),
-                "--resolution", str(resolution),
-            ]
             audio_for_args = _safe_str(audio_override_path) or audio_path
-            if audio_for_args:
-                built += ["--audio", str(audio_for_args)]
-            if seed is not None:
-                built += ["--seed", str(int(seed))]
-            if wgp_py and os.path.isfile(wgp_py):
-                built += ["--wgp-py", wgp_py]
-            if lora_file:
-                built += ["--lora-file", lora_file]
-            if lora_json:
-                built += ["--lora-json", lora_json]
-            if lora_file or lora_json:
-                built += ["--lora-multiplier", str(float(lora_multiplier))]
-            return built
+            settings_path = _safe_child_file_path(test_dir, f"{stem}_wangp_settings_{int(frame_count)}.json", f"{stem}_wangp_settings.json")
+            _ltx23_write_wangp_settings_json(
+                settings_path,
+                wangp_root=str(wangp_root),
+                prompt=prompt,
+                negative=negative,
+                start_image_path=start_image_path,
+                output_path=out_path,
+                fps=int(fps),
+                frames=int(frame_count),
+                steps=int(steps),
+                resolution=str(resolution),
+                seed=seed,
+                audio_path=str(audio_for_args or ""),
+                lora_file=lora_file,
+                lora_json=lora_json,
+                lora_multiplier=float(lora_multiplier),
+            )
+            return [str(wangp_python), str(cli), "--process", str(settings_path), "--output-dir", str(Path(out_path).parent)]
 
         planned_duration_for_retry = _safe_float(timing_plan.get("planned_duration"), 0.0)
         planned_ok_threshold = max(0.0, planned_duration_for_retry - float(DURATION_TOLERANCE_SECONDS))
@@ -11579,6 +11021,15 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
         final_frames_used = int(frames)
         final_clip_path = Path(clip_path)
         generation_duration_ok = False
+        # WanGP's wgp.py loads several files through relative paths such as
+        # models/_settings.json, so it must run with the WanGP root as CWD.
+        # The VRAMLab backend still runs from the FrameVision root.
+        ltx_working_dir = str(root)
+        if backend != "vramlab" and wangp_root:
+            try:
+                ltx_working_dir = str(Path(wangp_root).expanduser().resolve())
+            except Exception:
+                ltx_working_dir = str(wangp_root)
         debug_payload: Dict[str, Any] = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "shot_id": shot_id,
@@ -11604,6 +11055,10 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
             "requested_generation_frames": frames,
             "resolution": resolution,
             "ltx_generation_backend": backend,
+            "wangp_python": wangp_python,
+            "wangp_python_source": wangp_python_source,
+            "wangp_root": wangp_root,
+            "wgp_py": str(cli) if backend != "vramlab" else "",
             "steps": steps,
             "seed": seed,
             "ltx_lora_file": lora_file,
@@ -11615,6 +11070,7 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
             "final_ltx_prompt_word_count": _director_word_count(prompt),
             "ltx_prompt_removed_duplicate_phrases": ltx_prompt_removed_phrases,
             "ltx_command_args": args,
+            "ltx_working_dir": ltx_working_dir,
             "ltx_command_summary": {
                 "prompt": prompt,
                 "negative": negative,
@@ -11641,33 +11097,17 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
             except Exception:
                 pass
             attempt_audio_path = audio_path
-            audio_sync_info: Dict[str, Any] = {}
-            desired_attempt_audio_duration = max(float(current_frames) / float(max(1, fps)), planned_duration_for_retry)
-            if audio_path:
-                if attempt_index > 1:
-                    attempt_audio_path = _make_ltx_retry_audio_guide(
-                        root=root,
-                        plan_path=plan_path,
-                        director_plan=director_plan,
-                        shot=shot,
-                        out_dir=test_dir,
-                        stem=stem,
-                        attempt_index=attempt_index,
-                        desired_generation_duration=max(desired_attempt_audio_duration, planned_duration_for_retry + float(LTX_SHORT_SHOT_EXTRA_PAD_SECONDS)),
-                        fallback_audio_path=audio_path,
-                    )
-                # Attempt 1 also needs the audio guide to cover the extra raw
-                # generation frames.  Do not shorten the LTX clip to the WAV;
-                # pad/re-cut the WAV so later sync trimming still has headroom.
-                attempt_audio_path, audio_sync_info = _ensure_ltx_audio_guide_covers_generation_duration(
+            if attempt_index > 1 and audio_path:
+                attempt_audio_path = _make_ltx_retry_audio_guide(
                     root=root,
+                    plan_path=plan_path,
                     director_plan=director_plan,
                     shot=shot,
                     out_dir=test_dir,
                     stem=stem,
                     attempt_index=attempt_index,
-                    desired_generation_duration=desired_attempt_audio_duration,
-                    fallback_audio_path=attempt_audio_path,
+                    desired_generation_duration=max(float(current_frames) / float(max(1, fps)), planned_duration_for_retry + float(LTX_SHORT_SHOT_EXTRA_PAD_SECONDS)),
+                    fallback_audio_path=audio_path,
                 )
             attempt_args = _build_ltx_args(attempt_clip_path, current_frames, attempt_audio_path)
             args = attempt_args
@@ -11680,16 +11120,10 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
                 lf.write(f"\n[LTX generation attempt {attempt_index}/{max_attempts}]\n")
                 lf.write("Command:\n")
                 lf.write(" ".join([str(x) for x in attempt_args]) + "\n\n")
+                lf.write(f"Working directory: {ltx_working_dir}\n")
                 lf.write(f"Planned frames: {planned_frames}\n")
                 lf.write(f"Requested generation frames: {current_frames}\n")
                 lf.write(f"Attempt audio guide: {attempt_audio_path or 'disabled'}\n")
-                if audio_sync_info:
-                    lf.write(f"Audio guide original duration: {_safe_float(audio_sync_info.get('original_audio_guide_duration'), 0.0):.6f}s\n")
-                    lf.write(f"Audio guide desired generation duration: {_safe_float(audio_sync_info.get('desired_generation_duration'), 0.0):.6f}s\n")
-                    lf.write(f"Audio guide padded for requested frames: {bool(audio_sync_info.get('padded'))}\n")
-                    lf.write(f"Audio guide padding reason: {_safe_str(audio_sync_info.get('reason'))}\n")
-                    if _safe_str(audio_sync_info.get('error')):
-                        lf.write(f"Audio guide padding error: {_safe_str(audio_sync_info.get('error'))}\n")
                 lf.write(f"Planned duration: {planned_duration_for_retry:.6f}s\n")
                 lf.write(f"Tail pad seconds: {LTX_GENERATION_TAIL_PAD_SECONDS:.3f}\n")
                 lf.write(f"Short-shot generation padding applied: {bool(timing_plan.get('short_generation_padding_applied'))}\n")
@@ -11699,7 +11133,7 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
                 lf.flush()
                 proc = subprocess.Popen(
                     attempt_args,
-                    cwd=str(root),
+                    cwd=ltx_working_dir,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     bufsize=1,
@@ -11728,7 +11162,6 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
                 "requested_duration": round(float(current_frames) / float(max(1, fps)), 6),
                 "output_path": str(attempt_clip_path),
                 "audio_guide_path": str(attempt_audio_path or ""),
-                "audio_guide_duration_sync": dict(audio_sync_info) if isinstance(audio_sync_info, dict) else {},
                 "actual_raw_duration": round(float(actual_attempt_duration), 6) if actual_attempt_duration else 0.0,
             }
             attempt_records.append(attempt_record)
@@ -11768,11 +11201,6 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
             # increases, so add a full planned slot plus the short-shot pad.
             jump_frames = int(math.ceil((planned_duration_for_retry + float(LTX_SHORT_SHOT_EXTRA_PAD_SECONDS)) * float(max(1, fps))))
             next_frames = max(next_frames, current_frames + jump_frames, int(math.ceil(float(LTX_SHORT_SHOT_MIN_REQUEST_SECONDS) * float(max(1, fps)))))
-            if backend == "vramlab" and max_generation_frames > 0:
-                if int(current_frames) >= int(max_generation_frames):
-                    _emit(f"LTX returned {actual_attempt_duration:.2f}s for planned {planned_duration_for_retry:.2f}s, but the LTX-VRAMLab frame cap is already reached ({max_generation_frames} frames). Not requesting more than the allowed maximum.")
-                    break
-                next_frames = min(int(next_frames), int(max_generation_frames))
             _emit(f"LTX returned {actual_attempt_duration:.2f}s for planned {planned_duration_for_retry:.2f}s. Creating a new longer raw clip with more frames and a longer audio guide; no freeze or slow-motion padding.")
             current_frames = int(next_frames)
 
@@ -12017,6 +11445,20 @@ def _copy_own_image_to_full_run(source: str, target: Path) -> str:
         raise FileNotFoundError(f"Supplied start image was not found: {source_path}")
     target = Path(target).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
+
+    # Resume is idempotent: the normal LTXxx_start.png created by the original
+    # run is the stable job asset. Never rewrite/copy it on every Continue click.
+    try:
+        if target.is_file() and target.stat().st_size > 0:
+            return str(target)
+    except Exception:
+        pass
+    try:
+        if source_path == target or os.path.samefile(str(source_path), str(target)):
+            return str(target)
+    except Exception:
+        pass
+
     try:
         from PIL import Image
         with Image.open(str(source_path)) as image:
@@ -12141,6 +11583,50 @@ def _prepare_own_images_in_full_run(
     _write_json_file(plan_path, director_plan)
     return prepared
 
+
+def _own_images_incomplete_run_dir(plan_path: Path, director_plan: Dict[str, Any]) -> Optional[Path]:
+    """Return the existing own-image run only when it still needs continuation."""
+    meta = director_plan.get("own_images") if isinstance(director_plan.get("own_images"), dict) else {}
+    candidates: List[Path] = []
+    for key in ("full_run_dir", "prepared_full_run_dir"):
+        raw = _safe_str(meta.get(key))
+        if raw:
+            try:
+                candidates.append(Path(raw).expanduser().resolve())
+            except Exception:
+                pass
+    try:
+        base = (Path(plan_path).resolve().parent / "ltx_full_run").resolve()
+        if base.is_dir():
+            dirs = [p.resolve() for p in base.iterdir() if p.is_dir()]
+            dirs.sort(key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+            candidates.extend(dirs)
+    except Exception:
+        pass
+
+    seen = set()
+    for candidate in candidates:
+        norm = os.path.normcase(str(candidate))
+        if norm in seen or not candidate.is_dir() or candidate.parent.name.lower() != "ltx_full_run":
+            continue
+        seen.add(norm)
+        report_path = candidate / "ltx_full_run_report.json"
+        if not report_path.is_file():
+            # A folder created just before an abort is still the active run.
+            return candidate
+        try:
+            report = _read_json_file(str(report_path))
+            total = max(0, _safe_int(report.get("total_shots"), 0))
+            finished = max(0, _safe_int(report.get("finished_count"), 0))
+            skipped = max(0, _safe_int(report.get("skipped_count"), 0))
+            failed = max(0, _safe_int(report.get("failed_count"), 0))
+            cancelled = _safe_bool(report.get("cancelled"), False)
+            if cancelled or failed > 0 or total <= 0 or (finished + skipped) < total:
+                return candidate
+        except Exception:
+            return candidate
+    return None
+
 def run_all_ltx_director_shots(payload: dict) -> dict:
     """Generate a complete LTX director run in two strict phases.
 
@@ -12189,14 +11675,14 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
         own_images_config = _ltx_own_images_request(payload, director_plan)
         out_dir_raw = _safe_str(payload.get("output_dir"))
         if own_images_config.get("enabled"):
-            # Initial own-image jobs must use the normal dated full-run folder.
-            # Only accept an explicit output_dir when it is already a child of
-            # ltx_full_run (resume/retry); a job-root path is not a run folder.
+            # Initial own-image jobs create one normal dated full-run folder.
+            # Resume/retry keeps that same folder; Review may explicitly pass it.
             explicit_dir = Path(out_dir_raw).expanduser().resolve() if out_dir_raw else None
             if explicit_dir is not None and explicit_dir.parent.name.lower() == "ltx_full_run":
                 run_dir = explicit_dir
             else:
-                run_dir = _make_ltx_full_run_dir(plan_path)
+                resumable = _own_images_incomplete_run_dir(plan_path, director_plan)
+                run_dir = resumable if resumable is not None else _make_ltx_full_run_dir(plan_path)
         else:
             run_dir = Path(out_dir_raw).expanduser().resolve() if out_dir_raw else _make_ltx_full_run_dir(plan_path)
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -12219,11 +11705,8 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
             image_mode = "existing"
         skip_completed = _safe_bool(payload.get("skip_completed"), True)
         trim_clips = _safe_bool(payload.get("trim_clips"), True)
-        # Retry a failed LTX clip twice by default: total attempts = 3.
-        # This handles occasional backend crashes without aborting the whole music-video run.
-        ltx_retry_attempts = max(1, min(10, _safe_int(payload.get("ltx_retry_attempts"), _safe_int(payload.get("retry_attempts"), 3))))
         steps = max(1, _safe_int(payload.get("steps"), 8))
-        resolution = _safe_str(payload.get("resolution") or director_plan.get("resolution") or director_plan.get("ltx_resolution"), "1280x704") or "1280x704"
+        resolution = _safe_str(payload.get("resolution"), "1280x720") or "1280x720"
         review_continue_missing_only = _safe_bool(payload.get("review_continue_missing_only"), False)
         use_review_current_images = _safe_bool(payload.get("use_review_current_images"), False)
         review_state = _read_ltx_review_state(plan_path) if (review_continue_missing_only or use_review_current_images) else {}
@@ -12237,7 +11720,6 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
             "image_mode": image_mode,
             "skip_completed": skip_completed,
             "trim_clips": trim_clips,
-            "ltx_retry_attempts_per_shot": ltx_retry_attempts,
             "total_shots": len(shots),
             "finished_count": 0,
             "failed_count": 0,
@@ -12268,7 +11750,6 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
         image_phase_skipped_for_ready_clip = 0
         report["execution_order"] = "all_start_images_then_all_ltx_videos"
         hidream_batch_prepared_jobs: List[Dict[str, Any]] = []
-        qwen2511_int4_batch_prepared_jobs: List[Dict[str, Any]] = []
         report["image_phase"] = {
             "status": "running",
             "generated_count": 0,
@@ -12364,9 +11845,6 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
                 if prepared_model == "hidream":
                     hidream_batch_prepared_jobs.append(prepared)
                     _emit(f"Phase 1/2 image {image_idx}/{len(shots)}: queued {image_sid} for warm HiDream batch")
-                elif prepared_model == "qwen2511_int4":
-                    qwen2511_int4_batch_prepared_jobs.append(prepared)
-                    _emit(f"Phase 1/2 image {image_idx}/{len(shots)}: queued {image_sid} for warm Qwen2511 INT4 batch")
                 else:
                     image_result = generate_ltx_start_image_for_shot(image_payload)
                     if not isinstance(image_result, dict) or not bool(image_result.get("ok")):
@@ -12389,64 +11867,6 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
                 "failures": dict(image_phase_failures),
             })
             _save_report()
-
-        if qwen2511_int4_batch_prepared_jobs and not _safe_bool(report.get("cancelled"), False):
-            try:
-                _emit(
-                    f"Phase 1/2 - running warm Qwen2511 INT4 batch for "
-                    f"{len(qwen2511_int4_batch_prepared_jobs)} queued image(s)"
-                )
-                batch_results = _run_qwen2511_int4_batch_start_images(
-                    root,
-                    jobs=qwen2511_int4_batch_prepared_jobs,
-                    progress_callback=lambda msg: _emit(f"Qwen2511 INT4 batch: {msg}"),
-                )
-                result_map = {}
-                if isinstance(batch_results.get("jobs"), list):
-                    for item in batch_results.get("jobs") or []:
-                        if isinstance(item, dict):
-                            result_map[_safe_str(item.get("shot_id"))] = item
-                for prepared in qwen2511_int4_batch_prepared_jobs:
-                    sid = _safe_str(prepared.get("shot_id"))
-                    res = result_map.get(sid) or {}
-                    final_image_path = _safe_str(
-                        res.get("output_image") or prepared.get("start_image_path")
-                    )
-                    if bool(res.get("ok")) and final_image_path and os.path.isfile(final_image_path):
-                        prepared_start_images[sid] = final_image_path
-                        image_phase_generated += 1
-                    else:
-                        image_phase_failures[sid] = _safe_str(
-                            res.get("error")
-                            or batch_results.get("message")
-                            or "Qwen2511 INT4 batch generation failed."
-                        )
-                        _emit(f"Start image failed for {sid}: {image_phase_failures[sid]}")
-                    report["image_phase"].update({
-                        "generated_count": image_phase_generated,
-                        "reused_count": image_phase_reused,
-                        "skipped_for_ready_clip_count": image_phase_skipped_for_ready_clip,
-                        "failed_count": len(image_phase_failures),
-                        "prepared_start_images": dict(prepared_start_images),
-                        "failures": dict(image_phase_failures),
-                    })
-                    _save_report()
-            except Exception as batch_exc:
-                batch_msg = str(batch_exc)
-                for prepared in qwen2511_int4_batch_prepared_jobs:
-                    sid = _safe_str(prepared.get("shot_id"))
-                    if sid not in prepared_start_images and sid not in image_phase_failures:
-                        image_phase_failures[sid] = batch_msg
-                _emit(f"Qwen2511 INT4 warm batch failed: {batch_msg}")
-                report["image_phase"].update({
-                    "generated_count": image_phase_generated,
-                    "reused_count": image_phase_reused,
-                    "skipped_for_ready_clip_count": image_phase_skipped_for_ready_clip,
-                    "failed_count": len(image_phase_failures),
-                    "prepared_start_images": dict(prepared_start_images),
-                    "failures": dict(image_phase_failures),
-                })
-                _save_report()
 
         if hidream_batch_prepared_jobs and not _safe_bool(report.get("cancelled"), False):
             try:
@@ -12643,46 +12063,14 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
                     if key in payload:
                         single_payload[key] = payload.get(key)
 
-                result: Dict[str, Any] = {}
-                attempt_summaries: List[Dict[str, Any]] = []
-                last_error = ""
-                for attempt_no in range(1, ltx_retry_attempts + 1):
-                    retry_payload = dict(single_payload)
-                    if attempt_no > 1:
-                        existing_retry_start = str((shot_output_dir / start_image_name).resolve())
-                        if os.path.isfile(existing_retry_start):
-                            retry_payload["image_mode"] = "existing"
-                            retry_payload["existing_start_image_path"] = existing_retry_start
-                        retry_payload["progress_callback"] = lambda msg, _sid=sid, _attempt=attempt_no: _emit(f"{_sid}: retry {_attempt}/{ltx_retry_attempts}: {msg}")
-                        _emit(f"{sid}: retrying failed LTX clip, attempt {attempt_no}/{ltx_retry_attempts}...")
-                    result_raw = run_single_ltx_shot_test(retry_payload)
-                    result = result_raw if isinstance(result_raw, dict) else {}
-                    ok_attempt = bool(isinstance(result_raw, dict) and result_raw.get("ok"))
-                    last_error = _safe_str(result.get("message"), "LTX shot failed.") or "LTX shot failed."
-                    attempt_summaries.append({
-                        "attempt": attempt_no,
-                        "ok": ok_attempt,
-                        "message": last_error,
-                        "output_dir": _safe_str(result.get("output_dir")),
-                        "log_path": _safe_str(result.get("log_path")),
-                    })
-                    if ok_attempt:
-                        if attempt_no > 1:
-                            _emit(f"{sid}: retry succeeded on attempt {attempt_no}/{ltx_retry_attempts}")
-                        break
-                    if attempt_no < ltx_retry_attempts:
-                        _emit(f"{sid}: attempt {attempt_no}/{ltx_retry_attempts} failed: {last_error}")
+                result = run_single_ltx_shot_test(single_payload)
                 if not isinstance(result, dict) or not bool(result.get("ok")):
-                    item["attempts"] = attempt_summaries
-                    raise RuntimeError(f"LTX shot failed after {ltx_retry_attempts} attempt(s): {last_error}")
+                    raise RuntimeError(_safe_str(result.get("message") if isinstance(result, dict) else "", "LTX shot failed.") or "LTX shot failed.")
 
                 dur = result.get("duration_report") if isinstance(result.get("duration_report"), dict) else {}
                 item.update({
                     "status": "ok",
                     "message": _safe_str(result.get("message"), "Finished."),
-                    "attempts": attempt_summaries,
-                    "succeeded_attempt": len(attempt_summaries),
-                    "retry_count": max(0, len(attempt_summaries) - 1),
                     "start_image_path": _safe_str(result.get("start_image_path")),
                     "raw_clip_path": _safe_str(result.get("ltx_clip_path")),
                     "trimmed_clip_path": _safe_str(result.get("sync_clip_path")),
@@ -12762,7 +12150,6 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
                     "status": "failed",
                     "error": str(exc),
                     "audio_path": _safe_str(shot.get("audio_clip_path")),
-                    "can_recreate_later": True,
                 })
                 report["failed_count"] = _safe_int(report.get("failed_count"), 0) + 1
                 report["shots"].append(item)
@@ -13559,94 +12946,6 @@ def _write_ltx_assembly_text_report(path: Path, report: Dict[str, Any]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _parse_ltx_resolution_pair(value: Any, default: tuple[int, int] = (1280, 720)) -> tuple[int, int]:
-    try:
-        txt = _safe_str(value).lower().replace("×", "x")
-        m = re.search(r"(\d{3,5})\s*x\s*(\d{3,5})", txt)
-        if m:
-            w = max(2, int(m.group(1)))
-            h = max(2, int(m.group(2)))
-        else:
-            w, h = int(default[0]), int(default[1])
-    except Exception:
-        w, h = int(default[0]), int(default[1])
-    if w % 2:
-        w += 1
-    if h % 2:
-        h += 1
-    return max(2, w), max(2, h)
-
-
-def _make_ltx_missing_placeholder_clip(
-    *,
-    root: Path,
-    dst: Path,
-    source_image: str = "",
-    planned_duration: float,
-    planned_frames: int,
-    fps: int,
-    resolution: Any = "1280x720",
-    log_path: Path,
-) -> Dict[str, Any]:
-    """Create a timeline-safe placeholder for a failed/missing LTX shot.
-
-    This lets the full music video assembly finish even when one LTX clip failed
-    after all retry attempts. If a start image exists, the placeholder is a still
-    video of that image; otherwise it is a black frame. The review system can
-    still recreate the failed shot later.
-    """
-    ffmpeg = _find_media_binary(root, "FV_FFMPEG", "ffmpeg")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        if dst.exists():
-            dst.unlink()
-    except Exception:
-        pass
-    planned = max(0.05, float(planned_duration or 0.0))
-    frames = max(1, int(planned_frames or round(planned * max(1, int(fps or 24)))))
-    fps_i = max(1, int(fps or 24))
-    w, h = _parse_ltx_resolution_pair(resolution, (1280, 720))
-    src = _safe_str(source_image)
-    use_image = bool(src and os.path.isfile(src))
-    vf_common = f"fps={fps_i},scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
-    if use_image:
-        cmd = [
-            ffmpeg, "-y", "-hide_banner",
-            "-loop", "1", "-i", src,
-            "-t", f"{planned:.6f}",
-            "-vf", vf_common,
-            "-frames:v", str(frames),
-            "-r", str(fps_i),
-            "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            str(dst),
-        ]
-        header = "[assembly] Creating still-image placeholder for missing LTX clip"
-    else:
-        cmd = [
-            ffmpeg, "-y", "-hide_banner",
-            "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={fps_i}",
-            "-t", f"{planned:.6f}",
-            "-frames:v", str(frames),
-            "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            str(dst),
-        ]
-        header = "[assembly] Creating black placeholder for missing LTX clip"
-    result = _run_ffmpeg_logged(cmd, log_path, header, timeout=1800)
-    ok = bool(int(result.get("returncode", -1)) == 0 and dst.is_file() and dst.stat().st_size >= 1024)
-    duration = _probe_media_duration_seconds(root, dst) if ok else 0.0
-    return {
-        "ok": ok,
-        "placeholder_clip_path": str(dst),
-        "placeholder_source_image": src if use_image else "",
-        "placeholder_used_image": use_image,
-        "placeholder_duration": round(float(duration), 6) if duration else 0.0,
-        "message": "placeholder created" if ok else "placeholder ffmpeg failed or produced no output",
-        "ffmpeg_result": result,
-    }
-
-
 def assemble_ltx_music_video(payload: dict) -> dict:
     """Assemble generated LTX shots into one music video locked to the song timeline.
 
@@ -13852,55 +13151,13 @@ def assemble_ltx_music_video(payload: dict) -> dict:
                     shot_warnings.append(f"Could not check existing retimed clip; rebuilding this shot timing: {reuse_exc}")
 
             if not input_clip:
-                placeholder_source = ""
-                for cand in (
-                    _safe_str(explicit_review_item.get("current_start_image_path")) if isinstance(explicit_review_item, dict) else "",
-                    str(full_run_dir / f"{stem}_start.png"),
-                    str(full_run_dir / f"{stem}_start.jpg"),
-                    str(full_run_dir / f"{stem}_start.jpeg"),
-                    str(full_run_dir / f"{stem}_review_start_used.png"),
-                    str(full_run_dir / f"{stem}_review_start.png"),
-                ):
-                    if cand and os.path.isfile(cand):
-                        placeholder_source = cand
-                        break
-                item["status"] = "placeholder"
-                item["missing_original_clip"] = True
-                item["can_recreate_later"] = True
-                shot_warnings.append("Missing generated LTX clip; assembly inserted a placeholder so the full video can finish. Recreate this shot later from Review.")
-                warnings.append(f"{sid}: missing generated clip; placeholder inserted")
-                placeholder = _make_ltx_missing_placeholder_clip(
-                    root=root,
-                    dst=retimed_path,
-                    source_image=placeholder_source,
-                    planned_duration=planned_duration,
-                    planned_frames=int(grid["planned_frames"]),
-                    fps=fps,
-                    resolution=payload.get("resolution") or shot.get("resolution") or director_plan.get("resolution") or "1280x720",
-                    log_path=log_path,
-                )
-                item["placeholder_clip_path"] = _safe_str(placeholder.get("placeholder_clip_path"))
-                item["placeholder_source_image"] = _safe_str(placeholder.get("placeholder_source_image"))
-                item["placeholder_used_image"] = _safe_bool(placeholder.get("placeholder_used_image"), False)
-                item["input_clip_path"] = _safe_str(placeholder.get("placeholder_clip_path"))
-                item["retimed_clip_path"] = _safe_str(placeholder.get("placeholder_clip_path"))
-                item["input_clip_duration"] = _safe_float(placeholder.get("placeholder_duration"), planned_duration)
-                item["retimed_clip_duration"] = _safe_float(placeholder.get("placeholder_duration"), planned_duration)
-                item["speed_factor"] = 1.0
-                item["duration_error_after_retime"] = abs(float(item["retimed_clip_duration"] or 0.0) - planned_duration)
-                if not _safe_bool(placeholder.get("ok"), False):
-                    item["status"] = "missing"
-                    item["placeholder_error"] = _safe_str(placeholder.get("message"), "placeholder failed")
-                    shot_warnings.append("Placeholder creation failed; assembly cannot continue for this shot.")
-                    report["shots"].append(item)
-                    _write_json_file(report_json, report)
-                    _write_ltx_assembly_text_report(report_txt, report)
-                    return {"ok": False, "message": f"Missing generated clip for {sid} and placeholder creation failed. See report: {report_json}", "output_dir": str(out_dir), "report_json": str(report_json)}
-                retimed_clips.append(Path(_safe_str(placeholder.get("placeholder_clip_path"))))
+                item["status"] = "missing"
+                shot_warnings.append("Missing generated clip; assembly cannot continue.")
+                warnings.append(f"{sid}: missing generated clip")
                 report["shots"].append(item)
                 _write_json_file(report_json, report)
                 _write_ltx_assembly_text_report(report_txt, report)
-                continue
+                return {"ok": False, "message": f"Missing generated clip for {sid}. See report: {report_json}", "output_dir": str(out_dir), "report_json": str(report_json)}
 
             actual_input_duration = _probe_media_duration_seconds(root, Path(input_clip))
             item["input_clip_duration"] = round(float(actual_input_duration), 6) if actual_input_duration else 0.0
@@ -13970,46 +13227,11 @@ def assemble_ltx_music_video(payload: dict) -> dict:
                 warnings.append(f"{sid}: needs regeneration")
                 report["blocked_by_needs_regeneration"] = True
                 report["needs_regeneration_count"] = _safe_int(report.get("needs_regeneration_count"), 0) + 1
-                placeholder_source = ""
-                for cand in (
-                    _safe_str(explicit_review_item.get("current_start_image_path")) if isinstance(explicit_review_item, dict) else "",
-                    str(full_run_dir / f"{stem}_start.png"),
-                    str(full_run_dir / f"{stem}_start.jpg"),
-                    str(full_run_dir / f"{stem}_start.jpeg"),
-                ):
-                    if cand and os.path.isfile(cand):
-                        placeholder_source = cand
-                        break
-                placeholder = _make_ltx_missing_placeholder_clip(
-                    root=root,
-                    dst=retimed_path,
-                    source_image=placeholder_source,
-                    planned_duration=planned_duration,
-                    planned_frames=int(grid["planned_frames"]),
-                    fps=fps,
-                    resolution=payload.get("resolution") or shot.get("resolution") or director_plan.get("resolution") or "1280x720",
-                    log_path=log_path,
-                )
-                if _safe_bool(placeholder.get("ok"), False):
-                    item["status"] = "placeholder_needs_regeneration"
-                    item["assembly_blocked"] = False
-                    item["can_recreate_later"] = True
-                    item["placeholder_clip_path"] = _safe_str(placeholder.get("placeholder_clip_path"))
-                    item["placeholder_source_image"] = _safe_str(placeholder.get("placeholder_source_image"))
-                    item["retimed_clip_path"] = _safe_str(placeholder.get("placeholder_clip_path"))
-                    item["retimed_clip_duration"] = _safe_float(placeholder.get("placeholder_duration"), planned_duration)
-                    retimed_clips.append(Path(_safe_str(placeholder.get("placeholder_clip_path"))))
-                    shot_warnings.append("Inserted placeholder instead of stopping assembly; recreate this shot later.")
-                    report["warnings"] = warnings
-                    report["shots"].append(item)
-                    _write_json_file(report_json, report)
-                    _write_ltx_assembly_text_report(report_txt, report)
-                    continue
                 report["warnings"] = warnings
                 report["shots"].append(item)
                 _write_json_file(report_json, report)
                 _write_ltx_assembly_text_report(report_txt, report)
-                message = f"Assembly stopped: {sid} needs regeneration and placeholder creation failed. See report: {report_json}"
+                message = f"Assembly stopped: one or more clips need regeneration. {sid} is shorter than planned. Regenerate this shot from the Review tab. See report: {report_json}"
                 _emit(message)
                 return {"ok": False, "status": "needs_regeneration", "message": message, "output_dir": str(out_dir), "report_json": str(report_json), "needs_regeneration_shots": [sid]}
             if _safe_bool(retime.get("short_raw_padded_to_planned"), False):
@@ -14096,126 +13318,3 @@ def assemble_ltx_music_video(payload: dict) -> dict:
         return report
     except Exception as exc:
         return {"ok": False, "message": f"LTX assembly failed: {exc}"}
-
-
-# --------------------------- queued/headless runner ---------------------------
-def run_ltx_queue_payload(payload_path: str) -> int:
-    """Headless entrypoint for FrameVision Queue jobs.
-
-    The Music Clip Creator UI writes a small JSON payload, then Queue/worker runs
-    this function in a separate Python process through the normal tools_ffmpeg
-    runner.  Keep this stdlib-only so it stays safe to call from worker.py.
-    """
-    try:
-        payload_file = Path(_safe_str(payload_path)).expanduser().resolve()
-        if not payload_file.is_file():
-            print(f"ERROR: LTX queue payload not found: {payload_file}", flush=True)
-            return 2
-        payload = _read_json_file(str(payload_file))
-        if not isinstance(payload, dict):
-            print(f"ERROR: LTX queue payload is not a dictionary: {payload_file}", flush=True)
-            return 2
-    except Exception as exc:
-        print(f"ERROR: failed to read LTX queue payload: {exc}", flush=True)
-        return 2
-
-    queue_report_path = None
-    try:
-        queue_report_raw = _safe_str(payload.get("queue_report_path"))
-        if queue_report_raw:
-            queue_report_path = Path(queue_report_raw).expanduser().resolve()
-    except Exception:
-        queue_report_path = None
-
-    progress_state = {"last_pct": -1}
-
-    def _queue_write_report(data: Dict[str, Any]) -> None:
-        if queue_report_path is None:
-            return
-        try:
-            queue_report_path.parent.mkdir(parents=True, exist_ok=True)
-            _write_json_file(queue_report_path, data)
-        except Exception:
-            pass
-
-    def _emit_progress(message: str) -> None:
-        msg = _safe_str(message)
-        if msg:
-            print(msg, flush=True)
-        # The worker already parses "N / total" and "N%" from stdout, but emit
-        # a coarse percent too so long image-generation/LTX stages visibly move.
-        try:
-            m = re.search(r"(?i)generating\s+shot\s+(\d+)\s*/\s*(\d+)", msg)
-            if not m:
-                m = re.search(r"(?i)(?:finished|skipped|failed)\s+LTX(\d+)\b", msg)
-                # This fallback intentionally stays conservative because not all
-                # custom shot IDs end in a number.
-            if m and m.lastindex and m.lastindex >= 2:
-                cur = max(0, _safe_int(m.group(1), 0) - 1)
-                total = max(1, _safe_int(m.group(2), 1))
-                pct = int(max(0, min(95, (float(cur) / float(total)) * 95.0)))
-                if pct != progress_state.get("last_pct"):
-                    progress_state["last_pct"] = pct
-                    print(f"{pct}%", flush=True)
-        except Exception:
-            pass
-
-    try:
-        payload = dict(payload)
-        payload["progress_callback"] = _emit_progress
-        print("0%", flush=True)
-        print("Music Clip LTX queue job: starting full LTX run", flush=True)
-        result = run_all_ltx_director_shots(payload)
-        result = result if isinstance(result, dict) else {"ok": False, "message": "LTX run returned an invalid result."}
-        _queue_write_report({"stage": "generation", "result": result})
-        if not bool(result.get("ok")):
-            print(_safe_str(result.get("message"), "LTX generation failed."), flush=True)
-            return 1
-
-        assemble_after = _safe_bool(payload.get("assemble_after"), False)
-        if assemble_after:
-            print("96%", flush=True)
-            print("Music Clip LTX queue job: assembling final video", flush=True)
-            assembly_payload = dict(payload)
-            assembly_payload["progress_callback"] = _emit_progress
-            if _safe_str(result.get("output_dir")):
-                assembly_payload["full_run_dir"] = _safe_str(result.get("output_dir"))
-            assembly_result = assemble_ltx_music_video(assembly_payload)
-            assembly_result = assembly_result if isinstance(assembly_result, dict) else {"ok": False, "message": "LTX assembly returned an invalid result."}
-            final_output = _safe_str(assembly_result.get("final_output_path"))
-            queue_final_output = _safe_str(payload.get("queue_final_output"))
-            if bool(assembly_result.get("ok")) and final_output and queue_final_output:
-                try:
-                    src = Path(final_output).expanduser().resolve()
-                    dst = Path(queue_final_output).expanduser().resolve()
-                    if src.is_file():
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        if src.resolve() != dst.resolve():
-                            shutil.copy2(str(src), str(dst))
-                        assembly_result["queue_final_output"] = str(dst)
-                        print(f"Queue final output copied: {dst}", flush=True)
-                except Exception as copy_exc:
-                    assembly_result.setdefault("warnings", [])
-                    try:
-                        assembly_result["warnings"].append(f"Could not copy queue final output: {copy_exc}")
-                    except Exception:
-                        pass
-                    print(f"Warning: could not copy queue final output: {copy_exc}", flush=True)
-            _queue_write_report({"stage": "assembly", "generation_result": result, "assembly_result": assembly_result})
-            if not bool(assembly_result.get("ok")):
-                print(_safe_str(assembly_result.get("message"), "LTX assembly failed."), flush=True)
-                return 1
-            print("100%", flush=True)
-            print(_safe_str(assembly_result.get("message"), "Music Clip LTX queue job finished."), flush=True)
-            return 0
-
-        print("100%", flush=True)
-        print(_safe_str(result.get("message"), "Music Clip LTX queue job finished."), flush=True)
-        return 0
-    except KeyboardInterrupt:
-        print("Music Clip LTX queue job cancelled.", flush=True)
-        return 130
-    except Exception as exc:
-        print(f"ERROR: Music Clip LTX queue job failed: {exc}", flush=True)
-        return 1
-
