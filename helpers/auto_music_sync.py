@@ -22848,6 +22848,18 @@ class AutoMusicSyncWidget(QWidget):
         )
 
     def _ltx_musicclip_use_int8_text_encoder_enabled(self) -> bool:
+        """Return the external INT8 encoder toggle only for the native INT4 backend.
+
+        The checkbox may remain checked in saved settings while another backend is
+        selected. Never let that stale UI state leak into FP16/FP8 VRAM-Lab or
+        Wan2GP payloads.
+        """
+        try:
+            backend = self._current_ltx_generation_backend()
+        except Exception:
+            backend = ""
+        if backend != "int4":
+            return False
         try:
             return bool(getattr(self, "check_ltx_use_int8_text_encoder", None) and self.check_ltx_use_int8_text_encoder.isChecked())
         except Exception:
@@ -22957,7 +22969,23 @@ class AutoMusicSyncWidget(QWidget):
         if widget is not None:
             widget.setVisible(bool(visible))
         if not visible:
+            # This option is native-INT4-only. Clear a previously saved/checked
+            # state as soon as FP16/FP8 (VRAM Lab) or Wan2GP is selected so it
+            # cannot silently reappear in generated payloads.
+            if check is not None:
+                try:
+                    check.blockSignals(True)
+                    check.setChecked(False)
+                    check.setEnabled(False)
+                finally:
+                    check.blockSignals(False)
+            if button is not None:
+                button.setVisible(False)
+            if label is not None:
+                label.setText("")
             return
+        if check is not None:
+            check.setEnabled(True)
         enabled = bool(check and check.isChecked())
         resolved = self._ltx_musicclip_int8_text_encoder_root()
         downloading = bool(getattr(self, "_ltx_int8_text_encoder_download_thread", None) is not None and getattr(self._ltx_int8_text_encoder_download_thread, "isRunning", lambda: False)())

@@ -11930,8 +11930,6 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
                     msr_reference_paths=[_safe_str(x) for x in list(msr_pack.get("references") or [])],
                     msr_end_frame=_safe_str(msr_pack.get("end_frame")),
                     msr_reference_frames=int(msr_pack.get("reference_frames") or 41),
-                    use_int8_text_encoder=bool(payload.get("use_int8_text_encoder") or payload.get("ltx_use_int8_text_encoder") or (payload.get("bridge_generation_settings") or {}).get("use_int8_text_encoder") or (payload.get("bridge_generation_settings") or {}).get("ltx_use_int8_text_encoder")),
-                    ltx_use_int8_text_encoder=bool(payload.get("use_int8_text_encoder") or payload.get("ltx_use_int8_text_encoder") or (payload.get("bridge_generation_settings") or {}).get("use_int8_text_encoder") or (payload.get("bridge_generation_settings") or {}).get("ltx_use_int8_text_encoder")),
                 )
 
             built = [
