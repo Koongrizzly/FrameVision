@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Isolated FrameVision CLI backend for the split-folder LTX 2.3 INT4 model.
+"""Isolated FrameVision CLI backend for split-folder LTX 2.3 SDNQ INT8/INT4 models.
 
 This module deliberately keeps the SDNQ/Diffusers path isolated from the
 existing official ltx_core runner.  Importing ``SDNQConfig`` registers the
@@ -10,7 +10,7 @@ one giant BF16 checkpoint.
 
 Current scope:
 - LTX 2.3 Distilled 1.1 SDNQ INT4 folder in Diffusers layout.
-- INT8 is intentionally not connected in this restart patch.
+- LTX 2.3 Distilled 1.1 SDNQ INT8 and INT4 folders in Diffusers layout.
 - one-stage and Euler two-stage text/image-to-video through official Diffusers LTX2 pipelines.
 - official-style repeated --image and --lora arguments used by the FrameVision LTX UI.
 - a2vid_two_stage is preserved as the public audio workflow name instead of being renamed by the UI.
@@ -284,6 +284,78 @@ def _select_sdnq_offload_policy(
             f"INT4 automatic VRAM planner disabled; fixed conservative "
             f"{profile_bucket}GB {stage} policy"
         )
+    elif variant == "int8" and not bool(automation_enabled):
+        # INT8 uses the same UI toggle but should not fall back to the very
+        # conservative generic SDNQ policy on a 24 GB card.  Match the proven
+        # INT4 idea: keep Stage 1 fast when the quarter-resolution workload is
+        # small enough, and keep Stage 2 on guarded grouped offload.
+        if profile_bucket == 24:
+            if workflow == "two_stages" and stage == "stage1":
+                full_limit = 0.65 if is_i2v else 1.75
+                if work_factor <= full_limit:
+                    desired = 32
+                    mode = "group_cpu_offload"
+                    reason = (
+                        f"INT8 automatic VRAM planner disabled; fixed 24GB {stage} 32-block fast path "
+                        f"(work={work_factor:.3f} <= {full_limit:.3f})"
+                    )
+                else:
+                    desired = 24 if work_factor <= (1.35 if is_i2v else 2.75) else 16
+                    mode = "group_cpu_offload"
+                    reason = (
+                        f"INT8 automatic VRAM planner disabled; fixed 24GB {stage} guard "
+                        f"(work={work_factor:.3f})"
+                    )
+            elif workflow == "two_stages" and stage == "stage2":
+                desired = 24 if work_factor <= 1.35 else 16 if work_factor <= 2.25 else 12
+                mode = "group_cpu_offload"
+                reason = (
+                    f"INT8 automatic VRAM planner disabled; fixed 24GB {stage} guarded groups "
+                    f"(work={work_factor:.3f})"
+                )
+            else:
+                if work_factor <= 1.25:
+                    desired = 32
+                    mode = "group_cpu_offload"
+                else:
+                    desired = 24 if work_factor <= 2.50 else 16
+                    mode = "group_cpu_offload"
+                reason = (
+                    f"INT8 automatic VRAM planner disabled; fixed 24GB general policy "
+                    f"(work={work_factor:.3f})"
+                )
+        elif profile_bucket == 16:
+            desired = 12 if stage == "stage1" else 6
+            if work_factor > 1.25:
+                desired = 8 if stage == "stage1" else 4
+            if work_factor > 2.25:
+                desired = 6 if stage == "stage1" else 3
+            mode = "group_cpu_offload"
+            reason = (
+                f"INT8 automatic VRAM planner disabled; fixed 16GB {stage} policy "
+                f"(work={work_factor:.3f})"
+            )
+        elif profile_bucket == 12:
+            desired = 8 if stage == "stage1" else 4
+            if work_factor > 1.25:
+                desired = 6 if stage == "stage1" else 3
+            if work_factor > 2.25:
+                desired = 4 if stage == "stage1" else 2
+            mode = "group_cpu_offload"
+            reason = (
+                f"INT8 automatic VRAM planner disabled; fixed 12GB {stage} policy "
+                f"(work={work_factor:.3f})"
+            )
+        else:
+            desired = 4 if stage == "stage1" else 2
+            if work_factor > 1.5:
+                desired = 1
+            mode = "group_cpu_offload" if desired > 1 else "sequential_cpu_offload"
+            reason = (
+                f"INT8 automatic VRAM planner disabled; fixed 8GB {stage} emergency policy "
+                f"(work={work_factor:.3f})"
+            )
+        use_stream = False
     elif (
         variant == "int4"
         and profile_bucket == 24
@@ -318,6 +390,39 @@ def _select_sdnq_offload_policy(
             use_stream = False
             reason = (
                 f"INT4 24GB {'I2V' if is_i2v else 'T2V'} Stage 1 guard; "
+                f"synchronous groups without CUDA prefetch (work={work_factor:.3f})"
+            )
+    elif (
+        variant == "int8"
+        and profile_bucket == 24
+        and workflow == "two_stages"
+        and stage == "stage1"
+    ):
+        # INT8 on a real 24 GB card should behave much closer to the proven
+        # INT4 Stage 1 route than to the ultra-conservative generic SDNQ
+        # fallback.  Keep the quarter-resolution denoiser on model offload for
+        # small workloads so the full transformer is not re-streamed in 24-block
+        # chunks every step.
+        full_limit = 0.65 if is_i2v else 1.75
+        if work_factor <= full_limit:
+            desired = 32
+            mode = "group_cpu_offload"
+            use_stream = False
+            reason = (
+                f"INT8 24GB {'I2V' if is_i2v else 'T2V'} Stage 1 32-block fast path "
+                f"(work={work_factor:.3f} <= {full_limit:.3f})"
+            )
+        else:
+            if work_factor <= (1.05 if is_i2v else 2.25):
+                desired = 32
+            elif work_factor <= (1.35 if is_i2v else 2.75):
+                desired = 24
+            else:
+                desired = 16
+            mode = "group_cpu_offload"
+            use_stream = False
+            reason = (
+                f"INT8 24GB {'I2V' if is_i2v else 'T2V'} Stage 1 guard; "
                 f"synchronous groups without CUDA prefetch (work={work_factor:.3f})"
             )
     elif (
@@ -1690,9 +1795,180 @@ def _frame_to_latent_index(frame: int, num_frames: int, temporal_ratio: int) -> 
     return ((frame - 1) // max(1, int(temporal_ratio))) + 1
 
 
-def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dict[str, Any]:
+
+def _resolve_external_text_encoder_dir(value: Any) -> Optional[Path]:
+    text = str(value or "").strip().strip('"')
+    if not text:
+        return None
+    selected = Path(text).expanduser().resolve()
+    candidates = [selected]
+    if selected.name.lower() != "text_encoder":
+        candidates.insert(0, selected / "text_encoder")
+    for candidate in candidates:
+        if (candidate / "config.json").is_file() and any(candidate.glob("*.safetensors")):
+            return candidate
+    raise FileNotFoundError(
+        "External SDNQ text encoder folder is incomplete. Select either the complete INT8 SDNQ model root "
+        "or its text_encoder subfolder. Expected config.json and one or more .safetensors files under: "
+        + ", ".join(str(x) for x in candidates)
+    )
+
+
+def _config_value(config: Any, name: str) -> Any:
+    try:
+        return getattr(config, name)
+    except Exception:
+        try:
+            return config.get(name)
+        except Exception:
+            return None
+
+
+def _replace_pipeline_text_encoder(pipe: Any, external_dir: Path, torch_module: Any, ctx: Dict[str, Any]) -> None:
+    current = getattr(pipe, "text_encoder", None)
+    if current is None:
+        raise RuntimeError("Loaded LTX pipeline does not expose a text_encoder component.")
+    encoder_cls = type(current)
+    current_config = getattr(current, "config", None)
+    print(f"[ltx-status] Loading external SDNQ text encoder from {external_dir}", flush=True)
+    load_t0 = time.perf_counter()
+    try:
+        replacement = encoder_cls.from_pretrained(
+            str(external_dir),
+            torch_dtype=torch_module.bfloat16,
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+        )
+    except TypeError:
+        replacement = encoder_cls.from_pretrained(
+            str(external_dir),
+            torch_dtype=torch_module.bfloat16,
+            local_files_only=True,
+        )
+    replacement_config = getattr(replacement, "config", None)
+    checks = ("model_type", "hidden_size", "num_hidden_layers", "vocab_size")
+    mismatches = []
+    for name in checks:
+        old_value = _config_value(current_config, name)
+        new_value = _config_value(replacement_config, name)
+        if old_value is not None and new_value is not None and old_value != new_value:
+            mismatches.append(f"{name}: active={old_value!r}, external={new_value!r}")
+    if mismatches:
+        del replacement
+        gc.collect()
+        raise RuntimeError("External text encoder is not architecture-compatible: " + "; ".join(mismatches))
+    pipe.text_encoder = replacement
+    try:
+        if hasattr(pipe, "register_modules"):
+            pipe.register_modules(text_encoder=replacement)
+    except Exception:
+        pass
+    del current
+    gc.collect()
+    try:
+        torch_module.cuda.empty_cache()
+    except Exception:
+        pass
+    elapsed = time.perf_counter() - load_t0
+    ctx["ltx_sdnq_external_text_encoder"] = str(external_dir)
+    ctx["ltx_sdnq_external_text_encoder_class"] = encoder_cls.__name__
+    ctx["ltx_sdnq_external_text_encoder_load_time_s"] = f"{elapsed:.3f}"
+    ctx["ltx_sdnq_external_text_encoder_status"] = "loaded and architecture compatibility check passed"
+    print(f"[ltx-status] External SDNQ text encoder ready in {elapsed:.2f}s", flush=True)
+
+
+class _WarmSdnqRuntime:
+    """Process-local cache for the 24 GB Music Clip INT4 worker.
+
+    The cache owns strong references to the quantized Diffusers components after
+    a job finishes.  Every new job receives a fresh pipeline wrapper and a fresh
+    scheduler, while the expensive transformer/text-encoder objects (including
+    their SDNQ/Torch compile state) are reused.  The normal one-shot CLI never
+    creates this object and therefore keeps its original isolated lifecycle.
+    """
+
+    def __init__(self) -> None:
+        self.key: Optional[Tuple[str, str, str, str]] = None
+        self.components: Optional[Dict[str, Any]] = None
+        self.scheduler_cls: Any = None
+        self.scheduler_config: Optional[Dict[str, Any]] = None
+        self.jobs_completed = 0
+
+    def _key_for(self, pipeline_cls: Any, root: Path, args: Any) -> Tuple[str, str, str, str]:
+        return (
+            str(Path(root).resolve()).lower(),
+            str(getattr(pipeline_cls, "__name__", pipeline_cls)),
+            str(getattr(args, "attention_backend", "auto") or "auto").lower(),
+            str(getattr(args, "external_text_encoder_root", "") or "").strip().lower(),
+        )
+
+    def acquire(self, pipeline_cls: Any, root: Path, args: Any, ctx: Dict[str, Any]) -> Any:
+        wanted = self._key_for(pipeline_cls, root, args)
+        if self.components is None or self.key != wanted:
+            return None
+        components = dict(self.components)
+        if self.scheduler_cls is not None and self.scheduler_config is not None:
+            try:
+                components["scheduler"] = self.scheduler_cls.from_config(dict(self.scheduler_config))
+            except Exception:
+                pass
+        try:
+            pipe = pipeline_cls(**components)
+        except Exception as exc:
+            self.invalidate()
+            ctx["ltx_sdnq_warm_reuse"] = (
+                f"failed to rebuild cached pipeline; cold reload required: {type(exc).__name__}: {exc}"
+            )
+            return None
+        ctx["ltx_sdnq_warm_reuse"] = (
+            f"YES: reused process-local INT4 components after {self.jobs_completed} completed job(s)"
+        )
+        ctx["ltx_sdnq_load_time_s"] = "0.000"
+        ctx["ltx_sdnq_load_status"] = "reused warm split pipeline components; no checkpoint reload"
+        print(
+            f"[ltx-status] Reusing warm SDNQ INT4 runtime (completed jobs: {self.jobs_completed})",
+            flush=True,
+        )
+        return pipe
+
+    def remember(self, pipe: Any, pipeline_cls: Any, root: Path, args: Any, ctx: Dict[str, Any]) -> None:
+        try:
+            components = dict(pipe.components)
+        except Exception as exc:
+            ctx["ltx_sdnq_warm_cache"] = f"unavailable: {type(exc).__name__}: {exc}"
+            return
+        scheduler = components.get("scheduler")
+        scheduler_config = None
+        try:
+            scheduler_config = dict(getattr(scheduler, "config", {}) or {})
+        except Exception:
+            scheduler_config = None
+        self.key = self._key_for(pipeline_cls, root, args)
+        self.components = components
+        self.scheduler_cls = type(scheduler) if scheduler is not None else None
+        self.scheduler_config = scheduler_config
+        ctx["ltx_sdnq_warm_cache"] = "stored quantized components and compile state for next job"
+
+    def finish_job(self) -> None:
+        self.jobs_completed += 1
+
+    def invalidate(self) -> None:
+        self.key = None
+        self.components = None
+        self.scheduler_cls = None
+        self.scheduler_config = None
+        gc.collect()
+
+
+def run_sdnq_diffusers(
+    args: Any,
+    ctx: Dict[str, Any],
+    torch_module: Any,
+    warm_runtime: Optional[_WarmSdnqRuntime] = None,
+) -> Dict[str, Any]:
     info = validate_sdnq_model_root(Path(str(args.sdnq_model_root)))
     root: Path = info["root"]
+    external_text_encoder_dir = _resolve_external_text_encoder_dir(getattr(args, "external_text_encoder_root", ""))
     requested_pipeline = str(getattr(args, "pipeline", "one_stage") or "one_stage").strip()
     if requested_pipeline == "two_stages_hq":
         raise RuntimeError(
@@ -1861,45 +2137,70 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         ctx["ltx_int4_condition_route"] = "text-to-video"
     ctx["ltx_sdnq_pipeline_class"] = pipeline_cls.__name__
 
-    load_t0 = time.perf_counter()
-    pipe = pipeline_cls.from_pretrained(
-        str(root),
-        torch_dtype=torch_module.bfloat16,
-        local_files_only=True,
-        low_cpu_mem_usage=True,
-    )
-    load_s = time.perf_counter() - load_t0
-    ctx["ltx_sdnq_load_time_s"] = f"{load_s:.3f}"
-    ctx["ltx_sdnq_load_status"] = f"loaded split pipeline successfully in {load_s:.3f}s"
+    pipe = warm_runtime.acquire(pipeline_cls, root, args, ctx) if warm_runtime is not None else None
+    warm_reused = pipe is not None
+    if pipe is None:
+        load_t0 = time.perf_counter()
+        pipe = pipeline_cls.from_pretrained(
+            str(root),
+            torch_dtype=torch_module.bfloat16,
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+        )
+        load_s = time.perf_counter() - load_t0
+        ctx["ltx_sdnq_load_time_s"] = f"{load_s:.3f}"
+        ctx["ltx_sdnq_load_status"] = f"loaded split pipeline successfully in {load_s:.3f}s"
+        ctx["ltx_sdnq_warm_reuse"] = "NO: first job in worker" if warm_runtime is not None else "disabled: isolated one-shot process"
+        print(f"[ltx-status] SDNQ model loaded in {load_s:.2f}s", flush=True)
+    else:
+        load_s = 0.0
+    if external_text_encoder_dir is not None and not warm_reused:
+        _replace_pipeline_text_encoder(pipe, external_text_encoder_dir, torch_module, ctx)
+    elif external_text_encoder_dir is not None:
+        ctx["ltx_sdnq_external_text_encoder"] = str(external_text_encoder_dir)
+        ctx["ltx_sdnq_external_text_encoder_status"] = "reused from warm SDNQ runtime"
+    else:
+        ctx["ltx_sdnq_external_text_encoder"] = "disabled: using text encoder bundled with selected SDNQ model"
     ctx["ltx_sdnq_cuda_after_load"] = _cuda_text(torch_module)
-    print(f"[ltx-status] SDNQ model loaded in {load_s:.2f}s", flush=True)
     _install_i2v_conditioning_mask_guard(pipe, ctx)
     _load_requested_loras(pipe, args, ctx)
 
-    quantized_matmul_status = []
-    for component_name in ("transformer", "text_encoder"):
-        component = getattr(pipe, component_name, None)
-        if component is None:
-            continue
-        try:
-            apply_sdnq_options_to_model(component, use_quantized_matmul=True)
-            quantized_matmul_status.append(f"{component_name}=enabled")
-        except Exception as exc:
-            quantized_matmul_status.append(f"{component_name}=unchanged ({type(exc).__name__}: {exc})")
-    ctx["ltx_sdnq_quantized_matmul"] = "; ".join(quantized_matmul_status) or "not found"
-    print(f"[ltx-status] SDNQ quantized matmul: {ctx['ltx_sdnq_quantized_matmul']}", flush=True)
+    if warm_reused:
+        ctx["ltx_sdnq_quantized_matmul"] = "reused from warm runtime: transformer=enabled; text_encoder=enabled"
+        ctx["ltx_sdnq_attention_backend"] = "reused from warm runtime"
+        print("[ltx-status] Reusing SDNQ quantized matmul and attention configuration", flush=True)
+    else:
+        quantized_matmul_status = []
+        for component_name in ("transformer", "text_encoder"):
+            component = getattr(pipe, component_name, None)
+            if component is None:
+                continue
+            try:
+                apply_sdnq_options_to_model(component, use_quantized_matmul=True)
+                quantized_matmul_status.append(f"{component_name}=enabled")
+            except Exception as exc:
+                quantized_matmul_status.append(f"{component_name}=unchanged ({type(exc).__name__}: {exc})")
+        ctx["ltx_sdnq_quantized_matmul"] = "; ".join(quantized_matmul_status) or "not found"
+        print(f"[ltx-status] SDNQ quantized matmul: {ctx['ltx_sdnq_quantized_matmul']}", flush=True)
 
-    _configure_attention_backend(
-        pipe,
-        str(getattr(args, "attention_backend", "auto") or "auto"),
-        ctx,
-    )
+        _configure_attention_backend(
+            pipe,
+            str(getattr(args, "attention_backend", "auto") or "auto"),
+            ctx,
+        )
 
     try:
         pipe.vae.enable_tiling()
         ctx["ltx_sdnq_vae_tiling"] = "enabled"
     except Exception as exc:
         ctx["ltx_sdnq_vae_tiling"] = f"unavailable: {type(exc).__name__}: {exc}"
+
+    # Store the complete component graph before this job temporarily detaches
+    # the text encoder and replaces scheduler/offload hooks.  The cache keeps
+    # strong CPU-side references while the per-job pipeline wrapper remains free
+    # to perform the existing aggressive VRAM teardown.
+    if warm_runtime is not None and not warm_reused:
+        warm_runtime.remember(pipe, pipeline_cls, root, args, ctx)
 
     reference_audio_latents, reference_audio_waveform, reference_audio_rate = _extract_audio_latents(
         args=args,
@@ -1919,12 +2220,14 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         or "unknown"
     )
     dtype_probe = " ".join([raw_weight_dtype, *[str(key) for key in info.get("dtype_counts", {}).keys()]]).lower()
-    if "int4" not in dtype_probe and "uint4" not in dtype_probe:
+    detected_variant = "INT4" if ("int4" in dtype_probe or "uint4" in dtype_probe) else "INT8" if ("int8" in dtype_probe or "uint8" in dtype_probe) else ""
+    if not detected_variant:
         raise RuntimeError(
-            "ltx_int4_cli.py only accepts the INT4 split model. "
+            "ltx_int4_cli.py accepts SDNQ INT8 or INT4 split models only. "
             f"Detected quantization description: {dtype_probe or 'unknown'}"
         )
-    ctx["ltx_int4_model_validation"] = "PASS: INT4 split model detected"
+    ctx["ltx_int4_model_validation"] = f"PASS: {detected_variant} split model detected"
+    ctx["ltx_sdnq_detected_variant"] = detected_variant
     block_count = int(info["transformer_config"].get("num_layers", 48) or 48)
     group_override = _int_option(
         extra,
@@ -3315,6 +3618,9 @@ def run_sdnq_diffusers(args: Any, ctx: Dict[str, Any], torch_module: Any) -> Dic
         del video, audio, pipe
     except Exception:
         pass
+    if warm_runtime is not None:
+        warm_runtime.finish_job()
+        ctx["ltx_sdnq_warm_jobs_completed"] = str(warm_runtime.jobs_completed)
     return {
         "output_path": output_path,
         "workflow": workflow,
@@ -3450,14 +3756,14 @@ def _write_report(path: Path, ctx: Dict[str, Any], exception_text: str = "") -> 
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         "=" * 78,
-        "FrameVision isolated LTX INT4 report",
+        "FrameVision isolated LTX SDNQ INT8/INT4 report",
         "=" * 78,
         f"Updated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"Python: {sys.executable}",
         "Native ltx23_vram_lab_cli.py modified: NO",
-        "INT8 enabled: NO",
+        "INT8 enabled: YES",
         "",
-        "INT4 run",
+        "SDNQ quantized run",
         "-" * 78,
     ]
     preferred = [
@@ -3515,6 +3821,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pipeline", choices=["one_stage", "two_stages", "two_stages_hq", "a2vid_two_stage"], default="two_stages")
     parser.add_argument("--model-root", "--sdnq-model-root", dest="sdnq_model_root", required=True)
+    parser.add_argument("--external-text-encoder-root", default="", help="Optional complete SDNQ model root or text_encoder subfolder used only for prompt encoding.")
     parser.add_argument("--vram-profile", choices=["auto", "24", "16", "12", "8"], default="auto")
     planner = parser.add_mutually_exclusive_group()
     planner.add_argument(
@@ -3544,6 +3851,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--i2v-image-frame", type=int, default=0)
     parser.add_argument("--i2v-image-strength", type=float, default=1.0)
     parser.add_argument("--i2v-image-crf", type=int, default=0)
+    parser.add_argument("--msr-enabled", action="store_true", help="Experimental INT4 MSR multi-reference route.")
+    parser.add_argument("--msr-background", default="")
+    parser.add_argument("--msr-ref", action="append", default=[])
+    parser.add_argument("--msr-end-frame", default="")
+    parser.add_argument("--msr-reference-frames", type=int, default=41)
+    parser.add_argument("--msr-lora", default="")
     parser.add_argument(
         "--image", dest="image_conditions", action="append", nargs="+", default=[],
         metavar="IMAGE_ARG",
@@ -3575,9 +3888,11 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    parser = _build_parser()
-    args = parser.parse_args()
+def _execute_parsed_args(
+    args: Any,
+    *,
+    warm_runtime: Optional[_WarmSdnqRuntime] = None,
+) -> int:
     args._python_executable = sys.executable
 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -3599,6 +3914,7 @@ def main() -> int:
         "requested_frames": str(args.num_frames),
         "requested_fps": str(args.frame_rate),
         "output_path": str(args.output_path),
+        "ltx_int4_worker_mode": "persistent 24GB worker" if warm_runtime is not None else "isolated one-shot",
     }
     started = time.perf_counter()
     monitor = None
@@ -3615,8 +3931,28 @@ def main() -> int:
             default_up = Path(args.ltx_root).expanduser() / "models" / "ltx23" / "spatial_upsampler" / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
             args.spatial_upsampler_path = str(default_up)
 
+        if bool(getattr(args, "msr_enabled", False)):
+            bg = str(getattr(args, "msr_background", "") or "").strip()
+            refs = [str(x).strip() for x in list(getattr(args, "msr_ref", []) or []) if str(x).strip()]
+            end = str(getattr(args, "msr_end_frame", "") or "").strip()
+            if not bg or not Path(bg).expanduser().is_file():
+                raise FileNotFoundError("INT4 MSR requires --msr-background.")
+            if not refs:
+                raise RuntimeError("INT4 MSR requires at least one --msr-ref image.")
+            args.image_conditions = [[bg, "0", "1.0", "0"]]
+            args.image_conditions.extend([[ref, "0", "1.0", "0"] for ref in refs[:4]])
+            if end and Path(end).expanduser().is_file():
+                args.image_conditions.append([end, str(max(0, int(args.num_frames)-1)), "1.0", "0"])
+            args.i2v_image = ""
+            msr_lora = str(getattr(args, "msr_lora", "") or "").strip()
+            if not msr_lora or not Path(msr_lora).expanduser().is_file():
+                raise FileNotFoundError("INT4 MSR requires --msr-lora pointing to the official MSR/IC-LoRA safetensors file.")
+            args.loras = list(getattr(args, "loras", []) or []) + [[msr_lora, "1.0"]]
+            ctx["ltx_int4_msr_mode"] = "experimental Diffusers multi-condition route with official MSR LoRA"
+            ctx["ltx_int4_msr_reference_count"] = str(len(refs))
+            ctx["ltx_int4_msr_reference_frames_requested"] = str(int(getattr(args, "msr_reference_frames", 41) or 41))
         _normalize_input_image(args, ctx)
-        print("[ltx-status] Loading isolated INT4 runtime", flush=True)
+        print("[ltx-status] Loading isolated SDNQ runtime" if warm_runtime is None else "[ltx-status] Preparing persistent SDNQ worker job", flush=True)
         import torch
         ctx["torch_version"] = str(torch.__version__)
         ctx["cuda_available"] = str(bool(torch.cuda.is_available()))
@@ -3632,12 +3968,37 @@ def main() -> int:
         ctx["resolved_vram_profile_gb"] = str(args.vram_profile)
         ctx["ltx_int4_vram_lab_toggle"] = "ON" if bool(args.int4_auto_vram) else "OFF"
 
+        if warm_runtime is not None:
+            if detected_total_gb < 23.0:
+                raise RuntimeError(
+                    f"Persistent INT4 reuse requires at least 23 GB detected VRAM; found {detected_total_gb:.2f} GB."
+                )
+            if str(args.pipeline) != "two_stages":
+                raise RuntimeError("Persistent INT4 reuse currently supports only the two_stages Music Clip route.")
+            if list(getattr(args, "loras", []) or []):
+                raise RuntimeError("Persistent INT4 reuse is disabled when LoRAs are requested.")
+            visual = list(getattr(args, "_visual_conditions", []) or [])
+            simple_i2v = bool(
+                len(visual) == 1
+                and int(visual[0].get("frame", 0)) == 0
+                and abs(float(visual[0].get("strength", 1.0)) - 1.0) < 1e-6
+                and int(visual[0].get("crf", 0)) == 0
+            )
+            if not simple_i2v:
+                raise RuntimeError("Persistent INT4 reuse currently supports exactly one normal start image.")
+            # The warm route is deliberately restricted to the proven fixed
+            # 24 GB policy. Lower profiles keep the old isolated process path.
+            args.vram_profile = "24"
+            args.int4_auto_vram = False
+            ctx["resolved_vram_profile_gb"] = "24"
+            ctx["ltx_int4_vram_lab_toggle"] = "OFF"
+
         if args.deep_lifecycle_log:
             monitor = _CudaMonitor(torch, deep_path, args.deep_log_interval, args.deep_log_max_events)
             monitor.start()
             ctx["cuda_monitor_path"] = str(deep_path)
 
-        result = run_sdnq_diffusers(args, ctx, torch)
+        result = run_sdnq_diffusers(args, ctx, torch, warm_runtime=warm_runtime)
         ctx["result"] = json.dumps({key: str(value) for key, value in result.items()}, ensure_ascii=False)
         ctx["generation_status"] = "completed"
         ctx["generation_completed"] = "YES"
@@ -3647,6 +4008,8 @@ def main() -> int:
         ctx["generation_status"] = f"failed: {type(exc).__name__}: {exc}"
         ctx["generation_completed"] = "NO"
         print(exception_text, file=sys.stderr, flush=True)
+        if warm_runtime is not None:
+            warm_runtime.invalidate()
         return_code = 1
     finally:
         if monitor is not None:
@@ -3654,12 +4017,92 @@ def main() -> int:
         ctx["total_runtime_s"] = f"{time.perf_counter() - started:.3f}"
         try:
             _write_report(report_path, ctx, exception_text)
-            print(f"[ltx-status] INT4 report saved: {report_path}", flush=True)
+            print(f"[ltx-status] SDNQ report saved: {report_path}", flush=True)
         except Exception as report_exc:
-            print(f"[ltx-warning] Could not write INT4 report: {type(report_exc).__name__}: {report_exc}", file=sys.stderr, flush=True)
+            print(f"[ltx-warning] Could not write SDNQ report: {type(report_exc).__name__}: {report_exc}", file=sys.stderr, flush=True)
 
     return return_code
 
 
+def _server_event(event: str, **payload: Any) -> None:
+    data = {"event": str(event), **payload}
+    print("FVLTX_EVENT " + json.dumps(data, ensure_ascii=False), flush=True)
+
+
+def _server_main() -> int:
+    # Server options are intentionally tiny; generation options arrive as the
+    # exact argv list produced by the existing Music Clip command builder.
+    root = Path(__file__).resolve().parent.parent
+    argv = list(sys.argv[1:])
+    if "--ltx-root" in argv:
+        try:
+            root = Path(argv[argv.index("--ltx-root") + 1]).expanduser().resolve()
+        except Exception:
+            pass
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("DIFFUSERS_OFFLINE", "1")
+    try:
+        import torch
+        detected = _detect_vram_total_gb(torch)
+        eligible = bool(torch.cuda.is_available() and detected >= 23.0)
+    except Exception as exc:
+        _server_event("ready", eligible=False, reason=f"CUDA probe failed: {type(exc).__name__}: {exc}")
+        return 1
+    _server_event(
+        "ready",
+        eligible=eligible,
+        detected_vram_gb=round(float(detected), 3),
+        policy="fixed-24GB-only",
+    )
+    if not eligible:
+        return 0
+
+    parser = _build_parser()
+    runtime = _WarmSdnqRuntime()
+    for raw_line in sys.stdin:
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        request_id = ""
+        try:
+            request = json.loads(line)
+            request_id = str(request.get("request_id") or "")
+            command = str(request.get("command") or "").lower()
+            if command in {"quit", "shutdown", "exit"}:
+                _server_event("stopped", request_id=request_id, jobs_completed=runtime.jobs_completed)
+                break
+            if command != "generate":
+                raise ValueError(f"Unknown server command: {command!r}")
+            request_argv = request.get("argv")
+            if not isinstance(request_argv, list):
+                raise ValueError("Persistent worker request needs an argv list.")
+            args = parser.parse_args([str(item) for item in request_argv])
+            _server_event("status", request_id=request_id, message="job accepted")
+            rc = _execute_parsed_args(args, warm_runtime=runtime)
+            _server_event(
+                "result",
+                request_id=request_id,
+                returncode=int(rc),
+                output_path=str(getattr(args, "output_path", "") or ""),
+                jobs_completed=runtime.jobs_completed,
+            )
+        except SystemExit as exc:
+            _server_event("result", request_id=request_id, returncode=int(exc.code or 2), error="invalid generation arguments")
+        except Exception as exc:
+            runtime.invalidate()
+            print(traceback.format_exc(), file=sys.stderr, flush=True)
+            _server_event("result", request_id=request_id, returncode=1, error=f"{type(exc).__name__}: {exc}")
+    runtime.invalidate()
+    return 0
+
+
+def main() -> int:
+    parser = _build_parser()
+    args = parser.parse_args()
+    return _execute_parsed_args(args)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_server_main() if "--server" in sys.argv[1:] else main())

@@ -156,11 +156,16 @@ def _filter_ic_lora_extra_args(extra: Sequence[str]) -> List[str]:
 
 
 def _build_prompt(args: argparse.Namespace, generated_prompt_block: str) -> str:
-    prompt = _clean_text(getattr(args, "prompt", ""))
-    prompt_block = _clean_text(getattr(args, "msr_prompt_block", "")) or _clean_text(generated_prompt_block)
-    if prompt_block and prompt_block not in prompt:
-        return f"{prompt_block}\n\n{prompt}" if prompt else prompt_block
-    return prompt
+    """Return the actual prompt sent to native IC-LoRA.
+
+    The MSR reference video already carries the visual reference. Do not inject
+    the generated/reference prompt block into the LTX prompt on this route.
+    Otherwise the model can generate reference-sheet-like frames because the
+    prompt literally talks about reference images/sheets.
+
+    The generated block is still returned in the plan for UI/history/debug use.
+    """
+    return _clean_text(getattr(args, "prompt", ""))
 
 
 def prepare_msr_iclora_plan(
@@ -239,8 +244,12 @@ def prepare_msr_iclora_plan(
         extra = extra[1:]
     extra = _filter_ic_lora_extra_args(extra)
 
+    audio_path = _clean_text(getattr(args, "audio_path", ""))
+    use_supplied_audio = bool(audio_path and Path(audio_path).expanduser().is_file())
+    module_name = "ltx23_msr_audio_pipeline" if use_supplied_audio else "ltx_pipelines.ic_lora"
+
     argv: List[str] = [
-        "ltx_pipelines.ic_lora",
+        module_name,
         "--distilled-checkpoint-path", str(getattr(args, "checkpoint_path")),
         "--gemma-root", str(getattr(args, "gemma_root")),
         "--prompt", prompt,
@@ -256,20 +265,30 @@ def prepare_msr_iclora_plan(
     if spatial:
         argv.extend(["--spatial-upsampler-path", spatial])
 
-    # Normal start image support remains native --image input, separate from MSR.
-    if _clean_text(getattr(args, "i2v_image", "")) and not _has_cli_option(extra, "--image"):
+    # MSR background and subject references are transported only through the
+    # reference video. Do not also turn the background into a normal start image.
+    # An optional end frame remains a native final-frame image condition.
+    end_frame = _clean_text(getattr(args, "msr_end_frame", ""))
+    if end_frame and Path(end_frame).expanduser().is_file() and not _has_cli_option(extra, "--image"):
         argv.extend([
             "--image",
-            str(getattr(args, "i2v_image")),
-            str(int(getattr(args, "i2v_image_frame", 0))),
-            str(float(getattr(args, "i2v_image_strength", 1.0))),
-            str(int(getattr(args, "i2v_image_crf", 0))),
+            str(Path(end_frame).expanduser().resolve()),
+            str(max(0, int(getattr(args, "num_frames", 1) or 1) - 1)),
+            "1.0",
+            "0",
         ])
 
     _append_lora_groups(argv, getattr(args, "lora", None))
 
     strength = float(getattr(args, "msr_strength", 1.0) or 1.0)
     argv.extend(["--video-conditioning", str(result.video_path), f"{strength:g}"])
+
+    if use_supplied_audio:
+        argv.extend(["--audio-path", str(Path(audio_path).expanduser().resolve())])
+        argv.extend(["--audio-start-time", str(float(getattr(args, "audio_start_time", 0.0) or 0.0))])
+        audio_max_duration = getattr(args, "audio_max_duration", None)
+        if audio_max_duration is not None and float(audio_max_duration) > 0:
+            argv.extend(["--audio-max-duration", str(float(audio_max_duration))])
 
     if str(getattr(args, "vram_lab", "off")).lower().strip() != "off" and not _has_cli_option(extra, "--offload"):
         argv.extend(["--offload", "cpu"])
@@ -280,10 +299,15 @@ def prepare_msr_iclora_plan(
     print(f"[ltx-msr] Built MSR reference: {result.frame_count} frames, {result.width}x{result.height}, frames={result.frames_dir}", flush=True)
     print(f"[ltx-msr] MP4 reference: {result.video_path}", flush=True)
     print(f"[ltx-msr] Metadata: {result.metadata_path}", flush=True)
-    print("[ltx-msr] Native IC-LoRA transport: ltx_pipelines.ic_lora --video-conditioning", flush=True)
+    if use_supplied_audio:
+        print("[ltx-msr] Native hybrid transport: IC-LoRA video conditioning + frozen supplied audio", flush=True)
+        print(f"[ltx-msr] Supplied audio: {Path(audio_path).expanduser().resolve()}", flush=True)
+    else:
+        print("[ltx-msr] Native IC-LoRA transport: ltx_pipelines.ic_lora --video-conditioning", flush=True)
+    print("[ltx-msr] Prompt route: main prompt only; reference prompt block not injected", flush=True)
 
     return MSRICLoRAPlan(
-        module_name="ltx_pipelines.ic_lora",
+        module_name=module_name,
         argv=argv,
         reference_video_path=str(result.video_path or ""),
         frames_dir=str(result.frames_dir or ""),

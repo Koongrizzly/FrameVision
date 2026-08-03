@@ -87,9 +87,9 @@ PRESETS: list[ModelPreset] = [
         "stabilityai/stable-diffusion-xl-base-1.0", 1024, 32, 2000, 0.0001,
     ),
     ModelPreset(
-        "LTX 2.3 — Video LoRA", "LTX", "video", "ltx2.3",
+        "LTX 2.3 — Image or Video LoRA", "LTX", "video", "ltx2.3",
         "Lightricks/LTX-2.3", 512, 32, 3000, 0.0001, frames=121, fps=24,
-        notes="Video training is substantially heavier than image training. Windows uses zero data-loader workers."
+        notes="Choose Images for character or appearance training, or Videos for motion training. Video training is substantially heavier."
     ),
     ModelPreset(
         "Wan 2.2 I2V A14B — Video LoRA", "Wan", "video", "wan22",
@@ -349,6 +349,11 @@ class FrameVisionLoraTrainer(QMainWindow):
         layout.addWidget(info)
 
         controls = QHBoxLayout()
+        controls.addWidget(QLabel("Dataset type:"))
+        self.dataset_type = QComboBox()
+        self.dataset_type.addItems(["Images", "Videos"])
+        self.dataset_type.currentIndexChanged.connect(self._dataset_type_changed)
+        controls.addWidget(self.dataset_type)
         self.add_files_btn = QPushButton("Add Files")
         self.add_files_btn.clicked.connect(self.add_files)
         controls.addWidget(self.add_files_btn)
@@ -592,7 +597,13 @@ class FrameVisionLoraTrainer(QMainWindow):
         self.fps.setValue(p.fps)
         self.quantize.setChecked(p.quantize)
         self.notes.setText(p.notes or "Review generated YAML before training.")
-        video = p.media == "video"
+        if p.family == "LTX":
+            self.dataset_type.setEnabled(True)
+            self.dataset_type.setCurrentIndex(0)
+        else:
+            self.dataset_type.setEnabled(False)
+            self.dataset_type.setCurrentIndex(1 if p.media == "video" else 0)
+        video = self.effective_media_type() == "video"
         self.frames.setEnabled(video)
         self.fps.setEnabled(video)
         self.clear_media()
@@ -619,12 +630,30 @@ class FrameVisionLoraTrainer(QMainWindow):
         if path:
             self.model_path.setText(path)
 
+    def effective_media_type(self) -> str:
+        p = self.current_preset()
+        if p.family == "LTX":
+            return "image" if self.dataset_type.currentIndex() == 0 else "video"
+        return p.media
+
+    def _dataset_type_changed(self) -> None:
+        if not hasattr(self, "dataset_type"):
+            return
+        p = self.current_preset()
+        is_ltx = p.family == "LTX"
+        self.dataset_type.setEnabled(is_ltx)
+        video = self.effective_media_type() == "video"
+        self.frames.setEnabled(video)
+        self.fps.setEnabled(video)
+        self.clear_media()
+        self._update_dataset_summary()
+
     def accepted_extensions(self) -> set[str]:
-        media = self.current_preset().media
+        media = self.effective_media_type()
         return IMAGE_EXTS if media == "image" else VIDEO_EXTS if media == "video" else AUDIO_EXTS
 
     def file_filter(self) -> str:
-        media = self.current_preset().media
+        media = self.effective_media_type()
         if media == "image":
             return "Images (*.png *.jpg *.jpeg *.webp *.bmp)"
         if media == "video":
@@ -656,7 +685,7 @@ class FrameVisionLoraTrainer(QMainWindow):
     def _refresh_media_list(self) -> None:
         current = self.media_list.currentRow()
         self.media_list.clear()
-        media_type = self.current_preset().media
+        media_type = self.effective_media_type()
         for path in self.media_paths:
             item = QListWidgetItem()
             item.setSizeHint(QSize(400, 78))
@@ -722,7 +751,7 @@ class FrameVisionLoraTrainer(QMainWindow):
             encoding="utf-8", errors="ignore").strip()) for p in self.media_paths)
         self.dataset_summary.setText(
             f"{len(self.media_paths)} source files  •  {captions} captions present  •  "
-            f"Expected media: {self.current_preset().media}"
+            f"Expected media: {self.effective_media_type()}"
         )
 
     def _settings_dict(self) -> dict[str, Any]:
@@ -750,6 +779,7 @@ class FrameVisionLoraTrainer(QMainWindow):
             "disable_samples": self.disable_samples.isChecked(),
             "sample_prompts": self.sample_prompts.toPlainText(),
             "sample_every": self.sample_every.value(),
+            "dataset_type": self.dataset_type.currentText(),
             "media_paths": [str(p) for p in self.media_paths],
         }
 
@@ -794,6 +824,8 @@ class FrameVisionLoraTrainer(QMainWindow):
             if key in data:
                 widget.setChecked(bool(data[key]))
         self.sample_prompts.setPlainText(data.get("sample_prompts", ""))
+        if self.current_preset().family == "LTX":
+            self.dataset_type.setCurrentText(data.get("dataset_type", "Images"))
         self.media_paths = [Path(p) for p in data.get("media_paths", []) if Path(p).exists()]
         self._refresh_media_list()
 
@@ -819,6 +851,7 @@ class FrameVisionLoraTrainer(QMainWindow):
 
     def build_config(self, dataset_dir: Path) -> dict[str, Any]:
         p = self.current_preset()
+        dataset_media = self.effective_media_type()
         job = slugify(self.job_name.text())
         output_dir = OUTPUT_ROOT / p.family.replace(" ", "_").lower()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -903,12 +936,21 @@ class FrameVisionLoraTrainer(QMainWindow):
 
         if p.media == "video":
             ds = process["datasets"][0]
-            ds.update({
-                "shrink_video_to_frames": True,
-                "num_frames": self.frames.value(),
-                "do_i2v": "I2V" in p.label,
-                "fps": self.fps.value(),
-            })
+            if dataset_media == "image":
+                ds.update({
+                    "shrink_video_to_frames": True,
+                    "num_frames": 1,
+                    "auto_frame_count": False,
+                    "do_i2v": False,
+                })
+            else:
+                ds.update({
+                    "shrink_video_to_frames": True,
+                    "num_frames": self.frames.value(),
+                    "auto_frame_count": False,
+                    "do_i2v": "I2V" in p.label,
+                    "fps": self.fps.value(),
+                })
             if os.name == "nt":
                 process["train"]["num_dataloader_workers"] = 0
         elif p.media == "audio":

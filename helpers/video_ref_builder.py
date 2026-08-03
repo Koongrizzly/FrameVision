@@ -5,9 +5,9 @@ Reusable video/reference-frame builder for FrameVision.
 Initial target: LTX 2.3 LiconStudio MSR / Multiple-Subject-Reference workflows.
 
 What this does:
-- Loads up to 4 subject/reference images plus one required background image.
-- Keeps the same source order used by ComfyUI-Licon-MSR:
-      ref_1 -> ref_2 -> ref_3 -> ref_4 -> background
+- Loads up to 4 subject/reference images plus one optional background/world image.
+- Uses FrameVision's proven background-first MSR source order:
+      background -> ref_1 -> ref_2 -> ref_3 -> ref_4
 - Resizes every source to the target video size.
 - Expands the sources into a short fixed-frame reference sequence.
 - Can save that sequence as PNG frames, optional MP4, metadata JSON, and/or return a torch tensor.
@@ -114,7 +114,7 @@ def build_msr_reference(
     subject_paths:
         Up to 4 image paths. Empty/None items are skipped.
     background_path:
-        Required background/environment image path. Always placed last.
+        Optional background/environment image path. When provided it is placed first.
     width, height:
         Target frame size. LTX sizes should normally be divisible by 32.
     frame_count:
@@ -265,7 +265,15 @@ def build_reference_prompt_block(
             lines.append(f"- {label}: {desc}")
         else:
             lines.append(f"- {label}: {role}")
-    lines.append("Preserve character identity, clothing, object details, environment style, and background consistency across the generated video.")
+    has_background = False
+    try:
+        has_background = any((item.slot if isinstance(item, ReferenceSource) else str(item.get("slot", ""))) == "background" for item in sources)
+    except Exception:
+        has_background = False
+    if has_background:
+        lines.append("Preserve character identity, clothing, object details, environment style, and background consistency across the generated video.")
+    else:
+        lines.append("Preserve character identity, clothing, and object details from the references. Create the environment/background from the main prompt.")
     return "\n".join(lines)
 
 
@@ -274,8 +282,8 @@ def validate_is_msr_ready(result: ReferenceBuildResult) -> Tuple[bool, str]:
 
     if not result.ok:
         return False, result.error or "MSR reference build failed."
-    if not result.used_sources or len(result.used_sources) < 2:
-        return False, "MSR needs at least one subject/reference image plus one background image."
+    if not result.used_sources or len(result.used_sources) < 1:
+        return False, "MSR needs at least one subject/reference image."
     if result.frame_count not in MSR_ALLOWED_FRAME_COUNTS:
         return False, f"MSR frame count should be one of {MSR_ALLOWED_FRAME_COUNTS}."
     return True, "MSR reference is ready."
@@ -287,20 +295,38 @@ def validate_is_msr_ready(result: ReferenceBuildResult) -> Tuple[bool, str]:
 
 
 def collect_msr_sources(
-    subject_paths: Optional[Sequence[Optional[PathLike]]],
-    background_path: Optional[PathLike],
+    subject_paths: Optional[Sequence[Optional[PathLike]]] = None,
+    background_path: Optional[PathLike] = None,
+    *,
     descriptions: Optional[Sequence[str]] = None,
     background_description: str = "",
 ) -> List[ReferenceSource]:
-    """Collect sources in the same order as ComfyUI-Licon-MSR."""
+    """Collect subject references and an optional background reference.
 
-    if background_path is None or not str(background_path).strip():
-        raise VideoReferenceError("background_path is required for MSR reference building.")
-
+    FrameVision allows the background/world reference to be empty so Planner,
+    Music Clip Creator, and the normal LTX tab can let the main prompt create
+    the scene while only using MSR references for characters/subjects.
+    """
     descriptions = list(descriptions or [])
     subject_paths = list(subject_paths or [])[:MSR_MAX_SUBJECTS]
 
     sources: List[ReferenceSource] = []
+
+    # Background must be the first conditioning source. The IC-LoRA reference
+    # video is temporal, so placing a neutral subject sheet first can make the
+    # generated clip open on that sheet before cutting to the intended scene.
+    if background_path is not None and str(background_path).strip():
+        bg_path = normalize_existing_path(background_path)
+        sources.append(
+            ReferenceSource(
+                slot="background",
+                path=str(bg_path),
+                role="background/environment",
+                description=background_description.strip() if background_description else "",
+                source_index=0,
+            )
+        )
+
     for idx, raw_path in enumerate(subject_paths, start=1):
         if raw_path is None or not str(raw_path).strip():
             continue
@@ -316,22 +342,10 @@ def collect_msr_sources(
             )
         )
 
-    if not sources:
+    if not any(src.slot.startswith("ref_") for src in sources):
         raise VideoReferenceError("At least one subject/reference image is required.")
 
-    bg_path = normalize_existing_path(background_path)
-    sources.append(
-        ReferenceSource(
-            slot="background",
-            path=str(bg_path),
-            role="background/environment",
-            description=background_description.strip() if background_description else "",
-            source_index=len(sources) + 1,
-        )
-    )
     return sources
-
-
 def normalize_existing_path(path: PathLike) -> Path:
     p = Path(path).expanduser().resolve()
     if not p.exists():
@@ -524,12 +538,12 @@ def write_metadata(
         "output_dir": output_dir,
         "frames_dir": frames_dir,
         "video_path": video_path,
-        "source_order": ["ref_1", "ref_2", "ref_3", "ref_4", "background"],
+        "source_order": ["background", "ref_1", "ref_2", "ref_3", "ref_4"],
         "used_sources": [asdict(src) for src in sources],
         "frame_plan": list(frame_plan),
         "prompt_block": build_reference_prompt_block(sources),
         "notes": [
-            "Initial behavior mirrors ComfyUI-Licon-MSR source ordering and frame distribution.",
+            "FrameVision background-first source ordering is used to anchor the opening scene before subject references.",
             "Load the matching LTX 2.3 MSR LoRA in the LTX pipeline before using this reference sequence.",
             "For high-motion MSR tests, 50 fps is commonly recommended by the model notes.",
         ],

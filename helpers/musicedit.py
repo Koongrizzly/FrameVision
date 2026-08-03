@@ -32,6 +32,10 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QComboBox,
     QCheckBox,
+    QSpinBox,
+    QDoubleSpinBox,
+    QRadioButton,
+    QButtonGroup,
     QMessageBox,
     QMenu,
 )
@@ -119,6 +123,13 @@ class MusicEditSettings:
     fade_in_sec: float = 1.0
     fade_out_enabled: bool = False
     fade_out_sec: float = 1.0
+
+    # Batch split options
+    split_mode: str = "count"  # "count" or "time"
+    split_count: int = 10
+    split_time_sec: float = 20.0
+    split_extra_start_sec: float = 0.0
+    split_extra_end_sec: float = 0.0
 
 
 class WaveformWidget(QWidget):
@@ -957,6 +968,73 @@ class MusicEditWidget(QWidget):
 
         main_layout.addWidget(export_group)
 
+        # Batch split export
+        split_group = QGroupBox("Split track", self)
+        split_layout = QFormLayout(split_group)
+
+        self.radio_split_count = QRadioButton("Number of equal parts", self)
+        self.radio_split_time = QRadioButton("Length of each part", self)
+        self.split_mode_group = QButtonGroup(self)
+        self.split_mode_group.addButton(self.radio_split_count)
+        self.split_mode_group.addButton(self.radio_split_time)
+
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        mode_row.addWidget(self.radio_split_count)
+        mode_row.addWidget(self.radio_split_time)
+        mode_widget = QWidget(self)
+        mode_widget.setLayout(mode_row)
+
+        self.spin_split_count = QSpinBox(self)
+        self.spin_split_count.setRange(2, 999)
+        self.spin_split_count.setValue(10)
+        self.spin_split_count.setToolTip("Split the full track into this many equal-length audio files.")
+
+        self.spin_split_time = QDoubleSpinBox(self)
+        self.spin_split_time.setRange(0.1, 86400.0)
+        self.spin_split_time.setDecimals(1)
+        self.spin_split_time.setSingleStep(0.5)
+        self.spin_split_time.setSuffix(" s")
+        self.spin_split_time.setValue(20.0)
+        self.spin_split_time.setToolTip("Create consecutive parts of this duration. The final part may be shorter.")
+
+        self.spin_split_extra_start = QDoubleSpinBox(self)
+        self.spin_split_extra_start.setRange(0.0, 1.0)
+        self.spin_split_extra_start.setDecimals(1)
+        self.spin_split_extra_start.setSingleStep(0.1)
+        self.spin_split_extra_start.setSuffix(" s")
+        self.spin_split_extra_start.setToolTip("Add up to one second before every part, creating overlap with the previous part.")
+
+        self.spin_split_extra_end = QDoubleSpinBox(self)
+        self.spin_split_extra_end.setRange(0.0, 1.0)
+        self.spin_split_extra_end.setDecimals(1)
+        self.spin_split_extra_end.setSingleStep(0.1)
+        self.spin_split_extra_end.setSuffix(" s")
+        self.spin_split_extra_end.setToolTip("Add up to one second after every part, creating overlap with the next part.")
+
+        self.lbl_split_preview = QLabel("Open a track to see the split result.", self)
+        self.lbl_split_preview.setWordWrap(True)
+
+        self.btn_split_track = QPushButton("Split track…", self)
+        self.btn_split_track.setToolTip("Choose an output folder and export all parts using the format and quality settings above.")
+        self.btn_split_track.clicked.connect(self._on_split_track_clicked)
+
+        self.radio_split_count.toggled.connect(self._on_split_mode_changed)
+        self.radio_split_time.toggled.connect(self._on_split_mode_changed)
+        self.spin_split_count.valueChanged.connect(self._update_split_preview)
+        self.spin_split_time.valueChanged.connect(self._update_split_preview)
+        self.spin_split_extra_start.valueChanged.connect(self._update_split_preview)
+        self.spin_split_extra_end.valueChanged.connect(self._update_split_preview)
+
+        split_layout.addRow("Split by:", mode_widget)
+        split_layout.addRow("Number of parts:", self.spin_split_count)
+        split_layout.addRow("Part duration:", self.spin_split_time)
+        split_layout.addRow("Extra at start:", self.spin_split_extra_start)
+        split_layout.addRow("Extra at end:", self.spin_split_extra_end)
+        split_layout.addRow("Preview:", self.lbl_split_preview)
+        split_layout.addRow("", self.btn_split_track)
+        main_layout.addWidget(split_group)
+
         # Metadata group
         meta_group = QGroupBox("MP3 Metadata (optional)", self)
         meta_layout = QFormLayout(meta_group)
@@ -1064,6 +1142,16 @@ class MusicEditWidget(QWidget):
         _select_fade_combo(self.combo_fade_in, float(getattr(self._settings, "fade_in_sec", 1.0)))
         _select_fade_combo(self.combo_fade_out, float(getattr(self._settings, "fade_out_sec", 1.0)))
         self._on_fade_toggle()
+
+        # Batch split settings
+        mode = str(getattr(self._settings, "split_mode", "count")).lower()
+        self.radio_split_time.setChecked(mode == "time")
+        self.radio_split_count.setChecked(mode != "time")
+        self.spin_split_count.setValue(max(2, int(getattr(self._settings, "split_count", 10))))
+        self.spin_split_time.setValue(max(0.1, float(getattr(self._settings, "split_time_sec", 20.0))))
+        self.spin_split_extra_start.setValue(max(0.0, min(1.0, float(getattr(self._settings, "split_extra_start_sec", 0.0)))))
+        self.spin_split_extra_end.setValue(max(0.0, min(1.0, float(getattr(self._settings, "split_extra_end_sec", 0.0)))))
+        self._on_split_mode_changed()
 
         # Detected BPM label always resets
         self.lbl_bpm_detect.setText("Detected BPM: –")
@@ -1194,6 +1282,7 @@ class MusicEditWidget(QWidget):
         self.position_slider.setRange(0, self._duration_ms)
         if self._player is not None:
             self._update_time_label(self._player.position())
+        self._update_split_preview()
 
         # Update waveform once duration is known
         if self._waveform_needs_update and self._current_file:
@@ -1599,6 +1688,130 @@ class MusicEditWidget(QWidget):
             return
         self.load_file(out_path)
 
+
+    @Slot()
+    def _on_split_mode_changed(self):
+        by_count = bool(self.radio_split_count.isChecked())
+        self.spin_split_count.setEnabled(by_count)
+        self.spin_split_time.setEnabled(not by_count)
+        self._update_split_preview()
+
+    @Slot()
+    def _update_split_preview(self):
+        if not hasattr(self, "lbl_split_preview"):
+            return
+        if self._duration_ms <= 0:
+            self.lbl_split_preview.setText("Open a track to see the split result.")
+            return
+        total = self._duration_ms / 1000.0
+        extra_start = float(self.spin_split_extra_start.value())
+        extra_end = float(self.spin_split_extra_end.value())
+        if self.radio_split_count.isChecked():
+            count = int(self.spin_split_count.value())
+            base = total / count
+            last_base = base
+        else:
+            part = max(0.1, float(self.spin_split_time.value()))
+            count = max(1, int((total + part - 1e-9) // part))
+            if count * part < total - 1e-9:
+                count += 1
+            base = part
+            last_base = total - part * (count - 1)
+        normal_len = base + extra_start + extra_end
+        last_len = max(0.0, last_base) + extra_start + extra_end
+        if abs(last_len - normal_len) < 0.05:
+            detail = f"about {normal_len:.1f} s each"
+        else:
+            detail = f"about {normal_len:.1f} s each; final part about {last_len:.1f} s"
+        self.lbl_split_preview.setText(f"{count} files, {detail}. Boundary padding keeps the requested overlap length.")
+
+    def _split_ranges(self):
+        total = max(0.0, self._duration_ms / 1000.0)
+        if total <= 0.0:
+            return []
+        if self.radio_split_count.isChecked():
+            count = max(2, int(self.spin_split_count.value()))
+            step = total / count
+            return [(i * step, total if i == count - 1 else (i + 1) * step) for i in range(count)]
+        step = max(0.1, float(self.spin_split_time.value()))
+        ranges = []
+        start = 0.0
+        while start < total - 0.0005:
+            end = min(total, start + step)
+            ranges.append((start, end))
+            start = end
+        return ranges
+
+    @Slot()
+    def _on_split_track_clicked(self):
+        if not self._current_file or self._duration_ms <= 0:
+            QMessageBox.information(self, "No file", "Please open an audio file first.")
+            return
+        ff = self._get_ffmpeg_for_edit()
+        if not ff:
+            return
+        base_dir = self._settings.last_output_dir or self._settings.last_input_dir or os.path.dirname(self._current_file)
+        out_dir = QFileDialog.getExistingDirectory(self, "Choose folder for split audio files", base_dir)
+        if not out_dir:
+            return
+
+        fmt = str(self.combo_format.currentData() or "mp3")
+        ranges = self._split_ranges()
+        extra_start = float(self.spin_split_extra_start.value())
+        extra_end = float(self.spin_split_extra_end.value())
+        total = self._duration_ms / 1000.0
+        stem = os.path.splitext(os.path.basename(self._current_file))[0]
+        digits = max(2, len(str(len(ranges))))
+        created = []
+
+        for idx, (base_start, base_end) in enumerate(ranges, 1):
+            requested_start = base_start - extra_start
+            requested_end = base_end + extra_end
+            source_start = max(0.0, requested_start)
+            source_end = min(total, requested_end)
+            source_duration = max(0.0, source_end - source_start)
+            pad_start = max(0.0, -requested_start)
+            pad_end = max(0.0, requested_end - total)
+            target_duration = max(0.0, requested_end - requested_start)
+            out_path = os.path.join(out_dir, f"{stem}_part_{idx:0{digits}d}.{fmt}")
+
+            cmd = [ff, "-y", "-ss", f"{source_start:.6f}", "-i", self._current_file, "-t", f"{source_duration:.6f}"]
+            filters = []
+            if pad_start > 0.0005:
+                filters.append(f"adelay={int(round(pad_start * 1000))}:all=1")
+            if pad_end > 0.0005:
+                filters.append(f"apad=pad_dur={pad_end:.6f}")
+            if filters:
+                cmd += ["-af", ",".join(filters)]
+            cmd += ["-t", f"{target_duration:.6f}"]
+
+            if fmt == "mp3":
+                bitrate = int(self.combo_mp3_bitrate.currentData() or 320)
+                cmd += ["-vn", "-c:a", "libmp3lame", "-b:a", f"{bitrate}k"]
+            else:
+                sr = int(self.combo_wav_samplerate.currentData() or 48000)
+                cmd += ["-vn", "-c:a", "pcm_s16le", "-ar", str(sr)]
+            cmd.append(out_path)
+
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if proc.returncode != 0:
+                QMessageBox.critical(self, "Split track failed", f"Part {idx} failed.\n\nCommand:\n{' '.join(cmd)}\n\nError:\n{proc.stderr}")
+                return
+            created.append(out_path)
+
+        self._settings.last_output_dir = out_dir
+        self._settings.output_format = fmt
+        self._settings.split_mode = "count" if self.radio_split_count.isChecked() else "time"
+        self._settings.split_count = int(self.spin_split_count.value())
+        self._settings.split_time_sec = float(self.spin_split_time.value())
+        self._settings.split_extra_start_sec = extra_start
+        self._settings.split_extra_end_sec = extra_end
+        if fmt == "mp3":
+            self._settings.mp3_bitrate_kbps = int(self.combo_mp3_bitrate.currentData() or 320)
+        else:
+            self._settings.wav_samplerate_hz = int(self.combo_wav_samplerate.currentData() or 48000)
+        self._save_settings()
+        QMessageBox.information(self, "Split track complete", f"Created {len(created)} audio files in:\n{out_dir}")
 
     @Slot()
     def _on_format_changed(self):

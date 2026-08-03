@@ -6219,6 +6219,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--msr-ref-3", default="", help="MSR subject/reference image 3.")
     parser.add_argument("--msr-ref-4", default="", help="MSR subject/reference image 4.")
     parser.add_argument("--msr-background", default="", help="Optional MSR background/world reference image. Leave empty to let LTX create the background from the prompt.")
+    parser.add_argument("--msr-end-frame", default="", help="Optional MSR end frame, conditioned at the last generated frame.")
     parser.add_argument("--msr-ref-1-description", default="")
     parser.add_argument("--msr-ref-2-description", default="")
     parser.add_argument("--msr-ref-3-description", default="")
@@ -6324,6 +6325,9 @@ def _selected_module(args: argparse.Namespace) -> str:
     # MSR always uses the native IC-LoRA route. For normal two_stages runs,
     # the fast IC-LoRA route can be toggled on/off without keeping the MSR UI.
     if bool(getattr(args, "msr_enabled", False)):
+        audio_path = str(getattr(args, "audio_path", "") or "").strip()
+        if audio_path:
+            return "ltx23_msr_audio_pipeline"
         return "ltx_pipelines.ic_lora"
     if str(getattr(args, "pipeline", "")) == "two_stages" and str(getattr(args, "fast_iclora_route", "on")).lower().strip() == "on":
         return "ltx_pipelines.ic_lora"

@@ -69,6 +69,7 @@ APP_ROOT = HERE.parent if HERE.name.lower() == "helpers" else HERE
 DEFAULT_CLI_PATH = APP_ROOT / "helpers" / "ltx23_vram_lab_cli.py"
 INT4_CLI_PATH = APP_ROOT / "helpers" / "ltx_int4_cli.py"
 INT4_MODEL_RELATIVE = Path("models") / "ltx23_int4"
+INT8_MODEL_RELATIVE = Path("models") / "ltx23_int8"
 DEFAULT_LTX_ROOT = APP_ROOT
 OLD_DEFAULT_LTX_ROOTS = {str(Path(r"C:\ltx23")).lower(), str(Path(r"C:\ltx")).lower()}
 DEFAULT_PYTHON = DEFAULT_LTX_ROOT / "environments" / ".ltx23" / "python.exe"
@@ -1007,6 +1008,7 @@ class LTX23UISettings:
     cli_path: str = str(DEFAULT_CLI_PATH)
     checkpoint_path: str = str(DEFAULT_CHECKPOINT)
     gemma_root: str = str(DEFAULT_GEMMA_ROOT)
+    external_sdnq_text_encoder_root: str = ""
     output_dir: str = str(DEFAULT_OUTPUT_DIR)
     output_name: str = ""
     report_path: str = str(DEFAULT_REPORT_PATH)
@@ -1681,15 +1683,15 @@ class LTX23RunnerWidget(QWidget):
 
         if hasattr(self, "audio_hint_label"):
             if is_a2v:
-                is_int4 = False
+                selected_variant = "FP16"
                 try:
-                    is_int4 = self._selected_model_variant() == "INT4"
+                    selected_variant = self._selected_model_variant()
                 except Exception:
                     pass
-                if is_int4:
+                if selected_variant in {"INT8", "INT4"}:
                     self.audio_hint_label.setText(
-                        "INT4 uses the same a2vid_two_stage selection and audio arguments as the FP16/FP8 UI. "
-                        "Only the isolated INT4 model loader and VRAM policy differ."
+                        f"{selected_variant} uses the same a2vid_two_stage selection and audio arguments as the FP16/FP8 UI. "
+                        "Only the isolated SDNQ model loader and VRAM policy differ."
                     )
                 else:
                     self.audio_hint_label.setText(
@@ -1943,6 +1945,7 @@ class LTX23RunnerWidget(QWidget):
         self.cli_row = PathRow("LTX CLI", str(DEFAULT_CLI_PATH), mode="file", file_filter="Python (*.py);;All files (*.*)")
         self.checkpoint_row = PathRow("Checkpoint", str(DEFAULT_CHECKPOINT), mode="file", file_filter="Safetensors (*.safetensors);;All files (*.*)")
         self.gemma_row = PathRow("Gemma root", str(DEFAULT_GEMMA_ROOT), mode="dir")
+        self.external_sdnq_text_encoder_row = PathRow("External SDNQ text encoder", "", mode="dir", open_action="clear")
         self.output_dir_row = PathRow("Output folder", str(DEFAULT_OUTPUT_DIR), mode="dir")
         self.output_name_edit = QLineEdit()
         self.output_name_edit.setPlaceholderText("Blank = auto name")
@@ -1950,9 +1953,9 @@ class LTX23RunnerWidget(QWidget):
         self.report_row = PathRow("Report path", str(DEFAULT_REPORT_PATH), mode="file", file_filter="Text (*.txt);;All files (*.*)", save_file=True)
         self.deep_log_row = PathRow("Deep log path", str(DEFAULT_DEEP_LOG_PATH), mode="file", file_filter="Text (*.txt);;All files (*.*)", save_file=True)
         self.ffmpeg_row = PathRow("FFmpeg", "ffmpeg", mode="file", file_filter="FFmpeg (ffmpeg.exe ffmpeg);;All files (*.*)")
-        self._align_path_row_labels([self.ltx_root_row, self.python_row, self.cli_row, self.checkpoint_row, self.gemma_row, self.output_dir_row, self.report_row, self.deep_log_row, self.ffmpeg_row])
+        self._align_path_row_labels([self.ltx_root_row, self.python_row, self.cli_row, self.checkpoint_row, self.gemma_row, self.external_sdnq_text_encoder_row, self.output_dir_row, self.report_row, self.deep_log_row, self.ffmpeg_row])
         self.model_variant_combo = WheelGuardComboBox()
-        self.model_variant_combo.addItems(["FP16", "FP8", "INT4"])
+        self.model_variant_combo.addItems(["FP16", "FP8", "INT8", "INT4"])
         self.auto_fill_model_paths_btn = QPushButton("Auto fill selected")
         self.auto_fill_model_paths_btn.clicked.connect(self._auto_fill_selected_model_paths)
         model_preset_row = QWidget()
@@ -1965,7 +1968,7 @@ class LTX23RunnerWidget(QWidget):
         self.quantization_combo = WheelGuardComboBox()
         self.quantization_combo.addItems(QUANTIZATION_MODE_CHOICES)
         self._set_combo(self.quantization_combo, QUANTIZATION_MODE_NONE)
-        self._set_tooltip(self.model_variant_combo, "Choose FP16/FP8 on the untouched native VRAM Lab CLI, or INT4 on the isolated ltx_int4_cli.py route.")
+        self._set_tooltip(self.model_variant_combo, "Choose FP16/FP8 on the untouched native VRAM Lab CLI, or INT8/INT4 on the isolated SDNQ ltx_int4_cli.py route.")
         self._set_tooltip(self.auto_fill_model_paths_btn, "Auto-fill LTX root, env, checkpoint, Gemma, output and tool paths for the selected model.")
         self._set_tooltip(self.quantization_combo, "Quantization is off by default. FP8 modes are experimental and must be selected manually.")
         self._set_tooltip(self.ltx_root_row, "Portable LTX root folder. Default is the FrameVision install root; models, outputs and portable settings stay under this root.")
@@ -1973,6 +1976,7 @@ class LTX23RunnerWidget(QWidget):
         self._set_tooltip(self.cli_row, "FP16/FP8 use helpers\\ltx23_vram_lab_cli.py. INT4 uses helpers\\ltx_int4_cli.py. The UI switches this path automatically.")
         self._set_tooltip(self.checkpoint_row, "Main LTX 2.3 checkpoint / safetensors file. This is the large model file.")
         self._set_tooltip(self.gemma_row, "Gemma text encoder folder. Usually leave this unchanged once it works.")
+        self._set_tooltip(self.external_sdnq_text_encoder_row, "Optional INT4/INT8 experiment. Select a complete SDNQ model folder such as models\\ltx23_int8, or select its text_encoder subfolder. Only the text encoder is replaced; the active video transformer remains unchanged.")
         self._set_tooltip(self.output_dir_row, "Folder where generated videos are saved. Default is under the LTX root output folder.")
         self._set_tooltip(self.report_row, "VRAM Lab summary report path. Keep this inside the standalone LTX tools/vram_lab folder.")
         self._set_tooltip(self.deep_log_row, "Deep lifecycle log path used when Deep lifecycle log is enabled. Keep this inside tools/vram_lab.")
@@ -1982,7 +1986,7 @@ class LTX23RunnerWidget(QWidget):
         form.addRow("Model preset", model_preset_row)
         form.addRow("Quantization", self.quantization_combo)
         self._apply_quantization_availability("FP16")
-        for row in [self.ltx_root_row, self.python_row, self.cli_row, self.checkpoint_row, self.gemma_row, self.output_dir_row, self.report_row, self.deep_log_row, self.ffmpeg_row]:
+        for row in [self.ltx_root_row, self.python_row, self.cli_row, self.checkpoint_row, self.gemma_row, self.external_sdnq_text_encoder_row, self.output_dir_row, self.report_row, self.deep_log_row, self.ffmpeg_row]:
             form.addRow(row)
         form.addRow("Output filename", self.output_name_edit)
         form.addRow(self.open_when_done_check)
@@ -2645,7 +2649,7 @@ class LTX23RunnerWidget(QWidget):
         except Exception:
             is_extended = False
         auto_vram_enabled = self._is_auto_vram_profile_mode() if hasattr(self, "vram_profile_combo") else False
-        if self._selected_model_variant() == "INT4" and hasattr(self, "vram_lab_combo"):
+        if self._selected_model_variant() in {"INT8", "INT4"} and hasattr(self, "vram_lab_combo"):
             auto_vram_enabled = self.vram_lab_combo.currentText().strip().upper() != "OFF"
         should_show_manual_warning = bool(is_extended and not auto_vram_enabled)
         self.extended_frames_warning_label.setVisible(should_show_manual_warning)
@@ -2870,6 +2874,7 @@ class LTX23RunnerWidget(QWidget):
             cli_path=self.cli_row.text(),
             checkpoint_path=self.checkpoint_row.text(),
             gemma_root=self.gemma_row.text(),
+            external_sdnq_text_encoder_root=self.external_sdnq_text_encoder_row.text(),
             output_dir=self.output_dir_row.text(),
             output_name=self.output_name_edit.text(),
             report_path=self.report_row.text(),
@@ -3108,6 +3113,7 @@ class LTX23RunnerWidget(QWidget):
         if hasattr(self, "quantization_combo"):
             self._apply_quantization_availability()
         self.gemma_row.setText(s["gemma_root"])
+        self.external_sdnq_text_encoder_row.setText(s.get("external_sdnq_text_encoder_root", ""))
         self.output_dir_row.setText(s["output_dir"])
         self.output_name_edit.setText(s["output_name"])
         self.report_row.setText(s["report_path"])
@@ -3121,7 +3127,7 @@ class LTX23RunnerWidget(QWidget):
         self._loading = False
         self._update_frame_spin_limit(clamp=True)
         self._update_extended_frames_warning()
-        if self._selected_model_variant() != "INT4":
+        if self._selected_model_variant() not in {"INT8", "INT4"}:
             self._apply_auto_vram_settings(update_hint=True)
         self._update_fast_iclora_route_controls()
         self._update_flash_attention_status()
@@ -3774,8 +3780,8 @@ class LTX23RunnerWidget(QWidget):
             self._timestamped_diagnostic_path(self.deep_log_row.text(), stamp),
         )
 
-    def _build_int4_command(self, *, prepare_video_inputs: bool = False) -> Tuple[str, List[str], Path, List[str]]:
-        """Build the isolated INT4 command with under-the-hood VRAM automation."""
+    def _build_sdnq_command(self, *, prepare_video_inputs: bool = False) -> Tuple[str, List[str], Path, List[str]]:
+        """Build the isolated SDNQ INT8/INT4 command with under-the-hood VRAM automation."""
         python_exe = self.python_row.text() or str(DEFAULT_PYTHON)
         cli_path = str(INT4_CLI_PATH)
         self._normalize_resolution_for_pipeline()
@@ -3837,6 +3843,10 @@ class LTX23RunnerWidget(QWidget):
             "--report-path", report_path,
             "--attention-backend", "auto",
         ]
+        external_text_encoder = self.external_sdnq_text_encoder_row.text().strip() if hasattr(self, "external_sdnq_text_encoder_row") else ""
+        if external_text_encoder:
+            args.extend(["--external-text-encoder-root", external_text_encoder])
+
         negative_prompt = self.negative_edit.toPlainText().strip()
         if negative_prompt:
             args.extend(["--negative-prompt", negative_prompt])
@@ -3924,8 +3934,8 @@ class LTX23RunnerWidget(QWidget):
         if randomize_seed and self.random_seed_check.isChecked():
             self.seed_spin.setValue(int(time.time() * 1000) % 2_147_483_647)
 
-        if self._selected_model_variant() == "INT4":
-            return self._build_int4_command(prepare_video_inputs=prepare_video_inputs)
+        if self._selected_model_variant() in {"INT8", "INT4"}:
+            return self._build_sdnq_command(prepare_video_inputs=prepare_video_inputs)
 
         if self._is_auto_vram_profile_mode():
             auto_result = self._apply_auto_vram_settings(update_hint=True) or {}
@@ -4135,29 +4145,30 @@ class LTX23RunnerWidget(QWidget):
 
 
     def validate_before_run(self) -> bool:
-        is_int4 = self._selected_model_variant() == "INT4"
+        selected_variant = self._selected_model_variant()
+        is_sdnq = selected_variant in {"INT8", "INT4"}
         checks = [
             (self.python_row.text(), "Python executable is empty."),
-            (str(INT4_CLI_PATH) if is_int4 else self.cli_row.text(), "LTX CLI path is empty."),
-            (self.checkpoint_row.text(), "INT4 model folder is empty." if is_int4 else "Checkpoint path is empty."),
-            ("not-needed" if is_int4 else self.gemma_row.text(), "Gemma root is empty."),
+            (str(INT4_CLI_PATH) if is_sdnq else self.cli_row.text(), "LTX CLI path is empty."),
+            (self.checkpoint_row.text(), f"{selected_variant} model folder is empty." if is_sdnq else "Checkpoint path is empty."),
+            ("not-needed" if is_sdnq else self.gemma_row.text(), "Gemma root is empty."),
             (self.prompt_edit.toPlainText().strip(), "Prompt is empty."),
         ]
         for value, message in checks:
             if not str(value or "").strip():
                 QMessageBox.warning(self, "LTX 2.3", message)
                 return False
-        cli_path = INT4_CLI_PATH if is_int4 else Path(self.cli_row.text())
+        cli_path = INT4_CLI_PATH if is_sdnq else Path(self.cli_row.text())
         if not cli_path.exists():
             QMessageBox.warning(self, "LTX 2.3", f"CLI file not found:\n{cli_path}")
             return False
-        if is_int4:
+        if is_sdnq:
             model_root = Path(self.checkpoint_row.text().strip())
             required = [model_root / "model_index.json", model_root / "transformer" / "config.json", model_root / "text_encoder" / "config.json"]
             missing = [str(path) for path in required if not path.exists()]
             if not model_root.is_dir() or missing:
                 detail = "\n".join(missing) if missing else str(model_root)
-                QMessageBox.warning(self, "LTX 2.3 INT4", "INT4 model folder is incomplete:\n" + detail)
+                QMessageBox.warning(self, f"LTX 2.3 {selected_variant}", f"{selected_variant} model folder is incomplete:\n" + detail)
                 return False
 
         audio_mode = AUDIO_MODE_COMPAT_MAP.get(self.audio_mode_combo.currentText(), AUDIO_MODE_DISABLED)
@@ -4183,7 +4194,7 @@ class LTX23RunnerWidget(QWidget):
                 QMessageBox.warning(self, "LTX 2.3", f"FFmpeg not found:\n{ffmpeg}")
                 return False
 
-        if not is_int4 and not self._ensure_auto_vram_settings_supported():
+        if not is_sdnq and not self._ensure_auto_vram_settings_supported():
             return False
 
         pipeline_name = self._effective_pipeline()
@@ -4929,6 +4940,7 @@ class LTX23RunnerWidget(QWidget):
         self.spatial_upsampler_row.changed.connect(lambda *_: self._update_two_stage_asset_status())
         self.python_row.changed.connect(lambda *_: self._update_flash_attention_status())
         self.checkpoint_row.changed.connect(lambda *_: self._sync_model_variant_from_checkpoint())
+        self.external_sdnq_text_encoder_row.changed.connect(lambda *_: self._schedule_save())
         self.model_variant_combo.currentTextChanged.connect(lambda *_: self._model_variant_changed())
         self.distilled_lora_strength_spin.valueChanged.connect(lambda *_: self._update_test_lora_strength_ui())
         self.lora_cache_mode_combo.currentTextChanged.connect(lambda *_: self._update_test_lora_strength_ui())
@@ -5114,6 +5126,8 @@ class LTX23RunnerWidget(QWidget):
         token = str(variant or "FP16").strip().upper()
         if token == "INT4":
             return root / INT4_MODEL_RELATIVE
+        if token == "INT8":
+            return root / INT8_MODEL_RELATIVE
         rel = FP8_CHECKPOINT_RELATIVE if token == "FP8" else FP16_CHECKPOINT_RELATIVE
         return root / rel
 
@@ -5125,6 +5139,8 @@ class LTX23RunnerWidget(QWidget):
         # send a quant folder into the native FP16/FP8 CLI.
         if folder_name in {"ltx23_int4", "ltx_int4"} or folder_name.endswith("_int4"):
             return "INT4"
+        if folder_name in {"ltx23_int8", "ltx_int8"} or folder_name.endswith("_int8"):
+            return "INT8"
         return "FP8" if "fp8" in text else "FP16"
 
     def _selected_model_variant(self) -> str:
@@ -5135,11 +5151,11 @@ class LTX23RunnerWidget(QWidget):
         inferred = self._infer_model_variant_from_checkpoint(
             self.checkpoint_row.text() if hasattr(self, "checkpoint_row") else ""
         )
-        if inferred == "INT4":
-            return "INT4"
+        if inferred in {"INT8", "INT4"}:
+            return inferred
         if hasattr(self, "model_variant_combo"):
             token = self.model_variant_combo.currentText().strip().upper()
-            if token in {"FP16", "FP8", "INT4"}:
+            if token in {"FP16", "FP8", "INT8", "INT4"}:
                 return token
         return inferred
 
@@ -5167,17 +5183,20 @@ class LTX23RunnerWidget(QWidget):
 
     def _apply_model_variant_route(self, variant: str = "", *, update_checkpoint: bool = False) -> None:
         token = str(variant or self._selected_model_variant()).strip().upper() or "FP16"
-        is_int4 = token == "INT4"
+        is_sdnq = token in {"INT8", "INT4"}
         if hasattr(self, "cli_row"):
-            self.cli_row.setText(str(INT4_CLI_PATH if is_int4 else DEFAULT_CLI_PATH))
+            self.cli_row.setText(str(INT4_CLI_PATH if is_sdnq else DEFAULT_CLI_PATH))
         if hasattr(self, "checkpoint_row"):
-            self.checkpoint_row.mode = "dir" if is_int4 else "file"
-            self.checkpoint_row.label.setText("INT4 model folder" if is_int4 else "Checkpoint")
-            self.checkpoint_row.file_filter = "All files (*.*)" if is_int4 else "Safetensors (*.safetensors);;All files (*.*)"
+            self.checkpoint_row.mode = "dir" if is_sdnq else "file"
+            self.checkpoint_row.label.setText(f"{token} model folder" if is_sdnq else "Checkpoint")
+            self.checkpoint_row.file_filter = "All files (*.*)" if is_sdnq else "Safetensors (*.safetensors);;All files (*.*)"
             self._set_tooltip(
                 self.checkpoint_row,
-                "Local split-folder INT4 model, normally models\\ltx23_int4." if is_int4
-                else "Main LTX 2.3 checkpoint / safetensors file. This is the large model file.",
+                (
+                    f"Local split-folder {token} model, normally models\\ltx23_{token.lower()}."
+                    if is_sdnq
+                    else "Main LTX 2.3 checkpoint / safetensors file. This is the large model file."
+                ),
             )
             if update_checkpoint:
                 root = self._portable_ltx_root_for_autofill()
@@ -5191,12 +5210,12 @@ class LTX23RunnerWidget(QWidget):
             self._set_tooltip(
                 self.vram_lab_combo,
                 (
-                    "INT4 automatic VRAM planner. ON detects the installed GPU as a 12/16/24 GB profile and automatically scales Stage 1, Stage 2 and final decode from resolution and frame count. OFF uses a fixed per-card INT4 policy."
-                    if is_int4 else
+                    f"{token} automatic VRAM planner. ON detects the installed GPU as a 12/16/24 GB profile and automatically scales Stage 1, Stage 2 and final decode from resolution and frame count. OFF uses a fixed per-card SDNQ policy."
+                    if is_sdnq else
                     "Simple VRAM Lab toggle. ON uses the safe VRAM Lab mode. OFF disables VRAM Lab and runs without that protection layer."
                 ),
             )
-        self._set_vram_lab_tab_visible(not is_int4)
+        self._set_vram_lab_tab_visible(not is_sdnq)
 
     def _sync_model_variant_from_checkpoint(self) -> None:
         if self._loading or not hasattr(self, "model_variant_combo"):
@@ -5235,16 +5254,16 @@ class LTX23RunnerWidget(QWidget):
             return
         token = (variant or (self.model_variant_combo.currentText() if hasattr(self, "model_variant_combo") else "FP16")).strip().upper()
         is_fp8 = token == "FP8"
-        is_int4 = token == "INT4"
+        is_sdnq = token in {"INT8", "INT4"}
 
         self.quantization_combo.blockSignals(True)
         try:
-            if is_int4:
+            if is_sdnq:
                 self._set_combo(self.quantization_combo, QUANTIZATION_MODE_NONE)
                 self.quantization_combo.setEnabled(False)
                 self._set_tooltip(
                     self.quantization_combo,
-                    "INT4 is already pre-quantized and runs only through the isolated ltx_int4_cli.py.",
+                    f"{token} is already pre-quantized and runs only through the isolated SDNQ ltx_int4_cli.py.",
                 )
             elif not is_fp8:
                 self._set_combo(self.quantization_combo, QUANTIZATION_MODE_NONE)
@@ -5274,7 +5293,7 @@ class LTX23RunnerWidget(QWidget):
 
         self.ltx_root_row.setText(str(root))
         self.python_row.setText(str(python_path))
-        self.cli_row.setText(str(INT4_CLI_PATH if variant == "INT4" else DEFAULT_CLI_PATH))
+        self.cli_row.setText(str(INT4_CLI_PATH if variant in {"INT8", "INT4"} else DEFAULT_CLI_PATH))
         self.checkpoint_row.setText(str(self._checkpoint_for_variant(root, variant)))
         self._apply_model_variant_route(variant, update_checkpoint=False)
         if hasattr(self, "quantization_combo"):
@@ -5295,7 +5314,7 @@ class LTX23RunnerWidget(QWidget):
         if self._loading:
             return
         self._update_extended_frames_warning()
-        if self._selected_model_variant() != "INT4":
+        if self._selected_model_variant() not in {"INT8", "INT4"}:
             self._apply_auto_vram_settings(update_hint=True)
         self._update_fast_iclora_route_controls()
         self._refresh_command_preview()
@@ -5324,6 +5343,7 @@ class LTX23RunnerWidget(QWidget):
             "cli_path": self.cli_row,
             "checkpoint": self.checkpoint_row,
             "gemma_root": self.gemma_row,
+            "external_sdnq_text_encoder": self.external_sdnq_text_encoder_row,
             "output_dir": self.output_dir_row,
             "report_path": self.report_row,
             "deep_log_path": self.deep_log_row,

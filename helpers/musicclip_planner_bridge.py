@@ -12,9 +12,11 @@ It only exports a clean scene-plan JSON that later Planner/LTX work can consume.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
+import random
 import re
 import shutil
 import socket
@@ -863,6 +865,19 @@ def _normalize_bridge_generation_settings(*sources: Any) -> Dict[str, Any]:
         "avoid_effects_in_first_clip": _safe_bool(merged.get("avoid_effects_in_first_clip"), True),
         "avoid_effects_in_last_clip": _safe_bool(merged.get("avoid_effects_in_last_clip"), True),
         "avoid_short_start_end_clips": _safe_bool(merged.get("avoid_short_start_end_clips"), _safe_bool(merged.get("ltx_avoid_short_start_end"), True)),
+        "msr_enabled": _safe_bool(merged.get("msr_enabled"), False),
+        "msr_version": _safe_int(merged.get("msr_version"), 2),
+        "msr_background_paths": [str(x) for x in _as_list(merged.get("msr_background_paths")) if x],
+        "msr_reference_paths": [str(x) for x in _as_list(merged.get("msr_reference_paths")) if x][:4],
+        "msr_reference_pool_enabled": _safe_bool(merged.get("msr_reference_pool_enabled"), False),
+        "msr_reference_packs": [[str(y) for y in _as_list(x) if y][:4] for x in _as_list(merged.get("msr_reference_packs")) if _as_list(x)],
+        "msr_reference_pool_first_clip_default": _safe_bool(merged.get("msr_reference_pool_first_clip_default"), True),
+        "msr_use_end_frames": _safe_bool(merged.get("msr_use_end_frames"), False),
+        "msr_end_frame_paths": [str(x) for x in _as_list(merged.get("msr_end_frame_paths")) if x],
+        "msr_background_mode": _safe_str(merged.get("msr_background_mode") or "sequence"),
+        "msr_reference_frames": _safe_int(merged.get("msr_reference_frames"), 41),
+        "msr_remove_reference_backgrounds": _safe_bool(merged.get("msr_remove_reference_backgrounds"), True),
+        "msr_backend": _safe_str(merged.get("msr_backend") or "wan2gp"),
     }
     profile = _duration_profile_from_bridge_settings(cfg)
     cfg["target_clip_seconds"] = profile.get("target_clip_seconds")
@@ -6684,6 +6699,17 @@ def _select_ltx_video_prompt_source(shot: Dict[str, Any], payload: Optional[Dict
     )
     if override:
         return override, "clip_prompt_override", bool(_LTX_TIMESTAMP_RE.search(override))
+
+    # Qwen's MSR two-pass enhancer stores the rich result in ``video_prompt``
+    # and marks the shot.  A later generic director-cleanup pass may replace the
+    # director_* fields with its compact fallback.  Never let that fallback win
+    # over the preserved enhanced prompt on a normal new-job run.
+    if _safe_bool(shot.get("msr_prompt_enhanced"), False):
+        for key in ("video_prompt", "timestamped_video_prompt", "msr_enhanced_script"):
+            value = _safe_str(shot.get(key))
+            if value:
+                return value, f"msr_enhanced_{key}", "timestamped" in key or bool(_LTX_TIMESTAMP_RE.search(value))
+
     for key in ("director_timestamped_video_prompt", "director_video_prompt", "video_prompt", "template_timestamped_video_prompt", "template_video_prompt"):
         value = _safe_str(shot.get(key))
         if value:
@@ -6691,21 +6717,74 @@ def _select_ltx_video_prompt_source(shot: Dict[str, Any], payload: Optional[Dict
     return "", "", False
 
 
+def _prefix_msr_characters_subjects(prompt: Any, brief: Dict[str, str]) -> str:
+    """Inject the user's Characters / subjects line at the start of an MSR video prompt.
+
+    Timestamped LTX prompts must still begin with ``0:00 -``.  In that case the
+    identity/role anchor is inserted immediately after the first timestamp rather
+    than before it.
+    """
+    text = _safe_str(prompt).strip()
+    identity = _clean_text((brief or {}).get("characters_subjects"), 700).strip(" ,.;")
+    if not text or not identity:
+        return text
+
+    # Avoid injecting the same identity line twice when a review override or a
+    # previously saved MSR prompt already contains it.
+    norm_identity = re.sub(r"\W+", " ", identity.lower()).strip()
+    norm_head = re.sub(r"\W+", " ", text[: max(900, len(identity) * 3)].lower()).strip()
+    if norm_identity and norm_identity in norm_head:
+        return text
+
+    identity_sentence = identity + "."
+    match = re.match(r"^(\s*0:00\s*-\s*)(.*)$", text, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        rest = match.group(2).lstrip()
+        return f"{match.group(1)}{identity_sentence} {rest}".strip()
+    return f"{identity_sentence} {text}".strip()
+
+
 def _sanitize_final_ltx_prompt_for_model(raw_prompt: Any, *, brief: Dict[str, str], shot: Dict[str, Any], prompt_is_timestamped: bool = False) -> tuple[str, List[str]]:
     removed_all: List[str] = []
-    text = _clean_text(raw_prompt, 2400)
+    raw_text = _safe_str(raw_prompt)
+    # The Qwen MSR two-pass enhancer deliberately prefixes its rich prompt with
+    # ``#!PROMPT!:`` for Review/display.  That prompt can be several paragraphs
+    # long.  The old generic director compiler reduced every non-timestamped
+    # video prompt to 70 words, which discarded the later actions, camera cuts
+    # and ending development and left mostly the repeated opening tilt-up.
+    preserve_rich_msr_prompt = bool(
+        _safe_bool((shot or {}).get("msr_prompt_enhanced"), False)
+        or re.search(r"#!PROMPT!\s*:", raw_text[:1200], flags=re.IGNORECASE)
+    )
+    prompt_char_limit = 6500 if preserve_rich_msr_prompt else 2400
+    text = _clean_text(raw_text, prompt_char_limit)
+    # Keep the marker in Review and metadata, but never pass it to a backend.
+    # Identity text may have been prefixed before it, so remove the first marker
+    # wherever it appears rather than only at character zero.
+    text = re.sub(r"#!PROMPT!\s*:\s*", "", text, count=1, flags=re.IGNORECASE)
     text, removed = _director_strip_workflow_meta(text)
     removed_all.extend(removed)
     text, removed = _director_remove_full_main_idea_text(text, brief)
     removed_all.extend(removed)
     text, removed = _director_strip_visual_safety_for_video(text)
     removed_all.extend(removed)
-    text = _sanitize_prompt_no_visible_text(text, (shot or {}).get("lyrics"), image_prompt=False, max_len=2200)
+    text = _sanitize_prompt_no_visible_text(
+        text,
+        (shot or {}).get("lyrics"),
+        image_prompt=False,
+        max_len=6200 if preserve_rich_msr_prompt else 2200,
+    )
     if not _safe_bool((shot or {}).get("needs_lipsync"), False):
         text = _strip_non_lipsync_vocal_language(text)
-    max_words = 120 if prompt_is_timestamped or bool(_LTX_TIMESTAMP_RE.search(text)) else 70
-    text, removed = _director_clean_final_prompt(text, image_prompt=False, max_words=max_words, add_safety=False)
-    removed_all.extend(removed)
+    if preserve_rich_msr_prompt:
+        # Preserve the complete enhancer result.  Only perform lightweight
+        # whitespace/punctuation cleanup; do not run the legacy word limiter.
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\s*\n\s*", " ", text).strip()
+    else:
+        max_words = 120 if prompt_is_timestamped or bool(_LTX_TIMESTAMP_RE.search(text)) else 70
+        text, removed = _director_clean_final_prompt(text, image_prompt=False, max_words=max_words, add_safety=False)
+        removed_all.extend(removed)
     text, removed = _director_strip_visual_safety_for_video(text)
     removed_all.extend(removed)
     text, removed = _director_remove_full_main_idea_text(text, brief)
@@ -6715,7 +6794,8 @@ def _sanitize_final_ltx_prompt_for_model(raw_prompt: Any, *, brief: Dict[str, st
         text = _sanitize_ltx_timestamped_prompt(text, _safe_float((shot or {}).get("duration"), 0.0))
     text = re.sub(r"\b(?:in|on|at|inside|through)\s+([,.;])", r"\1", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+([,.;])", r"\1", text).strip(" ,.;")
-    return _sentence(_clean_text(text, 2200)), _dedupe_texts(removed_all, max_items=40, max_len=2200)
+    final_limit = 6200 if preserve_rich_msr_prompt else 2200
+    return _sentence(_clean_text(text, final_limit)), _dedupe_texts(removed_all, max_items=40, max_len=2200)
 
 
 def _director_final_validation_warnings(shot: Dict[str, Any], brief: Dict[str, str]) -> List[str]:
@@ -9407,7 +9487,7 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
         _emit(f"Selected {shot_id}")
 
         if image_model in {"existing", "use existing start image", "existing_start_image"}:
-            return {"ok": False, "message": "Use existing start image does not need generation. Pick Flux Klein 9B, Z-Image Turbo, or HiDream."}
+            return {"ok": False, "message": "Use existing start image does not need generation. Pick Flux Klein 9B, Z-Image Turbo, Krea 2, or HiDream."}
 
         out_dir_raw = _safe_str(payload.get("output_dir"))
         if out_dir_raw:
@@ -9420,7 +9500,11 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
         payload_path = _safe_child_file_path(test_dir, payload.get("start_image_payload_name"), f"{stem}_start_image_payload.json")
         log_path = _safe_child_file_path(test_dir, payload.get("start_image_log_name"), f"{stem}_imagegen.log.txt")
 
-        raw_prompt, selected_prompt_source = _select_start_image_prompt_source(shot, payload)
+        explicit_prompt = _safe_str(payload.get("image_prompt_override") or payload.get("background_prompt_override"))
+        if explicit_prompt:
+            raw_prompt, selected_prompt_source = explicit_prompt, "payload.image_prompt_override"
+        else:
+            raw_prompt, selected_prompt_source = _select_start_image_prompt_source(shot, payload)
         if not raw_prompt:
             return {"ok": False, "message": f"{shot_id} has no director image prompt."}
         lyrics = shot.get("lyrics") or shot.get("clip_relative_lyrics") or ""
@@ -9456,6 +9540,11 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
 
         prepare_only = _safe_bool(payload.get("prepare_only"), False)
 
+        if _safe_bool(payload.get("force_environment_only"), False):
+            character_reference = {"enabled": False, "reference_mode": False, "character_reference_sheets": {}, "reason": "automated_msr_background"}
+            shot["shot_subject_mode"] = "environment_only"
+            shot["visible_subject_detected"] = False
+            shot["reference_eligible"] = False
         selected_reference_paths, selected_reference_paths_source = _selected_reference_paths_for_start_image_handoff(shot, character_reference, payload, director_plan, limit=5)
         available_reference_sheet_paths = _reference_available_paths_from_normalized(character_reference, limit=5)
         loaded_reference_count = len(available_reference_sheet_paths)
@@ -9630,6 +9719,31 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
             )
             command_summary = result.get("command") if isinstance(result.get("command"), dict) else {"summary": result.get("command") or []}
             model_files = result.get("model_files") if isinstance(result.get("model_files"), dict) else {}
+        elif image_model == "krea2":
+            try:
+                from auto_music_sync import _musicclip_generate_krea2_start_image as _framevision_krea2_generate
+            except Exception as exc:
+                raise RuntimeError(f"Krea 2 helper could not be imported from auto_music_sync.py: {exc}")
+            result = _framevision_krea2_generate({
+                "root_dir": str(root),
+                "ltx_director_plan_path": str(plan_path),
+                "shot_id": shot_id,
+                "image_model": "krea2",
+                "seed": seed,
+                "resolution": resolution,
+                "output_dir": str(test_dir),
+                "start_image_name": start_path.name,
+                "start_image_payload_name": payload_path.name,
+                "start_image_log_name": log_path.name,
+                "image_prompt_override": prompt,
+                "progress_callback": progress_callback,
+                "own_prompts_enabled": payload.get("own_prompts_enabled", False),
+                "exact_prompt_passthrough": payload.get("exact_prompt_passthrough", False),
+                "krea2_use_loras": payload.get("krea2_use_loras"),
+                "krea2_loras": payload.get("krea2_loras"),
+            })
+            command_summary = {"type": "krea2_sdcli_delegate", "delegate": "auto_music_sync._musicclip_generate_krea2_start_image"}
+            model_files = {"delegate": "auto_music_sync._musicclip_generate_krea2_start_image"}
         elif image_model == "hidream":
             result = _run_hidream_start_image(
                 root,
@@ -9993,6 +10107,11 @@ def _ltx23_write_wangp_settings_json(
     lora_file: str,
     lora_json: str,
     lora_multiplier: float,
+    msr_enabled: bool = False,
+    msr_image_refs: Optional[List[str]] = None,
+    msr_end_image: str = "",
+    msr_reference_frames: int = 41,
+    msr_remove_reference_backgrounds: bool = True,
 ) -> Dict[str, Any]:
     """Write a WanGP settings JSON directly from the bridge; no copied extra CLI needed."""
     settings: Dict[str, Any] = {}
@@ -10041,6 +10160,30 @@ def _ltx23_write_wangp_settings_json(
         "audio_scale": float(settings.get("audio_scale", 1.0)),
         "perturbation_layers": settings.get("perturbation_layers") if isinstance(settings.get("perturbation_layers"), list) else [28],
     })
+    if msr_enabled:
+        refs = [str(x) for x in (msr_image_refs or []) if x and os.path.isfile(str(x))][:5]
+        settings.update({
+            "model_type": "ltx2_22B_msr_v2",
+            "base_model_type": "ltx2_22B_msr",
+            # MSR reference images are controlled by video_prompt_type="KI".
+            # Wan2GP uses the letter E for a real end-frame request. Recent
+            # LTX2.3 builds support an End Image without a Start Image.
+            "image_prompt_type": "E" if (msr_end_image and os.path.isfile(str(msr_end_image))) else "",
+            "image_start": None,
+            "image_end": [str(msr_end_image)] if (msr_end_image and os.path.isfile(str(msr_end_image))) else None,
+            "image_refs": refs,
+            "video_prompt_type": "KI",
+            "num_inference_steps": 8,
+            "guidance_scale": 5,
+            "guidance2_scale": 5,
+            "guidance3_scale": 5,
+            "guidance_phases": 2,
+            "image_refs_relative_size": 50,
+            "remove_background_images_ref": 1 if msr_remove_reference_backgrounds else 0,
+            "custom_settings": {"msr_reference_frames": int(msr_reference_frames or 41)},
+            "activated_loras": [],
+            "loras_multipliers": "",
+        })
     if audio_path and os.path.isfile(audio_path):
         settings["audio_prompt_type"] = "A"
         settings["audio_guide"] = audio_path
@@ -10065,6 +10208,720 @@ def _ltx23_write_wangp_settings_json(
         settings["ltx_transition_json_name"] = os.path.basename(lora_json)
     _write_json_file(path, settings)
     return settings
+
+
+
+def _msr_pair_key(path_value: Any, *, end_frame: bool = False) -> str:
+    stem = Path(_safe_str(path_value)).stem.strip().lower()
+    stem = re.sub(r"[\s\-]+", "_", stem)
+    suffixes = ("_end_frame", "_endframe", "_ending", "_end", "_final", "_last") if end_frame else ("_background", "_backdrop", "_scene", "_bg")
+    for suffix in suffixes:
+        if stem.endswith(suffix) and len(stem) > len(suffix):
+            stem = stem[:-len(suffix)]
+            break
+    if end_frame and re.fullmatch(r"\d+[a-z]", stem):
+        stem = stem[:-1]
+    return re.sub(r"_+", "_", stem).strip("_")
+
+
+def _msr_pair_end_frames(backgrounds: List[str], end_frames: List[str]) -> Dict[str, str]:
+    """Pair obvious matching names first, then pair remaining files by list order."""
+    result: Dict[str, str] = {}
+    remaining_ends = list(end_frames)
+    keyed: Dict[str, List[str]] = {}
+    for end in remaining_ends:
+        keyed.setdefault(_msr_pair_key(end, end_frame=True), []).append(end)
+    unmatched_backgrounds: List[str] = []
+    for bg in backgrounds:
+        key = _msr_pair_key(bg, end_frame=False)
+        candidates = keyed.get(key) or []
+        if candidates:
+            chosen = candidates.pop(0)
+            result[os.path.normcase(os.path.abspath(bg))] = chosen
+            try:
+                remaining_ends.remove(chosen)
+            except ValueError:
+                pass
+        else:
+            unmatched_backgrounds.append(bg)
+    for bg, end in zip(unmatched_backgrounds, remaining_ends):
+        result[os.path.normcase(os.path.abspath(bg))] = end
+    return result
+
+
+def _stage_msr_background_for_resolution(source_path: str, output_dir: Path, shot_id: str, resolution: str, root: Path) -> str:
+    """Create a target-size background copy without touching the user's original."""
+    match = re.fullmatch(r"\s*(\d+)\s*x\s*(\d+)\s*", _safe_str(resolution), flags=re.IGNORECASE)
+    if not match:
+        raise RuntimeError(f"Invalid MSR output resolution: {resolution}")
+    width, height = int(match.group(1)), int(match.group(2))
+    if width < 16 or height < 16:
+        raise RuntimeError(f"Invalid MSR output resolution: {width}x{height}")
+    src = Path(source_path).expanduser().resolve()
+    if not src.is_file():
+        raise RuntimeError(f"MSR background was not found: {src}")
+    assets = Path(output_dir).resolve() / "msr_assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    safe_id = _safe_stem(shot_id or "shot")
+    signature = hashlib.sha256(f"{src}|{src.stat().st_size}|{src.stat().st_mtime_ns}|{width}x{height}".encode("utf-8", errors="replace")).hexdigest()[:12]
+    dst = assets / f"{safe_id}_background_{width}x{height}_{signature}.png"
+    if dst.is_file() and dst.stat().st_size > 0:
+        return str(dst)
+    ffmpeg = _find_media_binary(root, "FV_FFMPEG", "ffmpeg")
+    vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
+    cmd = [str(ffmpeg), "-y", "-hide_banner", "-loglevel", "error", "-i", str(src), "-vf", vf, "-frames:v", "1", str(dst)]
+    proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0 or not dst.is_file() or dst.stat().st_size <= 0:
+        try:
+            dst.unlink(missing_ok=True)
+        except Exception:
+            pass
+        detail = (proc.stderr or proc.stdout or "ffmpeg did not create the resized background").strip()
+        raise RuntimeError(f"Could not resize MSR background to {width}x{height}: {detail}")
+    return str(dst)
+
+
+def _stage_msr_end_frame_copy(source_path: str, output_dir: Path, shot_id: str) -> str:
+    """Copy the end frame unchanged into the job assets with a stable internal name."""
+    raw = _safe_str(source_path)
+    if not raw:
+        return ""
+    src = Path(raw).expanduser().resolve()
+    if not src.is_file():
+        return ""
+    assets = Path(output_dir).resolve() / "msr_assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    suffix = src.suffix.lower() if src.suffix else ".png"
+    signature = hashlib.sha256(f"{src}|{src.stat().st_size}|{src.stat().st_mtime_ns}".encode("utf-8", errors="replace")).hexdigest()[:12]
+    dst = assets / f"{_safe_stem(shot_id or 'shot')}_end_{signature}{suffix}"
+    if not dst.is_file() or dst.stat().st_size <= 0:
+        shutil.copy2(src, dst)
+    return str(dst)
+
+
+
+def _msr_automated_background_prompt(shot: Dict[str, Any], director_plan: Dict[str, Any], index: int) -> str:
+    """Build a location-only plate prompt.
+
+    Do not pass the normal shot/image prompt through here. Those prompts describe
+    performers, faces, outfits and actions; placing them before a later "no people"
+    clause makes image models recreate the cast inside the supposed background.
+    """
+    fallback_locations = (
+        "empty underground rock club stage with dark brick walls and moody stage spotlights",
+        "empty backstage rehearsal room with amplifiers along the walls and practical studio lighting",
+        "empty industrial warehouse performance space with ceiling trusses and dramatic spotlights",
+        "empty city rooftop performance space with cinematic practical lights",
+        "empty downtown street performance block with storefront glow and open foreground",
+        "empty concrete parking structure with cinematic practical lights and open center space",
+        "empty abandoned theatre stage with footlights and overhead spotlights",
+        "empty beachside promenade performance space with string lights and wide open foreground",
+        "empty tunnel with textured walls and atmospheric strip lighting",
+        "empty loft studio with large windows and accent lights",
+        "empty alley behind a music venue with neon spill light and open center space",
+        "empty outdoor festival stage before the audience arrives with rigged spotlights and laser beams",
+        "empty underground rave hall with laser beams, moving lights, and open dancefloor space",
+        "empty garage party performance space with hanging bulbs, colored spotlights, and clear floor space",
+        "empty skate park performance area with portable stage lights and open concrete foreground",
+        "empty subway platform performance area with fluorescent overhead lighting and accent spotlights",
+        "empty motel courtyard stage area with neon lighting and open center space",
+        "empty rooftop greenhouse event space with string lights and clear foreground",
+        "empty bowling alley party space with glowing lane lights, disco beams, and open center space",
+        "empty warehouse rave corridor with laser beams, industrial lights, and open foreground",
+        "empty arcade venue with glowing cabinets, accent lighting, and clear center space",
+        "empty carnival midway performance space with marquee lights and rigged spotlights",
+        "empty drive-in stage lot with projector glow, practical lights, and open foreground",
+        "empty riverside shipping dock performance space with industrial floodlights and clear center space",
+        "empty record-store performance corner with neon accents, practical lights, and open foreground",
+    )
+
+    forbidden = (
+        "woman", "women", "man", "men", "girl", "boy", "person", "people",
+        "performer", "singer", "vocal", "drummer", "guitar", "bass", "band",
+        "character", "subject", "face", "hair", "outfit", "dress", "leather",
+        "danc", "playing", "singing", "microphone", "instrument", "crowd",
+        "close-up", "close up", "medium shot", "body language", "silhouette",
+    )
+
+    def _safe_environment_text(value: Any) -> str:
+        raw = _safe_str(value)
+        if not raw:
+            return ""
+        chunks = re.split(r"[\n.;]+|,(?=\s)", raw)
+        kept: List[str] = []
+        for chunk in chunks:
+            clean = " ".join(chunk.split()).strip(" ,-")
+            low = clean.lower()
+            if not clean or any(token in low for token in forbidden):
+                continue
+            # Keep clauses that actually describe a place, atmosphere or lighting.
+            place_terms = (
+                "stage", "studio", "room", "interior", "exterior", "street", "alley",
+                "rooftop", "beach", "warehouse", "club", "venue", "theatre", "theater",
+                "garage", "tunnel", "station", "forest", "desert", "city", "building",
+                "brick", "concrete", "industrial", "lighting", "lights", "night", "dusk",
+                "dawn", "rain", "fog", "moody", "cinematic", "warm", "cold", "neon",
+                "background", "location", "environment", "landscape", "architecture",
+            )
+            if any(term in low for term in place_terms):
+                kept.append(clean)
+            if len(", ".join(kept)) >= 320:
+                break
+        return ", ".join(kept)
+
+    location_parts: List[str] = []
+    # Explicit location fields are safest and take priority.
+    for key in ("location", "setting", "environment", "background", "director_location"):
+        value = _safe_environment_text(shot.get(key))
+        if value:
+            location_parts.append(value)
+
+    # Scene descriptions may contain useful architecture/lighting clauses, but all
+    # performer-related clauses are filtered out above.
+    for key in ("director_scene_description", "scene_description"):
+        value = _safe_environment_text(shot.get(key))
+        if value:
+            location_parts.append(value)
+
+    brief = _normalize_creative_brief(director_plan.get("creative_brief"))
+    style = _safe_environment_text(
+        brief.get("visual_style") or brief.get("style") or brief.get("lighting") or ""
+    )
+    if style:
+        location_parts.append(style)
+
+    location = _join_parts(location_parts)
+    if not location:
+        # A fresh unique shuffled bag is created for every director-plan/run.
+        # The previous index-based selection made shot 2 use fallback #2 in every
+        # test. Reusing the order on the plan keeps all shots in the same run
+        # stable while still changing the order for the next newly-created run.
+        order_key = "_msr_fallback_location_order"
+        raw_order = director_plan.get(order_key) if isinstance(director_plan, dict) else None
+        valid_order = (
+            isinstance(raw_order, list)
+            and len(raw_order) == len(fallback_locations)
+            and sorted(raw_order) == list(range(len(fallback_locations)))
+        )
+        if not valid_order:
+            raw_order = list(range(len(fallback_locations)))
+            random.SystemRandom().shuffle(raw_order)
+            if isinstance(director_plan, dict):
+                director_plan[order_key] = list(raw_order)
+        bag_position = (max(1, int(index)) - 1) % len(raw_order)
+        location = fallback_locations[int(raw_order[bag_position])]
+
+    return _join_parts([
+        f"Empty location background plate for music-video shot {index}",
+        location,
+        "wide establishing view of the environment, open foreground and open center space",
+        "unoccupied location, completely empty, no humans, no people, no performers, no crowd",
+        "no faces, no bodies, no instruments, no microphones, no vehicles in the foreground, no large foreground props",
+        "single coherent full-frame scene, no text, no logos, no collage, no split-screen, no grid",
+        "realistic cinematic lighting, clean unobstructed environment",
+    ])[:1200]
+
+
+def _find_framevision_ffmpeg(root: Path) -> str:
+    candidates = [root / "ffmpeg.exe", root / "presets" / "bin" / "ffmpeg.exe", root / "presets" / "bin" / "ffmpeg", root / "ffmpeg"]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return "ffmpeg"
+
+
+def _flatten_transparent_png_over_background(root: Path, background: str, overlay: str, output_path: Path, log_path: Path) -> str:
+    if not background or not os.path.isfile(background):
+        raise RuntimeError("Automated end frame could not find its generated background.")
+    if not overlay or not os.path.isfile(overlay):
+        raise RuntimeError("Automated end frame could not find its transparent character PNG.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg = _find_framevision_ffmpeg(root)
+    cmd = [
+        ffmpeg, "-y", "-i", str(background), "-i", str(overlay),
+        "-filter_complex", "[1:v][0:v]scale2ref=w=iw:h=ih[ov][bg];[bg][ov]overlay=(W-w)/2:H-h:format=auto",
+        "-frames:v", "1", str(output_path),
+    ]
+    result = _run_ffmpeg_logged(cmd, log_path, "[MSR automation] Flattening transparent character PNG over generated background")
+    if int(result.get("returncode", -1)) != 0 or not _valid_nonempty_file(output_path):
+        raise RuntimeError(f"ffmpeg could not create automated end frame: {output_path.name}")
+    return str(output_path)
+
+
+def _prepare_automated_msr_assets(payload: Dict[str, Any], director_plan: Dict[str, Any], shots: List[Dict[str, Any]], run_dir: Path, root: Path, emit: Callable[[str], None], image_generator: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None) -> Dict[str, Any]:
+    model = _safe_str(payload.get("msr_automation_image_model"), "z_image").lower() or "z_image"
+    if model in {"existing", "msr", "qwen2511_int4"}:
+        model = "z_image"
+    transparent_paths = [str(x) for x in _as_list(payload.get("msr_transparent_character_paths")) if x and os.path.isfile(str(x))]
+    use_end = _safe_bool(payload.get("msr_use_end_frames"), False)
+    # User-supplied location overrides are generated before this phase. When
+    # those backgrounds are present, this pass must reuse them and only create
+    # the transparent-PNG composites for matching end frames. Regenerating here
+    # would replace the requested locations with the fallback location pool.
+    reuse_pre_generated_backgrounds = bool(
+        _safe_bool(payload.get("msr_pre_generated_backgrounds"), False)
+        or _safe_bool(payload.get("msr_skip_background_automation"), False)
+    )
+    pre_generated_backgrounds = [
+        str(Path(x).expanduser().resolve())
+        for x in _as_list(payload.get("msr_background_paths"))
+        if x and os.path.isfile(str(x))
+    ]
+    if reuse_pre_generated_backgrounds and not pre_generated_backgrounds:
+        reuse_pre_generated_backgrounds = False
+    generated_backgrounds: List[str] = []
+    generated_end_frames: List[str] = []
+    failures: Dict[str, str] = {}
+    assets: List[Dict[str, Any]] = []
+    generator = image_generator if callable(image_generator) else generate_ltx_start_image_for_shot
+    for idx, shot in enumerate(shots, start=1):
+        sid = _safe_str(shot.get("id")) or f"LTX{idx:02d}"
+        stem = _safe_stem(sid)
+        generated_bg = ""
+        bg_path = run_dir / f"{stem}_msr_background.png"
+        try:
+            prompt = _safe_str(
+                shot.get("framevision_msr_background_prompt")
+                or shot.get("msr_background_prompt")
+            ) or _msr_automated_background_prompt(shot, director_plan, idx)
+            if reuse_pre_generated_backgrounds:
+                generated_bg = pre_generated_backgrounds[(idx - 1) % len(pre_generated_backgrounds)]
+                emit(f"MSR automation background {idx}/{len(shots)}: reusing requested location for {sid}")
+            else:
+                if not _valid_nonempty_file(bg_path):
+                    emit(f"MSR automation background {idx}/{len(shots)}: {sid} with {model.replace('_', ' ')}")
+                    result = generator({
+                        "root_dir": str(root), "ltx_director_plan_path": _safe_str(payload.get("ltx_director_plan_path")),
+                        "shot_id": sid, "image_model": model, "seed": payload.get("seed"),
+                        "resolution": payload.get("resolution") or shot.get("resolution") or "1280x720",
+                        "output_dir": str(run_dir), "start_image_name": bg_path.name,
+                        "start_image_payload_name": f"{stem}_msr_background_payload.json",
+                        "start_image_log_name": f"{stem}_msr_background.log.txt",
+                        "image_prompt_override": prompt, "force_environment_only": True,
+                        "character_reference": {"enabled": False}, "progress_callback": lambda msg, _sid=sid: emit(f"{_sid}: {msg}"),
+                        "krea2_use_loras": payload.get("krea2_use_loras"), "krea2_loras": payload.get("krea2_loras"),
+                    })
+                    if not isinstance(result, dict) or not bool(result.get("ok")):
+                        raise RuntimeError(_safe_str(result.get("message") if isinstance(result, dict) else "", "Background generation failed."))
+                    actual = _safe_str(result.get("start_image_path"))
+                    if actual and os.path.isfile(actual) and Path(actual).resolve() != bg_path.resolve():
+                        shutil.copy2(actual, bg_path)
+                if not _valid_nonempty_file(bg_path):
+                    raise RuntimeError("Background image was not written.")
+                generated_bg = str(bg_path)
+            if not generated_bg or not os.path.isfile(generated_bg):
+                raise RuntimeError("The selected MSR background is missing.")
+            generated_backgrounds.append(generated_bg)
+            shot["msr_background_prompt"] = prompt
+            shot["msr_background_path"] = generated_bg
+            shot["start_image_path"] = generated_bg
+            shot["current_start_image_path"] = generated_bg
+            shot["existing_start_image_path"] = generated_bg
+            end_path_text = ""
+            if use_end and transparent_paths:
+                overlay = transparent_paths[(idx - 1) % len(transparent_paths)]
+                end_path = run_dir / f"{stem}_msr_end.png"
+                if not _valid_nonempty_file(end_path):
+                    _flatten_transparent_png_over_background(root, generated_bg, overlay, end_path, run_dir / f"{stem}_msr_end.log.txt")
+                generated_end_frames.append(str(end_path))
+                end_path_text = str(end_path)
+                shot["msr_end_frame_path"] = end_path_text
+            assets.append({
+                "shot_id": sid,
+                "background_prompt": prompt,
+                "background_path": generated_bg,
+                "end_frame_path": end_path_text,
+                "image_model": model,
+            })
+        except Exception as exc:
+            failures[sid] = str(exc)
+            emit(f"MSR automation failed for {sid}: {exc}")
+    return {"backgrounds": generated_backgrounds, "end_frames": generated_end_frames, "failures": failures, "model": model, "assets": assets}
+
+
+
+
+def _run_process_logged(cmd: List[str], log_path: Path, cwd: Optional[str] = None, timeout: int = 1800) -> Dict[str, Any]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8", errors="replace") as handle:
+        handle.write("\nCommand:\n" + subprocess.list2cmdline([str(x) for x in cmd]) + "\n\n")
+        handle.flush()
+        try:
+            proc = subprocess.run(
+                [str(x) for x in cmd], cwd=cwd, stdout=handle, stderr=subprocess.STDOUT,
+                text=True, timeout=timeout, check=False,
+            )
+            handle.write(f"\n[MSR prompt enhancer] exit code: {proc.returncode}\n")
+            return {"returncode": int(proc.returncode), "cmd": cmd}
+        except Exception as exc:
+            handle.write(f"\n[MSR prompt enhancer] failed: {exc}\n")
+            return {"returncode": -1, "cmd": cmd, "error": str(exc)}
+
+
+def _msr_prompt_enhancer_python_candidates(root: Path) -> List[str]:
+    candidates: List[Path] = []
+    env_override = _safe_str(os.environ.get("FRAMEVISION_DESCRIBER_PYTHON"))
+    if env_override:
+        candidates.append(Path(env_override))
+    # The describer runs inside FrameVision's isolated project environments. Try
+    # the known project-local names first, then the currently executing project
+    # interpreter when it is also below environments/.
+    for rel in (
+        "environments/.images_models/python.exe",
+        "environments/.describe/python.exe",
+        "environments/.framevision/python.exe",
+        "environments/.main/python.exe",
+        "environments/framevision/python.exe",
+    ):
+        candidates.append(root / rel)
+    try:
+        current = Path(sys.executable).resolve()
+        if (root / "environments") in current.parents:
+            candidates.append(current)
+    except Exception:
+        pass
+    out: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = str(candidate.resolve())
+        except Exception:
+            resolved = str(candidate)
+        key = resolved.lower()
+        if key not in seen and Path(resolved).is_file():
+            seen.add(key)
+            out.append(resolved)
+    return out
+
+
+def _msr_shot_prompt_parts(
+    shot: Dict[str, Any],
+    payload: Optional[Dict[str, Any]] = None,
+    director_plan: Optional[Dict[str, Any]] = None,
+    shot_index: int = 1,
+) -> tuple[str, str, str]:
+    """Return the untouched user prompt plus existing image/video context.
+
+    The MSR two-pass enhancer must not mistake generated director/template text for
+    the user's original prompt. Own video prompts are exact and take priority; the
+    creative-brief main idea is the next-best original input.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    director_plan = director_plan if isinstance(director_plan, dict) else {}
+    image_prompt = _safe_str(
+        shot.get("director_image_prompt")
+        or shot.get("image_prompt")
+        or shot.get("template_image_prompt")
+    )
+    video_prompt = _safe_str(
+        shot.get("video_prompt")
+        or shot.get("director_video_prompt")
+        or shot.get("director_timestamped_video_prompt")
+        or shot.get("timestamped_video_prompt")
+        or shot.get("template_video_prompt")
+    )
+
+    # Use only prompt sources that belong to this current run. Generic shot-level
+    # original_prompt/user_prompt fields may survive from an old director/review
+    # plan and must never override the prompt entered for the new run.
+    own_prompts_enabled = _safe_bool(payload.get("own_prompts_enabled"), False)
+    original = _safe_str(shot.get("msr_original_user_prompt"))
+    if not original and own_prompts_enabled:
+        original = _safe_str(
+            shot.get("own_video_prompt")
+            or shot.get("clip_prompt_override")
+        )
+    if not original and own_prompts_enabled:
+        own_video_prompts = _as_list(payload.get("own_video_prompts"))
+        if own_video_prompts:
+            original = str(own_video_prompts[(max(1, int(shot_index)) - 1) % len(own_video_prompts)] or "").strip()
+    if not original:
+        brief = _normalize_creative_brief(director_plan.get("creative_brief"))
+        original = _safe_str(
+            payload.get("main_idea")
+            or payload.get("idea")
+            or payload.get("prompt")
+            or brief.get("main_idea")
+            or brief.get("idea")
+            or director_plan.get("main_idea")
+        )
+    if not original:
+        # Last-resort current compiled prompt only. Deliberately do not read
+        # shot.original_prompt or shot.user_prompt because those are stale-prone.
+        original = _safe_str(video_prompt or image_prompt)
+    return original, image_prompt, video_prompt
+
+
+def _enhance_msr_prompts_with_qwen3vl(
+    payload: Dict[str, Any],
+    director_plan: Dict[str, Any],
+    shots: List[Dict[str, Any]],
+    run_dir: Path,
+    root: Path,
+    emit: Callable[[str], None],
+) -> Dict[str, Any]:
+    """Enhance final MSR video prompts after references are ready.
+
+    The exact original/base prompt stays first. Qwen3-VL then appends a grounded
+    script after inspecting the per-shot background and the fixed references.
+    End frames are intentionally excluded.
+    """
+    if not _safe_bool(payload.get("msr_enhance_prompts"), False):
+        return {"enabled": False, "status": "disabled", "enhanced_count": 0}
+
+    model_dir = root / "models" / "describe" / "default" / "qwen3vl2b"
+    helper = root / "helpers" / "msr_qwen3vl_prompt_enhancer.py"
+    if not helper.is_file():
+        # Supports tests/patch staging where the bridge and helper sit together.
+        helper = Path(__file__).resolve().parent / "msr_qwen3vl_prompt_enhancer.py"
+    if not model_dir.is_dir():
+        raise RuntimeError(f"MSR prompt enhancement needs Qwen3-VL at: {model_dir}")
+    if not helper.is_file():
+        raise RuntimeError("MSR Qwen3-VL prompt enhancer helper was not found.")
+
+    jobs: List[Dict[str, Any]] = []
+    for idx, shot in enumerate(shots, start=1):
+        sid = _safe_str(shot.get("id")) or f"LTX{idx:02d}"
+        pack = _resolve_msr_shot_pack(payload, director_plan, sid, payload.get("seed"))
+        bg = _safe_str(pack.get("background"))
+        references = [str(x) for x in _as_list(pack.get("references")) if x and os.path.isfile(str(x))][:4]
+        original, image_prompt, video_prompt = _msr_shot_prompt_parts(shot, payload, director_plan, idx)
+        vocals_active = bool(
+            _safe_bool(shot.get("needs_lipsync"), False)
+            or _safe_bool(shot.get("active_vocal_window"), False)
+            or _safe_str(shot.get("vocal_presence")).lower() in {"strong", "vocal", "mixed"}
+            or _safe_int(shot.get("active_vocal_scene_count"), 0) > 0
+        )
+        jobs.append({
+            "shot_id": sid,
+            "original_prompt": original,
+            "image_prompt": image_prompt,
+            "video_prompt": video_prompt,
+            "vocals_active": vocals_active,
+            "image_paths": ([bg] if bg else []) + references,
+        })
+
+    input_json = run_dir / "msr_qwen3vl_prompt_enhancer_input.json"
+    output_json = run_dir / "msr_qwen3vl_prompt_enhancer_output.json"
+    log_path = run_dir / "msr_qwen3vl_prompt_enhancer.log.txt"
+    _write_json_file(input_json, {
+        "root_dir": str(root),
+        "model_dir": str(model_dir),
+        "jobs": jobs,
+    })
+
+    candidates = _msr_prompt_enhancer_python_candidates(root)
+    if not candidates:
+        raise RuntimeError("No isolated FrameVision Python environment was found for Qwen3-VL prompt enhancement.")
+    attempts: List[Dict[str, Any]] = []
+    success = False
+    for python_exe in candidates:
+        cmd = [python_exe, str(helper), str(input_json), str(output_json)]
+        emit(f"MSR prompt enhancement: loading Qwen3-VL with {Path(python_exe).parent.name}.")
+        result = _run_process_logged(cmd, log_path, cwd=str(root))
+        attempts.append({"python": python_exe, "returncode": int(result.get("returncode", -1))})
+        if int(result.get("returncode", -1)) == 0 and _valid_nonempty_file(output_json):
+            success = True
+            break
+    if not success:
+        raise RuntimeError(f"Qwen3-VL prompt enhancement failed. See: {log_path}")
+
+    data = _read_json_file(output_json)
+    result_rows = data.get("results") if isinstance(data, dict) else []
+    by_id = {
+        _safe_str(row.get("shot_id")): row
+        for row in _as_list(result_rows)
+        if isinstance(row, dict) and _safe_str(row.get("shot_id"))
+    }
+    enhanced_count = 0
+    diagnostics: List[Dict[str, Any]] = []
+    for shot in shots:
+        sid = _safe_str(shot.get("id"))
+        row = by_id.get(sid)
+        if not isinstance(row, dict):
+            continue
+        combined = _safe_str(row.get("combined_prompt"))
+        enhanced_script = _safe_str(row.get("enhanced_script"))
+        if not combined:
+            continue
+        # MSR command builders may select any one of these fields. Keep them in
+        # sync so Wan2GP, INT4 and FP8/FP16 all receive the same enhanced prompt.
+        for key in (
+            "video_prompt", "timestamped_video_prompt",
+            "director_video_prompt", "director_timestamped_video_prompt",
+            "template_video_prompt", "template_timestamped_video_prompt",
+        ):
+            shot[key] = combined
+        shot["msr_prompt_enhanced"] = True
+        shot["msr_original_prompt_preserved_first"] = True
+        shot["msr_original_user_prompt"] = str(row.get("original_prompt") or "")
+        shot["msr_enhanced_script"] = enhanced_script
+        shot["msr_background_description"] = _safe_str(row.get("background_description"))
+        shot["msr_reference_description"] = _safe_str(row.get("reference_description"))
+        enhanced_count += 1
+        diagnostics.append({
+            "shot_id": sid,
+            "combined_prompt": combined,
+            "original_prompt": shot.get("msr_original_user_prompt", ""),
+            "background_description": shot["msr_background_description"],
+            "reference_description": shot["msr_reference_description"],
+        })
+        emit(f"MSR prompt enhancement {enhanced_count}/{len(shots)}: {sid}")
+
+    report = {
+        "enabled": True,
+        "status": "ok" if enhanced_count == len(shots) else "partial",
+        "enhanced_count": enhanced_count,
+        "total_shots": len(shots),
+        "model_dir": str(model_dir),
+        "attempts": attempts,
+        "diagnostics": diagnostics,
+        "input_json": str(input_json),
+        "output_json": str(output_json),
+        "log_path": str(log_path),
+    }
+    _write_json_file(run_dir / "msr_qwen3vl_prompt_enhancement_report.json", report)
+    return report
+
+
+def _normalized_msr_reference_packs(raw_value: Any) -> List[List[str]]:
+    packs: List[List[str]] = []
+    for raw_pack in _as_list(raw_value):
+        vals = raw_pack if isinstance(raw_pack, list) else [raw_pack]
+        pack: List[str] = []
+        seen = set()
+        for value in vals:
+            candidate = str(value or "").strip()
+            if not candidate or not os.path.isfile(candidate):
+                continue
+            candidate = str(Path(candidate).expanduser().resolve())
+            key = os.path.normcase(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            pack.append(candidate)
+        if pack:
+            packs.append(pack[:4])
+    return packs
+
+
+def _select_msr_reference_pack_for_shot(reference_packs: List[List[str]], shot_index: int, total_shots: int, seed: Optional[int], first_clip_default: bool) -> Tuple[List[str], Dict[str, Any]]:
+    total = max(int(total_shots or 0), 1)
+    if not reference_packs:
+        return [], {"used_pool": False, "reason": "no_packs"}
+    if first_clip_default and int(shot_index or 0) == 0:
+        return [], {"used_pool": False, "reason": "first_clip_default"}
+    assignable = total - 1 if first_clip_default else total
+    if assignable <= 0:
+        return [], {"used_pool": False, "reason": "no_assignable_shots"}
+    rel_index = int(shot_index or 0) - (1 if first_clip_default else 0)
+    if rel_index < 0:
+        return [], {"used_pool": False, "reason": "before_first_assignable"}
+    order = list(range(len(reference_packs)))
+    signature = "|".join(";".join(os.path.normcase(x) for x in pack) for pack in reference_packs)
+    stable_seed = int(hashlib.sha256(f"{seed}|{total}|{signature}|msr-reference-pool".encode("utf-8", errors="replace")).hexdigest()[:16], 16)
+    rng = random.Random(stable_seed)
+    rng.shuffle(order)
+    usable = order[: min(len(order), assignable)]
+    if rel_index >= len(usable):
+        return [], {"used_pool": False, "reason": "fallback_to_default", "usable_count": len(usable)}
+    pack_index = usable[rel_index]
+    selected = list(reference_packs[pack_index])[:4]
+    return selected, {"used_pool": bool(selected), "pack_index": pack_index, "slot_index": rel_index, "usable_count": len(usable)}
+
+
+def _resolve_msr_shot_pack(payload: Dict[str, Any], director_plan: Dict[str, Any], shot_id: str, seed: Optional[int]) -> Dict[str, Any]:
+    # MSR is a reference-conditioning workflow, not an I2V/start-image mode.
+    # Accept the settings from every payload/plan container used by the Music
+    # Clip Creator so Full Run, Continue and Review all resolve the same pack.
+    sources: List[Dict[str, Any]] = []
+    for candidate in (
+        payload,
+        payload.get("bridge_generation_settings") if isinstance(payload, dict) else None,
+        payload.get("generation_settings") if isinstance(payload, dict) else None,
+        payload.get("ltx_settings") if isinstance(payload, dict) else None,
+        director_plan.get("bridge_generation_settings") if isinstance(director_plan, dict) else None,
+        director_plan.get("generation_settings") if isinstance(director_plan, dict) else None,
+        director_plan.get("msr") if isinstance(director_plan, dict) else None,
+        director_plan,
+    ):
+        if isinstance(candidate, dict):
+            sources.append(candidate)
+
+    def _first(*keys: str, default: Any = None) -> Any:
+        for source in sources:
+            for key in keys:
+                value = source.get(key)
+                if value not in (None, "", []):
+                    return value
+        return default
+
+    enabled = _safe_bool(_first("msr_enabled", "use_msr", "ltx_use_msr", default=False), False)
+    explicit_refs = [str(x) for x in _as_list(_first("msr_image_refs", "image_refs", default=[])) if x and os.path.isfile(str(x))]
+    backgrounds = [str(x) for x in _as_list(_first("msr_background_paths", "msr_backgrounds", "background_paths", default=[])) if x and os.path.isfile(str(x))]
+    references = [str(x) for x in _as_list(_first("msr_reference_paths", "msr_references", "reference_paths", default=[])) if x and os.path.isfile(str(x))][:4]
+    reference_pool_enabled = _safe_bool(_first("msr_reference_pool_enabled", "use_msr_reference_pool", default=False), False)
+    reference_packs = _normalized_msr_reference_packs(_first("msr_reference_packs", "msr_reference_pool_packs", default=[]))
+    reference_pool_first_clip_default = _safe_bool(_first("msr_reference_pool_first_clip_default", "msr_reference_pool_first_clip_use_default", default=True), True)
+    use_end_frames = _safe_bool(_first("msr_use_end_frames", "use_matching_end_frames", default=False), False)
+    end_frames = [str(x) for x in _as_list(_first("msr_end_frame_paths", "msr_end_frames", "end_frame_paths", default=[])) if x and os.path.isfile(str(x))]
+    assigned_background = _safe_str(_first("msr_assigned_background", "msr_background", default=""))
+    assigned_end_frame = _safe_str(_first("msr_assigned_end_frame", "msr_end_frame", default=""))
+    if assigned_background and os.path.isfile(assigned_background):
+        backgrounds = [assigned_background]
+    if explicit_refs:
+        # Wan2GP expects background first. A per-shot explicit pack takes
+        # priority and avoids recalculating random assignments during resume.
+        backgrounds = explicit_refs[:1]
+        references = explicit_refs[1:5]
+    if not enabled:
+        return {"enabled": False}
+    shots = _director_plan_shots(director_plan)
+    index = 0
+    for i, row in enumerate(shots):
+        if _safe_str(row.get("id")).lower() == _safe_str(shot_id).lower():
+            index = i
+            break
+    mode = _safe_str(_first("msr_background_mode", "background_mode", default="sequence")).lower()
+    total_shots = len(shots) if isinstance(shots, list) and shots else 1
+    if reference_pool_enabled and reference_packs:
+        selected_refs, pool_meta = _select_msr_reference_pack_for_shot(reference_packs, index, total_shots, seed, reference_pool_first_clip_default)
+        if selected_refs:
+            references = selected_refs
+    else:
+        pool_meta = {"used_pool": False, "reason": "disabled_or_empty"}
+    ordered = list(backgrounds)
+    if mode.startswith("random") and len(ordered) > 1:
+        import random
+        signature = "|".join(os.path.normcase(x) for x in ordered)
+        stable_seed = int(hashlib.sha256(f"{seed}|{signature}|msr-background-bag".encode("utf-8", errors="replace")).hexdigest()[:16], 16)
+        rng = random.Random(stable_seed)
+        rng.shuffle(ordered)
+    background = ordered[index % len(ordered)] if ordered else ""
+    end_frame = ""
+    if use_end_frames:
+        if assigned_end_frame and os.path.isfile(assigned_end_frame):
+            end_frame = assigned_end_frame
+        else:
+            pair_map = _msr_pair_end_frames(list(backgrounds), list(end_frames))
+            end_frame = pair_map.get(os.path.normcase(os.path.abspath(background)), "") if background else ""
+    return {
+        "enabled": bool(enabled),
+        "background": background,
+        "references": references,
+        "image_refs": ([background] if background else []) + references,
+        "use_end_frames": bool(use_end_frames),
+        "end_frame": end_frame,
+        "reference_frames": _safe_int(_first("msr_reference_frames", "reference_frames", default=41), 41),
+        "remove_backgrounds": _safe_bool(_first("msr_remove_reference_backgrounds", "remove_background_images_ref", default=True), True),
+        "mode": mode,
+        "shot_index": index,
+        "reference_pool_enabled": bool(reference_pool_enabled),
+        "reference_pool_first_clip_default": bool(reference_pool_first_clip_default),
+        "reference_pool_pack_count": len(reference_packs),
+        "reference_pool_used": bool(pool_meta.get("used_pool")),
+        "reference_pool_pack_index": pool_meta.get("pack_index"),
+    }
 
 
 def _find_director_shot(plan: Dict[str, Any], shot_id: str) -> Optional[Dict[str, Any]]:
@@ -10866,17 +11723,38 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
         sync_clip_path = _safe_child_file_path(test_dir, payload.get("sync_clip_name"), f"{stem}_ltx_sync.mp4")
         duration_report_path = _safe_child_file_path(test_dir, payload.get("duration_report_name"), f"{stem}_duration_report.json")
 
-        image_mode = _safe_str(payload.get("image_mode"), "existing").lower() or "existing"
+        seed_raw = payload.get("seed", None)
+        seed = None
+        if seed_raw not in (None, ""):
+            seed = _safe_int(seed_raw, -1)
+        msr_pack = _resolve_msr_shot_pack(payload, director_plan, shot_id, seed)
+        if msr_pack.get("enabled"):
+            if not msr_pack.get("background"):
+                return {"ok": False, "message": "MSR is enabled, but no readable background image is available."}
+            if not msr_pack.get("references"):
+                return {"ok": False, "message": "MSR is enabled, but no readable subject/object reference is available."}
+
+        image_mode = "msr" if msr_pack.get("enabled") else (_safe_str(payload.get("image_mode"), "existing").lower() or "existing")
         if image_mode in {"use existing start image", "existing_start_image"}:
             image_mode = "existing"
-        if image_mode == "existing":
+        if image_mode == "msr":
+            # Wan2GP MSR consumes image_refs directly; no ordinary start-image stage is used.
+            start_image_path = _safe_str(msr_pack.get("background"))
+            image_generation_result = {
+                "msr_enabled": True,
+                "msr_background": start_image_path,
+                "msr_reference_paths": list(msr_pack.get("references") or []),
+                "msr_image_refs": list(msr_pack.get("image_refs") or []),
+            }
+            _emit(f"MSR background for {shot_id}: {os.path.basename(start_image_path)}")
+        elif image_mode == "existing":
             existing = _safe_str(payload.get("existing_start_image_path"))
             if not existing:
                 return {"ok": False, "message": "Use existing start image is selected, but no start image path was provided."}
             _emit("Using existing start image...")
             start_image_path = _copy_existing_start_image(existing, start_path)
             image_generation_result: Dict[str, Any] = {}
-        elif image_mode in {"flux_klein_9b", "z_image", "hidream"}:
+        elif image_mode in {"flux_klein_9b", "z_image", "krea2", "hidream"}:
             _emit(f"Preparing start image with {image_mode.replace('_', ' ')}...")
             start_payload: Dict[str, Any] = {
                 "root_dir": str(root),
@@ -10910,6 +11788,12 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
             shot=shot,
             prompt_is_timestamped=prompt_is_timestamped,
         )
+        if msr_pack.get("enabled"):
+            # MSR references need an explicit text binding for who/what each
+            # subject is.  The normal character-bible/reference-image path is
+            # disabled in MSR mode, so preserve the visible Characters / subjects
+            # field as a stable identity/role anchor at the start of every shot.
+            prompt = _prefix_msr_characters_subjects(prompt, brief)
         negative = _safe_str(shot.get("director_negative_prompt"))
         if not prompt:
             return {"ok": False, "message": f"{shot_id} has no director timestamped video prompt."}
@@ -10920,11 +11804,27 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
         frames = max(1, _safe_int(timing_plan.get("requested_generation_frames"), planned_frames))
         steps = max(1, _safe_int(payload.get("steps"), 8))
         resolution = _safe_str(payload.get("resolution") or shot.get("resolution"), "1280x720") or "1280x720"
-        seed_raw = payload.get("seed", None)
-        seed = None
-        if seed_raw not in (None, ""):
-            seed = _safe_int(seed_raw, -1)
-
+        if msr_pack.get("enabled"):
+            try:
+                staged_background = _stage_msr_background_for_resolution(
+                    _safe_str(msr_pack.get("background")), test_dir, shot_id, resolution, root
+                )
+            except Exception as exc:
+                return {"ok": False, "message": str(exc), "output_dir": str(test_dir)}
+            msr_pack["original_background"] = _safe_str(msr_pack.get("background"))
+            msr_pack["background"] = staged_background
+            msr_pack["image_refs"] = [staged_background] + list(msr_pack.get("references") or [])
+            if msr_pack.get("end_frame"):
+                msr_pack["original_end_frame"] = _safe_str(msr_pack.get("end_frame"))
+                msr_pack["end_frame"] = _stage_msr_end_frame_copy(_safe_str(msr_pack.get("end_frame")), test_dir, shot_id)
+            start_image_path = staged_background
+            image_generation_result.update({
+                "msr_original_background": msr_pack.get("original_background"),
+                "msr_background": staged_background,
+                "msr_image_refs": list(msr_pack.get("image_refs") or []),
+                "msr_end_frame": _safe_str(msr_pack.get("end_frame")),
+            })
+            _emit(f"MSR background resized/staged for {shot_id}: {resolution}")
         audio_path = _safe_str(shot.get("audio_clip_path"))
         audio_ok = bool(audio_path and os.path.isfile(audio_path))
         needs_lipsync = _safe_bool(shot.get("needs_lipsync"), False)
@@ -10936,6 +11836,8 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
             audio_path = ""
 
         backend = _normalize_ltx_generation_backend(payload.get("ltx_backend") or payload.get("ltx_generation_backend"), root)
+        if msr_pack.get("enabled"):
+            _emit(f"MSR V2 will use the selected LTX backend: {backend}.")
         bridge_cfg = _ltx23_bridge_config(root)
         wangp_root = _safe_str(payload.get("wangp_root") or bridge_cfg.get("wangp_root"))
         wgp_py = _safe_str(payload.get("wgp_py") or bridge_cfg.get("wgp_py"))
@@ -10989,6 +11891,13 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
                     built += ["--seed", str(int(seed))]
                 if lora_file:
                     built += ["--lora-file", lora_file]
+                if msr_pack.get("enabled"):
+                    built += ["--msr-enabled", "--msr-background", _safe_str(msr_pack.get("background"))]
+                    for ref in list(msr_pack.get("references") or [])[:4]:
+                        built += ["--msr-ref", _safe_str(ref)]
+                    if _safe_str(msr_pack.get("end_frame")):
+                        built += ["--msr-end-frame", _safe_str(msr_pack.get("end_frame"))]
+                    built += ["--msr-reference-frames", str(int(msr_pack.get("reference_frames") or 41))]
                 return built
 
             audio_for_args = _safe_str(audio_override_path) or audio_path
@@ -11009,6 +11918,11 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
                 lora_file=lora_file,
                 lora_json=lora_json,
                 lora_multiplier=float(lora_multiplier),
+                msr_enabled=bool(msr_pack.get("enabled")),
+                msr_image_refs=list(msr_pack.get("image_refs") or []),
+                msr_end_image=_safe_str(msr_pack.get("end_frame")),
+                msr_reference_frames=int(msr_pack.get("reference_frames") or 41),
+                msr_remove_reference_backgrounds=bool(msr_pack.get("remove_backgrounds", True)),
             )
             return [str(wangp_python), str(cli), "--process", str(settings_path), "--output-dir", str(Path(out_path).parent)]
 
@@ -11055,6 +11969,7 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
             "requested_generation_frames": frames,
             "resolution": resolution,
             "ltx_generation_backend": backend,
+            "msr_pack": msr_pack,
             "wangp_python": wangp_python,
             "wangp_python_source": wangp_python_source,
             "wangp_root": wangp_root,
@@ -11672,7 +12587,23 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
         if not shots:
             return {"ok": False, "message": "No shots were found in the LTX director plan."}
 
-        own_images_config = _ltx_own_images_request(payload, director_plan)
+        msr_settings = director_plan.get("bridge_generation_settings") if isinstance(director_plan.get("bridge_generation_settings"), dict) else {}
+        msr_enabled = _safe_bool(payload.get("msr_enabled"), _safe_bool(msr_settings.get("msr_enabled"), False))
+        if msr_enabled:
+            # MSR owns the complete visual-conditioning stage. Never let stale
+            # own-image metadata or a selected image model create/prepare images.
+            payload = dict(payload)
+            payload.update({
+                "msr_enabled": True,
+                "own_images_enabled": False,
+                "own_images_selected": False,
+                "own_image_paths": [],
+                "own_images_prepared": False,
+                "image_mode": "msr",
+                "image_model": "msr",
+            })
+
+        own_images_config = {"enabled": False} if msr_enabled else _ltx_own_images_request(payload, director_plan)
         out_dir_raw = _safe_str(payload.get("output_dir"))
         if own_images_config.get("enabled"):
             # Initial own-image jobs create one normal dated full-run folder.
@@ -11700,7 +12631,7 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
             )
             _emit(f"Own images: prepared {len(own_prepared_images)} normal full-run start image(s) in {run_dir}")
 
-        image_mode = "existing" if own_prepared_images else (_safe_str(payload.get("image_mode"), "flux_klein_9b").lower() or "flux_klein_9b")
+        image_mode = "msr" if msr_enabled else ("existing" if own_prepared_images else (_safe_str(payload.get("image_mode"), "flux_klein_9b").lower() or "flux_klein_9b"))
         if image_mode in {"use existing start image", "existing_start_image"}:
             image_mode = "existing"
         skip_completed = _safe_bool(payload.get("skip_completed"), True)
@@ -11745,10 +12676,57 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
         # back to image 1 -> video 1 -> image 2 -> video 2 scheduling.
         prepared_start_images: Dict[str, str] = dict(own_prepared_images)
         image_phase_failures: Dict[str, str] = {}
+        if msr_enabled and _safe_bool(payload.get("msr_automate_backgrounds"), False):
+            _emit("MSR automation - generating empty location backgrounds after final shot-list creation.")
+            automated = _prepare_automated_msr_assets(payload, director_plan, shots, run_dir, root, _emit)
+            payload = dict(payload)
+            payload["msr_background_paths"] = list(automated.get("backgrounds") or [])
+            if _safe_bool(payload.get("msr_use_end_frames"), False):
+                payload["msr_end_frame_paths"] = list(automated.get("end_frames") or [])
+            image_phase_failures.update(dict(automated.get("failures") or {}))
+            report["msr_automation"] = automated
+            if not payload["msr_background_paths"]:
+                raise RuntimeError("MSR background automation did not create any usable backgrounds.")
+            # Persist automated MSR assets immediately. Single-shot generation and
+            # the Review tab reload the director plan from disk, so keeping this
+            # only in memory loses the generated backgrounds and their prompts.
+            director_plan["msr_background_paths"] = list(payload.get("msr_background_paths") or [])
+            director_plan["msr_end_frame_paths"] = list(payload.get("msr_end_frame_paths") or [])
+            director_plan["msr_reference_paths"] = list(payload.get("msr_reference_paths") or [])
+            director_plan["msr_reference_packs"] = [list(x) for x in _as_list(payload.get("msr_reference_packs")) if _as_list(x)]
+            director_plan["msr_reference_pool_enabled"] = _safe_bool(payload.get("msr_reference_pool_enabled"), False)
+            director_plan["msr_reference_pool_first_clip_default"] = _safe_bool(payload.get("msr_reference_pool_first_clip_default"), True)
+            director_plan["msr_enabled"] = True
+            bridge_settings = director_plan.setdefault("bridge_generation_settings", {})
+            if isinstance(bridge_settings, dict):
+                bridge_settings.update({
+                    "msr_enabled": True,
+                    "msr_automate_backgrounds": True,
+                    "msr_background_paths": list(payload.get("msr_background_paths") or []),
+                    "msr_end_frame_paths": list(payload.get("msr_end_frame_paths") or []),
+                    "msr_reference_paths": list(payload.get("msr_reference_paths") or []),
+                    "msr_reference_packs": [list(x) for x in _as_list(payload.get("msr_reference_packs")) if _as_list(x)],
+                    "msr_reference_pool_enabled": _safe_bool(payload.get("msr_reference_pool_enabled"), False),
+                    "msr_reference_pool_first_clip_default": _safe_bool(payload.get("msr_reference_pool_first_clip_default"), True),
+                    "msr_use_end_frames": bool(payload.get("msr_use_end_frames")),
+                    "msr_automation_image_model": payload.get("msr_automation_image_model"),
+                })
+            _write_json_file(plan_path, director_plan)
+        if msr_enabled and _safe_bool(payload.get("msr_enhance_prompts"), False):
+            _emit("MSR prompt enhancement - inspecting backgrounds and references before clip creation.")
+            prompt_enhancement = _enhance_msr_prompts_with_qwen3vl(payload, director_plan, shots, run_dir, root, _emit)
+            report["msr_prompt_enhancement"] = prompt_enhancement
+            if int(prompt_enhancement.get("enhanced_count", 0)) <= 0:
+                raise RuntimeError("MSR prompt enhancement was enabled but no shot prompts were enhanced.")
+            # The per-shot runner opens the plan again for every clip. Save the
+            # enhanced fields now so FP16/FP8 and INT4 receive the same Qwen3-VL
+            # prompt that Wan2GP receives, and Review displays the actual prompt.
+            director_plan["msr_prompt_enhancement"] = prompt_enhancement
+            _write_json_file(plan_path, director_plan)
         image_phase_generated = 0
         image_phase_reused = 0
         image_phase_skipped_for_ready_clip = 0
-        report["execution_order"] = "all_start_images_then_all_ltx_videos"
+        report["execution_order"] = "msr_reference_packs_then_ltx_videos" if msr_enabled else "all_start_images_then_all_ltx_videos"
         hidream_batch_prepared_jobs: List[Dict[str, Any]] = []
         report["image_phase"] = {
             "status": "running",
@@ -11761,7 +12739,7 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
         }
         _save_report()
 
-        _emit(f"Phase 1/2 - preparing all start images: {len(shots)} shots")
+        _emit(f"Phase 1/2 - {'assigning MSR background/reference packs' if msr_enabled else 'preparing all start images'}: {len(shots)} shots")
         for image_idx, image_shot in enumerate(shots, start=1):
             image_sid = _safe_str(image_shot.get("id")) or f"LTX{image_idx:02d}"
             image_stem = _safe_stem(image_sid)
@@ -11784,6 +12762,24 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
                     and _safe_bool(image_review_item.get("clip_invalidated_by_new_image"), False)
                 )
                 image_trimmed = run_dir / f"{image_stem}_ltx_trimmed.mp4"
+
+                if msr_enabled:
+                    pack = _resolve_msr_shot_pack(payload, director_plan, image_sid, payload.get("seed"))
+                    if not pack.get("background"):
+                        raise RuntimeError("MSR is enabled, but no readable background image is available.")
+                    if not pack.get("references"):
+                        raise RuntimeError("MSR is enabled, but no readable subject/object reference is available.")
+                    # MSR has no start image. Record only the resolved reference
+                    # pack for diagnostics/review and go straight to Wan2GP MSR.
+                    report.setdefault("msr_reference_packs", {})[image_sid] = {
+                        "background": str(pack.get("background") or ""),
+                        "references": list(pack.get("references") or []),
+                        "image_refs": list(pack.get("image_refs") or []),
+                        "end_frame": str(pack.get("end_frame") or ""),
+                    }
+                    image_phase_reused += 1
+                    _emit(f"MSR pack {image_idx}/{len(shots)} ready for {image_sid}: {os.path.basename(str(pack.get('background'))) }")
+                    continue
 
                 # A ready clip needs no new image. This mirrors the video phase's
                 # skip rules so resuming a run does not waste image generations.
@@ -11939,10 +12935,13 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
             _save_report()
             return report
 
-        _emit(
-            f"Phase 1/2 complete - start images ready: {len(prepared_start_images)} | "
-            f"failed: {len(image_phase_failures)}. Phase 2/2 - generating all LTX videos."
-        )
+        if msr_enabled:
+            _emit(f"MSR reference assignment complete - packs ready: {len(shots) - len(image_phase_failures)} | failed: {len(image_phase_failures)}. Generating MSR clips.")
+        else:
+            _emit(
+                f"Phase 1/2 complete - start images ready: {len(prepared_start_images)} | "
+                f"failed: {len(image_phase_failures)}. Phase 2/2 - generating all LTX videos."
+            )
 
         _emit(f"Starting Phase 2/2 LTX video run: {len(shots)} shots")
         for idx, shot in enumerate(shots, start=1):
@@ -11973,9 +12972,11 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
                 if sid in image_phase_failures:
                     item.update({
                         "status": "failed",
-                        "stage": "start_image",
+                        "stage": "msr_reference_pack" if msr_enabled else "start_image",
                         "error": image_phase_failures[sid],
-                        "message": "Video generation was skipped because the start image failed in Phase 1/2.",
+                        "message": ("Video generation was skipped because the MSR reference pack could not be resolved."
+                                    if msr_enabled else
+                                    "Video generation was skipped because the start image failed in Phase 1/2."),
                         "audio_path": _safe_str(shot.get("audio_clip_path")),
                         "can_recreate_later": True,
                     })
@@ -12020,7 +13021,10 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
                 test_payload_name = f"{stem}_payload.json"
                 log_name = f"{stem}_ltx23.log.txt"
                 duration_report_name = f"{stem}_duration_report.json"
-                if force_review_clip_from_image:
+                if msr_enabled:
+                    run_image_mode = "msr"
+                    existing_start = ""
+                elif force_review_clip_from_image:
                     run_image_mode = "existing"
                     existing_start = review_start
                     shot_output_dir = review_dir
@@ -12059,7 +13063,31 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
                     "duration_report_name": duration_report_name,
                     "progress_callback": lambda msg, _sid=sid: _emit(f"{_sid}: {msg}"),
                 }
-                for key in ("ltx_backend", "ltx_generation_backend", "ltx_lora_file", "ltx_lora_json", "ltx_lora_multiplier", "wangp_root", "wgp_py", "character_reference"):
+                if msr_enabled:
+                    msr_pack = _resolve_msr_shot_pack(payload, director_plan, sid, payload.get("seed"))
+                    single_payload.update({
+                        "msr_enabled": True,
+                        "image_mode": "msr",
+                        "existing_start_image_path": "",
+                        "own_images_enabled": False,
+                        "own_images_selected": False,
+                        "own_image_paths": [],
+                        "msr_assigned_background": str(msr_pack.get("background") or ""),
+                        "msr_assigned_end_frame": str(msr_pack.get("end_frame") or ""),
+                        "msr_image_refs": list(msr_pack.get("image_refs") or []),
+                        "msr_reference_frames": int(msr_pack.get("reference_frames") or 41),
+                        "msr_remove_reference_backgrounds": bool(msr_pack.get("remove_backgrounds", True)),
+                    })
+
+                for key in (
+                    "ltx_backend", "ltx_generation_backend", "ltx_lora_file", "ltx_lora_json",
+                    "ltx_lora_multiplier", "wangp_root", "wgp_py", "character_reference", "seed",
+                    "msr_enabled", "msr_version", "msr_background_paths", "msr_reference_paths",
+                    "msr_automate_backgrounds", "msr_enhance_prompts", "msr_automation_image_model", "msr_transparent_character_paths",
+                    "msr_use_end_frames", "msr_end_frame_paths",
+                    "msr_background_mode", "msr_reference_frames",
+                    "msr_remove_reference_backgrounds", "msr_backend",
+                ):
                     if key in payload:
                         single_payload[key] = payload.get(key)
 
@@ -12299,7 +13327,11 @@ def load_ltx_review_state(payload: dict) -> dict:
             sid = _safe_str(shot.get("id")) or f"LTX{idx:02d}"
             paths = _latest_ltx_review_or_fullrun_paths(plan_path, shot, full_run_dir)
             item = ((state.get("shots") or {}).get(sid) if isinstance(state.get("shots"), dict) else {}) or {}
-            prompt = _safe_str(item.get("image_prompt")) or _safe_str(shot.get("director_image_prompt") or shot.get("image_prompt") or shot.get("template_image_prompt"))
+            prompt = (
+                _safe_str(item.get("image_prompt"))
+                or _safe_str(shot.get("msr_background_prompt"))
+                or _safe_str(shot.get("director_image_prompt") or shot.get("image_prompt") or shot.get("template_image_prompt"))
+            )
             seed = item.get("image_seed")
             if seed in (None, ""):
                 seed = ""
@@ -12390,30 +13422,73 @@ def recreate_ltx_review_shot(payload: dict) -> dict:
         seed_raw = payload.get("image_seed")
         clip_prompt_override = _safe_str(payload.get("clip_prompt_override") or payload.get("video_prompt_override") or payload.get("clip_prompt"))
         clip_seed_raw = payload.get("clip_seed")
-        image_model = _safe_str(payload.get("image_model") or payload.get("image_mode"), "flux_klein_9b") or "flux_klein_9b"
+        # Review must use the exact MSR assets assigned to this shot.  The UI
+        # payload can still contain old global background/end-frame lists from a
+        # previous run, and _resolve_msr_shot_pack() intentionally gives payload
+        # values priority.  Inject the shot-local pair before resolving so an old
+        # but still-existing end frame can never be selected by fallback pairing.
+        review_msr_payload = dict(payload)
+        shot_background = _safe_str(
+            item.get("msr_assigned_background")
+            or shot.get("msr_assigned_background")
+            or shot.get("msr_background_path")
+            or shot.get("current_start_image_path")
+            or shot.get("start_image_path")
+        )
+        shot_end_frame = _safe_str(
+            item.get("msr_assigned_end_frame")
+            or shot.get("msr_assigned_end_frame")
+            or shot.get("msr_end_frame_path")
+        )
+        if shot_background and os.path.isfile(shot_background):
+            review_msr_payload["msr_assigned_background"] = shot_background
+        if shot_end_frame and os.path.isfile(shot_end_frame):
+            review_msr_payload["msr_assigned_end_frame"] = shot_end_frame
+            review_msr_payload["msr_use_end_frames"] = True
+        msr_pack = _resolve_msr_shot_pack(review_msr_payload, director_plan, shot_id, payload.get("clip_seed") if payload.get("clip_seed") not in (None, "") else payload.get("seed"))
+        msr_enabled = bool(msr_pack.get("enabled"))
+        image_model = "msr" if msr_enabled else (_safe_str(payload.get("image_model") or payload.get("image_mode"), "flux_klein_9b") or "flux_klein_9b")
         start_path = _safe_str(item.get("current_start_image_path"))
+        if msr_enabled:
+            if not msr_pack.get("background"):
+                return {"ok": False, "message": "MSR is enabled, but no readable background image is available for this review shot."}
+            if not msr_pack.get("references"):
+                return {"ok": False, "message": "MSR is enabled, but no readable subject/object reference is available for this review shot."}
+            start_path = str(msr_pack.get("background"))
         image_result: Dict[str, Any] = {}
         clip_result: Dict[str, Any] = {}
         if action in {"image", "image_and_clip", "both", "image_then_clip"}:
-            _emit(f"Re-creating start image for {shot_id}...")
-            image_payload = dict(payload)
-            image_payload.update({
-                "ltx_director_plan_path": str(plan_path),
-                "shot_id": shot_id,
-                "image_model": image_model,
-                "output_dir": str(review_dir),
-                "start_image_name": f"{stem}_review_start.png",
-                "start_image_payload_name": f"{stem}_review_start_image_payload.json",
-                "start_image_log_name": f"{stem}_review_imagegen.log.txt",
-                "image_prompt_override": prompt_override,
-                "progress_callback": progress_callback,
-            })
-            if seed_raw not in (None, ""):
-                image_payload["seed"] = seed_raw
-            image_result = generate_ltx_start_image_for_shot(image_payload)
-            if not isinstance(image_result, dict) or not bool(image_result.get("ok")):
-                raise RuntimeError(_safe_str(image_result.get("message") if isinstance(image_result, dict) else "", "Start-image recreate failed."))
-            start_path = _safe_str(image_result.get("start_image_path"))
+            if msr_enabled:
+                _emit(f"Refreshing MSR reference pack for {shot_id}...")
+                image_result = {
+                    "ok": True,
+                    "shot_id": shot_id,
+                    "start_image_path": start_path,
+                    "image_model": "msr",
+                    "source_image_model": "msr_background",
+                    "msr_image_refs": list(msr_pack.get("image_refs") or []),
+                    "message": "MSR uses the assigned background and fixed references; no start image was generated.",
+                }
+            else:
+                _emit(f"Re-creating start image for {shot_id}...")
+                image_payload = dict(payload)
+                image_payload.update({
+                    "ltx_director_plan_path": str(plan_path),
+                    "shot_id": shot_id,
+                    "image_model": image_model,
+                    "output_dir": str(review_dir),
+                    "start_image_name": f"{stem}_review_start.png",
+                    "start_image_payload_name": f"{stem}_review_start_image_payload.json",
+                    "start_image_log_name": f"{stem}_review_imagegen.log.txt",
+                    "image_prompt_override": prompt_override,
+                    "progress_callback": progress_callback,
+                })
+                if seed_raw not in (None, ""):
+                    image_payload["seed"] = seed_raw
+                image_result = generate_ltx_start_image_for_shot(image_payload)
+                if not isinstance(image_result, dict) or not bool(image_result.get("ok")):
+                    raise RuntimeError(_safe_str(image_result.get("message") if isinstance(image_result, dict) else "", "Start-image recreate failed."))
+                start_path = _safe_str(image_result.get("start_image_path"))
             item.update({
                 "status": "Image ready - clip needs recreate",
                 "image_prompt": prompt_override,
@@ -12446,7 +13521,12 @@ def recreate_ltx_review_shot(payload: dict) -> dict:
             if not start_path or not os.path.isfile(start_path):
                 return {"ok": False, "message": f"No current start image exists for {shot_id}. Re-create the image first."}
             _emit(f"Re-creating LTX clip for {shot_id}...")
-            single_payload = dict(payload)
+            single_payload = dict(review_msr_payload if msr_enabled else payload)
+            if msr_enabled:
+                single_payload["msr_enabled"] = True
+                single_payload["msr_assigned_background"] = _safe_str(msr_pack.get("background"))
+                single_payload["msr_assigned_end_frame"] = _safe_str(msr_pack.get("end_frame"))
+                single_payload["msr_use_end_frames"] = bool(msr_pack.get("end_frame"))
             if clip_prompt_override or clip_seed_raw not in (None, ""):
                 item.update({
                     "clip_prompt": clip_prompt_override or item.get("clip_prompt") or _safe_str(shot.get("director_timestamped_video_prompt") or shot.get("director_video_prompt") or shot.get("video_prompt") or shot.get("template_timestamped_video_prompt") or shot.get("template_video_prompt")),
@@ -12457,8 +13537,10 @@ def recreate_ltx_review_shot(payload: dict) -> dict:
             single_payload.update({
                 "ltx_director_plan_path": str(plan_path),
                 "shot_id": shot_id,
-                "image_mode": "existing",
+                "image_mode": "msr" if msr_enabled else "existing",
+                "image_model": "msr" if msr_enabled else "existing",
                 "existing_start_image_path": start_path,
+                "msr_enabled": bool(msr_enabled),
                 "clip_prompt_override": clip_prompt_override,
                 "output_dir": str(review_dir),
                 "start_image_name": f"{stem}_review_start_used.png",

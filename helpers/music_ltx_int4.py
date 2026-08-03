@@ -82,6 +82,36 @@ def _int4_cli_path(root: Optional[Path] = None) -> Path:
     return _resolve_path(base, env_path, base / "helpers" / "ltx_int4_cli.py")
 
 
+def _int8_text_encoder_root(root: Optional[Path] = None) -> str:
+    base = Path(root or _project_root()).resolve()
+    candidates = [
+        base / "models" / "int8",
+        base / "models" / "ltx23_int8",
+    ]
+    for candidate in candidates:
+        try:
+            c = candidate.expanduser().resolve()
+        except Exception:
+            c = candidate.expanduser()
+        if (c / "text_encoder" / "config.json").is_file():
+            return str((c / "text_encoder").resolve())
+        if c.name.lower() == "text_encoder" and (c / "config.json").is_file():
+            return str(c)
+    return ""
+
+
+def _use_external_int8_text_encoder(extra: Dict[str, Any]) -> bool:
+    for key in ("ltx_use_int8_text_encoder", "use_int8_text_encoder"):
+        value = extra.get(key)
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            continue
+        if str(value).strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
 def _base_bridge_path(root: Optional[Path] = None) -> Path:
     base = Path(root or _project_root()).resolve()
     return base / "helpers" / "clip2ltx_cli.py"
@@ -253,14 +283,38 @@ def _build_int4_args(
     audio_path: str,
     seed: Optional[int],
     lora_file: str = "",
+    msr_enabled: bool = False,
+    msr_background: str = "",
+    msr_reference_paths: Optional[List[str]] = None,
+    msr_end_frame: str = "",
+    msr_reference_frames: int = 41,
     **_extra: Any,
 ) -> List[str]:
     base = Path(root).resolve()
 
+    # SDNQ INT4 does not implement native IC-LoRA / MSR reference-video
+    # conditioning. Never fake MSR by stacking all references as competing
+    # frame-zero images. Route MSR through the known-good native VRAM Lab
+    # IC-LoRA builder while leaving ordinary Music Clip jobs on INT4.
+    if bool(msr_enabled):
+        if not callable(_ORIGINAL_BUILD):
+            raise RuntimeError("MSR V2 needs the native LTX IC-LoRA builder, but the VRAM Lab bridge is unavailable.")
+        print("[music-ltx-int4] MSR V2 selected: routing this shot through native VRAM Lab IC-LoRA; SDNQ INT4 has no real MSR reference-video conditioning.", flush=True)
+        return list(_ORIGINAL_BUILD(
+            root=base, prompt=prompt, start_image_path=start_image_path,
+            out_path=out_path, fps=fps, frame_count=frame_count, steps=steps,
+            resolution=resolution, audio_path=audio_path, seed=seed,
+            lora_file=lora_file, msr_enabled=True,
+            msr_background=msr_background,
+            msr_reference_paths=list(msr_reference_paths or []),
+            msr_end_frame=msr_end_frame,
+            msr_reference_frames=msr_reference_frames,
+        ))
+
     # The isolated INT4 runner currently has no LoRA interface. Preserve the
     # requested feature by using the original FP16/FP8 command builder instead
     # of silently dropping the LoRA.
-    if _safe_text(lora_file):
+    if _safe_text(lora_file) and not bool(msr_enabled):
         if not callable(_ORIGINAL_BUILD):
             raise RuntimeError("LTX LoRA was requested, but the FP16/FP8 fallback bridge is unavailable.")
         return list(
@@ -319,9 +373,43 @@ def _build_int4_args(
         str(base),
     ]
 
-    image = Path(start_image_path).expanduser()
-    if image.is_file():
-        command.extend(["--i2v-image", str(image.resolve())])
+    if _use_external_int8_text_encoder(_extra):
+        external_text_encoder = _int8_text_encoder_root(base)
+        if external_text_encoder:
+            command.extend(["--external-text-encoder-root", external_text_encoder])
+
+    if bool(msr_enabled):
+        command.append("--msr-enabled")
+        if msr_background and Path(msr_background).expanduser().is_file():
+            command.extend(["--msr-background", str(Path(msr_background).expanduser().resolve())])
+        for ref in list(msr_reference_paths or [])[:4]:
+            if ref and Path(ref).expanduser().is_file():
+                command.extend(["--msr-ref", str(Path(ref).expanduser().resolve())])
+        if msr_end_frame and Path(msr_end_frame).expanduser().is_file():
+            command.extend(["--msr-end-frame", str(Path(msr_end_frame).expanduser().resolve())])
+        command.extend(["--msr-reference-frames", str(int(msr_reference_frames or 41))])
+        msr_lora = _safe_text(lora_file)
+        if not msr_lora:
+            candidates = []
+            for search_root in (base / "models" / "loras", base / "models" / "ltx23"):
+                if not search_root.is_dir():
+                    continue
+                for candidate in search_root.rglob("*.safetensors"):
+                    name = candidate.name.lower().replace("-", "_").replace(" ", "_")
+                    if "msr" in name or ("ic" in name and "lora" in name) or ("multi" in name and "ref" in name):
+                        version_match = re.search(r"(?:^|[_\.])v(\d+)(?:[_\.]|$)", name)
+                        version = int(version_match.group(1)) if version_match else 0
+                        candidates.append((version, candidate.stat().st_mtime, candidate))
+            if candidates:
+                candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                msr_lora = str(candidates[0][2])
+        if not msr_lora or not Path(msr_lora).is_file():
+            raise RuntimeError("INT4 MSR needs an MSR/IC-LoRA safetensors file under models/loras or models/ltx23, or in the selected LTX LoRA field.")
+        command.extend(["--msr-lora", str(Path(msr_lora).resolve())])
+    else:
+        image = Path(start_image_path).expanduser()
+        if image.is_file():
+            command.extend(["--i2v-image", str(image.resolve())])
     audio = Path(_safe_text(audio_path)).expanduser() if _safe_text(audio_path) else None
     if audio is not None and audio.is_file():
         command.extend(

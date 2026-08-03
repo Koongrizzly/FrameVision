@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QScrollArea,
+    QSlider,
 )
 
 
@@ -466,6 +467,124 @@ class Krea2Widget(QWidget):
         run.addWidget(self.extra_args_edit, 4, 1)
         layout.addWidget(run_box)
 
+        lora_box = QGroupBox("LoRA")
+        lora = QGridLayout(lora_box)
+        lora.setColumnStretch(1, 1)
+
+        self.lora1_edit = QLineEdit()
+        self.lora1_edit.setPlaceholderText("Optional LoRA 1 (.safetensors, .ckpt, .pt, .gguf)")
+        self.lora1_edit.setToolTip("First optional LoRA. Its folder is passed to sd-cli and remembered after restart.")
+        lora1_browse = QPushButton("Browse")
+        lora1_browse.clicked.connect(lambda: self._browse_lora(self.lora1_edit))
+        lora1_clear = QPushButton("Clear")
+        lora1_clear.clicked.connect(self.lora1_edit.clear)
+        lora.addWidget(QLabel("LoRA 1"), 0, 0)
+        lora.addWidget(self.lora1_edit, 0, 1)
+        lora.addWidget(lora1_browse, 0, 2)
+        lora.addWidget(lora1_clear, 0, 3)
+
+        self.lora1_slider = QSlider(Qt.Horizontal)
+        self.lora1_slider.setRange(-200, 200)
+        self.lora1_slider.setValue(100)
+        self.lora1_slider.setToolTip("LoRA 1 strength from -2.00 to 2.00.")
+        self.lora1_strength = NoWheelDoubleSpinBox()
+        self.lora1_strength.setRange(-2.0, 2.0)
+        self.lora1_strength.setDecimals(2)
+        self.lora1_strength.setSingleStep(0.05)
+        self.lora1_strength.setValue(1.0)
+        self.lora1_strength.setFixedWidth(90)
+        self.lora1_strength.setToolTip("Exact LoRA 1 strength.")
+        self._connect_lora_strength(self.lora1_slider, self.lora1_strength)
+        lora.addWidget(QLabel("Strength"), 1, 0)
+        lora.addWidget(self.lora1_slider, 1, 1, 1, 2)
+        lora.addWidget(self.lora1_strength, 1, 3)
+
+        self.lora2_edit = QLineEdit()
+        self.lora2_edit.setPlaceholderText("Optional LoRA 2 (.safetensors, .ckpt, .pt, .gguf)")
+        self.lora2_edit.setToolTip("Second optional LoRA. All selected LoRAs must be stored in the same folder for sd-cli.")
+        lora2_browse = QPushButton("Browse")
+        lora2_browse.clicked.connect(lambda: self._browse_lora(self.lora2_edit))
+        lora2_clear = QPushButton("Clear")
+        lora2_clear.clicked.connect(self.lora2_edit.clear)
+        lora.addWidget(QLabel("LoRA 2"), 2, 0)
+        lora.addWidget(self.lora2_edit, 2, 1)
+        lora.addWidget(lora2_browse, 2, 2)
+        lora.addWidget(lora2_clear, 2, 3)
+
+        self.lora2_slider = QSlider(Qt.Horizontal)
+        self.lora2_slider.setRange(-200, 200)
+        self.lora2_slider.setValue(100)
+        self.lora2_slider.setToolTip("LoRA 2 strength from -2.00 to 2.00.")
+        self.lora2_strength = NoWheelDoubleSpinBox()
+        self.lora2_strength.setRange(-2.0, 2.0)
+        self.lora2_strength.setDecimals(2)
+        self.lora2_strength.setSingleStep(0.05)
+        self.lora2_strength.setValue(1.0)
+        self.lora2_strength.setFixedWidth(90)
+        self.lora2_strength.setToolTip("Exact LoRA 2 strength.")
+        self._connect_lora_strength(self.lora2_slider, self.lora2_strength)
+        lora.addWidget(QLabel("Strength"), 3, 0)
+        lora.addWidget(self.lora2_slider, 3, 1, 1, 2)
+        lora.addWidget(self.lora2_strength, 3, 3)
+
+        self.lora3_edit = QLineEdit()
+        self.lora3_edit.setPlaceholderText("Optional LoRA 3 (.safetensors, .ckpt, .pt, .gguf)")
+        self.lora3_edit.setToolTip("Third optional LoRA. All selected LoRAs must be stored in the same folder for sd-cli.")
+        lora3_browse = QPushButton("Browse")
+        lora3_browse.clicked.connect(lambda: self._browse_lora(self.lora3_edit))
+        lora3_clear = QPushButton("Clear")
+        lora3_clear.clicked.connect(self.lora3_edit.clear)
+        lora.addWidget(QLabel("LoRA 3"), 4, 0)
+        lora.addWidget(self.lora3_edit, 4, 1)
+        lora.addWidget(lora3_browse, 4, 2)
+        lora.addWidget(lora3_clear, 4, 3)
+
+        self.lora3_slider = QSlider(Qt.Horizontal)
+        self.lora3_slider.setRange(-200, 200)
+        self.lora3_slider.setValue(100)
+        self.lora3_slider.setToolTip("LoRA 3 strength from -2.00 to 2.00.")
+        self.lora3_strength = NoWheelDoubleSpinBox()
+        self.lora3_strength.setRange(-2.0, 2.0)
+        self.lora3_strength.setDecimals(2)
+        self.lora3_strength.setSingleStep(0.05)
+        self.lora3_strength.setValue(1.0)
+        self.lora3_strength.setFixedWidth(90)
+        self.lora3_strength.setToolTip("Exact LoRA 3 strength.")
+        self._connect_lora_strength(self.lora3_slider, self.lora3_strength)
+        lora.addWidget(QLabel("Strength"), 5, 0)
+        lora.addWidget(self.lora3_slider, 5, 1, 1, 2)
+        lora.addWidget(self.lora3_strength, 5, 3)
+
+        self.lora4_edit = QLineEdit()
+        self.lora4_edit.setPlaceholderText("Optional LoRA 4 (.safetensors, .ckpt, .pt, .gguf)")
+        self.lora4_edit.setToolTip("Fourth optional LoRA. All selected LoRAs must be stored in the same folder for sd-cli.")
+        lora4_browse = QPushButton("Browse")
+        lora4_browse.clicked.connect(lambda: self._browse_lora(self.lora4_edit))
+        lora4_clear = QPushButton("Clear")
+        lora4_clear.clicked.connect(self.lora4_edit.clear)
+        lora.addWidget(QLabel("LoRA 4"), 6, 0)
+        lora.addWidget(self.lora4_edit, 6, 1)
+        lora.addWidget(lora4_browse, 6, 2)
+        lora.addWidget(lora4_clear, 6, 3)
+
+        self.lora4_slider = QSlider(Qt.Horizontal)
+        self.lora4_slider.setRange(-200, 200)
+        self.lora4_slider.setValue(100)
+        self.lora4_slider.setToolTip("LoRA 4 strength from -2.00 to 2.00.")
+        self.lora4_strength = NoWheelDoubleSpinBox()
+        self.lora4_strength.setRange(-2.0, 2.0)
+        self.lora4_strength.setDecimals(2)
+        self.lora4_strength.setSingleStep(0.05)
+        self.lora4_strength.setValue(1.0)
+        self.lora4_strength.setFixedWidth(90)
+        self.lora4_strength.setToolTip("Exact LoRA 4 strength.")
+        self._connect_lora_strength(self.lora4_slider, self.lora4_strength)
+        lora.addWidget(QLabel("Strength"), 7, 0)
+        lora.addWidget(self.lora4_slider, 7, 1, 1, 2)
+        lora.addWidget(self.lora4_strength, 7, 3)
+
+        layout.addWidget(lora_box)
+
         optional_box = QGroupBox("Optional")
         opt = QGridLayout(optional_box)
         opt.setColumnStretch(1, 1)
@@ -526,6 +645,41 @@ class Krea2Widget(QWidget):
         layout.addStretch(1)
         return page
 
+    def _connect_lora_strength(self, slider: QSlider, spin: QDoubleSpinBox):
+        slider.valueChanged.connect(lambda value, target=spin: target.setValue(value / 100.0))
+        spin.valueChanged.connect(lambda value, target=slider: target.setValue(round(value * 100)))
+
+    def _browse_lora(self, target: QLineEdit):
+        remembered = str(self._settings.get("lora_last_dir", "")).strip()
+        start_dir = remembered or target.text().strip()
+        if start_dir and Path(start_dir).suffix:
+            start_dir = str(Path(start_dir).parent)
+        if not start_dir:
+            start_dir = str(self.models_dir / "loras")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select LoRA",
+            start_dir,
+            "LoRA files (*.safetensors *.ckpt *.pt *.pth *.gguf);;All files (*.*)",
+        )
+        if path:
+            target.setText(_rel(Path(path), self.app_root))
+            self._settings["lora_last_dir"] = str(Path(path).parent)
+            self._schedule_save_settings()
+
+    def _selected_loras(self) -> List[Tuple[Path, float]]:
+        selected: List[Tuple[Path, float]] = []
+        for edit, strength in (
+            (self.lora1_edit, self.lora1_strength),
+            (self.lora2_edit, self.lora2_strength),
+            (self.lora3_edit, self.lora3_strength),
+            (self.lora4_edit, self.lora4_strength),
+        ):
+            text = edit.text().strip()
+            if text:
+                selected.append((self._path_from_text(text), float(strength.value())))
+        return selected
+
     # ---------- settings / discovery ----------
     def _load_settings(self):
         self._settings = {}
@@ -554,6 +708,14 @@ class Krea2Widget(QWidget):
         self.flow_shift_spin.setValue(float(s.get("flow_shift", 1.15)))
         self.batch_spin.setValue(int(s.get("batch", 1)))
         self.strength_spin.setValue(float(s.get("strength", 0.75)))
+        self.lora1_edit.setText(str(s.get("lora1", "")))
+        self.lora1_strength.setValue(float(s.get("lora1_strength", 1.0)))
+        self.lora2_edit.setText(str(s.get("lora2", "")))
+        self.lora2_strength.setValue(float(s.get("lora2_strength", 1.0)))
+        self.lora3_edit.setText(str(s.get("lora3", "")))
+        self.lora3_strength.setValue(float(s.get("lora3_strength", 1.0)))
+        self.lora4_edit.setText(str(s.get("lora4", "")))
+        self.lora4_strength.setValue(float(s.get("lora4_strength", 1.0)))
         self.offload_chk.setChecked(bool(s.get("offload", False)))
         self.diff_fa_chk.setChecked(bool(s.get("diffusion_fa", True)))
         self.vae_tiling_chk.setChecked(bool(s.get("vae_tiling", False)))
@@ -573,7 +735,9 @@ class Krea2Widget(QWidget):
             for w in [
                 self.prompt_edit, self.negative_edit, self.size_combo, self.width_spin, self.height_spin, self.steps_spin,
                 self.seed_spin, self.cfg_spin, self.guidance_spin, self.flow_shift_spin, self.batch_spin,
-                self.init_img_edit, self.strength_spin, self.sdcli_edit, self.vae_edit, self.output_dir_edit,
+                self.init_img_edit, self.strength_spin, self.lora1_edit, self.lora1_strength,
+                self.lora2_edit, self.lora2_strength, self.lora3_edit, self.lora3_strength,
+                self.lora4_edit, self.lora4_strength, self.sdcli_edit, self.vae_edit, self.output_dir_edit,
                 self.backend_edit, self.params_backend_edit, self.extra_args_edit,
                 self.model_combo, self.llm_combo, self.sampler_combo, self.scheduler_combo,
                 self.offload_chk, self.diff_fa_chk, self.vae_tiling_chk, self.verbose_chk, self.use_queue_chk, self.disable_metadata_chk,
@@ -629,6 +793,15 @@ class Krea2Widget(QWidget):
             "flow_shift": self.flow_shift_spin.value(),
             "batch": self.batch_spin.value(),
             "strength": self.strength_spin.value(),
+            "lora1": self.lora1_edit.text().strip(),
+            "lora1_strength": self.lora1_strength.value(),
+            "lora2": self.lora2_edit.text().strip(),
+            "lora2_strength": self.lora2_strength.value(),
+            "lora3": self.lora3_edit.text().strip(),
+            "lora3_strength": self.lora3_strength.value(),
+            "lora4": self.lora4_edit.text().strip(),
+            "lora4_strength": self.lora4_strength.value(),
+            "lora_last_dir": str(self._settings.get("lora_last_dir", "")),
             "offload": self.offload_chk.isChecked(),
             "diffusion_fa": self.diff_fa_chk.isChecked(),
             "vae_tiling": self.vae_tiling_chk.isChecked(),
@@ -760,7 +933,11 @@ class Krea2Widget(QWidget):
         out_dir = self._path_from_text(self.output_dir_edit.text())
         out_dir.mkdir(parents=True, exist_ok=True)
         prompt = self.prompt_edit.toPlainText().strip()
-        name = _safe_name(prompt.splitlines()[0] if prompt else "krea2")
+        loras = self._selected_loras()
+        if loras:
+            lora_tags = "".join(f"<lora:{path.stem}:{strength:g}>" for path, strength in loras)
+            prompt = f"{prompt} {lora_tags}".strip()
+        name = _safe_name(self.prompt_edit.toPlainText().strip().splitlines()[0] if self.prompt_edit.toPlainText().strip() else "krea2")
         stamp = time.strftime("%Y%m%d_%H%M%S")
         if self.batch_spin.value() > 1:
             output_path = out_dir / f"{stamp}_{name}_%03d.png"
@@ -772,6 +949,10 @@ class Krea2Widget(QWidget):
             "--diffusion-model", str(model),
             "--llm", str(llm),
             "--vae", str(vae),
+        ]
+        if loras:
+            args += ["--lora-model-dir", str(loras[0][0].parent)]
+        args += [
             "-p", prompt,
             "--steps", str(self.steps_spin.value()),
             "--cfg-scale", str(self.cfg_spin.value()),
@@ -830,11 +1011,24 @@ class Krea2Widget(QWidget):
             ("Qwen3VL text encoder", self._selected_llm_path()),
             ("VAE", self._path_from_text(self.vae_edit.text())),
         ]
+        loras = self._selected_loras()
         missing = [f"{name}: {path}" for name, path in checks if not path.exists()]
+        missing.extend(f"LoRA: {path}" for path, _strength in loras if not path.exists())
         if missing:
             QMessageBox.warning(self, "Krea 2", "Missing file(s):\n\n" + "\n".join(missing))
             self.tabs.setCurrentIndex(1)
             return False
+        if len(loras) > 1:
+            lora_dirs = {path.parent.resolve() for path, _strength in loras}
+            if len(lora_dirs) > 1:
+                QMessageBox.warning(
+                    self,
+                    "Krea 2",
+                    "All selected LoRAs must be in the same folder.\n\n"
+                    "stable-diffusion.cpp accepts one --lora-model-dir per run.",
+                )
+                self.tabs.setCurrentIndex(1)
+                return False
         return True
 
     def _queue_enabled(self) -> bool:

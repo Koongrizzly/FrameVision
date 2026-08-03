@@ -56,6 +56,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QFrame,
     QTextEdit,
+    QAbstractItemView,
 )
 from PySide6.QtGui import QIcon, QPixmap, QDesktopServices
 from .visual_thumbs import VisualThumbManager
@@ -147,6 +148,68 @@ def _musicclip_write_json_file(path: str, data: Dict[str, Any]) -> None:
         os.replace(tmp, path)
     except Exception:
         pass
+
+
+def _musicclip_int8_text_encoder_candidate_roots(root: Optional[str] = None) -> list[Path]:
+    base = Path(str(root or _musicclip_project_root())).resolve()
+    return [
+        base / "models" / "int8",
+        base / "models" / "ltx23_int8",
+    ]
+
+
+def _musicclip_find_int8_text_encoder_root(root: Optional[str] = None) -> str:
+    for candidate in _musicclip_int8_text_encoder_candidate_roots(root):
+        try:
+            c = candidate.expanduser().resolve()
+        except Exception:
+            c = candidate.expanduser()
+        direct_cfg = c / "config.json"
+        nested_cfg = c / "text_encoder" / "config.json"
+        if direct_cfg.is_file() and c.name.lower() == "text_encoder":
+            return str(c)
+        if nested_cfg.is_file():
+            return str((c / "text_encoder").resolve())
+    return ""
+
+
+def _musicclip_int8_text_encoder_download_root(root: Optional[str] = None) -> str:
+    base = Path(str(root or _musicclip_project_root())).resolve()
+    return str((base / "models" / "int8").resolve())
+
+
+class _MusicClipInt8TextEncoderDownloadThread(QThread):
+    status = Signal(str)
+    done = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, target_root: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.target_root = str(target_root or "").strip()
+
+    def run(self) -> None:
+        try:
+            from huggingface_hub import snapshot_download
+        except Exception as exc:
+            self.failed.emit(f"huggingface_hub is not available: {type(exc).__name__}: {exc}")
+            return
+        try:
+            target_root = self.target_root or _musicclip_int8_text_encoder_download_root()
+            os.makedirs(target_root, exist_ok=True)
+            self.status.emit("Connecting to Hugging Face...")
+            snapshot_download(
+                repo_id="OzzyGT/LTX-2.3-Distilled-1.1-sdnq-dynamic-int8",
+                repo_type="model",
+                local_dir=target_root,
+                allow_patterns=["text_encoder/*"],
+                resume_download=True,
+            )
+            resolved = _musicclip_find_int8_text_encoder_root(target_root) or _musicclip_find_int8_text_encoder_root()
+            if not resolved:
+                raise RuntimeError("Download finished but text_encoder/config.json was not found.")
+            self.done.emit(str(resolved))
+        except Exception as exc:
+            self.failed.emit(f"Could not download the INT8 text encoder: {type(exc).__name__}: {exc}")
 
 
 def _musicclip_coerce_bool(value: Any, default: bool = False) -> bool:
@@ -454,6 +517,66 @@ def _musicclip_generate_krea2_start_image(payload: dict) -> dict:
         return {"ok": False, "message": "Missing Krea 2 file(s):\n" + "\n".join(missing)}
     s, paths = info["settings"], info["paths"]
     prompt = str(payload.get("image_prompt_override") or payload.get("image_prompt") or "cinematic music video start image, sharp, detailed").strip()
+
+    # Music Clip Creator owns a separate persistent Krea 2 LoRA set. Prefer an
+    # explicit job payload, then fall back to the saved music-clip settings so
+    # review/recreate paths and every LTX backend use exactly the same LoRAs.
+    krea_loras = []
+    use_krea_loras = _musicclip_bool_value(payload.get("krea2_use_loras"), False)
+    raw_loras = payload.get("krea2_loras")
+    if raw_loras is None:
+        try:
+            music_settings = json.loads(Path(_musicclip_settings_path()).read_text(encoding="utf-8"))
+        except Exception:
+            music_settings = {}
+        use_krea_loras = _musicclip_bool_value(music_settings.get("ltx/krea2_use_loras"), False)
+        raw_loras = []
+        for _idx in range(1, 5):
+            _path = str(music_settings.get(f"ltx/krea2_lora_{_idx}") or "").strip()
+            if _path:
+                raw_loras.append({"path": _path, "strength": music_settings.get(f"ltx/krea2_lora_{_idx}_strength", 1.0)})
+    if use_krea_loras and isinstance(raw_loras, list):
+        seen = set()
+        for item in raw_loras[:4]:
+            if isinstance(item, dict):
+                path_text = str(item.get("path") or "").strip()
+                strength = item.get("strength", 1.0)
+            elif isinstance(item, (list, tuple)) and item:
+                path_text = str(item[0] or "").strip()
+                strength = item[1] if len(item) > 1 else 1.0
+            else:
+                continue
+            if not path_text:
+                continue
+            lp = Path(path_text).expanduser()
+            if not lp.is_absolute():
+                lp = Path(root) / lp
+            try:
+                resolved = lp.resolve()
+            except Exception:
+                resolved = lp
+            key = os.path.normcase(str(resolved))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                strength = float(strength)
+            except Exception:
+                strength = 1.0
+            krea_loras.append((resolved, strength))
+    if krea_loras:
+        missing_loras = [str(path) for path, _strength in krea_loras if not path.is_file()]
+        if missing_loras:
+            return {"ok": False, "message": "Missing Krea 2 LoRA file(s):\n" + "\n".join(missing_loras)}
+        parent_dirs = {os.path.normcase(str(path.parent.resolve())) for path, _strength in krea_loras}
+        if len(parent_dirs) > 1:
+            return {
+                "ok": False,
+                "message": "All selected Krea 2 LoRAs must be in the same folder because stable-diffusion.cpp accepts one --lora-model-dir per run.",
+            }
+        lora_tags = "".join(f"<lora:{path.stem}:{strength:g}>" for path, strength in krea_loras)
+        prompt = f"{prompt} {lora_tags}".strip()
+
     seed = payload.get("seed", -1)
     try: seed = int(seed) if seed not in (None, "") else -1
     except Exception: seed = -1
@@ -469,7 +592,10 @@ def _musicclip_generate_krea2_start_image(payload: dict) -> dict:
     steps = int(s.get("steps", 8 if is_turbo else 30) or (8 if is_turbo else 30))
     cfg = float(s.get("cfg", 1.0 if is_turbo else 3.0) or (1.0 if is_turbo else 3.0))
     guidance = float(s.get("guidance", 3.5) or 3.5)
-    cmd = [str(paths["sd_cli"]), "--diffusion-model", str(paths["model"]), "--llm", str(paths["llm"]), "--vae", str(paths["vae"]), "-p", prompt, "--steps", str(steps), "--cfg-scale", str(cfg), "--guidance", str(guidance), "--width", str(w), "--height", str(h), "--seed", str(seed), "--batch-count", "1", "--output", str(output_path)]
+    cmd = [str(paths["sd_cli"]), "--diffusion-model", str(paths["model"]), "--llm", str(paths["llm"]), "--vae", str(paths["vae"])]
+    if krea_loras:
+        cmd += ["--lora-model-dir", str(krea_loras[0][0].parent)]
+    cmd += ["-p", prompt, "--steps", str(steps), "--cfg-scale", str(cfg), "--guidance", str(guidance), "--width", str(w), "--height", str(h), "--seed", str(seed), "--batch-count", "1", "--output", str(output_path)]
     exact_passthrough = _musicclip_bool_value(
         payload.get("exact_prompt_passthrough", payload.get("prompt_passthrough", payload.get("own_prompts_enabled", False))),
         False,
@@ -519,7 +645,7 @@ def _musicclip_generate_krea2_start_image(payload: dict) -> dict:
         return {"ok": False, "message": f"Krea 2 sd-cli finished but no output image was found: {output_path}"}
     try:
         payload_name = str(payload.get("start_image_payload_name") or f"{shot_id}_krea2_start_image_payload.json")
-        (out_dir / payload_name).write_text(json.dumps({"image_model": "krea2", "prompt": prompt, "seed": seed, "width": w, "height": h, "command": cmd, "start_image_path": start_path}, indent=2, ensure_ascii=False), encoding="utf-8")
+        (out_dir / payload_name).write_text(json.dumps({"image_model": "krea2", "prompt": prompt, "seed": seed, "width": w, "height": h, "krea2_loras": [{"path": str(path), "strength": strength} for path, strength in krea_loras], "command": cmd, "start_image_path": start_path}, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception: pass
     return {"ok": True, "start_image_path": start_path, "seed": seed, "image_model": "krea2", "message": "Krea 2 start image ready."}
 
@@ -983,14 +1109,16 @@ def _musicclip_ltx_hard_cap_seconds_from_payload(payload: dict) -> float:
     has_vramlab_limit = backend in {"int4", "vramlab"} or settings.get("ltx_max_generation_frames") or settings.get("hard_max_ltx_shot_seconds") or settings.get("ltx_max_generation_seconds")
     if not has_vramlab_limit:
         return 0.0
+    msr_v2 = bool(settings.get("msr_enabled") or payload.get("msr_enabled") or settings.get("use_msr") or payload.get("use_msr"))
+    fallback_cap = 15.0 if msr_v2 else 10.0
     for key in ("hard_max_ltx_shot_seconds", "ltx_max_generation_seconds", "max_ltx_shot_seconds"):
         try:
             v = float(settings.get(key) or payload.get(key) or 0.0)
             if v > 0.05:
-                return max(0.5, min(10.0, v))
+                return max(0.5, min(fallback_cap, v))
         except Exception:
             pass
-    return 10.0
+    return fallback_cap
 
 
 def _musicclip_ltx_shot_list_ref(plan: dict):
@@ -1100,6 +1228,306 @@ def _musicclip_bool_value(value: Any, default: bool = False) -> bool:
         return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
     except Exception:
         return bool(default)
+
+
+def _musicclip_parse_location_overrides(value: Any) -> list[str]:
+    try:
+        raw = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    except Exception:
+        raw = ""
+    if not raw.strip():
+        return []
+    parts = re.split(r"[\n,;|]+", raw)
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        item = re.sub(r"\s+", " ", str(part or "").strip(" \t-–—"))
+        if not item:
+            continue
+        key = item.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(item)
+    return cleaned
+
+
+def _musicclip_msr_location_override_list(payload: dict | None = None, plan_data: dict | None = None) -> list[str]:
+    src_payload = dict(payload or {})
+    direct = src_payload.get("msr_user_locations")
+    if isinstance(direct, list):
+        joined = "\n".join(str(x or "") for x in direct)
+        parsed = _musicclip_parse_location_overrides(joined)
+        if parsed:
+            return parsed
+    for key in ("locations_world", "msr_locations_world", "location_override_text"):
+        parsed = _musicclip_parse_location_overrides(src_payload.get(key))
+        if parsed:
+            return parsed
+    brief = src_payload.get("creative_brief")
+    if isinstance(brief, dict):
+        parsed = _musicclip_parse_location_overrides(brief.get("locations_world"))
+        if parsed:
+            return parsed
+    settings = src_payload.get("bridge_generation_settings")
+    if isinstance(settings, dict):
+        parsed = _musicclip_parse_location_overrides(settings.get("locations_world"))
+        if parsed:
+            return parsed
+    plan = plan_data if isinstance(plan_data, dict) else {}
+    for key in ("creative_brief", "brief"):
+        candidate = plan.get(key)
+        if isinstance(candidate, dict):
+            parsed = _musicclip_parse_location_overrides(candidate.get("locations_world"))
+            if parsed:
+                return parsed
+    parsed = _musicclip_parse_location_overrides(plan.get("locations_world"))
+    return parsed
+
+
+def _musicclip_msr_background_prompt_for_location(location: str, payload: dict | None = None, shot: dict | None = None) -> str:
+    loc = re.sub(r"\s+", " ", str(location or "").strip()) or "cinematic location"
+    src_payload = dict(payload or {})
+    brief = src_payload.get("creative_brief") if isinstance(src_payload.get("creative_brief"), dict) else {}
+    style = re.sub(r"\s+", " ", str((brief or {}).get("style_theme") or src_payload.get("style_theme") or "").strip())
+    mood = ""
+    if isinstance(shot, dict):
+        for key in ("microclip_style", "scene_role_summary", "title", "description"):
+            candidate = re.sub(r"\s+", " ", str(shot.get(key) or "").strip())
+            if candidate:
+                mood = candidate
+                break
+    bits = [
+        loc,
+        "empty location background plate for a music video",
+        "no people",
+        "no humans",
+        "no crowd",
+        "no character",
+        "no foreground subject",
+        "no large foreground objects",
+        "no text",
+        "clean composition",
+        "detailed environment",
+        "cinematic wide shot",
+    ]
+    if style:
+        bits.append(style)
+    if mood:
+        bits.append(mood)
+    return ", ".join(bit for bit in bits if bit)
+
+
+def _musicclip_result_image_path(result: dict | None) -> str:
+    data = result if isinstance(result, dict) else {}
+    for key in ("start_image_path", "image_path", "output_path", "path"):
+        candidate = str(data.get(key) or "").strip()
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    outputs = data.get("outputs")
+    if isinstance(outputs, list):
+        for item in outputs:
+            candidate = str(item or "").strip()
+            if candidate and os.path.isfile(candidate):
+                return candidate
+    return ""
+
+
+def _musicclip_apply_msr_location_override_metadata(plan_path: str, assignments: list[dict], locations: list[str]) -> None:
+    path = str(plan_path or "").strip()
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            plan = json.load(f)
+    except Exception:
+        return
+    if not isinstance(plan, dict):
+        return
+    shots, _key = _musicclip_ltx_shot_list_ref(plan)
+    if not isinstance(shots, list):
+        return
+    by_id = {str(item.get("shot_id") or "").strip(): item for item in assignments if isinstance(item, dict)}
+    for index, shot in enumerate(shots):
+        if not isinstance(shot, dict):
+            continue
+        sid = str(shot.get("id") or shot.get("shot_id") or shot.get("ltx_id") or shot.get("name") or f"LTX{index + 1:02d}").strip()
+        info = by_id.get(sid)
+        if not isinstance(info, dict):
+            continue
+        shot["framevision_msr_background_location"] = str(info.get("location") or "")
+        shot["framevision_msr_background_path"] = str(info.get("path") or "")
+        shot["framevision_msr_background_prompt"] = str(info.get("prompt") or "")
+    plan["framevision_msr_location_overrides"] = list(locations or [])
+    plan["framevision_msr_background_assignments"] = assignments
+    _musicclip_write_json_file(path, plan)
+    _musicclip_update_msr_background_review_state(path, assignments)
+
+
+
+def _musicclip_update_msr_background_review_state(plan_path: str, assignments: list[dict]) -> None:
+    """Keep canonical/legacy review state pointed at already-created MSR backgrounds."""
+    try:
+        pp = Path(str(plan_path or "")).expanduser().resolve()
+    except Exception:
+        return
+    normalized: list[tuple[str, str, str, str]] = []
+    for item in assignments or []:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("shot_id") or "").strip()
+        path = str(item.get("path") or "").strip()
+        if sid and path and os.path.isfile(path):
+            normalized.append((sid, path, str(item.get("location") or ""), str(item.get("prompt") or "")))
+    if not normalized:
+        return
+    candidates = [
+        pp.parent / "musicclip_ltx_review_state.json",
+        pp.parent / "ltx_review_current" / "ltx_review_state.json",
+    ]
+    for state_path in candidates:
+        try:
+            if state_path.is_file():
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if not isinstance(state, dict):
+                    state = {}
+            else:
+                state = {}
+            state.setdefault("shots", {})
+            if not isinstance(state.get("shots"), dict):
+                state["shots"] = {}
+            for sid, image_path, location, prompt in normalized:
+                row = state["shots"].setdefault(sid, {})
+                if not isinstance(row, dict):
+                    row = {}
+                    state["shots"][sid] = row
+                clip_ready = False
+                for key in ("current_clip_path", "clip_path", "sync_clip_path", "ltx_clip_path", "current_raw_clip_path"):
+                    candidate = str(row.get(key) or "").strip()
+                    if candidate and os.path.isfile(candidate):
+                        clip_ready = True
+                        break
+                row.update({
+                    "current_start_image_path": image_path,
+                    "start_image_path": image_path,
+                    "existing_start_image_path": image_path,
+                    "image_path": image_path,
+                    "image_ready": True,
+                    "clip_ready": clip_ready,
+                    "image_mode": "msr",
+                    "image_model": "msr",
+                    "source_image_model": "msr_background",
+                    "msr_background_location": location,
+                    "image_prompt": prompt or row.get("image_prompt") or "",
+                    "status": "Ready" if clip_ready else "Needs clip",
+                })
+            state["director_plan_path"] = str(pp)
+            state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            _musicclip_write_json_atomic(state_path, state)
+        except Exception:
+            pass
+
+def _musicclip_prepare_msr_location_override_backgrounds(mod: Any, payload: dict | None) -> dict:
+    src = dict(payload or {})
+    if not _musicclip_bool_value(src.get("msr_enabled") or src.get("use_msr")):
+        return {"ok": True, "changed": False, "payload": src, "message": "MSR disabled."}
+    if not _musicclip_bool_value(src.get("msr_automate_backgrounds")):
+        return {"ok": True, "changed": False, "payload": src, "message": "MSR automation disabled."}
+    plan_path = _musicclip_own_prompt_plan_path(src)
+    if not plan_path:
+        return {"ok": True, "changed": False, "payload": src, "message": "No LTX director plan path was available for MSR location overrides."}
+    try:
+        with open(plan_path, "r", encoding="utf-8") as f:
+            plan = json.load(f)
+    except Exception as exc:
+        return {"ok": False, "changed": False, "payload": src, "message": f"Could not read the LTX director plan for MSR location overrides: {exc}"}
+    if not isinstance(plan, dict):
+        return {"ok": False, "changed": False, "payload": src, "message": "The LTX director plan for MSR location overrides is not valid JSON."}
+    locations = _musicclip_msr_location_override_list(src, plan)
+    if not locations:
+        return {"ok": True, "changed": False, "payload": src, "message": "No user locations supplied; keep the default MSR automated backgrounds."}
+    shots, _key = _musicclip_ltx_shot_list_ref(plan)
+    if not isinstance(shots, list) or not shots:
+        return {"ok": False, "changed": False, "payload": src, "message": "No shots were found in the LTX director plan for MSR location overrides."}
+    generate_fn = getattr(mod, "generate_ltx_start_image_for_shot", None)
+    if not callable(generate_fn):
+        return {"ok": False, "changed": False, "payload": src, "message": "The current LTX bridge cannot generate automated MSR backgrounds."}
+
+    prepared = dict(src)
+    prepared["msr_user_locations"] = list(locations)
+    automation_model = str(prepared.get("msr_automation_image_model") or prepared.get("image_model") or prepared.get("image_mode") or "z_image").strip() or "z_image"
+    bg_dir = Path(plan_path).resolve().parent / "ltx_msr_auto_backgrounds"
+    bg_dir.mkdir(parents=True, exist_ok=True)
+    assignments: list[dict] = []
+    generated_paths: list[str] = []
+    use_end_auto = _musicclip_bool_value(prepared.get("msr_use_end_frames")) and bool(list(prepared.get("msr_transparent_character_paths") or []))
+
+    for index, shot in enumerate(shots):
+        if not isinstance(shot, dict):
+            continue
+        sid = str(shot.get("id") or shot.get("shot_id") or shot.get("ltx_id") or shot.get("name") or f"LTX{index + 1:02d}").strip() or f"LTX{index + 1:02d}"
+        safe_sid = re.sub(r"[^A-Za-z0-9_.-]+", "_", sid).strip("._") or f"LTX{index + 1:02d}"
+        location = locations[index % len(locations)]
+        prompt = _musicclip_msr_background_prompt_for_location(location, prepared, shot)
+        existing_path = str(shot.get("framevision_msr_background_path") or "").strip()
+        existing_location = str(shot.get("framevision_msr_background_location") or "").strip()
+        if existing_path and os.path.isfile(existing_path) and existing_location.casefold() == location.casefold():
+            generated_paths.append(existing_path)
+            assignments.append({"shot_id": sid, "location": location, "prompt": prompt, "path": existing_path})
+            continue
+        request = dict(prepared)
+        request.update({
+            "shot_id": sid,
+            "image_mode": automation_model,
+            "image_model": automation_model,
+            "image_prompt_override": prompt,
+            "image_prompt": prompt,
+            "prompt": prompt,
+            "msr_enabled": False,
+            "use_msr": False,
+            "msr_automate_backgrounds": False,
+            "output_dir": str(bg_dir),
+            "start_image_name": f"{safe_sid}_msr_background.png",
+            "start_image_payload_name": f"{safe_sid}_msr_background_payload.json",
+            "start_image_log_name": f"{safe_sid}_msr_background.log.txt",
+            "character_reference": {"enabled": False, "reference_mode": False, "character_reference_sheets": {}},
+        })
+        result = generate_fn(request)
+        if not isinstance(result, dict) or not bool(result.get("ok")):
+            return {
+                "ok": False,
+                "changed": False,
+                "payload": src,
+                "message": str((result or {}).get("message") or f"Could not create the MSR background for {sid} ({location})."),
+            }
+        image_path = _musicclip_result_image_path(result)
+        if not image_path:
+            return {
+                "ok": False,
+                "changed": False,
+                "payload": src,
+                "message": f"The automated MSR background for {sid} was created, but no output image path was returned.",
+            }
+        generated_paths.append(image_path)
+        assignments.append({"shot_id": sid, "location": location, "prompt": prompt, "path": image_path})
+
+    prepared["msr_background_paths"] = list(generated_paths)
+    prepared["msr_background_mode"] = "sequence"
+    prepared["msr_pre_generated_backgrounds"] = True
+    prepared["msr_skip_background_automation"] = True
+    if not use_end_auto:
+        prepared["msr_automate_backgrounds"] = False
+    _musicclip_apply_msr_location_override_metadata(plan_path, assignments, locations)
+    return {
+        "ok": True,
+        "changed": True,
+        "payload": prepared,
+        "generated_paths": generated_paths,
+        "locations": locations,
+        "assignments": assignments,
+        "message": f"Prepared {len(generated_paths)} MSR background(s) from {len(locations)} user location(s).",
+    }
 
 
 def _musicclip_own_prompt_plan_path(payload: dict) -> str:
@@ -1456,20 +1884,23 @@ def _musicclip_ltx_raw_padding_settings_from_payload(payload: dict) -> tuple[flo
     backend = str(settings.get("ltx_backend") or payload.get("ltx_backend") or payload.get("generation_backend") or "").strip().lower()
     if backend not in {"int4", "vramlab"} and not (settings.get("ltx_raw_generation_seconds") or payload.get("ltx_raw_generation_seconds")):
         return 0.0, 0, 0.0
+    msr_v2 = bool(settings.get("msr_enabled") or payload.get("msr_enabled") or settings.get("use_msr") or payload.get("use_msr"))
+    default_raw_seconds = 16.0 if msr_v2 else 11.0
+    default_raw_frames = 385 if msr_v2 else 265
     try:
-        raw_seconds = float(settings.get("ltx_raw_generation_seconds") or payload.get("ltx_raw_generation_seconds") or 11.0)
+        raw_seconds = float(settings.get("ltx_raw_generation_seconds") or payload.get("ltx_raw_generation_seconds") or default_raw_seconds)
     except Exception:
-        raw_seconds = 11.0
+        raw_seconds = default_raw_seconds
     try:
-        raw_frames = int(settings.get("ltx_raw_generation_frames") or payload.get("ltx_raw_generation_frames") or 265)
+        raw_frames = int(settings.get("ltx_raw_generation_frames") or payload.get("ltx_raw_generation_frames") or default_raw_frames)
     except Exception:
-        raw_frames = 265
+        raw_frames = default_raw_frames
     try:
         pad_seconds = float(settings.get("ltx_generation_tail_padding_seconds") or payload.get("ltx_generation_tail_padding_seconds") or 0.5)
     except Exception:
         pad_seconds = 0.5
-    raw_seconds = max(0.0, min(11.0, raw_seconds))
-    raw_frames = max(0, min(265, raw_frames))
+    raw_seconds = max(0.0, min(16.0 if msr_v2 else 11.0, raw_seconds))
+    raw_frames = max(0, min(385 if msr_v2 else 265, raw_frames))
     pad_seconds = max(0.0, min(2.0, pad_seconds))
     return raw_seconds, raw_frames, pad_seconds
 
@@ -1527,8 +1958,8 @@ def _musicclip_ltx_apply_raw_padding_to_plan_file(plan_path: str, payload: dict,
             _start, _end, dur = _musicclip_ltx_read_timing(shot)
             if dur <= 0.03:
                 continue
-            # Add up to one second of raw tail, capped at 11s/265f. For a 10s
-            # planned shot this becomes 11s/265f, but assembly/audio still see 10s.
+            # Add a small raw tail. Normal LTX is capped at 11s/265f; MSR V2
+            # may use up to 16s/385f so a 15s planned shot keeps trim breathing room.
             render_seconds = min(float(raw_seconds), max(float(dur), float(dur) + float(pad_seconds)))
             render_frames = min(int(raw_frames), _musicclip_ltx_frames_for_duration(render_seconds, max(1, fps)))
             old = (
@@ -2347,12 +2778,23 @@ def _musicclip_patch_krea2_bridge(mod):
                 result = original_create_director(payload)
                 return _musicclip_ltx_apply_sanitize_result(result, dict(payload or {}), ("ltx_director_plan_path", "director_plan_path", "plan_path"), "LTX director plan")
             setattr(mod, "create_ltx_director_plan", _create_director)
-        original_gen = getattr(mod, "generate_ltx_start_image_for_shot", None)
-        if callable(original_gen):
+        def _patch_krea_generator(target):
+            if target is None or bool(getattr(target, "_framevision_krea2_generator_patched", False)):
+                return
+            original_gen = getattr(target, "generate_ltx_start_image_for_shot", None)
+            if not callable(original_gen):
+                return
             def _gen(payload):
-                if _musicclip_krea2_is_mode(payload or {}): return _musicclip_generate_krea2_start_image(dict(payload or {}))
+                if _musicclip_krea2_is_mode(payload or {}):
+                    return _musicclip_generate_krea2_start_image(dict(payload or {}))
                 return original_gen(payload)
-            setattr(mod, "generate_ltx_start_image_for_shot", _gen)
+            setattr(target, "generate_ltx_start_image_for_shot", _gen)
+            setattr(target, "_framevision_krea2_generator_patched", True)
+
+        _patch_krea_generator(mod)
+        base_mod = getattr(mod, "_BASE", None)
+        if base_mod is not None and base_mod is not mod:
+            _patch_krea_generator(base_mod)
         original_single = getattr(mod, "run_single_ltx_shot_test", None)
         if callable(original_single):
             def _single(payload):
@@ -3265,6 +3707,9 @@ def _musicclip_patch_own_images_bridge(mod):
         if callable(original_create_director):
             def _create_director_with_own_images(payload):
                 p = dict(payload or {})
+                if _musicclip_bool_value(p.get("msr_enabled"), False):
+                    p.update({"own_images_enabled": False, "own_images_selected": False, "own_image_paths": []})
+                    return original_create_director(p)
                 result = original_create_director(p)
                 if not isinstance(result, dict) or not bool(result.get("ok")):
                     return result
@@ -3291,6 +3736,8 @@ def _musicclip_patch_own_images_bridge(mod):
         if callable(original_generate):
             def _reuse_supplied_start_image(payload):
                 p = dict(payload or {})
+                if _musicclip_bool_value(p.get("msr_enabled"), False):
+                    return original_generate(p)
                 plan_path = _musicclip_own_prompt_plan_path(p)
                 if plan_path and _musicclip_plan_uses_own_images(plan_path):
                     shot_id = str(p.get("shot_id") or "").strip()
@@ -3323,6 +3770,9 @@ def _musicclip_patch_own_images_bridge(mod):
         if callable(original_single):
             def _single_with_own_image(payload):
                 p = dict(payload or {})
+                if _musicclip_bool_value(p.get("msr_enabled"), False):
+                    p.update({"own_images_enabled": False, "own_images_selected": False, "own_image_paths": []})
+                    return original_single(p)
                 plan_path = _musicclip_own_prompt_plan_path(p)
                 if plan_path and _musicclip_plan_uses_own_images(plan_path):
                     shot_id = str(p.get("shot_id") or "").strip()
@@ -3352,6 +3802,9 @@ def _musicclip_patch_own_images_bridge(mod):
         if callable(original_run_all):
             def _run_all_with_own_images(payload):
                 p = dict(payload or {})
+                if _musicclip_bool_value(p.get("msr_enabled"), False):
+                    p.update({"own_images_enabled": False, "own_images_selected": False, "own_image_paths": [], "own_images_prepared": False})
+                    return original_run_all(p)
                 plan_path = _musicclip_own_prompt_plan_path(p)
                 own_enabled = False
                 if plan_path:
@@ -3406,6 +3859,8 @@ def _musicclip_patch_own_images_bridge(mod):
         if callable(original_load_review):
             def _load_review_with_own_images(payload):
                 p = dict(payload or {})
+                if _musicclip_bool_value(p.get("msr_enabled"), False):
+                    return original_load_review(p)
                 plan_path = _musicclip_own_prompt_plan_path(p)
                 if plan_path and _musicclip_plan_uses_own_images(plan_path):
                     _musicclip_sync_own_images_to_full_run(plan_path)
@@ -3658,10 +4113,107 @@ def _musicclip_patch_int4_vram_policy(mod):
     return mod
 
 
+def _musicclip_patch_msr_location_override_bridge(mod):
+    """Let MSR V2 reuse the user-entered Locations / world list for backgrounds."""
+    if mod is None or bool(getattr(mod, "_framevision_msr_location_override_patched", False)):
+        return mod
+    try:
+        original_create_director = getattr(mod, "create_ltx_director_plan", None)
+        if callable(original_create_director):
+            def _create_director_with_msr_location_metadata(payload):
+                result = original_create_director(payload)
+                if not isinstance(result, dict) or not bool(result.get("ok")):
+                    return result
+                try:
+                    src = dict(payload or {})
+                    if not (_musicclip_bool_value(src.get("msr_enabled") or src.get("use_msr")) and _musicclip_bool_value(src.get("msr_automate_backgrounds"))):
+                        return result
+                    plan_path = ""
+                    for key in ("ltx_director_plan_path", "director_plan_path", "plan_path"):
+                        plan_path = str(result.get(key) or "").strip()
+                        if plan_path:
+                            break
+                    if not plan_path:
+                        return result
+                    try:
+                        with open(plan_path, "r", encoding="utf-8") as f:
+                            plan = json.load(f)
+                    except Exception:
+                        plan = {}
+                    locations = _musicclip_msr_location_override_list(src, plan)
+                    if locations:
+                        assignments = []
+                        shots, _key = _musicclip_ltx_shot_list_ref(plan if isinstance(plan, dict) else {})
+                        if isinstance(shots, list):
+                            for idx, shot in enumerate(shots):
+                                if isinstance(shot, dict):
+                                    sid = str(shot.get("id") or shot.get("shot_id") or shot.get("ltx_id") or shot.get("name") or f"LTX{idx + 1:02d}").strip() or f"LTX{idx + 1:02d}"
+                                    assignments.append({"shot_id": sid, "location": locations[idx % len(locations)], "prompt": _musicclip_msr_background_prompt_for_location(locations[idx % len(locations)], src, shot), "path": ""})
+                        _musicclip_apply_msr_location_override_metadata(plan_path, assignments, locations)
+                        warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+                        warnings.append(f"MSR automated backgrounds will use {len(locations)} user location(s) from Locations / world when the full run starts.")
+                        result["warnings"] = warnings
+                except Exception:
+                    pass
+                return result
+            setattr(mod, "create_ltx_director_plan", _create_director_with_msr_location_metadata)
+
+        original_run_all = getattr(mod, "run_all_ltx_director_shots", None)
+        if callable(original_run_all):
+            def _run_all_with_msr_location_override(payload):
+                prepared_payload = dict(payload or {})
+                prep = _musicclip_prepare_msr_location_override_backgrounds(mod, prepared_payload)
+                if isinstance(prep, dict) and not bool(prep.get("ok", True)):
+                    return {"ok": False, "message": str(prep.get("message") or "MSR location override preparation failed.")}
+                if isinstance(prep, dict) and isinstance(prep.get("payload"), dict):
+                    prepared_payload = dict(prep.get("payload") or {})
+                result = original_run_all(prepared_payload)
+                if isinstance(result, dict) and bool(prep.get("changed")):
+                    warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+                    warnings.append(str(prep.get("message") or "MSR background location overrides prepared."))
+                    result["warnings"] = warnings
+                return result
+            setattr(mod, "run_all_ltx_director_shots", _run_all_with_msr_location_override)
+
+        original_single = getattr(mod, "run_single_ltx_shot_test", None)
+        if callable(original_single):
+            def _single_with_msr_location_override(payload):
+                prepared_payload = dict(payload or {})
+                prep = _musicclip_prepare_msr_location_override_backgrounds(mod, prepared_payload)
+                if isinstance(prep, dict) and bool(prep.get("changed")) and isinstance(prep.get("payload"), dict):
+                    single_payload = dict(prep.get("payload") or {})
+                    shot_id = str(single_payload.get("shot_id") or "").strip()
+                    bg_paths = list(single_payload.get("msr_background_paths") or [])
+                    if shot_id and bg_paths:
+                        plan_path = _musicclip_own_prompt_plan_path(single_payload)
+                        try:
+                            with open(plan_path, "r", encoding="utf-8") as f:
+                                plan = json.load(f)
+                            shots, _key = _musicclip_ltx_shot_list_ref(plan)
+                            if isinstance(shots, list):
+                                for idx, shot in enumerate(shots):
+                                    sid = str((shot or {}).get("id") or (shot or {}).get("shot_id") or (shot or {}).get("ltx_id") or (shot or {}).get("name") or f"LTX{idx + 1:02d}").strip() or f"LTX{idx + 1:02d}"
+                                    if sid == shot_id:
+                                        single_payload["msr_background_paths"] = [bg_paths[idx % len(bg_paths)]]
+                                        break
+                        except Exception:
+                            pass
+                    prepared_payload = single_payload
+                elif isinstance(prep, dict) and not bool(prep.get("ok", True)):
+                    return {"ok": False, "message": str(prep.get("message") or "MSR location override preparation failed.")}
+                return original_single(prepared_payload)
+            setattr(mod, "run_single_ltx_shot_test", _single_with_msr_location_override)
+
+        setattr(mod, "_framevision_msr_location_override_patched", True)
+    except Exception:
+        pass
+    return mod
+
+
 def _load_musicclip_planner_bridge():
     # Original/Wan2GP bridge. Keep this separate so the option can hide again
     # when this file is removed.
-    return _musicclip_patch_own_images_bridge(_musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("musicclip_planner_bridge.py", "_framevision_musicclip_planner_bridge")))))
+    return _musicclip_patch_msr_location_override_bridge(_musicclip_patch_own_images_bridge(_musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(_load_musicclip_bridge_file("musicclip_planner_bridge.py", "_framevision_musicclip_planner_bridge"))))))
 
 
 def _musicclip_patch_vramlab_fp16_checkpoint_guard(mod):
@@ -3726,7 +4278,7 @@ def _load_clip2ltx_bridge():
     # that calls helpers/ltx23_vram_lab_cli.py directly.
     bridge = _load_musicclip_bridge_file("clip2ltx_cli.py", "_framevision_clip2ltx_bridge")
     bridge = _musicclip_patch_vramlab_fp16_checkpoint_guard(bridge)
-    return _musicclip_patch_own_images_bridge(_musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(bridge))))
+    return _musicclip_patch_msr_location_override_bridge(_musicclip_patch_own_images_bridge(_musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(bridge)))))
 
 
 def _load_music_ltx_int4_bridge():
@@ -3734,7 +4286,7 @@ def _load_music_ltx_int4_bridge():
     # routes only the generation command to helpers/ltx_int4_cli.py.
     bridge = _load_musicclip_bridge_file("music_ltx_int4.py", "_framevision_music_ltx_int4_bridge")
     bridge = _musicclip_patch_int4_vram_policy(bridge)
-    return _musicclip_patch_own_images_bridge(_musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(bridge))))
+    return _musicclip_patch_msr_location_override_bridge(_musicclip_patch_own_images_bridge(_musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(bridge)))))
 
 
 def _musicclip_default_llama_runner() -> str:
@@ -13848,6 +14400,10 @@ class AutoMusicSyncWidget(QWidget):
         self.edit_ltx_single_lora_json = None
         self.btn_browse_ltx_single_lora_json = None
         self.spin_ltx_single_lora_multiplier = None
+        self.check_krea2_use_loras = None
+        self.krea2_lora_edits = []
+        self.krea2_lora_browse_buttons = []
+        self.krea2_lora_strength_spins = []
         self.btn_test_ltx_single_shot = None
         self.edit_ltx_audio = None
         self.btn_browse_ltx_audio = None
@@ -13891,6 +14447,47 @@ class AutoMusicSyncWidget(QWidget):
         self._ltx_review_loading = False
         self._ltx_review_busy = False
         self._ltx_review_selected_shot_id = ""
+        self.check_ltx_use_msr = None
+        self.ltx_section_msr = None
+        self.list_ltx_msr_backgrounds = None
+        self.list_ltx_msr_references = None
+        self.check_ltx_msr_use_reference_pool = None
+        self.label_ltx_msr_reference_pool_info = None
+        self.list_ltx_msr_reference_packs = None
+        self.btn_ltx_msr_add_reference_pack = None
+        self.btn_ltx_msr_ref_pack_up = None
+        self.btn_ltx_msr_ref_pack_down = None
+        self.btn_ltx_msr_ref_pack_remove = None
+        self.btn_ltx_msr_ref_pack_clear = None
+        self.check_ltx_msr_reference_pool_first_clip_default = None
+        self.check_ltx_msr_automate_backgrounds = None
+        self.check_ltx_msr_enhance_prompts = None
+        self.label_ltx_msr_automation_info = None
+        self.list_ltx_msr_transparent_characters = None
+        self.btn_ltx_msr_add_transparent_characters = None
+        self.btn_ltx_msr_transparent_remove = None
+        self.btn_ltx_msr_transparent_clear = None
+        self.check_ltx_msr_use_end_frames = None
+        self.label_ltx_msr_end_frames_info = None
+        self.list_ltx_msr_end_frames = None
+        self.btn_ltx_msr_add_end_frames = None
+        self.btn_ltx_msr_end_up = None
+        self.btn_ltx_msr_end_down = None
+        self.btn_ltx_msr_end_remove = None
+        self.btn_ltx_msr_end_clear = None
+        self.combo_ltx_msr_background_mode = None
+        self.spin_ltx_msr_reference_frames = None
+        self.check_ltx_msr_remove_backgrounds = None
+        self.label_ltx_msr_status = None
+        self._ltx_backend_before_msr = ""
+        self.row_ltx_int8_text_encoder = None
+        self.check_ltx_use_int8_text_encoder = None
+        self.label_ltx_use_int8_text_encoder = None
+        self.btn_ltx_download_int8_text_encoder = None
+        self.label_ltx_int8_text_encoder_status = None
+        self._ltx_int8_text_encoder_download_thread = None
+        self._ltx_int8_text_encoder_download_timer = None
+        self._ltx_int8_text_encoder_download_phase = 0
         if self._has_any_ltx_bridge() and ltx_workflow_main is not None:
             self.box_planner_bridge = QGroupBox("Planner Bridge / LTX workflow", page_ltx_workflow)
             bridge_lay = QVBoxLayout(self.box_planner_bridge)
@@ -13970,6 +14567,7 @@ class AutoMusicSyncWidget(QWidget):
             self.ltx_section_music_track, ltx_music_lay = _make_ltx_section("Music track", expanded=True)
             self.ltx_section_idea, ltx_idea_lay = _make_ltx_section("Idea / project setup", expanded=True)
             self.ltx_section_own_images, ltx_own_images_lay = _make_ltx_section("Use own images", expanded=False)
+            self.ltx_section_msr, ltx_msr_lay = _make_ltx_section("MSR reference workflow", expanded=False)
             self.ltx_section_reference_images, ltx_ref_lay = _make_ltx_section("Reference image section", expanded=False)
             self.ltx_section_videoclip_settings, ltx_video_lay = _make_ltx_section("Effects and Loras", expanded=False)
             self.ltx_section_lyrics_lipsync, ltx_lipsync_lay = _make_ltx_section("Lyrics / lipsync", expanded=False)
@@ -14023,13 +14621,41 @@ class AutoMusicSyncWidget(QWidget):
             backend_form.setSpacing(6)
             self.combo_ltx_generation_backend = QComboBox(self.ltx_section_idea)
             self.combo_ltx_generation_backend.setToolTip(
-                "Choose which backend generates the LTX clips for this Music Clip Creator workflow. "
-                "LTX INT4 is preferred when helpers/music_ltx_int4.py, helpers/ltx_int4_cli.py, the .ltx23 environment, "
-                "and models/ltx23_int4 are complete. FP16/FP8 remains available through helpers/clip2ltx_cli.py and "
-                "helpers/ltx23_vram_lab_cli.py. Wan2GP is shown only when its bridge and a valid Wan2GP/wgp.py are found."
+                "Choose which installed LTX backend generates the clips for this Music Clip Creator workflow."
             )
             backend_form.addRow("LTX Music Workflow:", self.combo_ltx_generation_backend)
             ltx_idea_lay.addLayout(backend_form)
+
+            self.check_ltx_use_msr = QCheckBox("Use MSR V2 reference workflow", self.ltx_section_idea)
+            self.check_ltx_use_msr.setToolTip(
+                "Use the LTX 2.3 MSR V2 reference workflow with the currently selected LTX backend. "
+                "The first reference is the selected background, followed by the fixed subject/object references."
+            )
+            ltx_idea_lay.addWidget(self.check_ltx_use_msr)
+
+            self.row_ltx_int8_text_encoder = QWidget(self.ltx_section_idea)
+            row_ltx_int8_wrap = QVBoxLayout(self.row_ltx_int8_text_encoder)
+            row_ltx_int8_wrap.setContentsMargins(20, 0, 0, 0)
+            row_ltx_int8_wrap.setSpacing(2)
+            self.check_ltx_use_int8_text_encoder = QCheckBox("Use INT8 text encoder", self.row_ltx_int8_text_encoder)
+            self.check_ltx_use_int8_text_encoder.setToolTip("Only for the LTX INT4 music workflow. Uses an external SDNQ INT8 text encoder for prompt encoding only.")
+            row_ltx_int8_wrap.addWidget(self.check_ltx_use_int8_text_encoder)
+            self.label_ltx_use_int8_text_encoder = QLabel("(little slower, needs more vram, gives better results)", self.row_ltx_int8_text_encoder)
+            self.label_ltx_use_int8_text_encoder.setStyleSheet("color: #8a8a8a;")
+            self.label_ltx_use_int8_text_encoder.setWordWrap(True)
+            row_ltx_int8_wrap.addWidget(self.label_ltx_use_int8_text_encoder)
+            row_ltx_int8_actions = QHBoxLayout()
+            row_ltx_int8_actions.setContentsMargins(0, 0, 0, 0)
+            row_ltx_int8_actions.setSpacing(6)
+            self.btn_ltx_download_int8_text_encoder = QPushButton("Download INT8 text encoder", self.row_ltx_int8_text_encoder)
+            self.btn_ltx_download_int8_text_encoder.setToolTip("Download only the INT8 text_encoder folder into models/int8 so the Music Clip Creator can use it with INT4.")
+            row_ltx_int8_actions.addWidget(self.btn_ltx_download_int8_text_encoder)
+            self.label_ltx_int8_text_encoder_status = QLabel("", self.row_ltx_int8_text_encoder)
+            self.label_ltx_int8_text_encoder_status.setWordWrap(True)
+            self.label_ltx_int8_text_encoder_status.setStyleSheet("color: #8a8a8a;")
+            row_ltx_int8_actions.addWidget(self.label_ltx_int8_text_encoder_status, 1)
+            row_ltx_int8_wrap.addLayout(row_ltx_int8_actions)
+            ltx_idea_lay.addWidget(self.row_ltx_int8_text_encoder)
 
             row_ltx_queue_mode = QHBoxLayout()
             row_ltx_queue_mode.setContentsMargins(0, 0, 0, 0)
@@ -14048,9 +14674,19 @@ class AutoMusicSyncWidget(QWidget):
             try:
                 self.combo_ltx_generation_backend.currentIndexChanged.connect(lambda _i: self._apply_ltx_backend_duration_limits())
                 self.combo_ltx_generation_backend.currentIndexChanged.connect(lambda _i: self._save_settings())
+                self.combo_ltx_generation_backend.currentIndexChanged.connect(lambda _i: self._update_ltx_int8_text_encoder_ui())
+            except Exception:
+                pass
+            try:
+                if getattr(self, "check_ltx_use_int8_text_encoder", None) is not None:
+                    self.check_ltx_use_int8_text_encoder.toggled.connect(lambda _v: self._update_ltx_int8_text_encoder_ui())
+                    self.check_ltx_use_int8_text_encoder.toggled.connect(lambda _v: self._save_settings())
+                if getattr(self, "btn_ltx_download_int8_text_encoder", None) is not None:
+                    self.btn_ltx_download_int8_text_encoder.clicked.connect(self._download_ltx_int8_text_encoder)
             except Exception:
                 pass
             self._apply_ltx_backend_duration_limits()
+            self._update_ltx_int8_text_encoder_ui()
 
             bridge_form = QFormLayout()
             bridge_form.setContentsMargins(0, 0, 0, 0)
@@ -14211,6 +14847,193 @@ class AutoMusicSyncWidget(QWidget):
             self.label_ltx_own_images_status.setStyleSheet("color: #8a8a8a;")
             ltx_own_images_lay.addWidget(self.label_ltx_own_images_status)
             bridge_lay.addWidget(self.ltx_section_own_images)
+
+            msr_credit = QLabel(
+                "LTX 2.3 MSR V2 / LiconStudio Multiple Subject Reference workflow, executed through Wan2GP. "
+                "For every shot FrameVision packs the chosen background first, then the subject/object references.",
+                self.ltx_section_msr,
+            )
+            msr_credit.setWordWrap(True)
+            ltx_msr_lay.addWidget(msr_credit)
+
+            self.check_ltx_msr_automate_backgrounds = QCheckBox("Automate background & end frames", self.ltx_section_msr)
+            self.check_ltx_msr_automate_backgrounds.setChecked(False)
+            self.check_ltx_msr_automate_backgrounds.setToolTip(
+                "After the final shot list is ready, generate one empty location background per shot with the selected image model. "
+                "When matching end frames are enabled, transparent character PNGs are flattened over each generated background automatically."
+            )
+            ltx_msr_lay.addWidget(self.check_ltx_msr_automate_backgrounds)
+
+            self.check_ltx_msr_enhance_prompts = QCheckBox("Enhance prompts with Qwen3-VL", self.ltx_section_msr)
+            self.check_ltx_msr_enhance_prompts.setChecked(False)
+            self.check_ltx_msr_enhance_prompts.setToolTip(
+                "After automated backgrounds/end frames are ready, Qwen3-VL reads both existing prompts, "
+                "the matching background, and the fixed reference image(s), then appends one grounded cinematic clip script. "
+                "The original prompt stays first. End frames are not sent to the prompt enhancer."
+            )
+            ltx_msr_lay.addWidget(self.check_ltx_msr_enhance_prompts)
+            self.label_ltx_msr_automation_info = QLabel(
+                "Automation uses the normal image-model selector and existing image settings. Background prompts are derived from each final shot and forced to contain no people or large foreground objects.",
+                self.ltx_section_msr,
+            )
+            self.label_ltx_msr_automation_info.setWordWrap(True)
+            self.label_ltx_msr_automation_info.setStyleSheet("color: #8a8a8a;")
+            ltx_msr_lay.addWidget(self.label_ltx_msr_automation_info)
+
+            msr_bg_label = QLabel("Background pool", self.ltx_section_msr)
+            msr_bg_label.setStyleSheet("font-weight: 600;")
+            ltx_msr_lay.addWidget(msr_bg_label)
+            self.list_ltx_msr_backgrounds = QListWidget(self.ltx_section_msr)
+            self.list_ltx_msr_backgrounds.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            self.list_ltx_msr_backgrounds.setIconSize(QSize(112, 72))
+            self.list_ltx_msr_backgrounds.setMinimumHeight(170)
+            self.list_ltx_msr_backgrounds.setAlternatingRowColors(True)
+            self.list_ltx_msr_backgrounds.setToolTip("Backgrounds are assigned to shots in sequence or with a shuffled unique bag. Double-click to open.")
+            ltx_msr_lay.addWidget(self.list_ltx_msr_backgrounds)
+            bg_btns = QHBoxLayout()
+            self.btn_ltx_msr_add_backgrounds = QPushButton("Add backgrounds...", self.ltx_section_msr)
+            self.btn_ltx_msr_bg_up = QPushButton("Up", self.ltx_section_msr)
+            self.btn_ltx_msr_bg_down = QPushButton("Down", self.ltx_section_msr)
+            self.btn_ltx_msr_bg_remove = QPushButton("Remove", self.ltx_section_msr)
+            self.btn_ltx_msr_bg_clear = QPushButton("Clear", self.ltx_section_msr)
+            for w in (self.btn_ltx_msr_add_backgrounds, self.btn_ltx_msr_bg_up, self.btn_ltx_msr_bg_down, self.btn_ltx_msr_bg_remove, self.btn_ltx_msr_bg_clear): bg_btns.addWidget(w)
+            bg_btns.addStretch(1)
+            ltx_msr_lay.addLayout(bg_btns)
+
+            msr_ref_label = QLabel("Fixed subject / object references (1 to 4)", self.ltx_section_msr)
+            msr_ref_label.setStyleSheet("font-weight: 600;")
+            ltx_msr_lay.addWidget(msr_ref_label)
+            self.list_ltx_msr_references = QListWidget(self.ltx_section_msr)
+            self.list_ltx_msr_references.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            self.list_ltx_msr_references.setIconSize(QSize(112, 72))
+            self.list_ltx_msr_references.setMinimumHeight(170)
+            self.list_ltx_msr_references.setAlternatingRowColors(True)
+            self.list_ltx_msr_references.setToolTip("These references stay fixed for all shots. Their order follows the background in the MSR pack.")
+            ltx_msr_lay.addWidget(self.list_ltx_msr_references)
+            ref_btns = QHBoxLayout()
+            self.btn_ltx_msr_add_refs = QPushButton("Add references...", self.ltx_section_msr)
+            self.btn_ltx_msr_ref_up = QPushButton("Up", self.ltx_section_msr)
+            self.btn_ltx_msr_ref_down = QPushButton("Down", self.ltx_section_msr)
+            self.btn_ltx_msr_ref_remove = QPushButton("Remove", self.ltx_section_msr)
+            self.btn_ltx_msr_ref_clear = QPushButton("Clear", self.ltx_section_msr)
+            for w in (self.btn_ltx_msr_add_refs, self.btn_ltx_msr_ref_up, self.btn_ltx_msr_ref_down, self.btn_ltx_msr_ref_remove, self.btn_ltx_msr_ref_clear): ref_btns.addWidget(w)
+            ref_btns.addStretch(1)
+            ltx_msr_lay.addLayout(ref_btns)
+
+            self.check_ltx_msr_use_reference_pool = QCheckBox("Use MSR shot reference pool", self.ltx_section_msr)
+            self.check_ltx_msr_use_reference_pool.setChecked(False)
+            self.check_ltx_msr_use_reference_pool.setToolTip(
+                "Use alternative MSR reference packs for individual generated shot clips. Each pool place is one coherent shot-reference pack, not a merge of several different packs. "
+                "When enabled, one pack can be used per generated shot; if there are too many packs some are skipped randomly, and if there are too few the normal fixed MSR references fill the remaining shots."
+            )
+            ltx_msr_lay.addWidget(self.check_ltx_msr_use_reference_pool)
+            self.label_ltx_msr_reference_pool_info = QLabel(
+                "Optional variation pool. Add one or more reference pack places. Each pool place can contain multiple matching reference images for one shot clip. "
+                "The pool is used per generated shot clip, not for combining several pool places into one image.",
+                self.ltx_section_msr,
+            )
+            self.label_ltx_msr_reference_pool_info.setWordWrap(True)
+            self.label_ltx_msr_reference_pool_info.setStyleSheet("color: #8a8a8a;")
+            self.label_ltx_msr_reference_pool_info.setToolTip(self.check_ltx_msr_use_reference_pool.toolTip())
+            ltx_msr_lay.addWidget(self.label_ltx_msr_reference_pool_info)
+
+            self.list_ltx_msr_reference_packs = QListWidget(self.ltx_section_msr)
+            self.list_ltx_msr_reference_packs.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            self.list_ltx_msr_reference_packs.setIconSize(QSize(112, 72))
+            self.list_ltx_msr_reference_packs.setMinimumHeight(145)
+            self.list_ltx_msr_reference_packs.setAlternatingRowColors(True)
+            self.list_ltx_msr_reference_packs.setToolTip(self.check_ltx_msr_use_reference_pool.toolTip())
+            ltx_msr_lay.addWidget(self.list_ltx_msr_reference_packs)
+            ref_pack_btns = QHBoxLayout()
+            self.btn_ltx_msr_add_reference_pack = QPushButton("Add pool place...", self.ltx_section_msr)
+            self.btn_ltx_msr_ref_pack_up = QPushButton("Up", self.ltx_section_msr)
+            self.btn_ltx_msr_ref_pack_down = QPushButton("Down", self.ltx_section_msr)
+            self.btn_ltx_msr_ref_pack_remove = QPushButton("Remove", self.ltx_section_msr)
+            self.btn_ltx_msr_ref_pack_clear = QPushButton("Clear", self.ltx_section_msr)
+            for w in (self.btn_ltx_msr_add_reference_pack, self.btn_ltx_msr_ref_pack_up, self.btn_ltx_msr_ref_pack_down, self.btn_ltx_msr_ref_pack_remove, self.btn_ltx_msr_ref_pack_clear):
+                ref_pack_btns.addWidget(w)
+            ref_pack_btns.addStretch(1)
+            ltx_msr_lay.addLayout(ref_pack_btns)
+            self.check_ltx_msr_reference_pool_first_clip_default = QCheckBox("First clip use default refs", self.ltx_section_msr)
+            self.check_ltx_msr_reference_pool_first_clip_default.setChecked(True)
+            self.check_ltx_msr_reference_pool_first_clip_default.setToolTip(
+                "Keep the first generated shot clip on the normal fixed MSR reference image(s). This avoids the randomizer starting the full video clip with another pool place when that is not wanted."
+            )
+            ltx_msr_lay.addWidget(self.check_ltx_msr_reference_pool_first_clip_default)
+
+            msr_transparent_label = QLabel("Transparent character PNG(s) for automated end frames", self.ltx_section_msr)
+            msr_transparent_label.setObjectName("label_ltx_msr_transparent_characters")
+            msr_transparent_label.setStyleSheet("font-weight: 600;")
+            ltx_msr_lay.addWidget(msr_transparent_label)
+            self.list_ltx_msr_transparent_characters = QListWidget(self.ltx_section_msr)
+            self.list_ltx_msr_transparent_characters.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            self.list_ltx_msr_transparent_characters.setIconSize(QSize(112, 72))
+            self.list_ltx_msr_transparent_characters.setMinimumHeight(120)
+            self.list_ltx_msr_transparent_characters.setToolTip("Add one or more transparent PNGs. They are assigned in stable list order and flattened over the matching generated backgrounds.")
+            ltx_msr_lay.addWidget(self.list_ltx_msr_transparent_characters)
+            transparent_btns = QHBoxLayout()
+            self.btn_ltx_msr_add_transparent_characters = QPushButton("Add transparent PNG(s)...", self.ltx_section_msr)
+            self.btn_ltx_msr_transparent_remove = QPushButton("Remove", self.ltx_section_msr)
+            self.btn_ltx_msr_transparent_clear = QPushButton("Clear", self.ltx_section_msr)
+            for w in (self.btn_ltx_msr_add_transparent_characters, self.btn_ltx_msr_transparent_remove, self.btn_ltx_msr_transparent_clear): transparent_btns.addWidget(w)
+            transparent_btns.addStretch(1)
+            ltx_msr_lay.addLayout(transparent_btns)
+
+            self.check_ltx_msr_use_end_frames = QCheckBox("Use matching end frames", self.ltx_section_msr)
+            self.check_ltx_msr_use_end_frames.setChecked(False)
+            self.check_ltx_msr_use_end_frames.setToolTip(
+                "Optional consistency anchor. Add end frames that contain the desired characters/instruments, often composited over the matching background. "
+                "Matching names such as 01.png + 01a.png or 01_background.png + 01_end.png are detected automatically. "
+                "Arbitrary filenames also work: FrameVision pairs remaining files by their stable list order and stages internal names without changing your originals."
+            )
+            ltx_msr_lay.addWidget(self.check_ltx_msr_use_end_frames)
+
+            self.label_ltx_msr_end_frames_info = QLabel(
+                "Optional: use a final frame containing the intended characters and instruments. This gives LTX a strong target to return to at the end of the shot.",
+                self.ltx_section_msr,
+            )
+            self.label_ltx_msr_end_frames_info.setWordWrap(True)
+            self.label_ltx_msr_end_frames_info.setStyleSheet("color: #8a8a8a;")
+            self.label_ltx_msr_end_frames_info.setToolTip(self.check_ltx_msr_use_end_frames.toolTip())
+            ltx_msr_lay.addWidget(self.label_ltx_msr_end_frames_info)
+
+            self.list_ltx_msr_end_frames = QListWidget(self.ltx_section_msr)
+            self.list_ltx_msr_end_frames.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            self.list_ltx_msr_end_frames.setIconSize(QSize(112, 72))
+            self.list_ltx_msr_end_frames.setMinimumHeight(150)
+            self.list_ltx_msr_end_frames.setAlternatingRowColors(True)
+            self.list_ltx_msr_end_frames.setToolTip(self.check_ltx_msr_use_end_frames.toolTip())
+            ltx_msr_lay.addWidget(self.list_ltx_msr_end_frames)
+            end_btns = QHBoxLayout()
+            self.btn_ltx_msr_add_end_frames = QPushButton("Add end frames...", self.ltx_section_msr)
+            self.btn_ltx_msr_end_up = QPushButton("Up", self.ltx_section_msr)
+            self.btn_ltx_msr_end_down = QPushButton("Down", self.ltx_section_msr)
+            self.btn_ltx_msr_end_remove = QPushButton("Remove", self.ltx_section_msr)
+            self.btn_ltx_msr_end_clear = QPushButton("Clear", self.ltx_section_msr)
+            for w in (self.btn_ltx_msr_add_end_frames, self.btn_ltx_msr_end_up, self.btn_ltx_msr_end_down, self.btn_ltx_msr_end_remove, self.btn_ltx_msr_end_clear): end_btns.addWidget(w)
+            end_btns.addStretch(1)
+            ltx_msr_lay.addLayout(end_btns)
+
+            msr_form = QFormLayout()
+            self.combo_ltx_msr_background_mode = QComboBox(self.ltx_section_msr)
+            self.combo_ltx_msr_background_mode.addItems(["Sequence", "Random (unique bag)"])
+            msr_form.addRow("Background order:", self.combo_ltx_msr_background_mode)
+            self.spin_ltx_msr_reference_frames = QSpinBox(self.ltx_section_msr)
+            self.spin_ltx_msr_reference_frames.setRange(17, 129)
+            self.spin_ltx_msr_reference_frames.setSingleStep(8)
+            self.spin_ltx_msr_reference_frames.setValue(41)
+            self.spin_ltx_msr_reference_frames.setToolTip("Wan2GP's MSR reference-video length. 41 is the model default; 65 is a useful longer setting.")
+            msr_form.addRow("MSR reference frames:", self.spin_ltx_msr_reference_frames)
+            self.check_ltx_msr_remove_backgrounds = QCheckBox("Remove backgrounds from subject/object references", self.ltx_section_msr)
+            self.check_ltx_msr_remove_backgrounds.setChecked(True)
+            msr_form.addRow("Reference cleanup:", self.check_ltx_msr_remove_backgrounds)
+            ltx_msr_lay.addLayout(msr_form)
+            self.label_ltx_msr_status = QLabel("Add at least one background and one subject/object reference.", self.ltx_section_msr)
+            self.label_ltx_msr_status.setWordWrap(True)
+            self.label_ltx_msr_status.setStyleSheet("color: #8a8a8a;")
+            ltx_msr_lay.addWidget(self.label_ltx_msr_status)
+            self.ltx_section_msr.setVisible(False)
+            bridge_lay.addWidget(self.ltx_section_msr)
 
             row_bridge_roles = QHBoxLayout()
             self.check_bridge_use_vocal_roles = QCheckBox("Use vocal/non-vocal scene roles", self.box_planner_bridge)
@@ -14586,6 +15409,46 @@ class AutoMusicSyncWidget(QWidget):
             self.spin_ltx_single_lora_multiplier.setValue(1.0)
             lora_form.addRow("LoRA multiplier:", self.spin_ltx_single_lora_multiplier)
             ltx_video_lay.addLayout(lora_form)
+
+            krea_lora_toggle_row = QHBoxLayout()
+            self.check_krea2_use_loras = QCheckBox("Use Krea 2 LoRA(s)", self.ltx_section_videoclip_settings)
+            self.check_krea2_use_loras.setChecked(False)
+            self.check_krea2_use_loras.setToolTip(
+                "Apply up to four LoRAs to Krea 2 start-image generation. "
+                "The selected files and strengths are remembered after restart and when starting a new LTX job."
+            )
+            krea_lora_toggle_row.addWidget(self.check_krea2_use_loras)
+            krea_lora_toggle_row.addStretch(1)
+            ltx_video_lay.addLayout(krea_lora_toggle_row)
+
+            self.krea2_lora_edits = []
+            self.krea2_lora_browse_buttons = []
+            self.krea2_lora_strength_spins = []
+            krea_lora_form = QFormLayout()
+            krea_lora_form.setContentsMargins(0, 0, 0, 0)
+            krea_lora_form.setSpacing(6)
+            for _idx in range(4):
+                _row = QWidget(self.ltx_section_videoclip_settings)
+                _row_lay = QHBoxLayout(_row)
+                _row_lay.setContentsMargins(0, 0, 0, 0)
+                _row_lay.setSpacing(6)
+                _edit = QLineEdit(_row)
+                _edit.setPlaceholderText("Optional Krea 2 .safetensors LoRA")
+                _strength = QDoubleSpinBox(_row)
+                _strength.setRange(-10.0, 10.0)
+                _strength.setSingleStep(0.05)
+                _strength.setDecimals(2)
+                _strength.setValue(1.0)
+                _strength.setPrefix("Strength ")
+                _browse = QPushButton("Browse", _row)
+                _row_lay.addWidget(_edit, 1)
+                _row_lay.addWidget(_strength)
+                _row_lay.addWidget(_browse)
+                krea_lora_form.addRow(f"Krea LoRA {_idx + 1}:", _row)
+                self.krea2_lora_edits.append(_edit)
+                self.krea2_lora_strength_spins.append(_strength)
+                self.krea2_lora_browse_buttons.append(_browse)
+            ltx_video_lay.addLayout(krea_lora_form)
             bridge_lay.addWidget(self.ltx_section_videoclip_settings)
 
             row_ltx_single_actions = QHBoxLayout()
@@ -16413,6 +17276,56 @@ class AutoMusicSyncWidget(QWidget):
                     _own_edit.textChanged.connect(self._update_ltx_own_prompts_ui)
                     _own_edit.textChanged.connect(self._queue_settings_save)
             self._update_ltx_own_prompts_ui()
+            if getattr(self, "check_ltx_use_msr", None) is not None:
+                self.check_ltx_use_msr.toggled.connect(lambda _v: self._update_ltx_msr_ui())
+                self.check_ltx_use_msr.toggled.connect(lambda _v: self._apply_ltx_backend_duration_limits())
+                self.check_ltx_use_msr.toggled.connect(self._queue_settings_save)
+            if getattr(self, "check_ltx_msr_automate_backgrounds", None) is not None:
+                self.check_ltx_msr_automate_backgrounds.toggled.connect(lambda _v: self._update_ltx_msr_ui())
+                self.check_ltx_msr_automate_backgrounds.toggled.connect(self._queue_settings_save)
+            if getattr(self, "check_ltx_msr_enhance_prompts", None) is not None:
+                self.check_ltx_msr_enhance_prompts.toggled.connect(self._queue_settings_save)
+            if getattr(self, "check_ltx_msr_use_reference_pool", None) is not None:
+                self.check_ltx_msr_use_reference_pool.toggled.connect(lambda _v: self._update_ltx_msr_ui())
+                self.check_ltx_msr_use_reference_pool.toggled.connect(self._queue_settings_save)
+            if getattr(self, "check_ltx_msr_reference_pool_first_clip_default", None) is not None:
+                self.check_ltx_msr_reference_pool_first_clip_default.toggled.connect(self._queue_settings_save)
+            if getattr(self, "btn_ltx_msr_add_transparent_characters", None) is not None:
+                self.btn_ltx_msr_add_transparent_characters.clicked.connect(lambda: self._ltx_msr_add_images("transparent"))
+                self.btn_ltx_msr_transparent_remove.clicked.connect(lambda: self._ltx_msr_remove_selected(self.list_ltx_msr_transparent_characters))
+                self.btn_ltx_msr_transparent_clear.clicked.connect(lambda: self._ltx_msr_clear(self.list_ltx_msr_transparent_characters))
+            if getattr(self, "check_ltx_msr_use_end_frames", None) is not None:
+                self.check_ltx_msr_use_end_frames.toggled.connect(lambda _v: self._update_ltx_msr_ui())
+                self.check_ltx_msr_use_end_frames.toggled.connect(self._queue_settings_save)
+            if getattr(self, "btn_ltx_msr_add_end_frames", None) is not None:
+                self.btn_ltx_msr_add_end_frames.clicked.connect(lambda _checked=False: self._ltx_msr_add_images("end"))
+                self.btn_ltx_msr_end_up.clicked.connect(lambda _checked=False: self._ltx_msr_move_item(self.list_ltx_msr_end_frames, -1))
+                self.btn_ltx_msr_end_down.clicked.connect(lambda _checked=False: self._ltx_msr_move_item(self.list_ltx_msr_end_frames, 1))
+                self.btn_ltx_msr_end_remove.clicked.connect(lambda _checked=False: self._ltx_msr_remove_selected(self.list_ltx_msr_end_frames))
+                self.btn_ltx_msr_end_clear.clicked.connect(lambda _checked=False: self._ltx_msr_clear(self.list_ltx_msr_end_frames))
+                self.btn_ltx_msr_add_backgrounds.clicked.connect(lambda: self._ltx_msr_add_images("background"))
+                self.btn_ltx_msr_add_refs.clicked.connect(lambda: self._ltx_msr_add_images("reference"))
+                self.btn_ltx_msr_bg_up.clicked.connect(lambda: self._ltx_msr_move_item(self.list_ltx_msr_backgrounds, -1))
+                self.btn_ltx_msr_bg_down.clicked.connect(lambda: self._ltx_msr_move_item(self.list_ltx_msr_backgrounds, 1))
+                self.btn_ltx_msr_ref_up.clicked.connect(lambda: self._ltx_msr_move_item(self.list_ltx_msr_references, -1))
+                self.btn_ltx_msr_ref_down.clicked.connect(lambda: self._ltx_msr_move_item(self.list_ltx_msr_references, 1))
+                self.btn_ltx_msr_bg_remove.clicked.connect(lambda: self._ltx_msr_remove_selected(self.list_ltx_msr_backgrounds))
+                self.btn_ltx_msr_ref_remove.clicked.connect(lambda: self._ltx_msr_remove_selected(self.list_ltx_msr_references))
+                self.btn_ltx_msr_bg_clear.clicked.connect(lambda: self._ltx_msr_clear(self.list_ltx_msr_backgrounds))
+                self.btn_ltx_msr_ref_clear.clicked.connect(lambda: self._ltx_msr_clear(self.list_ltx_msr_references))
+                if getattr(self, "btn_ltx_msr_add_reference_pack", None) is not None:
+                    self.btn_ltx_msr_add_reference_pack.clicked.connect(self._ltx_msr_add_reference_pool_pack)
+                    self.btn_ltx_msr_ref_pack_up.clicked.connect(lambda: self._ltx_msr_move_item(self.list_ltx_msr_reference_packs, -1))
+                    self.btn_ltx_msr_ref_pack_down.clicked.connect(lambda: self._ltx_msr_move_item(self.list_ltx_msr_reference_packs, 1))
+                    self.btn_ltx_msr_ref_pack_remove.clicked.connect(lambda: self._ltx_msr_remove_selected(self.list_ltx_msr_reference_packs))
+                    self.btn_ltx_msr_ref_pack_clear.clicked.connect(lambda: self._ltx_msr_clear(self.list_ltx_msr_reference_packs))
+                    self.list_ltx_msr_reference_packs.itemDoubleClicked.connect(lambda item: self._on_open_ltx_own_image_item(item))
+                self.list_ltx_msr_backgrounds.itemDoubleClicked.connect(lambda item: self._on_open_ltx_own_image_item(item))
+                self.list_ltx_msr_references.itemDoubleClicked.connect(lambda item: self._on_open_ltx_own_image_item(item))
+                self.combo_ltx_msr_background_mode.currentIndexChanged.connect(self._queue_settings_save)
+                self.spin_ltx_msr_reference_frames.valueChanged.connect(self._queue_settings_save)
+                self.check_ltx_msr_remove_backgrounds.toggled.connect(self._queue_settings_save)
+
             if getattr(self, "check_ltx_use_own_images", None) is not None:
                 self.check_ltx_use_own_images.toggled.connect(lambda _v: self._update_ltx_own_images_ui())
                 self.check_ltx_use_own_images.toggled.connect(self._queue_settings_save)
@@ -16511,6 +17424,11 @@ class AutoMusicSyncWidget(QWidget):
                 self.btn_browse_ltx_single_lora_file.clicked.connect(self._on_browse_ltx_single_lora_file_clicked)
             if getattr(self, "btn_browse_ltx_single_lora_json", None) is not None:
                 self.btn_browse_ltx_single_lora_json.clicked.connect(self._on_browse_ltx_single_lora_json_clicked)
+            for _idx, _button in enumerate(getattr(self, "krea2_lora_browse_buttons", []) or []):
+                try:
+                    _button.clicked.connect(lambda _checked=False, i=_idx: self._on_browse_krea2_lora_clicked(i))
+                except Exception:
+                    pass
             if getattr(self, "btn_refresh_ltx_previous_jobs", None) is not None:
                 self.btn_refresh_ltx_previous_jobs.clicked.connect(self._on_refresh_ltx_previous_jobs_clicked)
             if getattr(self, "btn_load_ltx_previous_job", None) is not None:
@@ -17734,12 +18652,17 @@ class AutoMusicSyncWidget(QWidget):
             target_clip_seconds = 0.0
             max_ltx = 0.0
 
+        try:
+            msr = self._ltx_msr_payload()
+        except Exception:
+            msr = {"msr_enabled": False}
+
         backend = self._current_ltx_generation_backend() if hasattr(self, "_current_ltx_generation_backend") else ""
+        msr_v2_enabled = bool(msr.get("msr_enabled"))
         if backend in {"int4", "vramlab"}:
-            # Planned/music/audio shot timing should stay just under the 10s hard
-            # render limit. Raw LTX renders still get the separate 11s/265f tail for
-            # trimming/lipsync breathing room.
-            planned_ltx_cap = 9.9
+            # Normal LTX keeps the proven 9.9s plan cap. MSR V2 is the explicit
+            # exception and may plan up to 15.0s / 361 frames at 24 fps.
+            planned_ltx_cap = 15.0 if msr_v2_enabled else 9.9
             manual_max = min(float(manual_max), planned_ltx_cap)
             if resolved_max > 0.0:
                 resolved_max = min(float(resolved_max), planned_ltx_cap)
@@ -17788,7 +18711,6 @@ class AutoMusicSyncWidget(QWidget):
                 "own_image_count": 0,
                 "own_images_signature": "",
             }
-
         return {
             "preset": preset,
             "director_preset": preset,
@@ -17805,6 +18727,7 @@ class AutoMusicSyncWidget(QWidget):
             "target_clip_seconds": float(target_clip_seconds) if target_clip_seconds > 0.0 else None,
             "scene_cut_style": scene_cut_style,
             "beat_style": scene_cut_style,
+            "locations_world": self._planner_bridge_text("edit_bridge_locations_world"),
             "smart_scene_duration_guard": bool(duration_guard),
             "smart_min_scene_len": float(manual_min),
             "smart_max_scene_mode": max_scene_mode,
@@ -17812,17 +18735,20 @@ class AutoMusicSyncWidget(QWidget):
             "smart_resolved_min_scene_len": float(resolved_min) if duration_guard else 0.0,
             "smart_resolved_max_scene_len": float(resolved_max) if duration_guard else 0.0,
             "ltx_backend": str(backend or ""),
+            "use_int8_text_encoder": bool(self._ltx_musicclip_use_int8_text_encoder_enabled()),
+            "ltx_use_int8_text_encoder": bool(self._ltx_musicclip_use_int8_text_encoder_enabled()),
+            **msr,
             "output_resolution": output_resolution,
             "output_resolution_label": str(self.combo_res.currentText() or "") if getattr(self, "combo_res", None) is not None else "",
             "ltx_resolution": ltx_resolution,
             "ltx_aspect_mode": "portrait" if ltx_portrait else "landscape",
-            # Planned/music/audio shot timing stays just below 10s. Raw LTX renders
-            # get a small extra tail for trimming/lipsync breathing room.
-            "ltx_max_generation_seconds": 10.0 if backend in {"int4", "vramlab"} else None,
-            "ltx_max_generation_frames": 241 if backend in {"int4", "vramlab"} else None,
-            "hard_max_ltx_shot_seconds": 9.9 if backend in {"int4", "vramlab"} else None,
-            "ltx_raw_generation_seconds": 11.0 if backend in {"int4", "vramlab"} else None,
-            "ltx_raw_generation_frames": 265 if backend in {"int4", "vramlab"} else None,
+            # MSR V2 is allowed 15s / 361 frames. Its raw render gets up to
+            # 16s / 385 frames for the same trim/lipsync breathing room.
+            "ltx_max_generation_seconds": (15.0 if msr_v2_enabled else 10.0) if backend in {"int4", "vramlab"} else None,
+            "ltx_max_generation_frames": (361 if msr_v2_enabled else 241) if backend in {"int4", "vramlab"} else None,
+            "hard_max_ltx_shot_seconds": (15.0 if msr_v2_enabled else 9.9) if backend in {"int4", "vramlab"} else None,
+            "ltx_raw_generation_seconds": (16.0 if msr_v2_enabled else 11.0) if backend in {"int4", "vramlab"} else None,
+            "ltx_raw_generation_frames": (385 if msr_v2_enabled else 265) if backend in {"int4", "vramlab"} else None,
             "ltx_generation_tail_padding_seconds": 0.5 if backend in {"int4", "vramlab"} else None,
             "ltx_trim_to_planned_shot_seconds": True if backend in {"int4", "vramlab"} else None,
             "timestamped_microclips_enabled": bool(getattr(self, "check_bridge_timestamped_microclips", None) and self.check_bridge_timestamped_microclips.isChecked()),
@@ -17875,7 +18801,331 @@ class AutoMusicSyncWidget(QWidget):
     def _ltx_own_images_active(self) -> bool:
         return bool(self._ltx_own_images_selected() and self._ltx_own_image_paths())
 
+    def _ltx_msr_enabled(self) -> bool:
+        try:
+            return bool(self.check_ltx_use_msr and self.check_ltx_use_msr.isChecked())
+        except Exception:
+            return False
+
+    def _ltx_msr_paths(self, widget) -> list:
+        out = []
+        if widget is None:
+            return out
+        for i in range(widget.count()):
+            item = widget.item(i)
+            path = str(item.data(Qt.UserRole) or "") if item else ""
+            if path and os.path.isfile(path):
+                out.append(os.path.abspath(path))
+        return out
+
+    def _ltx_msr_reference_pool_packs(self) -> list[list[str]]:
+        packs = []
+        widget = getattr(self, "list_ltx_msr_reference_packs", None)
+        if widget is None:
+            return packs
+        for i in range(widget.count()):
+            item = widget.item(i)
+            raw = item.data(Qt.UserRole + 1) if item is not None else []
+            vals = raw if isinstance(raw, list) else ([raw] if raw not in (None, "") else [])
+            pack = []
+            seen = set()
+            for value in vals:
+                candidate = str(value or "").strip()
+                if not candidate or not os.path.isfile(candidate):
+                    continue
+                candidate = os.path.abspath(candidate)
+                key = os.path.normcase(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                pack.append(candidate)
+            if pack:
+                packs.append(pack[:4])
+        return packs
+
+    def _ltx_msr_reference_pack_label(self, pack_paths: list[str], index: int | None = None) -> str:
+        names = [os.path.basename(str(x)) for x in list(pack_paths or []) if str(x or "").strip()]
+        prefix = f"Pool place {int(index) + 1}: " if index is not None else ""
+        if not names:
+            return prefix + "Empty"
+        shown = ", ".join(names[:2])
+        if len(names) > 2:
+            shown += f" +{len(names) - 2} more"
+        return f"{prefix}{len(names)} ref(s) · {shown}"
+
+    def _ltx_msr_add_reference_pool_pack(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(self, "Add MSR shot reference pool place", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+        paths = []
+        seen = set()
+        for path in files or []:
+            full = os.path.abspath(str(path))
+            if not os.path.isfile(full):
+                continue
+            key = os.path.normcase(full)
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(full)
+        if not paths:
+            return
+        paths = paths[:4]
+        item = QListWidgetItem(self._ltx_msr_reference_pack_label(paths, getattr(self, "list_ltx_msr_reference_packs", None).count() if getattr(self, "list_ltx_msr_reference_packs", None) is not None else None))
+        item.setData(Qt.UserRole, paths[0])
+        item.setData(Qt.UserRole + 1, list(paths))
+        item.setToolTip("This pool place contains:\n" + "\n".join(paths))
+        try:
+            item.setIcon(QIcon(paths[0]))
+        except Exception:
+            pass
+        self.list_ltx_msr_reference_packs.addItem(item)
+        self._update_ltx_msr_reference_pool_labels()
+        self._update_ltx_msr_ui()
+        self._queue_settings_save()
+
+    def _update_ltx_msr_reference_pool_labels(self) -> None:
+        widget = getattr(self, "list_ltx_msr_reference_packs", None)
+        if widget is None:
+            return
+        for row in range(widget.count()):
+            item = widget.item(row)
+            raw = item.data(Qt.UserRole + 1) if item is not None else []
+            vals = raw if isinstance(raw, list) else ([raw] if raw not in (None, "") else [])
+            pack = [os.path.abspath(str(x)) for x in vals if str(x or "").strip() and os.path.isfile(str(x))][:4]
+            if item is not None:
+                item.setText(self._ltx_msr_reference_pack_label(pack, row))
+                item.setToolTip("This pool place contains:\n" + "\n".join(pack) if pack else "Empty pool place")
+                if pack:
+                    item.setData(Qt.UserRole, pack[0])
+                    item.setData(Qt.UserRole + 1, list(pack))
+
+    def _ltx_msr_add_images(self, kind: str) -> None:
+        if kind == "transparent":
+            dialog_title = "Add transparent character PNGs"
+            file_filter = "Transparent PNG images (*.png)"
+            target = self.list_ltx_msr_transparent_characters
+            limit = 999
+        else:
+            dialog_title = "Add MSR images"
+            file_filter = "Images (*.png *.jpg *.jpeg *.webp *.bmp)"
+            if kind == "background":
+                target = self.list_ltx_msr_backgrounds
+                limit = 999
+            elif kind == "end":
+                target = self.list_ltx_msr_end_frames
+                limit = 999
+            else:
+                target = self.list_ltx_msr_references
+                limit = 4
+        files, _ = QFileDialog.getOpenFileNames(self, dialog_title, "", file_filter)
+        existing = {os.path.normcase(x) for x in self._ltx_msr_paths(target)}
+        for path in files or []:
+            if target.count() >= limit:
+                break
+            full = os.path.abspath(path)
+            if os.path.normcase(full) in existing or not os.path.isfile(full):
+                continue
+            item = QListWidgetItem(os.path.basename(full))
+            item.setData(Qt.UserRole, full)
+            try:
+                item.setIcon(QIcon(full))
+            except Exception:
+                pass
+            target.addItem(item)
+            existing.add(os.path.normcase(full))
+        self._update_ltx_msr_ui()
+        self._queue_settings_save()
+
+    def _ltx_msr_move_item(self, widget, delta: int) -> None:
+        if widget is None:
+            return
+        row = widget.currentRow()
+        new = row + int(delta)
+        if row < 0 or new < 0 or new >= widget.count():
+            return
+        item = widget.takeItem(row)
+        widget.insertItem(new, item)
+        widget.setCurrentRow(new)
+        if widget is getattr(self, "list_ltx_msr_reference_packs", None):
+            self._update_ltx_msr_reference_pool_labels()
+        self._queue_settings_save()
+
+    def _ltx_msr_remove_selected(self, widget) -> None:
+        if widget is None:
+            return
+        for item in list(widget.selectedItems()):
+            widget.takeItem(widget.row(item))
+        if widget is getattr(self, "list_ltx_msr_reference_packs", None):
+            self._update_ltx_msr_reference_pool_labels()
+        self._update_ltx_msr_ui()
+        self._queue_settings_save()
+
+    def _ltx_msr_clear(self, widget) -> None:
+        if widget is not None:
+            widget.clear()
+        if widget is getattr(self, "list_ltx_msr_reference_packs", None):
+            self._update_ltx_msr_reference_pool_labels()
+        self._update_ltx_msr_ui()
+        self._queue_settings_save()
+
+    def _update_ltx_msr_ui(self) -> None:
+        enabled = self._ltx_msr_enabled()
+        try:
+            self.ltx_section_msr.setVisible(enabled)
+            if enabled:
+                self.ltx_section_msr.setExpanded(True)
+        except Exception:
+            pass
+        # MSR V2 follows the user's selected LTX backend. Keep the selector available
+        # so INT4, FP16/FP8 VRAM Lab, and the private comparison backend can all be tested.
+        try:
+            if self.combo_ltx_generation_backend is not None:
+                self.combo_ltx_generation_backend.setEnabled(self.combo_ltx_generation_backend.count() > 0)
+        except Exception:
+            pass
+        if enabled:
+            try:
+                own_toggle = getattr(self, "check_ltx_use_own_images", None)
+                if own_toggle is not None and own_toggle.isChecked():
+                    own_toggle.blockSignals(True)
+                    own_toggle.setChecked(False)
+                    own_toggle.blockSignals(False)
+            except Exception:
+                pass
+        for attr in ("ltx_section_own_images", "ltx_section_reference_images"):
+            try:
+                w = getattr(self, attr, None)
+                if w is not None:
+                    w.setVisible(not enabled)
+            except Exception:
+                pass
+        automate = bool(enabled and getattr(self, "check_ltx_msr_automate_backgrounds", None) and self.check_ltx_msr_automate_backgrounds.isChecked())
+        # Automated MSR backgrounds intentionally re-enable only the normal image-model selector.
+        try:
+            image_combo = getattr(self, "combo_ltx_single_image_mode", None)
+            image_label = getattr(self, "label_ltx_single_image_mode_field", None)
+            if image_combo is not None:
+                image_combo.setVisible(bool(not enabled or automate))
+                image_combo.setEnabled(bool(not enabled or automate))
+            if image_label is not None:
+                image_label.setVisible(bool(not enabled or automate))
+        except Exception:
+            pass
+        # These are normal text-to-image/character-reference selectors. MSR owns
+        # visual conditioning and must not allow a hidden character bible or reference-sheet workflow to inject other outfits/characters.
+        for attr in (
+            "combo_bridge_character_source", "label_bridge_character_source_field",
+            "label_bridge_character_source_note",
+        ):
+            try:
+                w = getattr(self, attr, None)
+                if w is not None:
+                    w.setVisible(not enabled)
+                    w.setEnabled(not enabled)
+            except Exception:
+                pass
+        use_end = bool(enabled and getattr(self, "check_ltx_msr_use_end_frames", None) and self.check_ltx_msr_use_end_frames.isChecked())
+        automate = bool(enabled and getattr(self, "check_ltx_msr_automate_backgrounds", None) and self.check_ltx_msr_automate_backgrounds.isChecked())
+        pool_enabled = bool(enabled and getattr(self, "check_ltx_msr_use_reference_pool", None) and self.check_ltx_msr_use_reference_pool.isChecked())
+        for attr in (
+            "label_ltx_msr_reference_pool_info", "list_ltx_msr_reference_packs",
+            "btn_ltx_msr_add_reference_pack", "btn_ltx_msr_ref_pack_up", "btn_ltx_msr_ref_pack_down",
+            "btn_ltx_msr_ref_pack_remove", "btn_ltx_msr_ref_pack_clear", "check_ltx_msr_reference_pool_first_clip_default",
+        ):
+            try:
+                w = getattr(self, attr, None)
+                if w is not None:
+                    w.setVisible(bool(pool_enabled))
+            except Exception:
+                pass
+        for attr in (
+            "label_ltx_msr_end_frames_info", "list_ltx_msr_end_frames",
+            "btn_ltx_msr_add_end_frames", "btn_ltx_msr_end_up", "btn_ltx_msr_end_down",
+            "btn_ltx_msr_end_remove", "btn_ltx_msr_end_clear",
+        ):
+            try:
+                w = getattr(self, attr, None)
+                if w is not None:
+                    w.setVisible(bool(use_end and not automate))
+            except Exception:
+                pass
+        for attr in ("label_ltx_msr_transparent_characters", "list_ltx_msr_transparent_characters", "btn_ltx_msr_add_transparent_characters", "btn_ltx_msr_transparent_remove", "btn_ltx_msr_transparent_clear"):
+            try:
+                w = getattr(self, attr, None) if attr != "label_ltx_msr_transparent_characters" else self.ltx_section_msr.findChild(QLabel, attr)
+                if w is not None:
+                    w.setVisible(bool(use_end and automate))
+            except Exception:
+                pass
+        bg = len(self._ltx_msr_paths(self.list_ltx_msr_backgrounds))
+        refs = len(self._ltx_msr_paths(self.list_ltx_msr_references))
+        ref_pack_count = len(self._ltx_msr_reference_pool_packs()) if getattr(self, "list_ltx_msr_reference_packs", None) is not None else 0
+        transparent_count = len(self._ltx_msr_paths(self.list_ltx_msr_transparent_characters)) if getattr(self, "list_ltx_msr_transparent_characters", None) is not None else 0
+        ends = len(self._ltx_msr_paths(self.list_ltx_msr_end_frames)) if use_end else 0
+        try:
+            automate = bool(enabled and getattr(self, "check_ltx_msr_automate_backgrounds", None) and self.check_ltx_msr_automate_backgrounds.isChecked())
+            if enabled and refs and (bg or automate):
+                if automate:
+                    end_note = f" Automated end frames will use {transparent_count} transparent PNG(s)." if use_end else ""
+                    pool_note = f" Reference pool active: {ref_pack_count} pool place(s)." if pool_enabled and ref_pack_count else ""
+                    self.label_ltx_msr_status.setText(f"Ready: backgrounds will be generated for every shot before LTX starts; {refs} fixed reference(s).{end_note}{pool_note}")
+                else:
+                    end_note = f", {ends} end frame(s)" if use_end else ""
+                    pool_note = f" Reference pool active: {ref_pack_count} pool place(s)." if pool_enabled and ref_pack_count else ""
+                    self.label_ltx_msr_status.setText(f"Ready: {bg} background(s), {refs} fixed reference(s){end_note}. Each shot uses the resized background first, then references.{pool_note}")
+                self.label_ltx_msr_status.setStyleSheet("color: #7fbf7f;")
+            else:
+                needed = "Add at least one subject/object reference; automated backgrounds need no manual first background." if automate else "Add at least one background and one subject/object reference."
+                self.label_ltx_msr_status.setText(needed)
+                self.label_ltx_msr_status.setStyleSheet("color: #d79a5b;" if enabled else "color: #8a8a8a;")
+        except Exception:
+            pass
+
+    def _ltx_msr_payload(self) -> dict:
+        enabled = self._ltx_msr_enabled()
+        backgrounds = self._ltx_msr_paths(self.list_ltx_msr_backgrounds)
+        refs = self._ltx_msr_paths(self.list_ltx_msr_references)[:4]
+        end_frames = self._ltx_msr_paths(self.list_ltx_msr_end_frames)
+        use_end_frames = bool(self.check_ltx_msr_use_end_frames and self.check_ltx_msr_use_end_frames.isChecked())
+        automate = bool(self.check_ltx_msr_automate_backgrounds and self.check_ltx_msr_automate_backgrounds.isChecked())
+        transparent_paths = self._ltx_msr_paths(self.list_ltx_msr_transparent_characters) if getattr(self, "list_ltx_msr_transparent_characters", None) is not None else []
+        automation_model = str(self.combo_ltx_single_image_mode.currentData() or "z_image") if getattr(self, "combo_ltx_single_image_mode", None) is not None else "z_image"
+        if automation_model in {"existing", "qwen2511_int4"}:
+            automation_model = "z_image"
+        mode = "random" if self.combo_ltx_msr_background_mode and self.combo_ltx_msr_background_mode.currentIndex() == 1 else "sequence"
+        return {
+            "msr_enabled": bool(enabled),
+            "msr_version": 2,
+            "msr_automate_backgrounds": bool(automate),
+            "msr_enhance_prompts": bool(getattr(self, "check_ltx_msr_enhance_prompts", None) and self.check_ltx_msr_enhance_prompts.isChecked()),
+            "msr_automation_image_model": automation_model,
+            "msr_transparent_character_paths": transparent_paths,
+            "msr_background_paths": backgrounds,
+            "msr_reference_paths": refs,
+            "msr_reference_pool_enabled": bool(getattr(self, "check_ltx_msr_use_reference_pool", None) and self.check_ltx_msr_use_reference_pool.isChecked()),
+            "msr_reference_packs": self._ltx_msr_reference_pool_packs(),
+            "msr_reference_pool_first_clip_default": bool(getattr(self, "check_ltx_msr_reference_pool_first_clip_default", None) and self.check_ltx_msr_reference_pool_first_clip_default.isChecked()),
+            "msr_use_end_frames": bool(use_end_frames),
+            "msr_end_frame_paths": end_frames if use_end_frames else [],
+            "msr_background_mode": mode,
+            "msr_reference_frames": int(self.spin_ltx_msr_reference_frames.value()) if self.spin_ltx_msr_reference_frames else 41,
+            "msr_remove_reference_backgrounds": bool(self.check_ltx_msr_remove_backgrounds and self.check_ltx_msr_remove_backgrounds.isChecked()),
+            "msr_backend": self._current_ltx_generation_backend() if hasattr(self, "_current_ltx_generation_backend") else "",
+            "msr_user_locations": _musicclip_parse_location_overrides(self._planner_bridge_text("edit_bridge_locations_world")),
+            "locations_world": self._planner_bridge_text("edit_bridge_locations_world"),
+        }
+
     def _ltx_own_images_payload(self) -> dict:
+        # MSR supplies its own background-first reference pack. Hidden own-image
+        # controls must not remain logically active behind the UI.
+        if self._ltx_msr_enabled():
+            return {
+                "own_images_enabled": False,
+                "own_images_selected": False,
+                "own_image_paths": [],
+                "own_image_count": 0,
+                "own_images_signature": "",
+                "own_image_paths_authoritative": True,
+                "own_image_source": "disabled_by_msr",
+            }
         paths = self._ltx_own_image_paths()
         selected = self._ltx_own_images_selected()
         signature_parts = []
@@ -18018,7 +19268,8 @@ class AutoMusicSyncWidget(QWidget):
     def _update_ltx_own_images_ui(self) -> None:
         paths = self._ltx_own_image_paths()
         selected = self._ltx_own_images_selected()
-        active = bool(selected and paths)
+        msr_enabled = self._ltx_msr_enabled()
+        active = bool(selected and paths and not msr_enabled)
         count = len(paths)
         try:
             label = getattr(self, "label_ltx_own_images_status", None)
@@ -18047,13 +19298,13 @@ class AutoMusicSyncWidget(QWidget):
             try:
                 widget = getattr(self, attr, None)
                 if widget is not None:
-                    widget.setVisible(not active)
+                    widget.setVisible(bool(not active and not msr_enabled))
             except Exception:
                 pass
         try:
             ref_section = getattr(self, "ltx_section_reference_images", None)
             if ref_section is not None:
-                if active:
+                if active or msr_enabled:
                     ref_section.setVisible(False)
                 else:
                     source = str(self.combo_bridge_character_source.currentData() if getattr(self, "combo_bridge_character_source", None) is not None else "built_in")
@@ -18064,7 +19315,7 @@ class AutoMusicSyncWidget(QWidget):
             try:
                 widget = getattr(self, attr, None)
                 if widget is not None:
-                    widget.setVisible(not active)
+                    widget.setVisible(bool(not active and not msr_enabled))
             except Exception:
                 pass
 
@@ -18074,7 +19325,7 @@ class AutoMusicSyncWidget(QWidget):
             try:
                 widget = getattr(self, attr, None)
                 if widget is not None:
-                    widget.setVisible(not active)
+                    widget.setVisible(bool(not active and not msr_enabled))
             except Exception:
                 pass
         try:
@@ -18105,7 +19356,12 @@ class AutoMusicSyncWidget(QWidget):
         image_prompts = _musicclip_split_own_prompt_blocks(image_text)
         video_prompts = _musicclip_split_own_prompt_blocks(video_text)
         own_images_active = self._ltx_own_images_active() if hasattr(self, "_ltx_own_images_active") else False
-        if own_images_active:
+        if not enabled:
+            # Keep the text saved in the UI/settings, but never expose disabled
+            # own prompts to planning, MSR enhancement, review, or generation.
+            image_prompts = []
+            video_prompts = []
+        elif own_images_active:
             # No text-to-image model runs in this mode. Mirror the exact I2V text
             # into image fields only as a harmless bridge fallback.
             image_prompts = list(video_prompts)
@@ -18126,6 +19382,7 @@ class AutoMusicSyncWidget(QWidget):
     def _update_ltx_own_prompts_ui(self) -> None:
         enabled = self._ltx_own_prompts_enabled()
         own_images_active = self._ltx_own_images_active() if hasattr(self, "_ltx_own_images_active") else False
+        msr_enabled = self._ltx_msr_enabled() if hasattr(self, "_ltx_msr_enabled") else False
         try:
             box = getattr(self, "box_ltx_own_prompts", None)
             if box is not None:
@@ -18149,7 +19406,7 @@ class AutoMusicSyncWidget(QWidget):
             for attr in ("edit_ltx_own_image_prompts", "label_ltx_own_image_prompts_field"):
                 widget = getattr(self, attr, None)
                 if widget is not None:
-                    widget.setVisible(not own_images_active)
+                    widget.setVisible(bool(not own_images_active and not msr_enabled))
         except Exception:
             pass
         try:
@@ -19115,6 +20372,10 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
         try:
+            payload.update(self._krea2_loras_payload())
+        except Exception:
+            pass
+        try:
             llama_settings = None if payload.get("own_prompts_enabled") else self._bridge_own_llama_payload_if_enabled()
             if llama_settings:
                 payload["llama_settings"] = llama_settings
@@ -19366,6 +20627,25 @@ class AutoMusicSyncWidget(QWidget):
                 except Exception:
                     pass
                 return False
+            msr_cfg = self._ltx_msr_payload() if hasattr(self, "_ltx_msr_payload") else {"msr_enabled": False}
+            if bool(msr_cfg.get("msr_enabled")):
+                if not bool(msr_cfg.get("msr_automate_backgrounds")) and not list(msr_cfg.get("msr_background_paths") or []):
+                    msg = "MSR is enabled, but no readable background image is loaded."
+                    self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+                    try:
+                        QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+                    except Exception:
+                        pass
+                    return False
+                if not list(msr_cfg.get("msr_reference_paths") or []):
+                    msg = "MSR is enabled, but no readable subject/object reference image is loaded."
+                    self._set_planner_bridge_status(f"Planner Bridge: {msg}")
+                    try:
+                        QMessageBox.warning(self, "Planner Bridge", msg, QMessageBox.Ok)
+                    except Exception:
+                        pass
+                    return False
+                return True
             refs = self._planner_bridge_character_reference_payload() if hasattr(self, "_planner_bridge_character_reference_payload") else {}
             if isinstance(refs, dict) and refs.get("enabled"):
                 ok, label = self._find_hidream_reference_dev_model_for_ltx()
@@ -19474,6 +20754,21 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
         try:
+            payload.update(self._ltx_msr_payload())
+            if payload.get("msr_enabled"):
+                payload["image_mode"] = "msr"
+                payload["image_model"] = "msr"
+                payload["own_images_enabled"] = False
+                payload["own_images_selected"] = False
+                payload["own_image_paths"] = []
+                payload["character_reference"] = {"enabled": False, "reference_mode": False, "character_reference_sheets": {}, "reason": "msr"}
+        except Exception:
+            pass
+        try:
+            payload.update(self._krea2_loras_payload())
+        except Exception:
+            pass
+        try:
             llama_settings = None if payload.get("own_prompts_enabled") else self._bridge_own_llama_payload_if_enabled()
             if llama_settings:
                 payload["llama_settings"] = llama_settings
@@ -19506,6 +20801,24 @@ class AutoMusicSyncWidget(QWidget):
             except Exception:
                 pass
 
+    def _krea2_loras_payload(self) -> dict:
+        enabled = bool(getattr(self, "check_krea2_use_loras", None) and self.check_krea2_use_loras.isChecked())
+        items = []
+        edits = list(getattr(self, "krea2_lora_edits", []) or [])
+        spins = list(getattr(self, "krea2_lora_strength_spins", []) or [])
+        for idx in range(min(4, len(edits))):
+            try:
+                path = str(edits[idx].text() or "").strip()
+            except Exception:
+                path = ""
+            try:
+                strength = float(spins[idx].value()) if idx < len(spins) else 1.0
+            except Exception:
+                strength = 1.0
+            if path:
+                items.append({"path": path, "strength": strength})
+        return {"krea2_use_loras": bool(enabled), "krea2_loras": items}
+
     def _ltx_full_run_payload_from_current_settings(self, plan_path: str, *, assemble_after: bool = False) -> dict:
         """Build a reproducible full-run payload for direct or queued MusicClip-LTX."""
         image_combo = getattr(self, "combo_ltx_single_image_mode", None)
@@ -19524,6 +20837,9 @@ class AutoMusicSyncWidget(QWidget):
             "ltx_avoid_short_start_end": bool((getattr(self, "check_ltx_avoid_short_start_end", None) is None) or self.check_ltx_avoid_short_start_end.isChecked()),
             "character_reference": self._planner_bridge_character_reference_payload(),
             "assemble_after": bool(assemble_after),
+            "use_int8_text_encoder": bool(self._ltx_musicclip_use_int8_text_encoder_enabled()),
+            "ltx_use_int8_text_encoder": bool(self._ltx_musicclip_use_int8_text_encoder_enabled()),
+            "locations_world": self._planner_bridge_text("edit_bridge_locations_world"),
         }
         try:
             settings = self._planner_bridge_generation_settings()
@@ -19564,9 +20880,22 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
         try:
+            payload.update(self._ltx_msr_payload())
+            if payload.get("msr_enabled"):
+                payload["image_mode"] = "msr"
+                payload["image_model"] = "msr"
+                payload["own_images_enabled"] = False
+                payload["own_images_selected"] = False
+                payload["own_image_paths"] = []
+                payload["own_image_count"] = 0
+                payload["character_reference"] = {"enabled": False, "reference_mode": False, "character_reference_sheets": {}, "reason": "msr"}
+        except Exception:
+            pass
+        try:
             if str(payload.get("ltx_backend") or "").strip().lower() in {"int4", "vramlab"}:
-                payload["ltx_raw_generation_seconds"] = 11.0
-                payload["ltx_raw_generation_frames"] = 265
+                _msr_long = bool(payload.get("msr_enabled") or payload.get("use_msr"))
+                payload["ltx_raw_generation_seconds"] = 16.0 if _msr_long else 11.0
+                payload["ltx_raw_generation_frames"] = 385 if _msr_long else 265
                 payload["ltx_generation_tail_padding_seconds"] = 0.5
                 payload["ltx_trim_to_planned_shot_seconds"] = True
         except Exception:
@@ -20225,6 +21554,7 @@ class AutoMusicSyncWidget(QWidget):
 
     def _update_ltx_character_source_ui(self) -> None:
         try:
+            msr_enabled = bool(hasattr(self, "_ltx_msr_enabled") and self._ltx_msr_enabled())
             own_images_active = bool(hasattr(self, "_ltx_own_images_active") and self._ltx_own_images_active())
             source_combo = getattr(self, "combo_bridge_character_source", None)
             source = str(source_combo.currentData() if source_combo is not None else "built_in")
@@ -20238,10 +21568,11 @@ class AutoMusicSyncWidget(QWidget):
             ):
                 widget = getattr(self, attr, None)
                 if widget is not None:
-                    widget.setVisible(not own_images_active)
+                    widget.setVisible(bool(not own_images_active and not msr_enabled))
+                    widget.setEnabled(bool(not msr_enabled))
             ref_section = getattr(self, "ltx_section_reference_images", None)
             if ref_section is not None:
-                ref_section.setVisible(bool(ref_mode and not own_images_active))
+                ref_section.setVisible(bool(ref_mode and not own_images_active and not msr_enabled))
             chars = getattr(self, "edit_bridge_characters_subjects", None)
             if chars is not None:
                 chars.setPlaceholderText(
@@ -20264,7 +21595,7 @@ class AutoMusicSyncWidget(QWidget):
                 except Exception:
                     pass
             image_combo = getattr(self, "combo_ltx_single_image_mode", None)
-            if image_combo is not None and not own_images_active:
+            if image_combo is not None and not own_images_active and not msr_enabled:
                 current = str(image_combo.currentData() or "hidream")
                 wanted = [("HiDream", "hidream"), ("Qwen 2511 INT4", "qwen2511_int4")] if ref_mode else [
                     ("Use existing start image", "existing"), ("Z-Image Turbo", "z_image"), ("Krea 2", "krea2"),
@@ -20323,7 +21654,8 @@ class AutoMusicSyncWidget(QWidget):
             combo = getattr(self, "combo_ltx_single_image_mode", None)
             mode = combo.currentData() if combo is not None else "existing"
             own_images_active = bool(hasattr(self, "_ltx_own_images_active") and self._ltx_own_images_active())
-            visible = bool(not own_images_active and str(mode or "existing") == "existing")
+            msr_enabled = bool(hasattr(self, "_ltx_msr_enabled") and self._ltx_msr_enabled())
+            visible = bool(not own_images_active and not msr_enabled and str(mode or "existing") == "existing")
             row = getattr(self, "row_ltx_single_start_image", None)
             if row is not None:
                 row.setVisible(visible)
@@ -20368,6 +21700,29 @@ class AutoMusicSyncWidget(QWidget):
                 self.edit_ltx_single_lora_json.setText(path)
         except Exception as exc:
             self._set_planner_bridge_status(f"Planner Bridge: Could not select LoRA JSON: {exc}")
+
+    def _on_browse_krea2_lora_clicked(self, index: int) -> None:
+        try:
+            edits = list(getattr(self, "krea2_lora_edits", []) or [])
+            if index < 0 or index >= len(edits):
+                return
+            current = str(edits[index].text() or "").strip()
+            start_dir = os.path.dirname(current) if current else str(self._settings.get("ltx/krea2_lora_last_dir", "", str) or "")
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                f"Select Krea 2 LoRA {index + 1}",
+                start_dir,
+                "LoRA files (*.safetensors);;All files (*.*)",
+            )
+            if path:
+                edits[index].setText(path)
+                try:
+                    self._settings.set("ltx/krea2_lora_last_dir", os.path.dirname(path))
+                    self._settings.sync()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _ltx_shot_browse_text(self, shot: dict) -> str:
         try:
@@ -21335,6 +22690,14 @@ class AutoMusicSyncWidget(QWidget):
                     "own_images_enabled": True,
                     "character_reference": {"enabled": False, "mode": "disabled", "reason": "own_images"},
                 })
+            else:
+                recovered_msr = self._ltx_review_resolve_msr_job_config(plan_path)
+                if bool(recovered_msr.get("msr_enabled")):
+                    run_payload.update(recovered_msr)
+                    run_payload["image_mode"] = "msr"
+                    run_payload["image_model"] = "msr"
+                    run_payload["own_images_enabled"] = False
+                    run_payload["character_reference"] = {"enabled": False, "mode": "disabled", "reason": "msr"}
             if full_run_dir:
                 run_payload["output_dir"] = full_run_dir
             try:
@@ -21484,6 +22847,138 @@ class AutoMusicSyncWidget(QWidget):
             or getattr(self, "_planner_bridge", None)
         )
 
+    def _ltx_musicclip_use_int8_text_encoder_enabled(self) -> bool:
+        try:
+            return bool(getattr(self, "check_ltx_use_int8_text_encoder", None) and self.check_ltx_use_int8_text_encoder.isChecked())
+        except Exception:
+            return False
+
+    def _ltx_musicclip_int8_text_encoder_root(self) -> str:
+        try:
+            return _musicclip_find_int8_text_encoder_root(_musicclip_project_root())
+        except Exception:
+            return ""
+
+    def _animate_ltx_int8_text_encoder_download(self) -> None:
+        button = getattr(self, "btn_ltx_download_int8_text_encoder", None)
+        if button is None:
+            return
+        self._ltx_int8_text_encoder_download_phase = int(getattr(self, "_ltx_int8_text_encoder_download_phase", 0) or 0) + 1
+        dots = "." * (((self._ltx_int8_text_encoder_download_phase - 1) % 3) + 1)
+        button.setText(f"Downloading INT8 text encoder{dots}")
+
+    def _download_ltx_int8_text_encoder(self) -> None:
+        existing = getattr(self, "_ltx_int8_text_encoder_download_thread", None)
+        if existing is not None and getattr(existing, "isRunning", lambda: False)():
+            return
+        target_root = _musicclip_int8_text_encoder_download_root(_musicclip_project_root())
+        thread = _MusicClipInt8TextEncoderDownloadThread(target_root, self)
+        self._ltx_int8_text_encoder_download_thread = thread
+        try:
+            thread.status.connect(self._on_ltx_int8_text_encoder_download_status)
+            thread.done.connect(self._on_ltx_int8_text_encoder_download_done)
+            thread.failed.connect(self._on_ltx_int8_text_encoder_download_failed)
+        except Exception:
+            pass
+        timer = getattr(self, "_ltx_int8_text_encoder_download_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.timeout.connect(self._animate_ltx_int8_text_encoder_download)
+            self._ltx_int8_text_encoder_download_timer = timer
+        self._ltx_int8_text_encoder_download_phase = 0
+        try:
+            timer.start(350)
+        except Exception:
+            pass
+        button = getattr(self, "btn_ltx_download_int8_text_encoder", None)
+        if button is not None:
+            button.setEnabled(False)
+            button.setText("Downloading INT8 text encoder")
+        label = getattr(self, "label_ltx_int8_text_encoder_status", None)
+        if label is not None:
+            label.setStyleSheet("color: #8a8a8a;")
+            label.setText("Preparing INT8 text encoder download...")
+        thread.start()
+        self._update_ltx_int8_text_encoder_ui()
+
+    def _on_ltx_int8_text_encoder_download_status(self, message: str) -> None:
+        label = getattr(self, "label_ltx_int8_text_encoder_status", None)
+        if label is not None:
+            label.setStyleSheet("color: #8a8a8a;")
+            label.setText(str(message or ""))
+
+    def _on_ltx_int8_text_encoder_download_done(self, resolved_path: str) -> None:
+        timer = getattr(self, "_ltx_int8_text_encoder_download_timer", None)
+        if timer is not None:
+            timer.stop()
+        button = getattr(self, "btn_ltx_download_int8_text_encoder", None)
+        if button is not None:
+            button.setEnabled(True)
+            button.setText("Download INT8 text encoder")
+        label = getattr(self, "label_ltx_int8_text_encoder_status", None)
+        if label is not None:
+            label.setStyleSheet("color: #6fbf73;")
+            label.setText(f"INT8 text encoder ready: {resolved_path}")
+        try:
+            QMessageBox.information(self, "INT8 text encoder", f"Download finished.\n\nUsing: {resolved_path}")
+        except Exception:
+            pass
+        self._update_ltx_int8_text_encoder_ui()
+
+    def _on_ltx_int8_text_encoder_download_failed(self, message: str) -> None:
+        timer = getattr(self, "_ltx_int8_text_encoder_download_timer", None)
+        if timer is not None:
+            timer.stop()
+        button = getattr(self, "btn_ltx_download_int8_text_encoder", None)
+        if button is not None:
+            button.setEnabled(True)
+            button.setText("Download INT8 text encoder")
+        label = getattr(self, "label_ltx_int8_text_encoder_status", None)
+        if label is not None:
+            label.setStyleSheet("color: #d26a6a;")
+            label.setText(str(message or "Download failed."))
+        try:
+            QMessageBox.warning(self, "INT8 text encoder", str(message or "Download failed."))
+        except Exception:
+            pass
+        self._update_ltx_int8_text_encoder_ui()
+
+    def _update_ltx_int8_text_encoder_ui(self) -> None:
+        widget = getattr(self, "row_ltx_int8_text_encoder", None)
+        check = getattr(self, "check_ltx_use_int8_text_encoder", None)
+        button = getattr(self, "btn_ltx_download_int8_text_encoder", None)
+        label = getattr(self, "label_ltx_int8_text_encoder_status", None)
+        backend = ""
+        try:
+            backend = self._current_ltx_generation_backend()
+        except Exception:
+            backend = ""
+        visible = backend == "int4"
+        if widget is not None:
+            widget.setVisible(bool(visible))
+        if not visible:
+            return
+        enabled = bool(check and check.isChecked())
+        resolved = self._ltx_musicclip_int8_text_encoder_root()
+        downloading = bool(getattr(self, "_ltx_int8_text_encoder_download_thread", None) is not None and getattr(self._ltx_int8_text_encoder_download_thread, "isRunning", lambda: False)())
+        if button is not None:
+            button.setVisible(bool(enabled and not resolved))
+            button.setEnabled(not downloading)
+        if label is not None:
+            if downloading:
+                if not label.text().strip():
+                    label.setStyleSheet("color: #8a8a8a;")
+                    label.setText("Downloading INT8 text encoder...")
+            elif not enabled:
+                label.setStyleSheet("color: #8a8a8a;")
+                label.setText("")
+            elif resolved:
+                label.setStyleSheet("color: #6fbf73;")
+                label.setText(f"Using external INT8 text encoder: {resolved}")
+            else:
+                label.setStyleSheet("color: #d2a86a;")
+                label.setText("INT8 text encoder not found. Expected models/int8 or models/ltx23_int8.")
+
     def _refresh_ltx_generation_backend_choices(self) -> None:
         """Populate LTX backends and prefer a complete INT4 installation once."""
         combo = getattr(self, "combo_ltx_generation_backend", None)
@@ -21590,7 +23085,8 @@ class AutoMusicSyncWidget(QWidget):
         try:
             spin = getattr(self, "spin_smart_max_scene_len", None)
             if spin is not None:
-                max_allowed = 30.0 if backend == "wan2gp" else 9.9
+                msr_v2 = bool(getattr(self, "check_ltx_use_msr", None) and self.check_ltx_use_msr.isChecked())
+                max_allowed = 30.0 if backend == "wan2gp" else (15.0 if msr_v2 else 9.9)
                 try:
                     spin.setRange(0.5, float(max_allowed))
                 except Exception:
@@ -21603,6 +23099,8 @@ class AutoMusicSyncWidget(QWidget):
                 try:
                     if backend == "wan2gp":
                         spin.setToolTip("Manual maximum smart scene length. Auto mode ignores this value and uses source clip stats.")
+                    elif msr_v2:
+                        spin.setToolTip("MSR V2 exception: shots may be planned up to 15.0s / 361 frames at 24 fps, with a small extra raw-render tail.")
                     elif backend == "int4":
                         spin.setToolTip("Manual maximum smart scene length for LTX INT4. It stops at 9.9s so the raw render has trim/lipsync breathing room.")
                     else:
@@ -21704,6 +23202,10 @@ class AutoMusicSyncWidget(QWidget):
         if use_generated and generated_start and (not generated_shot_id or generated_shot_id == shot_id):
             image_mode = "existing"
             existing_start = generated_start
+        msr_enabled = bool(hasattr(self, "_ltx_msr_enabled") and self._ltx_msr_enabled())
+        if msr_enabled:
+            image_mode = "msr"
+            existing_start = ""
         if image_mode == "existing" and not existing_start:
             msg = "No supplied image was assigned to this shot." if own_images_active else "Select an existing start image first, or generate one for the selected shot."
             self._set_planner_bridge_status(f"Planner Bridge: {msg}")
@@ -21738,8 +23240,18 @@ class AutoMusicSyncWidget(QWidget):
                 payload["character_reference"] = {"enabled": False, "reference_mode": False, "character_reference_sheets": {}}
         except Exception:
             pass
+        try:
+            payload.update(self._ltx_msr_payload())
+            if payload.get("msr_enabled"):
+                payload["image_mode"] = "msr"
+                payload["existing_start_image_path"] = ""
+                payload["own_images_enabled"] = False
+                payload["own_image_paths"] = []
+                payload["character_reference"] = {"enabled": False, "reference_mode": False, "character_reference_sheets": {}, "reason": "msr"}
+        except Exception:
+            pass
 
-        if use_lora:
+        if use_lora and not payload.get("msr_enabled"):
             payload["ltx_lora_file"] = str(getattr(self, "edit_ltx_single_lora_file", None).text() if getattr(self, "edit_ltx_single_lora_file", None) is not None else "").strip()
             payload["ltx_lora_json"] = str(getattr(self, "edit_ltx_single_lora_json", None).text() if getattr(self, "edit_ltx_single_lora_json", None) is not None else "").strip()
             try:
@@ -21890,8 +23402,16 @@ class AutoMusicSyncWidget(QWidget):
                 f"{stem}_review_start.png",
                 f"{stem}_review_start_used.png",
                 f"{stem}_start.png",
+                f"{stem}_background.png",
             )
-            globs = (f"{stem}*_krea2_start.*", f"{stem}*_review_start.*", f"{stem}*_start.*")
+            globs = (
+                f"{stem}*_krea2_start.*",
+                f"{stem}*_review_start.*",
+                f"{stem}*_start.*",
+                f"{stem}_background_*.*",
+                f"{stem}*_msr_background.*",
+                f"{stem}*background*.*",
+            )
             exts = {".png", ".jpg", ".jpeg", ".webp"}
         else:
             names = (
@@ -21917,6 +23437,15 @@ class AutoMusicSyncWidget(QWidget):
                     for cand in root.glob(pat):
                         if cand.is_file() and cand.suffix.lower() in exts:
                             candidates.append(cand)
+                if kind == "image":
+                    # Older MSR jobs stored generated backgrounds below the full-run
+                    # folder (usually msr_assets/ or ltx_msr_auto_backgrounds/) and
+                    # did not write them into review state. Search those folders
+                    # recursively so old jobs migrate when opened for review.
+                    for pat in globs:
+                        for cand in root.rglob(pat):
+                            if cand.is_file() and cand.suffix.lower() in exts:
+                                candidates.append(cand)
             except Exception:
                 pass
         if not candidates:
@@ -21938,6 +23467,272 @@ class AutoMusicSyncWidget(QWidget):
             except Exception:
                 return ""
 
+    def _ltx_review_resolve_msr_job_config(self, plan_path: str, shot_id: str = "") -> dict:
+        """Recover the complete MSR configuration from the loaded job itself.
+
+        Review/Continue must not depend on the current UI toggle or list widgets:
+        an older loaded job may have been created with MSR while the current UI
+        contains no MSR state. Recover payload JSON, prior command logs, plan
+        metadata and existing assets instead.
+        """
+        plan_path = str(plan_path or "").strip()
+        shot_id = str(shot_id or "").strip()
+        cfg: Dict[str, Any] = {
+            "msr_enabled": False,
+            "use_msr": False,
+            "msr_version": 2,
+            "msr_background_paths": [],
+            "msr_reference_paths": [],
+            "msr_reference_packs": [],
+            "msr_reference_pool_enabled": False,
+            "msr_reference_pool_first_clip_default": True,
+            "msr_end_frame_paths": [],
+            "msr_use_end_frames": False,
+            "msr_reference_frames": 41,
+            "msr_background_mode": "sequence",
+        }
+        plan_data = _musicclip_read_json_file(plan_path)
+        roots: List[Path] = []
+        try:
+            pp = Path(plan_path).resolve()
+            roots.append(pp.parent)
+            latest = self._ltx_review_find_latest_full_run_dir(pp.parent)
+            if latest:
+                roots.append(Path(latest).resolve())
+        except Exception:
+            pass
+
+        def _existing_list(value: Any) -> List[str]:
+            vals = value if isinstance(value, list) else ([value] if value not in (None, "") else [])
+            out: List[str] = []
+            seen = set()
+            for item in vals:
+                candidate = str(item or "").strip().strip('"')
+                if not candidate:
+                    continue
+                try:
+                    cp = Path(candidate).expanduser()
+                    if not cp.is_absolute() and plan_path:
+                        cp = Path(plan_path).resolve().parent / cp
+                    candidate = str(cp.resolve())
+                except Exception:
+                    pass
+                if not os.path.isfile(candidate):
+                    continue
+                key = os.path.normcase(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(candidate)
+            return out
+
+        def _merge_mapping(obj: Any) -> None:
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    low = str(key or "").strip().lower()
+                    if low in {"msr_enabled", "use_msr"} and _musicclip_bool_value(value, False):
+                        cfg["msr_enabled"] = True
+                        cfg["use_msr"] = True
+                    elif low in {"msr_reference_paths", "msr_ref_paths", "reference_paths", "image_refs"}:
+                        refs = _existing_list(value)
+                        if refs:
+                            cfg["msr_reference_paths"] = list(dict.fromkeys(list(cfg["msr_reference_paths"]) + refs))[:4]
+                    elif low in {"msr_reference_packs", "msr_reference_pool_packs"} and isinstance(value, list):
+                        packs = []
+                        for raw_pack in value:
+                            pack = _existing_list(raw_pack)
+                            if pack:
+                                packs.append(pack[:4])
+                        if packs:
+                            cfg["msr_reference_packs"] = packs
+                    elif low in {"msr_reference_pool_enabled", "use_msr_reference_pool"}:
+                        cfg["msr_reference_pool_enabled"] = _musicclip_bool_value(value, False)
+                    elif low in {"msr_reference_pool_first_clip_default", "msr_reference_pool_first_clip_use_default"}:
+                        cfg["msr_reference_pool_first_clip_default"] = _musicclip_bool_value(value, True)
+                    elif low in {"msr_background_paths", "background_paths"}:
+                        bgs = _existing_list(value)
+                        if bgs:
+                            cfg["msr_background_paths"] = list(dict.fromkeys(list(cfg["msr_background_paths"]) + bgs))
+                    elif low in {"msr_background", "background_path"}:
+                        bgs = _existing_list(value)
+                        if bgs:
+                            cfg["msr_background_paths"] = list(dict.fromkeys(list(cfg["msr_background_paths"]) + bgs))
+                    elif low in {"msr_end_frame_paths", "end_frame_paths"}:
+                        ends = _existing_list(value)
+                        if ends:
+                            cfg["msr_end_frame_paths"] = list(dict.fromkeys(list(cfg["msr_end_frame_paths"]) + ends))
+                    elif low in {"msr_end_frame", "image_end"}:
+                        ends = _existing_list(value)
+                        if ends:
+                            cfg["msr_end_frame_paths"] = list(dict.fromkeys(list(cfg["msr_end_frame_paths"]) + ends))
+                    elif low in {"msr_reference_frames", "reference_frames"}:
+                        try:
+                            cfg["msr_reference_frames"] = max(17, int(value))
+                        except Exception:
+                            pass
+                    elif low in {"msr_lora", "msr_lora_file", "ltx_msr_lora", "ltx_lora_file"}:
+                        vals = _existing_list(value)
+                        if vals and ("msr" in Path(vals[0]).name.lower() or "licon" in Path(vals[0]).name.lower()):
+                            cfg["msr_lora"] = vals[0]
+                    elif low == "msr_background_mode" and str(value or "").strip().lower() in {"sequence", "random"}:
+                        cfg["msr_background_mode"] = str(value).strip().lower()
+                    _merge_mapping(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _merge_mapping(item)
+
+        _merge_mapping(plan_data)
+        if isinstance(plan_data, dict):
+            assignments = plan_data.get("framevision_msr_background_assignments")
+            if isinstance(assignments, list):
+                for assignment in assignments:
+                    if not isinstance(assignment, dict):
+                        continue
+                    if shot_id and str(assignment.get("shot_id") or "").strip() != shot_id:
+                        continue
+                    paths = _existing_list(assignment.get("path"))
+                    if paths:
+                        cfg["msr_background_paths"] = paths
+                        cfg["msr_enabled"] = True
+                        cfg["use_msr"] = True
+                        break
+            if plan_data.get("framevision_msr_location_overrides"):
+                cfg["msr_enabled"] = True
+                cfg["use_msr"] = True
+
+        # Recover values from old payload/settings/report files.
+        inspected = 0
+        for root in roots:
+            try:
+                if not root.is_dir():
+                    continue
+                for candidate in root.rglob("*.json"):
+                    if inspected >= 350:
+                        break
+                    low_name = candidate.name.lower()
+                    if not any(token in low_name for token in ("payload", "settings", "report", "plan", "review_state")):
+                        continue
+                    inspected += 1
+                    try:
+                        data = json.loads(candidate.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    _merge_mapping(data)
+            except Exception:
+                pass
+
+        # Old INT4 logs preserve the exact working MSR command even when JSON
+        # state did not preserve the references.
+        for root in roots:
+            try:
+                if not root.is_dir():
+                    continue
+                patterns = [f"{shot_id}*ltx23*.log.txt"] if shot_id else ["LTX*ltx23*.log.txt"]
+                logs: List[Path] = []
+                for pattern in patterns:
+                    logs.extend(list(root.rglob(pattern)))
+                logs.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                for log_path in logs[:8]:
+                    try:
+                        raw = log_path.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    if "--msr-enabled" not in raw:
+                        continue
+                    cfg["msr_enabled"] = True
+                    cfg["use_msr"] = True
+                    for flag, dest, many in (
+                        ("msr-background", "msr_background_paths", False),
+                        ("msr-ref", "msr_reference_paths", True),
+                        ("msr-end-frame", "msr_end_frame_paths", False),
+                    ):
+                        vals = re.findall(rf"--{flag}\s+(.+?)(?=\s+--[A-Za-z0-9_-]+(?:\s|$)|\n|$)", raw)
+                        vals = _existing_list(vals)
+                        if vals:
+                            if many:
+                                cfg[dest] = list(dict.fromkeys(list(cfg[dest]) + vals))[:4]
+                            elif not cfg[dest]:
+                                cfg[dest] = [vals[0]]
+                    match = re.search(r"--msr-reference-frames\s+(\d+)", raw)
+                    if match:
+                        cfg["msr_reference_frames"] = int(match.group(1))
+                    match = re.search(r"--msr-lora\s+(.+?)(?=\s+--[A-Za-z0-9_-]+(?:\s|$)|\n|$)", raw)
+                    if match:
+                        vals = _existing_list(match.group(1))
+                        if vals:
+                            cfg["msr_lora"] = vals[0]
+                    if cfg["msr_reference_paths"]:
+                        break
+            except Exception:
+                pass
+
+        # Recover the selected background from the job's actual assets.
+        selected_bg = ""
+        if shot_id:
+            selected_bg = self._ltx_review_find_asset_for_shot(plan_path, shot_id, "image")
+        if selected_bg:
+            cfg["msr_background_paths"] = [selected_bg]
+        elif cfg["msr_background_paths"] and shot_id:
+            # A full list can be present; choose the shot's stable sequence item.
+            try:
+                shots, _key = _musicclip_ltx_shot_list_ref(plan_data)
+                idx = next((i for i, shot in enumerate(shots or []) if isinstance(shot, dict) and str(shot.get("id") or shot.get("shot_id") or "").strip() == shot_id), 0)
+                bgs = list(cfg["msr_background_paths"])
+                cfg["msr_background_paths"] = [bgs[idx % len(bgs)]] if bgs else []
+            except Exception:
+                pass
+
+        # Current UI values are only a supplement, never the source of truth.
+        try:
+            ui_cfg = self._ltx_msr_payload()
+            if isinstance(ui_cfg, dict):
+                if not cfg["msr_reference_paths"]:
+                    cfg["msr_reference_paths"] = _existing_list(ui_cfg.get("msr_reference_paths"))[:4]
+                if not cfg["msr_end_frame_paths"]:
+                    cfg["msr_end_frame_paths"] = _existing_list(ui_cfg.get("msr_end_frame_paths"))
+                if not cfg.get("msr_reference_packs"):
+                    cfg["msr_reference_packs"] = [pack[:4] for pack in list(ui_cfg.get("msr_reference_packs") or []) if isinstance(pack, list)]
+                if not cfg.get("msr_reference_pool_enabled"):
+                    cfg["msr_reference_pool_enabled"] = bool(ui_cfg.get("msr_reference_pool_enabled"))
+                if ui_cfg.get("msr_reference_pool_first_clip_default") not in (None, ""):
+                    cfg["msr_reference_pool_first_clip_default"] = bool(ui_cfg.get("msr_reference_pool_first_clip_default"))
+                if not cfg.get("msr_lora"):
+                    vals = _existing_list(ui_cfg.get("msr_lora") or ui_cfg.get("ltx_lora_file"))
+                    if vals:
+                        cfg["msr_lora"] = vals[0]
+        except Exception:
+            pass
+
+        if not cfg.get("msr_lora"):
+            try:
+                root = Path(_musicclip_project_root())
+                candidates: List[Path] = []
+                for search_root in (root / "models" / "loras", root / "models" / "ltx23"):
+                    if search_root.is_dir():
+                        candidates.extend([x for x in search_root.rglob("*.safetensors") if "msr" in x.name.lower() or "licon" in x.name.lower()])
+                if candidates:
+                    candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                    cfg["msr_lora"] = str(candidates[0].resolve())
+            except Exception:
+                pass
+
+        cfg["msr_reference_paths"] = _existing_list(cfg.get("msr_reference_paths"))[:4]
+        cfg["msr_background_paths"] = _existing_list(cfg.get("msr_background_paths"))
+        cfg["msr_end_frame_paths"] = _existing_list(cfg.get("msr_end_frame_paths"))
+        cfg["msr_reference_packs"] = [pack[:4] for pack in list(cfg.get("msr_reference_packs") or []) if isinstance(pack, list) and pack]
+        cfg["msr_use_end_frames"] = bool(cfg["msr_end_frame_paths"])
+        cfg["msr_automate_backgrounds"] = False
+        cfg["image_mode"] = "msr"
+        cfg["image_model"] = "msr"
+        cfg["msr_job_recovered_from_review"] = True
+        # A background alone is not enough to call this MSR. Require at least
+        # one recovered reference, which prevents normal I2V jobs from being
+        # misclassified merely because their image filename contains background.
+        valid = bool(cfg["msr_background_paths"] and cfg["msr_reference_paths"])
+        cfg["msr_enabled"] = bool(valid)
+        cfg["use_msr"] = bool(valid)
+        return cfg
+
     def _ltx_review_reconcile_row_assets(self, row: dict, state_item: dict, plan_path: str) -> dict:
         if not isinstance(row, dict):
             row = {}
@@ -21951,6 +23746,21 @@ class AutoMusicSyncWidget(QWidget):
                 break
         if not start_path:
             start_path = self._ltx_review_safe_existing_path(_musicclip_plan_start_image_for_shot(plan_path, sid))
+        if not start_path:
+            try:
+                plan_data = _musicclip_read_json_file(str(plan_path or ""))
+                assignments = plan_data.get("framevision_msr_background_assignments") if isinstance(plan_data, dict) else []
+                if isinstance(assignments, list):
+                    for assignment in assignments:
+                        if not isinstance(assignment, dict):
+                            continue
+                        if str(assignment.get("shot_id") or "").strip() != sid:
+                            continue
+                        start_path = self._ltx_review_safe_existing_path(assignment.get("path"))
+                        if start_path:
+                            break
+            except Exception:
+                pass
         if not start_path:
             start_path = self._ltx_review_find_asset_for_shot(plan_path, sid, "image")
         clip_path = ""
@@ -22874,13 +24684,34 @@ class AutoMusicSyncWidget(QWidget):
             image_seed = payload.get("image_seed")
             clip_seed = payload.get("clip_seed")
             plan_uses_own_images = _musicclip_plan_uses_own_images(plan_path)
-            image_model = "existing" if plan_uses_own_images else (str(payload.get("image_model") or "z_image").strip() or "z_image")
+            msr_cfg = self._ltx_review_resolve_msr_job_config(plan_path, shot_id)
+            msr_enabled = bool(msr_cfg.get("msr_enabled"))
+            if msr_enabled:
+                plan_uses_own_images = False
+            image_model = "msr" if msr_enabled else ("existing" if plan_uses_own_images else (str(payload.get("image_model") or "z_image").strip() or "z_image"))
             review_resolution = str(payload.get("resolution") or payload.get("ltx_resolution") or "").strip()
             if not review_resolution:
                 review_resolution = self._planner_bridge_ltx_resolution_for_plan(plan_path)
             character_reference = payload.get("character_reference") if isinstance(payload.get("character_reference"), dict) else {}
             start_path = str(item_state.get("current_start_image_path") or payload.get("current_start_image_path") or "").strip()
-            if plan_uses_own_images:
+            if msr_enabled:
+                try:
+                    backgrounds = list(msr_cfg.get("msr_background_paths") or [])
+                    if backgrounds:
+                        shot_index = next((i for i, it in enumerate(shots) if str(it.get("id") or "").strip() == shot_id), 0)
+                        mode = str(msr_cfg.get("msr_background_mode") or "sequence").lower()
+                        if mode == "random":
+                            import random as _random
+                            bag = list(backgrounds)
+                            _random.Random(str(plan_path) + "|" + str(msr_cfg.get("msr_reference_frames") or 41)).shuffle(bag)
+                            start_path = str(bag[shot_index % len(bag)])
+                        else:
+                            start_path = str(backgrounds[shot_index % len(backgrounds)])
+                        item_state["current_start_image_path"] = start_path
+                        item_state["start_image_path"] = start_path
+                except Exception:
+                    pass
+            elif plan_uses_own_images:
                 assigned_path = _musicclip_plan_start_image_for_shot(plan_path, shot_id)
                 if assigned_path and os.path.isfile(assigned_path):
                     start_path = assigned_path
@@ -22900,7 +24731,19 @@ class AutoMusicSyncWidget(QWidget):
             image_result = {}
             clip_result = {}
             if action in {"image", "image_and_clip", "both", "image_then_clip"}:
-                if plan_uses_own_images:
+                if msr_enabled:
+                    _emit(f"Restoring assigned MSR background preview for {shot_id}...")
+                    if not start_path or not os.path.isfile(start_path):
+                        return {"ok": False, "message": f"The assigned MSR background for {shot_id} could not be found."}
+                    image_result = {
+                        "ok": True,
+                        "shot_id": shot_id,
+                        "start_image_path": start_path,
+                        "image_model": "msr",
+                        "source_image_model": "msr_background",
+                        "message": "MSR background preview restored; text-to-image generation was skipped.",
+                    }
+                elif plan_uses_own_images:
                     _emit(f"Restoring supplied image for {shot_id}...")
                     if not start_path or not os.path.isfile(start_path):
                         return {"ok": False, "message": f"The supplied job image for {shot_id} could not be found."}
@@ -22940,9 +24783,9 @@ class AutoMusicSyncWidget(QWidget):
                         return {"ok": False, "message": str(image_result.get("message") if isinstance(image_result, dict) else "Image recreate failed.")}
                     start_path = str(image_result.get("start_image_path") or "").strip()
                 item_state.update({
-                    "status": "Supplied image ready - clip needs recreate" if plan_uses_own_images else "Image ready - clip needs recreate",
+                    "status": "MSR background ready - clip needs recreate" if msr_enabled else ("Supplied image ready - clip needs recreate" if plan_uses_own_images else "Image ready - clip needs recreate"),
                     "image_prompt": image_prompt,
-                    "image_seed": "" if plan_uses_own_images else (image_seed if image_seed not in (None, "") else image_result.get("seed", "")),
+                    "image_seed": "" if (msr_enabled or plan_uses_own_images) else (image_seed if image_seed not in (None, "") else image_result.get("seed", "")),
                     "current_start_image_path": start_path,
                     "current_raw_clip_path": "",
                     "current_clip_path": "",
@@ -22969,7 +24812,7 @@ class AutoMusicSyncWidget(QWidget):
                     }
                 action = "clip"
             if action in {"clip", "clip_only", "image_and_clip", "both", "image_then_clip"}:
-                if not start_path or not os.path.isfile(start_path):
+                if (not msr_enabled) and (not start_path or not os.path.isfile(start_path)):
                     return {"ok": False, "message": f"No current start image exists for {shot_id}. Recreate the image first."}
                 _emit(f"Recreating clip for {shot_id}...")
                 run_fn = getattr(bridge, "run_single_ltx_shot_test", None)
@@ -23018,6 +24861,12 @@ class AutoMusicSyncWidget(QWidget):
                     "progress_callback": progress_callback,
                 }
                 try:
+                    if msr_enabled:
+                        single_payload.update(msr_cfg)
+                        single_payload["image_mode"] = "msr"
+                        single_payload["existing_start_image_path"] = ""
+                        single_payload["own_images_enabled"] = False
+                        single_payload["character_reference"] = {"enabled": False, "reference_mode": False, "character_reference_sheets": {}, "reason": "msr"}
                     settings = self._planner_bridge_generation_settings()
                     if isinstance(settings, dict) and settings:
                         single_payload["bridge_generation_settings"] = settings
@@ -24251,6 +26100,67 @@ class AutoMusicSyncWidget(QWidget):
                     self.edit_ltx_own_video_prompts.setPlainText(str(s.get("ltx/own_video_prompts", "", str) or ""))
                 finally:
                     self.edit_ltx_own_video_prompts.blockSignals(False)
+            if getattr(self, "check_ltx_use_msr", None) is not None:
+                def _restore_msr_list(widget, key):
+                    widget.clear()
+                    try:
+                        values = json.loads(str(s.get(key, "[]") or "[]"))
+                    except Exception:
+                        values = []
+                    for path in values if isinstance(values, list) else []:
+                        if os.path.isfile(str(path)):
+                            item = QListWidgetItem(os.path.basename(str(path)))
+                            item.setData(Qt.UserRole, os.path.abspath(str(path)))
+                            try: item.setIcon(QIcon(str(path)))
+                            except Exception: pass
+                            widget.addItem(item)
+                _restore_msr_list(self.list_ltx_msr_backgrounds, "ltx/msr_backgrounds")
+                _restore_msr_list(self.list_ltx_msr_references, "ltx/msr_references")
+                _restore_msr_list(self.list_ltx_msr_end_frames, "ltx/msr_end_frames")
+                if getattr(self, "list_ltx_msr_transparent_characters", None) is not None:
+                    _restore_msr_list(self.list_ltx_msr_transparent_characters, "ltx/msr_transparent_characters")
+                if getattr(self, "list_ltx_msr_reference_packs", None) is not None:
+                    self.list_ltx_msr_reference_packs.clear()
+                    try:
+                        values = json.loads(str(s.get("ltx/msr_reference_packs", "[]") or "[]"))
+                    except Exception:
+                        values = []
+                    for pack in values if isinstance(values, list) else []:
+                        paths = []
+                        for value in (pack if isinstance(pack, list) else [pack]):
+                            try:
+                                candidate = os.path.abspath(str(value))
+                            except Exception:
+                                candidate = ""
+                            if candidate and os.path.isfile(candidate):
+                                paths.append(candidate)
+                        if not paths:
+                            continue
+                        item = QListWidgetItem(self._ltx_msr_reference_pack_label(paths))
+                        item.setData(Qt.UserRole, paths[0])
+                        item.setData(Qt.UserRole + 1, list(paths[:4]))
+                        item.setToolTip("This pool place contains:\n" + "\n".join(paths[:4]))
+                        try:
+                            item.setIcon(QIcon(paths[0]))
+                        except Exception:
+                            pass
+                        self.list_ltx_msr_reference_packs.addItem(item)
+                    self._update_ltx_msr_reference_pool_labels()
+                    if getattr(self, "check_ltx_msr_use_reference_pool", None) is not None:
+                        self.check_ltx_msr_use_reference_pool.setChecked(bool(int(s.get("ltx/msr_use_reference_pool", 0) or 0)))
+                    if getattr(self, "check_ltx_msr_reference_pool_first_clip_default", None) is not None:
+                        self.check_ltx_msr_reference_pool_first_clip_default.setChecked(bool(int(s.get("ltx/msr_reference_pool_first_clip_default", 1) or 0)))
+                self.combo_ltx_msr_background_mode.setCurrentIndex(int(s.get("ltx/msr_background_mode", 0) or 0))
+                self.spin_ltx_msr_reference_frames.setValue(int(s.get("ltx/msr_reference_frames", 41) or 41))
+                self.check_ltx_msr_remove_backgrounds.setChecked(bool(int(s.get("ltx/msr_remove_backgrounds", 1) or 0)))
+                if getattr(self, "check_ltx_msr_automate_backgrounds", None) is not None:
+                    self.check_ltx_msr_automate_backgrounds.setChecked(bool(int(s.get("ltx/msr_automate_backgrounds", 0) or 0)))
+                if getattr(self, "check_ltx_msr_enhance_prompts", None) is not None:
+                    self.check_ltx_msr_enhance_prompts.setChecked(bool(int(s.get("ltx/msr_enhance_prompts", 0) or 0)))
+                self.check_ltx_msr_use_end_frames.setChecked(bool(int(s.get("ltx/msr_use_end_frames", 0) or 0)))
+                self.check_ltx_use_msr.setChecked(bool(int(s.get("ltx/use_msr", 0) or 0)))
+                self._update_ltx_msr_ui()
+
             if getattr(self, "list_ltx_own_images", None) is not None:
                 try:
                     self.list_ltx_own_images.blockSignals(True)
@@ -24275,6 +26185,17 @@ class AutoMusicSyncWidget(QWidget):
             try:
                 self._update_ltx_own_images_ui()
                 self._update_ltx_own_prompts_ui()
+            except Exception:
+                pass
+            try:
+                if getattr(self, "check_krea2_use_loras", None) is not None:
+                    self.check_krea2_use_loras.setChecked(bool(int(s.get("ltx/krea2_use_loras", 0))))
+                _edits = list(getattr(self, "krea2_lora_edits", []) or [])
+                _spins = list(getattr(self, "krea2_lora_strength_spins", []) or [])
+                for _idx in range(min(4, len(_edits))):
+                    _edits[_idx].setText(str(s.get(f"ltx/krea2_lora_{_idx + 1}", "", str) or ""))
+                    if _idx < len(_spins):
+                        _spins[_idx].setValue(float(s.get(f"ltx/krea2_lora_{_idx + 1}_strength", 1.0)))
             except Exception:
                 pass
             if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
@@ -24361,6 +26282,22 @@ class AutoMusicSyncWidget(QWidget):
                         self._ltx_combo_set_data(self.combo_ltx_single_image_mode, "z_image")
                 finally:
                     self.combo_ltx_single_image_mode.blockSignals(False)
+                try:
+                    # Settings restore changes the model combo after the earlier MSR UI refresh.
+                    # Re-apply MSR visibility last so automated-background mode shows the selector immediately after restart.
+                    self._update_ltx_msr_ui()
+                except Exception:
+                    pass
+            if getattr(self, "check_ltx_use_int8_text_encoder", None) is not None:
+                try:
+                    self.check_ltx_use_int8_text_encoder.blockSignals(True)
+                    self.check_ltx_use_int8_text_encoder.setChecked(bool(int(s.get("ltx/use_int8_text_encoder", 0) or 0)))
+                finally:
+                    self.check_ltx_use_int8_text_encoder.blockSignals(False)
+                try:
+                    self._update_ltx_int8_text_encoder_ui()
+                except Exception:
+                    pass
             if getattr(self, "combo_ltx_generation_backend", None) is not None:
                 try:
                     self.combo_ltx_generation_backend.blockSignals(True)
@@ -24375,6 +26312,10 @@ class AutoMusicSyncWidget(QWidget):
                     self.combo_ltx_generation_backend.blockSignals(False)
                 try:
                     self._apply_ltx_backend_duration_limits()
+                except Exception:
+                    pass
+                try:
+                    self._update_ltx_int8_text_encoder_ui()
                 except Exception:
                     pass
             if getattr(self, "check_ltx_use_framevision_queue", None) is not None:
@@ -24890,6 +26831,19 @@ class AutoMusicSyncWidget(QWidget):
             _set("ltx/own_video_prompts", str(self.edit_ltx_own_video_prompts.toPlainText() or "") if getattr(self, "edit_ltx_own_video_prompts", None) is not None else "")
         except Exception:
             pass
+        _set("ltx/krea2_use_loras", _checked("check_krea2_use_loras", 0))
+        try:
+            _edits = list(getattr(self, "krea2_lora_edits", []) or [])
+            _spins = list(getattr(self, "krea2_lora_strength_spins", []) or [])
+            for _idx in range(4):
+                _path = str(_edits[_idx].text() or "").strip() if _idx < len(_edits) else ""
+                _strength = float(_spins[_idx].value()) if _idx < len(_spins) else 1.0
+                _set(f"ltx/krea2_lora_{_idx + 1}", _path)
+                _set(f"ltx/krea2_lora_{_idx + 1}_strength", _strength)
+                if _path:
+                    _set("ltx/krea2_lora_last_dir", os.path.dirname(_path))
+        except Exception:
+            pass
         _set("planner_bridge_use_vocal_roles", _checked("check_bridge_use_vocal_roles", 1))
         _set("planner_bridge_director_backend", _combo_text("combo_bridge_director_backend", "Template cleanup"))
         _llama_payload = self._bridge_own_llama_ui_payload() if hasattr(self, "_bridge_own_llama_ui_payload") else {}
@@ -25008,6 +26962,26 @@ class AutoMusicSyncWidget(QWidget):
                 s.set("ltx/own_image_prompts", str(self.edit_ltx_own_image_prompts.toPlainText() or ""))
             if getattr(self, "edit_ltx_own_video_prompts", None) is not None:
                 s.set("ltx/own_video_prompts", str(self.edit_ltx_own_video_prompts.toPlainText() or ""))
+            if getattr(self, "check_ltx_use_msr", None) is not None:
+                s.set("ltx/use_msr", int(self.check_ltx_use_msr.isChecked()))
+                s.set("ltx/msr_backgrounds", json.dumps(self._ltx_msr_paths(self.list_ltx_msr_backgrounds), ensure_ascii=False))
+                s.set("ltx/msr_references", json.dumps(self._ltx_msr_paths(self.list_ltx_msr_references), ensure_ascii=False))
+                s.set("ltx/msr_reference_packs", json.dumps(self._ltx_msr_reference_pool_packs(), ensure_ascii=False))
+                if getattr(self, "check_ltx_msr_use_reference_pool", None) is not None:
+                    s.set("ltx/msr_use_reference_pool", int(self.check_ltx_msr_use_reference_pool.isChecked()))
+                if getattr(self, "check_ltx_msr_reference_pool_first_clip_default", None) is not None:
+                    s.set("ltx/msr_reference_pool_first_clip_default", int(self.check_ltx_msr_reference_pool_first_clip_default.isChecked()))
+                s.set("ltx/msr_end_frames", json.dumps(self._ltx_msr_paths(self.list_ltx_msr_end_frames), ensure_ascii=False))
+                if getattr(self, "list_ltx_msr_transparent_characters", None) is not None:
+                    s.set("ltx/msr_transparent_characters", json.dumps(self._ltx_msr_paths(self.list_ltx_msr_transparent_characters), ensure_ascii=False))
+                if getattr(self, "check_ltx_msr_automate_backgrounds", None) is not None:
+                    s.set("ltx/msr_automate_backgrounds", int(self.check_ltx_msr_automate_backgrounds.isChecked()))
+                if getattr(self, "check_ltx_msr_enhance_prompts", None) is not None:
+                    s.set("ltx/msr_enhance_prompts", int(self.check_ltx_msr_enhance_prompts.isChecked()))
+                s.set("ltx/msr_use_end_frames", int(self.check_ltx_msr_use_end_frames.isChecked()))
+                s.set("ltx/msr_background_mode", int(self.combo_ltx_msr_background_mode.currentIndex()))
+                s.set("ltx/msr_reference_frames", int(self.spin_ltx_msr_reference_frames.value()))
+                s.set("ltx/msr_remove_backgrounds", int(self.check_ltx_msr_remove_backgrounds.isChecked()))
             if getattr(self, "check_ltx_use_own_images", None) is not None:
                 s.set("ltx/use_own_images", int(self.check_ltx_use_own_images.isChecked()))
             if hasattr(self, "_ltx_own_image_paths"):
@@ -25043,6 +27017,8 @@ class AutoMusicSyncWidget(QWidget):
                     s.set("musicclip_ltx_generation_backend", _ltx_backend_value)
                     if getattr(self, "_ltx_int4_bridge", None) is not None:
                         s.set("ltx/int4_preference_initialized", 1)
+            if getattr(self, "check_ltx_use_int8_text_encoder", None) is not None:
+                s.set("ltx/use_int8_text_encoder", int(self.check_ltx_use_int8_text_encoder.isChecked()))
             if getattr(self, "check_ltx_use_framevision_queue", None) is not None:
                 s.set("ltx/use_framevision_queue", int(self.check_ltx_use_framevision_queue.isChecked()))
             if getattr(self, "edit_ltx_output_dir", None) is not None:
