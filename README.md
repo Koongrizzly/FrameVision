@@ -3,12 +3,14 @@
 </p>
 
  <p align="center">                                  
-✨  FrameVision 2.5.2  ✨
+✨  FrameVision 2.5.3  ✨
  <p align="center">     
 All-in-one Sound/Image/Video Tool 
   <p align="center">     
 Create, Edit, Upscale, Play 
                               
+
+-> Small update v2.5.3 brings many bugfixes and The Licon MSR V2 workflow was added to the music clip creator
 
 ---
 - Comes with a simple setup menu and a one click installer for the main app,
@@ -27,13 +29,13 @@ Create, Edit, Upscale, Play
   Chat memory allows user for the chat to remember something in new chat
 - 🎨 TXT → IMG with SD15/SDXL- Z-Image Turbo - Chroma - Lens - Qwen 2512 - Krea 2 - Ideogram 4)
 - 🖌️ Image edit, reference, inpaint, (some also include txt 2 img)... with Qwen2511, Hi-dream studio,  Flux Klein, Boogu image and Fireredit 1.1
-- 🎬 txt/img/video to video with WAN 2.2 5B/ Wan2.2 Turbo 4 step - Hiar (experimental) - HunyuanVideo 1.5 - LTX 2.3 - Bernini R 1.3B (base on wan 2.1 also does image and video editing)
+- 🎬 txt/img/video to video with WAN 2.2 5B/ Wan2.2 Turbo 4 step - Hiar (experimental) - HunyuanVideo 1.5 - LTX 2.3 - Bernini R 1.3B (based on wan 2.1 also does image and video editing) 
 - 🧪 Upscaler with model loader (15+ open source upscale models for photo & video) + seed2VR
 - ⏱️ RIFE Interpolation
 - 📝 Describe in detail, offline chatbot with framevision knowledge and prompt enhancement with Qwen3 VL instruct.
 - 🎙️ Text to speech with Qwen 3 TTS (full model pack includes voice cloning and creating own style voices from a prompt)
 - 🎙️ speech to text or subtitle creation with Whisper
-- 🎵 (music) videoclip creator : 2 modes : use ready made clips or use ltx workflow to create a clip from scratch with reference images and story mode features
+- 🎵 (music) videoclip creator : 2 modes : use ready made clips or use ltx workflow to create a clip from scratch with reference images and story mode features. New : Use LTX with Licon Studio MSR V2.
 - 🎵 Ace Step 1.5 Music creation, probably the best open source a.i. music creation tool of today.
 - 🎶 Music player with playlist & 250+ beat synced visuals
 - 📁 Media Explorer with Json viewer.
