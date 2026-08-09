@@ -24537,6 +24537,10 @@ class AutoMusicSyncWidget(QWidget):
                 self.edit_ltx_review_image_seed.setText("" if val in (None, "") else str(val))
             if getattr(self, "edit_ltx_review_clip_prompt", None) is not None:
                 self.edit_ltx_review_clip_prompt.setPlainText(str(row.get("clip_prompt") or ""))
+                try:
+                    self.edit_ltx_review_clip_prompt.document().setModified(False)
+                except Exception:
+                    pass
             if getattr(self, "edit_ltx_review_clip_seed", None) is not None:
                 val = row.get("clip_seed", "")
                 self.edit_ltx_review_clip_seed.setText("" if val in (None, "") else str(val))
@@ -24570,6 +24574,13 @@ class AutoMusicSyncWidget(QWidget):
             self._set_planner_bridge_status(f"Planner Bridge: {model_msg}")
         self._ltx_review_release_previews()
         review_resolution = self._planner_bridge_ltx_resolution_for_plan(plan_path)
+        _clip_prompt_editor = getattr(self, "edit_ltx_review_clip_prompt", None)
+        try:
+            _clip_prompt_user_edited = bool(_clip_prompt_editor is not None and _clip_prompt_editor.document().isModified())
+        except Exception:
+            _clip_prompt_user_edited = False
+        _visible_clip_prompt = str(_clip_prompt_editor.toPlainText() if _clip_prompt_editor is not None else row.get("clip_prompt") or "").strip()
+
         payload = {
             "root_dir": _musicclip_project_root(),
             "ltx_backend": self._current_ltx_generation_backend(),
@@ -24582,7 +24593,8 @@ class AutoMusicSyncWidget(QWidget):
             "character_reference": self._ltx_review_character_reference_payload(),
             "image_prompt": str(getattr(self, "edit_ltx_review_image_prompt", None).toPlainText() if getattr(self, "edit_ltx_review_image_prompt", None) is not None else row.get("image_prompt") or "").strip(),
             "image_seed": self._ltx_review_parse_seed(getattr(self, "edit_ltx_review_image_seed", None).text() if getattr(self, "edit_ltx_review_image_seed", None) is not None else row.get("image_seed", "")),
-            "clip_prompt": str(getattr(self, "edit_ltx_review_clip_prompt", None).toPlainText() if getattr(self, "edit_ltx_review_clip_prompt", None) is not None else row.get("clip_prompt") or "").strip(),
+            "clip_prompt": _visible_clip_prompt if _clip_prompt_user_edited else "",
+            "clip_prompt_user_edited": _clip_prompt_user_edited,
             "clip_seed": self._ltx_review_parse_seed(getattr(self, "edit_ltx_review_clip_seed", None).text() if getattr(self, "edit_ltx_review_clip_seed", None) is not None else row.get("clip_seed", "")),
             "current_start_image_path": str(row.get("start_image_path") or "").strip(),
             "current_clip_path": str(row.get("clip_path") or "").strip(),

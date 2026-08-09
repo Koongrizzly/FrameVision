@@ -9483,7 +9483,14 @@ def generate_ltx_start_image_for_shot(payload: dict) -> dict:
             passed_to_model=(image_model == "hidream"),
         )
         character_reference = dict(shot.get("character_reference") or character_reference)
-        shot_id = _safe_str(shot.get("id")) or shot_id
+        # The explicit review shot id is authoritative. Older cancelled jobs can
+        # contain a stale positional ``index`` (for example LTX16 with index 14).
+        # Never allow that positional value to redefine the shot identity.
+        shot = dict(shot)
+        shot["id"] = shot_id
+        _sid_match = re.search(r"(\d+)$", shot_id)
+        if _sid_match:
+            shot["index"] = int(_sid_match.group(1))
         _emit(f"Selected {shot_id}")
 
         if image_model in {"existing", "use existing start image", "existing_start_image"}:
@@ -11825,7 +11832,47 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
                 "msr_end_frame": _safe_str(msr_pack.get("end_frame")),
             })
             _emit(f"MSR background resized/staged for {shot_id}: {resolution}")
-        audio_path = _safe_str(shot.get("audio_clip_path"))
+        # Resolve the audio guide from the explicit shot identity only. Do not
+        # use ``index`` or a stale ``audio_clip_path`` from an old/cancelled job.
+        expected_stem = _safe_stem(shot_id).lower()
+        canonical_audio_path = (plan_path.parent / "audio_chunks" / f"{_safe_stem(shot_id)}.wav").resolve()
+        audio_path = ""
+
+        # Newer plans may already contain identity-safe fields. Accept them only
+        # when the filename itself matches the selected shot id.
+        for _audio_key in ("ltx_audio_chunk_path", "audio_chunk_path"):
+            _candidate = _safe_str(shot.get(_audio_key))
+            try:
+                if _candidate and Path(_candidate).stem.lower() == expected_stem and os.path.isfile(_candidate):
+                    audio_path = _candidate
+                    break
+            except Exception:
+                pass
+
+        if canonical_audio_path.is_file():
+            audio_path = str(canonical_audio_path)
+        else:
+            # Rebuild the canonical LTXxx.wav directly from this shot's own
+            # song_start/song_end timing. _refresh_ltx_audio_chunk_for_shot uses
+            # the shot id for the filename and does not rely on list position.
+            repair_warnings: List[str] = []
+            try:
+                _refresh_ltx_audio_chunk_for_shot(root, plan_path, director_plan, shot, repair_warnings)
+            except Exception as exc:
+                repair_warnings.append(str(exc))
+            for warning in repair_warnings:
+                _emit(f"Warning: {warning}")
+            if canonical_audio_path.is_file():
+                audio_path = str(canonical_audio_path)
+                _emit(f"Rebuilt identity-safe audio guide for {shot_id}: {canonical_audio_path.name}")
+
+        # Repair all in-memory aliases so the debug payload and any downstream
+        # backend builder see the same identity-safe path.
+        if audio_path:
+            shot["audio_clip_path"] = audio_path
+            shot["audio_chunk_path"] = audio_path
+            shot["ltx_audio_chunk_path"] = audio_path
+            _emit(f"Audio guide locked to {shot_id}: {Path(audio_path).name}")
         audio_ok = bool(audio_path and os.path.isfile(audio_path))
         needs_lipsync = _safe_bool(shot.get("needs_lipsync"), False)
         allow_no_audio = _safe_bool(payload.get("allow_no_audio"), False)

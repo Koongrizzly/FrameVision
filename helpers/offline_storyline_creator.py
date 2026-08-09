@@ -1282,12 +1282,47 @@ Rules:
         recurrence_texts = list(story_outline or []) + list(draft_prompts or [])
         return self._filter_object_bibles_by_recurrence(cleaned, recurrence_texts, min_hits=2)
 
+    @classmethod
+    def _force_object_bibles_in_prompts(cls, prompts: List[str], object_bibles: List[str]) -> List[str]:
+        """Inject recurring object identity without asking the LLM to rewrite the prompt."""
+        entries = cls._clean_object_bible_entries(object_bibles)
+        if not prompts or not entries:
+            return prompts
+        parsed: List[Tuple[str, str]] = []
+        for entry in entries:
+            label, detail = cls._split_character_bible_entry(entry)
+            if label and detail:
+                parsed.append((label, detail))
+        out: List[str] = []
+        for prompt in prompts:
+            updated = str(prompt or '')
+            for label, detail in parsed:
+                inline = f"{label} ({detail})"
+                if inline.lower() in updated.lower():
+                    continue
+                variants = [label, cls._strip_leading_article(label)]
+                replaced = False
+                for variant in sorted({v for v in variants if v}, key=len, reverse=True):
+                    pat = re.compile(r'(?<!\\w)' + re.escape(variant) + r'(?!\\w)', re.I)
+                    m = pat.search(updated)
+                    if not m:
+                        continue
+                    updated = updated[:m.start()] + inline + updated[m.end():]
+                    replaced = True
+                    break
+            out.append(cls._postprocess_inline_bible_prompt(updated))
+        return out
+
     def _inject_object_bibles_into_t2i(self, *, story_outline: List[str], draft_prompts: List[str], object_bibles: List[str], shot_count: int, style_hint: str, negative_hint: str, t2i_model_hint: str) -> List[str]:
         if not draft_prompts or not object_bibles:
             return draft_prompts
         object_bibles = self._clean_object_bible_entries(object_bibles)
         if not object_bibles:
             return draft_prompts
+        # Do not run another creative rewrite pass just to add identity.  Every
+        # extra rewrite can mutate action, location, or story state.  Inject only
+        # the stable object phrase into the already-authored prompt.
+        return self._force_object_bibles_in_prompts(draft_prompts, object_bibles)
         beats_block = "\n".join(f"{idx+1}. {beat}" for idx, beat in enumerate(story_outline)) if story_outline else "none"
         draft_block = "\n".join(f"{idx+1}. {draft}" for idx, draft in enumerate(draft_prompts))
         bible_block = "\n".join(f"- {entry}" for entry in object_bibles)
@@ -1395,6 +1430,11 @@ Rules:
         character_bibles = self._clean_character_bible_entries(character_bibles)
         if not character_bibles:
             return draft_prompts
+        # Identity injection must not become another storytelling pass.  Keep the
+        # shot exactly as authored and deterministically expand only known labels.
+        prompts = self._force_character_bibles_in_prompts(draft_prompts, character_bibles)
+        prompts = self._dedupe_inline_bibles_per_prompt(prompts, character_bibles)
+        return [self._postprocess_inline_bible_prompt(p) for p in prompts]
         beats_block = "\n".join(f"{idx+1}. {beat}" for idx, beat in enumerate(story_outline)) if story_outline else "none"
         draft_block = "\n".join(f"{idx+1}. {draft}" for idx, draft in enumerate(draft_prompts))
         bible_block = "\n".join(f"- {entry}" for entry in character_bibles)
@@ -1586,6 +1626,8 @@ Clean partial output already accepted:
         beats_block = "\n".join(f"{idx+1}. {beat}" for idx, beat in enumerate(source_beats))
         draft_block = "\n".join(f"{idx+1}. {draft}" for idx, draft in enumerate(draft_prompts))
         style_hint = self._clean_style_hint(style_hint)
+        if not style_hint:
+            style_hint = 'consistent cinematic realistic style'
         negative_hint = self._normalize_prompt_text(negative_hint)
         if kind == "t2i":
             refine_prompt = f"""
@@ -1604,10 +1646,13 @@ Target text-to-image model: {t2i_model_hint or 'none'}
 Rules:
 - Return exactly {shot_count} numbered prompts.
 - Keep each prompt faithful to its matching story beat.
+- Make the beat visually unambiguous: actor, target, physical action, contact/result, and reaction where relevant.
+- Give each prompt a distinct visual purpose; remove repetitive standing, looking, mood-only, or interchangeable compositions.
+- Preserve spatial continuity and established direction when adjacent beats share the same action/location.
 - Do not invent outcomes, props, or resolutions that are not in the beat.
 - Do not change the core action, subject, or setting.
 - Keep each line image-focused and concrete.
-- Do not add camera movement.
+- Static framing/composition may be specified, but do not add camera movement.
 - Keep the wording compact and usable.
 - Return only the numbered prompts.
 """.strip()
@@ -1629,8 +1674,12 @@ Rules:
 - Return exactly {shot_count} numbered prompts.
 - This is for image-to-video: start from an already existing image and animate what is visible in that image.
 - Keep each prompt faithful to its matching story beat.
-- Focus on one main visible action per shot.
+- Focus on one dominant visible action chain per shot.
+- When useful, express a compact action -> effect -> reaction rather than a single vague verb.
+- Make interactions explicit: who moves, what they touch/hit/grab/avoid, where the target moves, and who reacts.
 - Optional: add one small secondary motion or one simple camera move only if useful.
+- Avoid repeating the same camera move or body action across neighboring shots when another clear coverage choice fits.
+- Preserve established screen direction and scene geography during continuous action.
 - Use direct positive motion sentences. Describe only what should visibly happen.
 - Never include workflow instructions such as start from the image, keep the same, preserve, avoid, do not, next beat, transition, payoff, build tension, reveal, or force a decision.
 - Keep every recurring subject that is visible in the source image visible during the shot.
@@ -1720,6 +1769,39 @@ Output rules:
             raise RuntimeError("Model returned an empty enhanced story idea.")
         return cleaned
 
+    @staticmethod
+    def _director_brief(idea: str) -> str:
+        """Choose a compact directing grammar without forcing a fixed shot template."""
+        low = str(idea or "").lower()
+        action_terms = ("action", "chase", "race", "fight", "battle", "crash", "escape", "rescue", "attack", "explosion", "pursuit")
+        comedy_terms = ("comedy", "comic", "funny", "joke", "gag", "absurd", "prank")
+        suspense_terms = ("thriller", "suspense", "horror", "mystery", "stalk", "tense", "danger")
+        performance_terms = ("concert", "band", "singer", "singing", "performance", "stage", "dance", "music video")
+        if any(term in low for term in action_terms):
+            return (
+                "Dynamic action sequence: establish usable geography, then vary pursuit/tracking, close physical detail, "
+                "reaction/scale, and escalation as appropriate. Preserve screen direction and make each beat change the situation."
+            )
+        if any(term in low for term in comedy_terms):
+            return (
+                "Visual comedy sequence: establish the normal situation quickly, make the setup physically clear, escalate through visible consequences, "
+                "show readable reactions, and land the payoff cleanly. Faster cuts are allowed when they strengthen the joke."
+            )
+        if any(term in low for term in suspense_terms):
+            return (
+                "Suspense sequence: establish geography and the threat clearly, alternate information and reaction, increase pressure through concrete changes, "
+                "and make each beat reveal or worsen something rather than repeating atmosphere."
+            )
+        if any(term in low for term in performance_terms):
+            return (
+                "Performance sequence: vary coverage between performer action, instrument/body detail, audience/environment reaction, and wider scale. "
+                "Every beat should contain new visible performance behavior rather than another static lineup."
+            )
+        return (
+            "Cinematic narrative sequence: give every beat a distinct visual purpose, preserve geography and continuity, and progress through "
+            "visible cause, consequence, and reaction instead of repeating poses or mood."
+        )
+
     def generate_project(
         self,
         *,
@@ -1750,12 +1832,16 @@ Output rules:
         i2v_prompts: List[str] = []
 
         system = (
-            "You are an offline story and prompt engine. "
+            "You are an offline cinematic story planner and prompt engine. "
+            "Think like a director blocking real visible events, not a prose writer decorating an idea. "
             "Follow the requested format exactly. "
             "Do not output chain-of-thought, thinking, explanations, JSON, markdown fences, or commentary. "
             "Return only the requested numbered lines. "
-            "Keep the writing concrete, visual, and direct."
+            "Keep the writing concrete, visual, direct, physically readable, and useful to image/video models. "
+            "Prefer visible cause -> effect -> reaction and meaningful progression over adjectives, mood repetition, or generic cinematic filler."
         )
+        director_brief = self._director_brief(idea)
+        self._log(f"Director mode: {director_brief}")
 
         style_hint = self._clean_style_hint(style_hint)
         negative_hint = re.sub(r"\s+", " ", str(negative_hint or "").strip())
@@ -1782,13 +1868,23 @@ Negative notes to avoid: {negative_hint.strip() or 'none'}
 Target text-to-image model: {t2i_model_hint or 'none'}
 Target image-to-video model: {i2v_model_hint or 'none'}
 
+Directing approach: {director_brief}
+
 Rules:
 - Write exactly {shot_count} numbered beats.
-- Each beat must describe one clear event or moment.
-- Keep each beat grounded, visual, and specific.
-- Build actual progression from beginning to ending.
-- Avoid generic filler, repeated mood labels, and poetic padding.
-- Avoid camera language unless the user asked for it.
+- Treat the user's idea as a story seed: expand it into concrete visible events without replacing its concept.
+- Every beat must have a distinct visual purpose; do not repeat the same situation, pose, action, scale, or reaction with different wording.
+- Every beat must be standalone: repeat the stable subject name/label instead of starting with ambiguous pronouns such as she, he, it, or they.
+- A named non-human/creature subject must keep its semantic type/species in the wording when the name alone would be meaningless to an image model.
+- Build actual progression from beginning to ending. Each beat should cause, reveal, worsen, solve, or react to something.
+- Favor cause -> effect -> reaction chains: if someone acts on a person or object, state who does what, what physically changes, and the readable consequence when relevant.
+- Keep geography understandable: preserve who is where, what they are facing, and screen/travel direction when continuity matters.
+- Escalate action, comedy, danger, emotion, or discovery when the story calls for it; do not plateau in the middle.
+- Give important characters active behavior and readable reactions instead of merely placing them in the scene.
+- Use specific physical verbs and interactions. Avoid vague phrases such as "they struggle", "chaos happens", "things intensify", or "an emotional moment" when a visible action can be stated.
+- Do not invent disposable props, crowds, scenery, or effects merely to make a beat sound cinematic.
+- Avoid generic filler, repeated mood labels, adjective stacks, and poetic padding.
+- Avoid camera language unless the user asked for it; this pass plans events, not camera movement.
 - No commentary before or after the list.
 """.strip()
             story_outline = self._generate_numbered_list_with_retry(
@@ -1815,13 +1911,22 @@ Global style hint: {style_hint.strip() or 'none'}
 Negative notes to avoid: {negative_hint.strip() or 'none'}
 Target text-to-image model: {t2i_model_hint or 'none'}
 
+Directing approach: {director_brief}
+
 Rules:
-- Each prompt must describe one strong image.
-- Focus on subject, setting, visible action, composition, and important details.
+- Each prompt must describe one strong, immediately readable image from its matching beat.
+- Treat the matching beat as authoritative. Stage it; do not replace it with a different event, discovery, prop, outcome, or action.
+- Every prompt must stand alone. Repeat the stable subject label/type needed to identify who or what is visible; never rely on previous prompts for identity.
+- Focus on subject, setting, the exact visible action, physical relationships, composition, and only important details.
+- Make consecutive prompts visually purposeful rather than interchangeable: vary useful framing/scale/composition when the story supports it, while keeping continuity intact.
+- When characters interact, identify the actor, target, contact/action, and visible result clearly enough that the image model cannot easily swap roles.
+- Show consequences and reactions when they are the point of the beat: displaced objects, changed body position, damage, expression, crowd response, environmental response, etc.
+- Preserve established geography, identities, wardrobe, recurring objects, vehicle direction, and environment unless the story explicitly changes them.
 - Keep each prompt direct and usable.
-- Do not write camera movement.
-- Do not mention previous or next prompts.
-- Avoid repeated filler such as "the mood is" unless truly needed.
+- Static camera/framing language is allowed when it improves composition (wide shot, medium shot, close-up, low angle, overhead), but do not write camera movement.
+- Do not mention previous or next prompts or use workflow language.
+- Do not invent decorative props/effects simply for variety.
+- Avoid repeated filler such as "the mood is", generic cinematic adjectives, or multiple shots that are basically people standing and looking.
 - Return only the {shot_count} numbered prompts.
 """.strip()
             t2i_prompts = self._generate_numbered_list_with_retry(
@@ -1832,17 +1937,9 @@ Rules:
                 max_tokens=shot_count * 180,
                 item_kind="text-to-image prompts",
             )
-            self._log("Refining text-to-image prompts for beat accuracy...")
-            t2i_prompts = self._refine_prompt_list(
-                kind="t2i",
-                source_beats=story_outline if story_outline else [idea.strip()] * shot_count,
-                draft_prompts=t2i_prompts,
-                shot_count=shot_count,
-                style_hint=style_hint,
-                negative_hint=negative_hint,
-                t2i_model_hint=t2i_model_hint,
-                i2v_model_hint=i2v_model_hint,
-            )
+            # Do not send good shot prompts through a second creative rewrite pass.
+            # The first T2I pass is the author; later passes may only inject stable
+            # identities/objects or normalize formatting.
             t2i_prompts = self._clean_prompt_list_items(t2i_prompts, story_outline if story_outline else [idea.strip()] * shot_count)
             if use_character_bible:
                 self._log("Generating character bible...")
@@ -1912,13 +2009,19 @@ Source prompts:
 Global style hint: {style_hint.strip() or 'none'}
 Target image-to-video model: {i2v_model_hint or 'none'}
 
+Directing approach: {director_brief}
+
 Rules:
 - This is for image-to-video, not text-to-image. Start from an already existing image and describe how it animates.
 - Each line must describe what actually changes or moves in the shot.
-- Keep the same main subject and setting from the source prompt.
+- Keep the same main subject, setting, geography, identities, and visible recurring objects from the source prompt.
 - Focus on visible action first, not appearance or pose.
-- Use one main action, plus at most one small secondary motion if useful.
-- Add only useful camera motion, and keep it simple and unambiguous.
+- Build a short physical micro-event when useful: action -> immediate effect -> readable reaction, but do not overload the clip with unrelated actions.
+- Name the acting subject and target when an interaction could be ambiguous; make contact and resulting motion explicit.
+- Use one dominant action chain, plus at most one small secondary motion if it supports that action.
+- Add only useful camera motion, keep it simple and unambiguous, and choose movement that supports the physical action rather than decorating the shot.
+- Across the sequence, avoid repeating the same camera behavior or the same character motion unless repetition is intentional.
+- Preserve screen direction/travel direction across adjacent action shots when relevant.
 - Use direct positive motion sentences. Describe only what should visibly happen.
 - Never include workflow instructions such as start from the image, keep the same, preserve, avoid, do not, next beat, transition, payoff, build tension, reveal, or force a decision.
 - Keep every recurring subject that is visible in the source image visible during the shot.

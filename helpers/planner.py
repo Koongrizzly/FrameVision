@@ -4153,6 +4153,7 @@ def _ensure_character_bible(manifest: Dict[str, Any], plan_obj: Any) -> List[Dic
                 "name": str(c.get("name") or '').strip() or "Character",
                 "role": str(c.get("role") or '').strip(),
                 "taxonomy": "human",
+                "age": str(c.get("age") or c.get("age_description") or '').strip(),
                 "face_traits": [str(x).strip() for x in (c.get("face_traits") or []) if str(x).strip()],
                 "hair": str(c.get("hair") or '').strip(),
                 "outfit": str(c.get("outfit") or '').strip(),
@@ -5463,10 +5464,23 @@ def _drift_prevention_negatives(chars: List[Dict[str, Any]]) -> List[str]:
         "duplicate", "cloned",
         ]
     for c in chars:
+        taxonomy = str(c.get("taxonomy") or '').strip().lower()
         for item in (c.get("do_not_change") or []):
-            tok = _normalize_no_item(str(item))
-            if tok:
-                out.append(tok)
+            raw = re.sub(r'\s+', ' ', str(item or '')).strip()
+            low = raw.lower()
+            # Some Character Bible entries are instructions, not negative-prompt tokens.
+            # Never turn "do not invent outfits; keep clothing..." into nonsense negatives.
+            if not raw or low.startswith(("keep ", "preserve ", "immutable", "natural appearance", "do not invent ", "don't invent ")):
+                continue
+            tok = _normalize_no_item(raw)
+            if not tok:
+                continue
+            # "no clothing" is useful for animals/creatures, destructive for humans.
+            if taxonomy == "human" and tok.lower() in {"clothing", "clothes", "outfit", "outfits"}:
+                continue
+            if len(tok.split()) > 8 or ';' in tok:
+                continue
+            out.append(tok)
     # de-dupe preserving order
     seen = set()
     dedup = []
@@ -6316,6 +6330,249 @@ def _story_subjects_for_event(plan_obj: Any, event_text: Any) -> List[Dict[str, 
     return []
 
 
+def _story_plan_character_map(plan_obj: Any) -> Dict[str, Dict[str, str]]:
+    """Return stable semantic identities from plan characters.
+
+    Names are useful to the planner, but arbitrary names alone mean nothing to a
+    txt2img model.  Keep the name while carrying the semantic type/species when
+    the plan knows it.  This is generic (person/animal/creature/role), not tied
+    to any particular story.
+    """
+    out: Dict[str, Dict[str, str]] = {}
+    for c in _plan_characters(plan_obj):
+        if not isinstance(c, dict):
+            continue
+        name = re.sub(r'\s+', ' ', str(c.get('name') or '')).strip()
+        if not name:
+            continue
+        taxonomy = re.sub(r'\s+', ' ', str(c.get('taxonomy') or '')).strip().lower()
+        species = re.sub(r'\s+', ' ', str(c.get('species') or c.get('role') or '')).strip()
+        out[name.lower()] = {'name': name, 'taxonomy': taxonomy, 'species': species}
+    return out
+
+
+def _story_character_semantic_label(char: Dict[str, str]) -> str:
+    name = str(char.get('name') or '').strip()
+    taxonomy = str(char.get('taxonomy') or '').strip().lower()
+    species = str(char.get('species') or '').strip()
+    if not name:
+        return ''
+    # Human names normally need no type suffix.  Non-human taxonomy/species is
+    # critical because image models cannot infer it from an invented name.
+    if species and (taxonomy in {'animal', 'creature'} or species.lower() not in {'human', 'person'}):
+        article = 'an' if species[:1].lower() in 'aeiou' else 'a'
+        return f"{name}, {article} {species}"
+    if taxonomy in {'animal', 'creature'}:
+        article = 'an' if taxonomy[:1].lower() in 'aeiou' else 'a'
+        return f"{name}, {article} {taxonomy}"
+    return name
+
+
+def _story_expand_character_semantics(text: Any, plan_obj: Any) -> str:
+    """Expand the first mention of known named subjects with their semantic type."""
+    out = str(text or '')
+    if not out.strip():
+        return out
+    for char in _story_plan_character_map(plan_obj).values():
+        name = char.get('name') or ''
+        label = _story_character_semantic_label(char)
+        if not name or not label or label.lower() == name.lower():
+            continue
+        # Do not duplicate an identity that is already present right after name.
+        pat = re.compile(r'(?<![A-Za-z0-9_])' + re.escape(name) + r'(?![A-Za-z0-9_])', re.I)
+        m = pat.search(out)
+        if not m:
+            continue
+        tail = out[m.end():m.end()+80].lower()
+        semantic_terms = [x for x in (char.get('species'), char.get('taxonomy')) if x]
+        if any(re.search(r'\b' + re.escape(str(term).lower()) + r'\b', tail) for term in semantic_terms):
+            continue
+        out = out[:m.start()] + label + out[m.end():]
+    return re.sub(r'\s+', ' ', out).strip()
+
+
+def _story_resolve_leading_pronouns(events: List[str], plan_obj: Any) -> List[str]:
+    """Resolve leading standalone pronouns into named subjects for independent renders.
+
+    Story prose can safely say "she" or "they" because the reader remembers the
+    previous sentence.  A txt2img render does not.  Track the most recent explicit
+    named subject set; when no such set exists, use exactly-two project characters
+    only for plural pronouns.  Never guess a plural group from 3+ characters.
+    """
+    cmap = _story_plan_character_map(plan_obj)
+    all_names = [str(c.get('name') or '').strip() for c in cmap.values() if str(c.get('name') or '').strip()]
+    last_names: List[str] = []
+    out: List[str] = []
+    for raw in events or []:
+        text = re.sub(r'\s+', ' ', str(raw or '')).strip()
+        if not text:
+            continue
+        explicit: List[str] = []
+        for c in cmap.values():
+            nm = c.get('name') or ''
+            if nm and re.search(r'(?<![A-Za-z0-9_])' + re.escape(nm) + r'(?![A-Za-z0-9_])', text, re.I):
+                explicit.append(nm)
+        if explicit:
+            last_names = explicit[:3]
+        else:
+            # Singular prose continuation.
+            if len(last_names) == 1:
+                nm = last_names[0]
+                text = re.sub(r'^\s*(?:she|he|it)\b', nm, text, count=1, flags=re.I)
+                text = re.sub(r'^\s*(?:her|his|its)\b', nm + "'s", text, count=1, flags=re.I)
+            # Plural prose continuation. Prefer the most recently established pair;
+            # if the whole project has exactly two characters, that pair is unambiguous.
+            plural_names = last_names[:2] if len(last_names) >= 2 else (all_names[:2] if len(all_names) == 2 else [])
+            if len(plural_names) == 2:
+                pair = f"{plural_names[0]} and {plural_names[1]}"
+                text = re.sub(r'^\s*(?:they|both)\b', pair, text, count=1, flags=re.I)
+                text = re.sub(r'^\s*their\b', pair + "'s", text, count=1, flags=re.I)
+                text = re.sub(r'^\s*together\b', pair + ' together', text, count=1, flags=re.I)
+        out.append(text)
+    return out
+
+
+def _story_assigned_events(plan_obj: Any, user_prompt: str, extra_info: str, n_shots: int) -> List[str]:
+    """Choose one authoritative visible event for every requested shot.
+
+    Prefer PLAN_JSON beats.  The shot-list pass may stage/enrich these events,
+    but must not become a second story writer.
+    """
+    beats: List[str] = []
+    if isinstance(plan_obj, dict):
+        for beat in (plan_obj.get('beats') or []):
+            bt = _story_beat_text(beat)
+            if bt:
+                beats.append(bt)
+    if not beats:
+        beats = _story_event_candidates(plan_obj, user_prompt, extra_info)
+    beats = _story_resolve_leading_pronouns(beats, plan_obj)
+    fitted = _story_fit_events_to_shots(beats, int(max(1, n_shots))) if beats else []
+    return [_story_expand_character_semantics(x, plan_obj) for x in fitted]
+
+
+def _story_visual_style_lock(plan_obj: Any, user_prompt: str, extra_info: str) -> str:
+    """Return one compact rendering-style anchor shared by all story images."""
+    if isinstance(plan_obj, dict):
+        for key in ('visual_style', 'render_style', 'art_style'):
+            val = re.sub(r'\s+', ' ', str(plan_obj.get(key) or '')).strip(' ,.;:-')
+            if val:
+                return val[:180]
+    source = f"{extra_info or ''} {user_prompt or ''}".lower()
+    patterns = (
+        r'\b3d[- ]animated[^,.;]*', r'\b3d animation[^,.;]*', r'\bphotorealistic\b',
+        r'\bphoto[- ]realistic\b', r'\brealistic cinematic[^,.;]*', r'\banime(?: style)?\b',
+        r'\bcartoon(?: style)?\b', r'\bcomic(?: book)? style\b', r'\bwatercolou?r(?: style)?\b',
+        r'\boil painting(?: style)?\b', r'\bclaymation(?: style)?\b', r'\bstop[- ]motion(?: style)?\b',
+        r'\bpixar(?:[- ]style| animated style| animation style)?\b'
+    )
+    for pat in patterns:
+        m = re.search(pat, source, re.I)
+        if m:
+            return re.sub(r'\s+', ' ', m.group(0)).strip()
+    # If the user did not choose a medium, choose one once rather than letting
+    # every image independently wander between illustration/anime/photo styles.
+    return 'consistent cinematic realistic style'
+
+
+def _story_project_setting_anchor(plan_obj: Any) -> str:
+    if not isinstance(plan_obj, dict):
+        return ''
+    setting = re.sub(r'\s+', ' ', str(plan_obj.get('setting') or '')).strip(' ,.;:-')
+    return setting[:260]
+
+
+def _story_persistent_visual_anchor(plan_obj: Any) -> str:
+    if not isinstance(plan_obj, dict):
+        return ''
+    raw = plan_obj.get('persistent_visual_anchors') or []
+    if isinstance(raw, str):
+        raw = [raw]
+    vals: List[str] = []
+    if isinstance(raw, list):
+        for x in raw:
+            if isinstance(x, dict):
+                x = x.get('description') or x.get('anchor') or x.get('name') or ''
+            t = re.sub(r'\s+', ' ', str(x or '')).strip(' ,.;:-')
+            if t and len(t.split()) <= 28:
+                vals.append(t)
+            if len(vals) >= 5:
+                break
+    return '; '.join(vals)[:420]
+
+
+def _story_t2i_stage_for_event(event: Any, fallback_camera: Any = '') -> Dict[str, str]:
+    """Choose still-image framing/light/mood from what happens, not a random palette.
+
+    This is intentionally broad and genre-agnostic. It prevents contradictions like
+    'bright/relieved' on a blackout or 'calm' on a crash while preserving variety only
+    when it helps communicate the event.
+    """
+    text = re.sub(r'\s+', ' ', str(event or '')).strip()
+    low = text.lower()
+    camera = _t2i_static_camera_hint(fallback_camera) or 'medium shot'
+
+    # Event-readable framing. Prefer geography for obstacles/arrivals and tighter frames
+    # only for reactions or object-detail actions.
+    if re.search(r'\b(arriv|enter|exit|approach|cross|city|street|road|alley|tunnel|platform|hospital|building|crowd|blocked|blocks|collapse|vehicle|truck|train|ship|stage|battlefield)\w*\b', low):
+        camera = 'wide shot'
+    if re.search(r'\b(two|three|both|group|team|pair|together|carry|push|pull|fight|chase|run|ride|drive|dance|perform)\b', low):
+        camera = 'medium-wide shot'
+    if re.search(r'\b(grab|pick up|retrieve|touch|press|hold|open|key|case|phone|letter|ring|button|object|hands?)\b', low):
+        camera = 'medium shot'
+    if re.search(r'\b(face|expression|eyes|react|realiz|stare|smile|cry|shock|fear|surpris)\w*\b', low):
+        camera = 'close-up'
+
+    # Lighting comes from explicit scene conditions. Otherwise use neutral natural
+    # continuity lighting instead of inventing golden/bright/even moods per shot.
+    if re.search(r'\b(night|dark|blackout|lights? (?:go|goes|went) out|plung\w* into darkness)\b', low):
+        lighting = 'low-key night lighting'
+    elif re.search(r'\b(storm|rain|thunder|flood|overcast)\w*\b', low):
+        lighting = 'overcast storm lighting'
+    elif re.search(r'\b(lightning|electric|sparks?|explosion|fire)\b', low):
+        lighting = 'dark ambient light with a strong practical flash'
+    elif re.search(r'\b(sunset|dusk|golden hour)\b', low):
+        lighting = 'natural dusk lighting'
+    elif re.search(r'\b(sunrise|dawn)\b', low):
+        lighting = 'natural dawn lighting'
+    elif re.search(r'\b(interior|inside|room|corridor|tunnel|warehouse|station|hospital)\b', low):
+        lighting = 'scene-consistent interior lighting'
+    else:
+        lighting = 'scene-consistent natural lighting'
+
+    if re.search(r'\b(crash|fall|blocked|danger|chase|fight|attack|storm|flood|explode|lightning|escape|rush|knock|drop|swept|break|broken)\w*\b', low):
+        mood = 'tense'
+    elif re.search(r'\b(arriv|success|safe|win|celebrat|relief|finally|deliver)\w*\b', low):
+        mood = 'relieved'
+    elif re.search(r'\b(discover|find|notice|reveal|mystery|strange|curious)\w*\b', low):
+        mood = 'curious'
+    elif re.search(r'\b(dance|perform|concert|race|energetic|party)\w*\b', low):
+        mood = 'energetic'
+    else:
+        mood = 'focused'
+    return {'camera': camera, 'lighting': lighting, 'mood': mood}
+
+
+def _t2i_static_camera_hint(camera: Any) -> str:
+    """Convert shot-list camera language into still-image framing only."""
+    c = re.sub(r'\s+', ' ', str(camera or '')).strip(' ,.;:-')
+    if not c:
+        return ''
+    low = c.lower()
+    static_markers = ('close-up', 'close up', 'extreme close', 'wide shot', 'full shot', 'full-body', 'full body',
+                      'medium shot', 'over-the-shoulder', 'over the shoulder', 'low-angle', 'low angle',
+                      'high-angle', 'high angle', 'overhead', 'bird', 'profile', 'two-shot', 'two shot')
+    if any(x in low for x in static_markers):
+        # Strip motion words while retaining framing/angle words.
+        c = re.sub(r'(?i)\b(?:tracking|track|panning|pan|dolly|dolly-in|dolly-out|push-in|push in|pull-back|pull back|orbit|arc|following|follow|tilting|tilt)\b(?:\s+(?:left|right|in|out|up|down|forward|backward))?', '', c)
+        c = re.sub(r'\s+', ' ', c).strip(' ,.;:-')
+        if c:
+            return c
+    if re.search(r'(?i)\b(?:pan|track|tracking|dolly|push|pull|orbit|arc|follow|tilt)\b', low):
+        return 'medium shot'
+    return c
+
+
 def _story_fit_events_to_shots(events: List[str], n_shots: int) -> List[str]:
     vals = [str(x or '').strip() for x in (events or []) if str(x or '').strip()]
     if not vals:
@@ -6884,15 +7141,14 @@ def _cb_compact_identity_phrase(c: Dict[str, Any]) -> str:
         if outfit:
             parts.append(outfit)
     else:
-        if role:
-            lead = role
-        elif age:
-            lead = age
-        elif name and name.lower() not in ("character", "person", "man", "woman"):
-            lead = name
+        # Keep invented names tied to a visible semantic identity. "a Leo" is bad
+        # prompt grammar and tells the image model nothing about age/role.
+        semantic = " ".join(x for x in (age, role) if x).strip()
+        if name and name.lower() not in ("character", "person", "man", "woman"):
+            lead = name + (f", {semantic}" if semantic else ", person")
         else:
-            lead = "person"
-        parts.append(f"a {lead}".strip())
+            lead = semantic or "person"
+        parts.append(lead)
         if face:
             parts.append(", ".join(face[:2]))
         if hair:
@@ -7715,7 +7971,8 @@ def _assemble_shot_prompt(
     # Shot visual seed (already generated upstream)
     visual_raw = str(shot.get("visual_description") or '').strip()
     visual_raw = _sanitize_visual_description(visual_raw) if visual_raw else ""
-    seed_txt = (visual_raw or str(shot.get("seed") or '').strip())
+    assigned_raw = str(shot.get('assigned_event') or '').strip()
+    seed_txt = (visual_raw or assigned_raw or str(shot.get("seed") or '').strip())
     seed_txt = re.sub(r'(?i)(?:\s*[—–-]\s*|\s+)?moment\s+\d+\s+of\s+\d+\.?\s*$', '', seed_txt).strip(' ,.;:-')
     seed_txt = _strip_nonvisual_markers(seed_txt)
 
@@ -7734,10 +7991,13 @@ def _assemble_shot_prompt(
     if _is_animal_shot:
         notes = _strip_human_language_from_prompt(notes)
 
-    # Camera / lighting / mood as lightweight tags (avoid spec formatting)
-    camera = str(stage_raw.get("camera") or shot.get("camera") or "medium shot").strip()
-    lighting = str(stage_raw.get("lighting") or shot.get("lighting") or "cinematic lighting").strip()
-    mood = str(stage_raw.get("mood") or shot.get("mood") or "neutral").strip()
+    # Derive framing/light/mood from the actual event. Random stage metadata can make
+    # the prompt contradict itself (e.g. bright/relieved during a blackout).
+    _event_for_stage = assigned_raw or seed_txt
+    _derived_stage = _story_t2i_stage_for_event(_event_for_stage, stage_raw.get("camera") or shot.get("camera") or "medium shot")
+    camera = _derived_stage.get("camera") or "medium shot"
+    lighting = _derived_stage.get("lighting") or "scene-consistent natural lighting"
+    mood = _derived_stage.get("mood") or "focused"
 
     # User start prompt & extra box (style/details)
     up = _strip_nonvisual_markers(str(user_prompt or '').strip())
@@ -7763,7 +8023,31 @@ def _assemble_shot_prompt(
     _ = own_character_prompts  # kept for call-site compatibility
 
     # Character Bible (auto): pick relevant characters and build a compact, positive-only identity clause.
+    # First use literal name mentions, then honor the shot's explicit/inferred subject list.
+    # This is important for standalone prompts whose visible action is phrased as
+    # "they/their/both": the outfit/identity lock must still be repeated every time.
     chars = _pick_relevant_characters(bible, f"{seed_txt}\n{notes}\n{up}\n{ex}")
+    try:
+        _picked_names = {str(c.get("name") or "").strip().lower() for c in chars if isinstance(c, dict)}
+        _subject_names: List[str] = []
+        for _sub in (shot.get("subjects") or []):
+            if isinstance(_sub, dict):
+                _nm = str(_sub.get("name") or _sub.get("label") or "").strip()
+            else:
+                _nm = str(_sub or "").strip()
+            if _nm:
+                _subject_names.append(_nm)
+        for _nm in _subject_names:
+            for _bc in bible or []:
+                if not isinstance(_bc, dict):
+                    continue
+                _bn = str(_bc.get("name") or "").strip()
+                if _bn and _bn.lower() == _nm.lower() and _bn.lower() not in _picked_names:
+                    chars.append(_bc)
+                    _picked_names.add(_bn.lower())
+                    break
+    except Exception:
+        pass
     people_clause = _people_policy_clause(chars, f"{up}\n{seed_txt}\n{notes}\n{ex}")
 
     # Build positive prompt as a single render-friendly paragraph.
@@ -7781,7 +8065,10 @@ def _assemble_shot_prompt(
 
     # Core intent: prefer the shot-specific visual seed and notes.
     # The raw user start prompt is fallback context only; otherwise it floods every shot prompt.
-    core_bits = [seed_txt, notes]
+    # Narrative purpose/producer notes must never enter the image prompt.
+    # Words such as 'introduce', 'build tension', 'reveal clue' and 'payoff'
+    # are useful planner metadata but are not visible image content.
+    core_bits = [seed_txt]
     if not seed_txt:
         core_bits.insert(0, up)
     for b in core_bits:
@@ -7790,6 +8077,16 @@ def _assemble_shot_prompt(
         if any(_story_prompt_texts_overlap(b, prev) for prev in bits):
             continue
         bits.append(b)
+
+    # Compact persistent project state. Keep this deliberately short: the event stays
+    # dominant, but independent image generations still know which world and recurring
+    # visual anchors belong to the sequence.
+    _setting_anchor = _normalize_t2i_prompt_text(str(shot.get('project_setting_anchor') or '').strip()) if shot.get('project_setting_anchor') else ''
+    if _setting_anchor and not any(_story_prompt_texts_overlap(_setting_anchor, prev) for prev in bits):
+        bits.append("Setting continuity: " + _setting_anchor + ".")
+    _persistent_anchor = _normalize_t2i_prompt_text(str(shot.get('persistent_visual_anchor') or '').strip()) if shot.get('persistent_visual_anchor') else ''
+    if _persistent_anchor and not any(_story_prompt_texts_overlap(_persistent_anchor, prev) for prev in bits):
+        bits.append("Recurring visual anchors when relevant: " + _persistent_anchor + ".")
 
     # Auto character/subject anchors: include compact identity phrases (plain prose, no IDs/labels).
     # This helps models that ignore negatives stay on the intended subjects.
@@ -7802,11 +8099,12 @@ def _assemble_shot_prompt(
         except Exception:
             pass
 
+    style_lock = _normalize_t2i_prompt_text(str(shot.get('visual_style_lock') or '').strip()) if shot.get('visual_style_lock') else ''
+    if style_lock and not any(_story_prompt_texts_overlap(style_lock, prev) for prev in bits):
+        bits.append(style_lock)
+
     if ex and not any(_story_prompt_texts_overlap(ex, prev) for prev in bits):
         bits.append(ex)
-
-    # Add a small quality/style tail (positive-only)
-    bits.append("cinematic, high detail, sharp focus, clean composition")
 
     final_prompt = ", ".join([b.strip().strip(",") for b in bits if b and b.strip()]).strip()
     final_prompt = _sanitize_prompt_text(final_prompt)
@@ -12741,12 +13039,23 @@ class PipelineWorker(QThread):
                                 ("music" if self.job.music_background else "none"))))
 
                 default_taxonomy = _infer_default_subject_taxonomy(self.job.prompt, self.job.extra_info)
+                # Use the SAME count logic here that the downstream shot generator uses.
+                # Previously the plan could ask for e.g. 11 beats while rendering only 9 shots,
+                # silently dropping story events and often the payoff.
                 try:
-                    _plan_avg_sec = float((gen_profile.get("min_sec", 2.5) + gen_profile.get("max_sec", 5.0)) / 2.0)
-                except Exception:
-                    _plan_avg_sec = 3.5
-                try:
-                    _plan_shot_hint = max(3, int(round(float(getattr(self.job, "approx_duration_sec", 0) or 0.0) / max(1.0, float(_plan_avg_sec)))))
+                    import math as _math
+                    _target_total_for_plan = float(max(1.0, float(getattr(self.job, "approx_duration_sec", 0) or 0.0)))
+                    _plan_avg_sec = float(_planner_preferred_clip_seconds(gen_profile))
+                    _plan_min_sec = float(gen_profile.get("min_sec", 2.5))
+                    _plan_max_sec = float(gen_profile.get("max_sec", 5.0))
+                    _plan_lo = max(1, int(_math.ceil(_target_total_for_plan / max(0.1, _plan_max_sec))))
+                    _plan_hi = max(1, int(_target_total_for_plan // max(0.1, _plan_min_sec)))
+                    if _plan_hi < _plan_lo:
+                        _plan_hi = _plan_lo
+                    _plan_guess = int(round(_target_total_for_plan / max(0.5, _plan_avg_sec)))
+                    _plan_shot_hint = max(_plan_lo, min(80, min(_plan_hi, max(1, _plan_guess))))
+                    if _uploaded_lipsync_count:
+                        _plan_shot_hint = max(1, min(80, int(_uploaded_lipsync_count)))
                 except Exception:
                     _plan_shot_hint = 6
                 _plan_section_hint = ", ".join([str(x).title() for x in _story_arc_template_keys(float(getattr(self.job, "approx_duration_sec", 0) or 0.0), int(_plan_shot_hint))])
@@ -12816,7 +13125,7 @@ class PipelineWorker(QThread):
                     user_p = (
                         "Convert the outline below into planner JSON.\n"
                         "Output JSON only.\n"
-                        "Include: title, logline, setting, characters (list), tone, continuity_rules (list), story_engine (object), arc_sections (list), beats (list).\n"
+                        "Include: title, logline, setting, visual_style, characters (list), tone, continuity_rules (list), persistent_visual_anchors (list), story_engine (object), arc_sections (list), beats (list).\n"
                         "story_engine keys: who_wants_what, what_blocks_them, what_happens_if_they_fail.\n"
                         "arc_sections item keys: key, label, job, change, emotion_shift.\n"
                         "Use 4-6 arc_sections depending on duration and complexity.\n"
@@ -12869,7 +13178,8 @@ class PipelineWorker(QThread):
                         "Create a concise but useful story plan and constraints for this video project.\n"
                         "Requirements:\n"
                         "- Output MUST be JSON only.\n"
-                        "- Include: title, logline, setting, characters (list), tone, continuity_rules (list), story_engine (object), arc_sections (list), beats (list).\n"
+                        "- Include: title, logline, setting, visual_style, characters (list), tone, continuity_rules (list), persistent_visual_anchors (list), story_engine (object), arc_sections (list), beats (list).\n"
+                        "- visual_style is ONE concise rendering medium/style for the entire project. Preserve an explicit user style; if none is given, choose one fitting stable style and keep it unchanged.\n"
                         "- story_engine keys: who_wants_what, what_blocks_them, what_happens_if_they_fail.\n"
                         "- arc_sections item keys: key, label, job, change, emotion_shift.\n"
                         "- Produce 3-4 arc_sections only; do not expand section count for longer durations.\n"
@@ -13405,6 +13715,13 @@ class PipelineWorker(QThread):
                     n_shots = max(1, min(80, int(_uploaded_lipsync_count)))
 
                 plan_obj = _normalize_story_arc(plan_obj, float(target_total), int(n_shots))
+                assigned_events = _story_assigned_events(plan_obj, self.job.prompt, self.job.extra_info, int(n_shots))
+                visual_style_lock = _story_visual_style_lock(plan_obj, self.job.prompt, self.job.extra_info)
+                try:
+                    if isinstance(plan_obj, dict):
+                        plan_obj['visual_style'] = visual_style_lock
+                except Exception:
+                    pass
                 try:
                     if isinstance(plan_obj, dict) and os.path.exists(plan_path):
                         _safe_write_json(plan_path, plan_obj)
@@ -13417,7 +13734,7 @@ class PipelineWorker(QThread):
                     "The JSON must be a single object with key 'shots' as an array. "
                     "Each shot MUST include fields: id, stage_directions, visual_description, subjects, story_section, shot_purpose, story_progression. "
                     "story_progression must be an object with keys: different_now, harder_now, revealed_now, prepares_payoff. "
-                    "CRITICAL: visual_description must be 2-3 sentences of pure visual content with NO technical cinematography terms. It MUST include surroundings: clearly state the setting/location and add 3-7 concrete environmental details (foreground/midground/background cues, materials or objects, time of day, and atmosphere). It MUST NOT contain: Camera:, Shot:, Lighting:, Cut to, Fade. The sequence must follow the plan's story_engine and arc_sections, so the middle never becomes filler. Every section must change something real: reveal new info, increase danger, change location, shift emotion, or force a decision. Every shot must have a clear internal purpose, but visual_description must contain only the visible event and never that purpose label. Keep recurring subjects on screen whenever the event involves them. Use an environment-only or object-led shot only when PLAN_JSON explicitly contains that event; never invent cutaways merely to vary framing. Avoid front-facing centered portraits unless the beat specifically needs a reaction or payoff. Default to humans unless the plan/prompt explicitly indicates animals or creatures; do not introduce animal protagonists unless requested." + " If OWN_CHARACTERS is provided, every shot MUST include those characters in subjects and visual_description, and you must not introduce new named protagonists."
+                    "CRITICAL: visual_description must be 2-3 sentences of pure visual content with NO technical cinematography terms. It MUST include surroundings: clearly state the setting/location and add 3-7 concrete environmental details (foreground/midground/background cues, materials or objects, time of day, and atmosphere). It MUST NOT contain: Camera:, Shot:, Lighting:, Cut to, Fade. The sequence must follow the supplied ASSIGNED_EVENTS exactly in order. You are staging those events, not writing a second story. The plan's story_engine and arc_sections are context only. Every section must change something real: reveal new info, increase danger, change location, shift emotion, or force a decision. Every shot must have a clear internal purpose, but visual_description must contain only the visible event and never that purpose label. Keep recurring subjects on screen whenever the event involves them. Use an environment-only or object-led shot only when PLAN_JSON explicitly contains that event; never invent cutaways merely to vary framing. Avoid front-facing centered portraits unless the beat specifically needs a reaction or payoff. Default to humans unless the plan/prompt explicitly indicates animals or creatures; do not introduce animal protagonists unless requested." + " If OWN_CHARACTERS is provided, every shot MUST include those characters in subjects and visual_description, and you must not introduce new named protagonists."
                 )
                 _story_creativity = _planner_story_creativity_profile(self.job.encoding)
                 _own_llama_story = bool(_story_creativity.get('use_own_llama'))
@@ -13430,6 +13747,8 @@ class PipelineWorker(QThread):
                         "- stage_directions: {camera, lighting, mood, purpose}\n"
                         "- story_progression: {different_now, harder_now, revealed_now, prepares_payoff}\n"
                         "- visual_description must stay pure visual content with no labels like Camera:, Shot:, Lighting:, Cut to, or Fade.\n"
+                        "- Shot S01 must visualize ASSIGNED_EVENT 1, S02 ASSIGNED_EVENT 2, and so on. Do not replace, skip, reorder, or invent a different event.\n"
+                        "- You may add only concrete surroundings/composition that make the assigned event renderable; do not add new plot actions, discoveries, props, or outcomes.\n"
                         "- Every shot must feel like the next real beat of the story, not a cosmetic variation of the previous one.\n"
                         "- Let the plot move: reveal something, change power, alter the plan, raise danger, shift emotion, or move to a more charged place.\n"
                         "- Use strong, memorable set pieces when the idea supports them.\n"
@@ -13447,6 +13766,8 @@ class PipelineWorker(QThread):
                         + (f"LYRICS_TRANSCRIPT:\n{_transcript_excerpt}\n" if (_lyrics_mode == "lyrics" and (_transcript_excerpt or '').strip()) else "")
                         + (f"REFERENCE_GUIDANCE:\n{_refs_guidance_excerpt}\n" if (_refs_guidance_excerpt or '').strip() else "")
                         + (f"OWN_CHARACTER_BIBLE_ENABLED: true\nOWN_CHARACTERS:\n{_own_prose}\n\nRULES_FOR_OWN_CHARACTERS:\n- Use ONLY these characters as recurring characters.\n- Keep them as the core cast across the shot list.\n- Do not introduce a replacement protagonist.\n\n" if bool(_own_active) else "")
+                        + "ASSIGNED_EVENTS_JSON:\n" + json.dumps(assigned_events, ensure_ascii=False) + "\n"
+                        + "PROJECT_VISUAL_STYLE_LOCK: " + visual_style_lock + "\n"
                         + "PLAN_JSON:\n"
                         + json.dumps(plan_obj, ensure_ascii=False)
                     )
@@ -13460,6 +13781,8 @@ class PipelineWorker(QThread):
                         "- story_progression: {different_now, harder_now, revealed_now, prepares_payoff}\n"
                         "- visual_description: 2-3 sentences of pure visual content, NO technical terms\n- visual_description MUST include setting + surroundings (location plus 3-7 concrete environmental details; include foreground/midground/background cues, time of day, weather/atmosphere, and a distinctive prop/landmark when relevant).\n"
                         "- Use ids like S01, S02, ... up to the requested count.\n"
+                        "- Shot S01 must visualize ASSIGNED_EVENT 1, S02 ASSIGNED_EVENT 2, and so on. Do not replace, skip, reorder, or invent a different event.\n"
+                        "- You may add only concrete surroundings/composition that make the assigned event renderable; do not add new plot actions, discoveries, props, or outcomes.\n"
                         "- Keep each shot to ONE clear visible action and ONE main subject group (one or two characters if needed).\n"
                         "- visual_description must describe the event itself, never the narrative purpose or instructions for a future shot.\n"
                         "- Keep continuity across shots.\n"
@@ -13479,6 +13802,8 @@ class PipelineWorker(QThread):
                         + (f"LYRICS_TRANSCRIPT:\n{_transcript_excerpt}\n" if (_lyrics_mode == "lyrics" and (_transcript_excerpt or '').strip()) else "")
                         + (f"REFERENCE_GUIDANCE:\n{_refs_guidance_excerpt}\n" if (_refs_guidance_excerpt or '').strip() else "")
                         + (f"OWN_CHARACTER_BIBLE_ENABLED: true\nOWN_CHARACTERS:\n{_own_prose}\n\nRULES_FOR_OWN_CHARACTERS:\n- Use ONLY these characters as recurring characters.\n- Every shot MUST include them in subjects and visual_description.\n- Do not introduce new named protagonists.\n\n" if bool(_own_active) else "")
+                        + "ASSIGNED_EVENTS_JSON:\n" + json.dumps(assigned_events, ensure_ascii=False) + "\n"
+                        + "PROJECT_VISUAL_STYLE_LOCK: " + visual_style_lock + "\n"
                         + "PLAN_JSON:\n"
                         + json.dumps(plan_obj, ensure_ascii=False)
                     )
@@ -13553,6 +13878,32 @@ class PipelineWorker(QThread):
                     except Exception:
                         pass
 
+                # Deterministic handoff guard: the shot LLM may stage an assigned event,
+                # but it may not silently become a second story writer.  Persist the
+                # authoritative event + style lock on each shot and restore the event
+                # when the generated description has drifted too far from it.
+                if shots_list and assigned_events:
+                    for _idx, _sh in enumerate(shots_list):
+                        if not isinstance(_sh, dict) or _idx >= len(assigned_events):
+                            continue
+                        _assigned = str(assigned_events[_idx] or '').strip()
+                        _generated = str(_sh.get('visual_description') or '').strip()
+                        _sh['assigned_event'] = _assigned
+                        _sh['visual_style_lock'] = visual_style_lock
+                        # Require at least semantic overlap with the assigned event.
+                        # If not, use the event itself rather than rendering hallucinated plot.
+                        if _assigned and (not _generated or not _story_prompt_texts_overlap(_assigned, _generated)):
+                            _sh['visual_description'] = _assigned
+                            _sh['seed'] = _assigned
+                            _sh['shot_handoff_repaired'] = True
+                        else:
+                            _sh['visual_description'] = _story_expand_character_semantics(_generated, plan_obj)
+                            _sh['seed'] = str(_sh.get('visual_description') or _assigned).strip()
+                        # Even when overlap passes, named non-human/typed identities must
+                        # remain meaningful to a standalone image model.
+                        _sh['visual_description'] = _story_expand_character_semantics(_sh.get('visual_description'), plan_obj)
+                        _sh['seed'] = str(_sh.get('visual_description') or _assigned).strip()
+
                 if shots_list and _story_shots_look_flat(shots_list):
                     shots_list = _build_local_story_fallback_shots(plan_obj, self.job.prompt, self.job.extra_info, int(n_shots), float(target_total))
                     shots_generation_note = "Rebuilt a section-aware fallback shot list because the generated shots were too repetitive."
@@ -13590,16 +13941,34 @@ class PipelineWorker(QThread):
                     stage_raw = sh.get("stage_directions") or {}
                     if not isinstance(stage_raw, dict):
                         stage_raw = {}
-                    cam = stage_raw.get("camera") or sh.get("camera") or "medium shot"
-                    mood = stage_raw.get("mood") or sh.get("mood") or "neutral"
-                    light = stage_raw.get("lighting") or sh.get("lighting") or "cinematic lighting"
                     purpose = stage_raw.get("purpose") or sh.get("purpose") or ""
                     visual_raw = sh.get("visual_description") or sh.get("seed") or ""
+                    _event_for_stage = str(sh.get("assigned_event") or visual_raw or sh.get("seed") or "")
+                    _derived_stage = _story_t2i_stage_for_event(_event_for_stage, stage_raw.get("camera") or sh.get("camera") or "medium shot")
+                    cam = _derived_stage.get("camera") or "medium shot"
+                    mood = _derived_stage.get("mood") or "focused"
+                    light = _derived_stage.get("lighting") or "scene-consistent natural lighting"
                     # Sanitize visual description to prevent metadata bleeding
                     visual_clean = _sanitize_visual_description(str(visual_raw))
                     subjects = sh.get("subjects")
                     if not isinstance(subjects, list):
                         subjects = []
+                    # Subject inference must survive into the standalone T2I stage.
+                    # Generated shot JSON often omits `subjects` even when the assigned
+                    # event says "they/their/both". Infer from the authoritative event
+                    # rather than expecting a downstream image model to remember prose.
+                    _inferred_subjects = _story_subjects_for_event(plan_obj, _event_for_stage)
+                    if _inferred_subjects:
+                        _seen_subject_names = {
+                            str((x.get("name") if isinstance(x, dict) else x) or "").strip().lower()
+                            for x in subjects
+                            if str((x.get("name") if isinstance(x, dict) else x) or "").strip()
+                        }
+                        for _sub in _inferred_subjects:
+                            _sn = str((_sub.get("name") if isinstance(_sub, dict) else _sub) or "").strip()
+                            if _sn and _sn.lower() not in _seen_subject_names:
+                                subjects.append(_sub)
+                                _seen_subject_names.add(_sn.lower())
                     seed = str(sh.get("seed") or visual_clean or f"{self.job.prompt} — moment {idx}").strip()
                     notes = str(sh.get("notes") or purpose or "One clear action, one subject. Keep continuity.").strip()
                     stage = {"camera": str(cam), "lighting": str(light), "mood": str(mood), "purpose": str(purpose).strip()}
@@ -13618,6 +13987,10 @@ class PipelineWorker(QThread):
                         "notes": str(notes),
                         "stage_directions": stage,
                         "visual_description": str(visual_clean),
+                        "assigned_event": str(sh.get("assigned_event") or (assigned_events[idx-1] if idx-1 < len(assigned_events) else visual_clean)).strip(),
+                        "visual_style_lock": str(sh.get("visual_style_lock") or visual_style_lock).strip(),
+                        "project_setting_anchor": _story_project_setting_anchor(plan_obj),
+                        "persistent_visual_anchor": _story_persistent_visual_anchor(plan_obj),
                         "subjects": subjects,
                         "story_section": str(sh.get("story_section") or sh.get("section") or "").strip(),
                         "section_change": str(sh.get("section_change") or sh.get("change") or "").strip(),
@@ -13943,14 +14316,15 @@ class PipelineWorker(QThread):
                                 schema = """{
                   "name": "character name",
                   "taxonomy": "human",
-                  "face_traits": ["6-10 stable facial characteristics (face only)"],
-                  "hair": "hair details ONLY if clearly implied by the prompt; otherwise empty string",
-                  "outfit": "",
+                  "age": "explicit visible age/life stage from source when available, otherwise empty string",
+                  "face_traits": ["4-8 stable facial characteristics (face only)"],
+                  "hair": "stable hair details; infer a simple natural hairstyle only when needed for repeatability",
+                  "outfit": "stable outfit only when the source gives one; otherwise empty string",
                   "palette": ["2-4 colors (optional)"],
                   "vibe": ["2-3 visual adjectives (optional)"],
                   "do_not_change": ["do not invent outfits; keep clothing from the shot prompt", "no extra people", "no makeup unless explicitly requested"]
                 }"""
-                                rules = "Human character. Focus on FACE identity anchors (no outfits). Hair only if clearly implied. Never add makeup unless explicitly requested."
+                                rules = "Human character. Preserve explicit age/life stage and role (teenager, elderly, courier, soldier, etc.). Focus on stable face identity. Hair may use one simple natural repeatable description when source detail is absent. Do not invent a fashion-heavy outfit; preserve explicit clothing if supplied. Never add makeup unless explicitly requested."
 
                             # Build system prompt with correct schema
                             sys_p = f"""You are a Character Bible generator. Create a locked identity reference.
