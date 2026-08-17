@@ -341,6 +341,8 @@ class MusicProject:
     ref_image_size: str = "match"
     sage_attention: bool = False
     spectrum: bool = False
+    use_hybrid_model: bool = False
+    hybrid_model_path: str = ""
     vram_manager_enabled: bool = True
     vram_auto_bypass: bool = True
     # Keep the MiniMax GUI fresh-install VRAM defaults here so Music Clip Creator
@@ -960,8 +962,8 @@ def _creative_pool_items(value: str, *, allow_commas: bool = False) -> List[str]
         " then ", " followed by ", " before ", " after ", " while ",
         " from ", " through ", " into ", " to the ", " and then ", "->", "→",
     )
-    normalized = re.sub(r"\s+", " ", raw).lower()
-    low = f" {normalized} "
+    normalized_raw = re.sub(r"\s+", " ", raw)
+    low = f" {normalized_raw.lower()} "
     connected_sequence = any(marker in low for marker in sequence_markers)
 
     parts = re.split(r"[\r\n;|]+", raw)
@@ -1779,6 +1781,11 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             "--ref-audio", str(audio_chunk),
             "--output", str(out_path),
         ]
+        if project.use_hybrid_model:
+            hybrid = Path(str(project.hybrid_model_path or "").strip())
+            if not hybrid.is_file():
+                raise RuntimeError("Use hybrid model is enabled, but the selected hybrid .safetensors file was not found.")
+            cmd += ["--ref2va-checkpoint", str(hybrid.resolve())]
         if project.vram_manager_enabled:
             cmd += ["--vram-manager-auto" if project.vram_auto_bypass else "--vram-manager"]
             cmd += [
@@ -2226,6 +2233,12 @@ class MiniMaxMusicClipWidget(QWidget):
     def _build_generate_tab(self) -> None:
         outer, body, lay = self._scrollable_tab_body(self.page_generate)
         row = QHBoxLayout()
+        self.btn_create_video_clip = QPushButton("Create video clip", self.page_generate)
+        self.btn_create_video_clip.setToolTip(
+            "One-click workflow: analyze the selected song, use Whisper lyric timing when enabled, "
+            "build/direct the complete shot list, add all missing MiniMax clips to the FrameVision queue, "
+            "then queue final trim and assembly."
+        )
         self.btn_generate_selected = QPushButton("Generate selected shot", self.page_generate)
         self.btn_generate_all = QPushButton("Generate all missing shots", self.page_generate)
         self.btn_stop_generation = QPushButton("Stop generation", self.page_generate)
@@ -2235,7 +2248,7 @@ class MiniMaxMusicClipWidget(QWidget):
             self.btn_stop_generation.setVisible(False)
         self.btn_assemble = QPushButton("Assemble final music video", self.page_generate)
         self.btn_open_output = QPushButton("Open output folder", self.page_generate)
-        row.addWidget(self.btn_generate_selected); row.addWidget(self.btn_generate_all); row.addWidget(self.btn_stop_generation); row.addWidget(self.btn_assemble); row.addWidget(self.btn_open_output); row.addStretch(1)
+        row.addWidget(self.btn_create_video_clip); row.addWidget(self.btn_generate_selected); row.addWidget(self.btn_generate_all); row.addWidget(self.btn_stop_generation); row.addWidget(self.btn_assemble); row.addWidget(self.btn_open_output); row.addStretch(1)
         self.label_job_seed = QLabel("Job seed: auto (first generation locks one random seed for the whole job). Edit a shot's Seed value below to override it for retries.", body)
         self.label_job_seed.setWordWrap(True)
         lay.addWidget(self.label_job_seed)
@@ -2271,6 +2284,7 @@ class MiniMaxMusicClipWidget(QWidget):
         lay.addWidget(preview_box)
         outer.addLayout(row)
 
+        self.btn_create_video_clip.clicked.connect(self.create_video_clip)
         self.btn_generate_selected.clicked.connect(self._generate_selected)
         self.btn_generate_all.clicked.connect(self._generate_all)
         self.btn_stop_generation.clicked.connect(self._stop_generation)
@@ -2320,6 +2334,17 @@ class MiniMaxMusicClipWidget(QWidget):
         lora_row.addWidget(self.edit_turbo_lora, 1); lora_row.addWidget(self.btn_turbo_lora); lora_row.addWidget(QLabel("Strength:", gen)); lora_row.addWidget(self.spin_turbo_lora)
         form.addRow("Turbo / speed LoRA:", lora_row)
         self.btn_turbo_lora.clicked.connect(self._browse_turbo_lora)
+        self.check_hybrid_model = QCheckBox("Use hybrid model", gen)
+        self.check_hybrid_model.setToolTip("Use one hybrid MiniMax H3 diffusion checkpoint for these Ref2VA music clips instead of the normal Ref2VA checkpoint. This choice is remembered after restart.")
+        hybrid_row = QHBoxLayout()
+        self.edit_hybrid_model = QLineEdit(gen); self.edit_hybrid_model.setPlaceholderText("Hybrid MiniMax H3 checkpoint (.safetensors)")
+        self.btn_hybrid_model = QPushButton("Browse...", gen)
+        hybrid_row.addWidget(self.edit_hybrid_model, 1); hybrid_row.addWidget(self.btn_hybrid_model)
+        form.addRow(self.check_hybrid_model)
+        form.addRow("Hybrid checkpoint:", hybrid_row)
+        self.btn_hybrid_model.clicked.connect(self._browse_hybrid_model)
+        self.check_hybrid_model.toggled.connect(self._sync_hybrid_model_controls)
+        self._sync_hybrid_model_controls(False)
         self.check_vram_manager = QCheckBox("Enable VRAM Manager protection", gen); self.check_vram_manager.setChecked(True)
         self.check_vram_manager.setToolTip("Master switch. Off = never use VRAM Manager. On = use the setting below to choose automatic bypass or always-on protection.")
         self.check_vram_auto_bypass = QCheckBox("Automatic bypass when job fits", gen); self.check_vram_auto_bypass.setChecked(True)
@@ -2384,6 +2409,8 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.ref_image_size = self.combo_ref_size.currentText()
         self.project.turbo_lora_path = self.edit_turbo_lora.text().strip()
         self.project.turbo_lora_strength = self.spin_turbo_lora.value()
+        self.project.use_hybrid_model = self.check_hybrid_model.isChecked()
+        self.project.hybrid_model_path = self.edit_hybrid_model.text().strip()
         self.project.vram_manager_enabled = self.check_vram_manager.isChecked()
         self.project.vram_auto_bypass = self.check_vram_auto_bypass.isChecked()
         self.project.sage_attention = self.check_sage.isChecked()
@@ -2407,6 +2434,8 @@ class MiniMaxMusicClipWidget(QWidget):
         self.combo_ref_size.setCurrentText(p.ref_image_size if p.ref_image_size in ("match", "max") else "match")
         self.edit_turbo_lora.setText(p.turbo_lora_path or "")
         self.spin_turbo_lora.setValue(float(p.turbo_lora_strength or 1.0))
+        self.check_hybrid_model.setChecked(bool(getattr(p, "use_hybrid_model", False)))
+        self.edit_hybrid_model.setText(str(getattr(p, "hybrid_model_path", "") or ""))
         self.check_vram_manager.setChecked(bool(p.vram_manager_enabled)); self.check_vram_auto_bypass.setChecked(bool(p.vram_auto_bypass)); self.check_sage.setChecked(p.sage_attention); self.check_spectrum.setChecked(p.spectrum)
         self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
         self._populate_refs(); self._populate_analysis(); self._populate_shots(); self._populate_review(); self._update_frame_label()
@@ -2444,6 +2473,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "resolution", "aspect", "max_frames", "head_padding", "tail_padding",
             "phrase_snap_tolerance", "steps", "cfg", "shift", "audio_shift",
             "ref_image_size", "turbo_lora_path", "turbo_lora_strength",
+            "use_hybrid_model", "hybrid_model_path",
             "vram_manager_enabled", "vram_auto_bypass", "vram_residency_engine",
             "vram_runtime_free_gb", "vram_text_headroom_gb", "vram_diffusion_headroom_gb",
             "vram_offload_chunk_mb", "vram_max_resident_weights_gb", "vram_block_check_interval",
@@ -3090,6 +3120,11 @@ class MiniMaxMusicClipWidget(QWidget):
             "--ref-audio", str(audio_chunk),
             "--output", str(out_path),
         ]
+        if self.project.use_hybrid_model:
+            hybrid = Path(str(self.project.hybrid_model_path or "").strip())
+            if not hybrid.is_file():
+                raise RuntimeError("Use hybrid model is enabled, but the selected hybrid .safetensors file was not found.")
+            args += ["--ref2va-checkpoint", str(hybrid.resolve())]
         if self.project.vram_manager_enabled:
             args += ["--vram-manager-auto" if self.project.vram_auto_bypass else "--vram-manager"]
             args += [
@@ -3271,6 +3306,18 @@ class MiniMaxMusicClipWidget(QWidget):
     def _open_output_folder(self) -> None:
         path = Path(self.edit_output.text().strip() or OUTPUT_ROOT); path.mkdir(parents=True, exist_ok=True); QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
+    def _sync_hybrid_model_controls(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self.edit_hybrid_model.setEnabled(enabled)
+        self.btn_hybrid_model.setEnabled(enabled)
+
+    def _browse_hybrid_model(self) -> None:
+        start = self.edit_hybrid_model.text().strip() or str(ROOT / "models" / "minimax_h3")
+        path, _ = QFileDialog.getOpenFileName(self, "Select hybrid MiniMax H3 checkpoint", start, "SafeTensors (*.safetensors);;All files (*.*)")
+        if path:
+            self.edit_hybrid_model.setText(path)
+            self._pull_ui(); self._save_settings()
+
     def _browse_turbo_lora(self) -> None:
         start = self.edit_turbo_lora.text().strip()
         if start and Path(start).is_file():
@@ -3382,6 +3429,8 @@ class MiniMaxMusicClipWidget(QWidget):
                 ):
                     if key in data:
                         setattr(self.project, key, data[key])
+                self.project.use_hybrid_model = bool(data.get("use_hybrid_model", self.project.use_hybrid_model))
+                self.project.hybrid_model_path = str(data.get("hybrid_model_path") or self.project.hybrid_model_path)
                 self.project.sage_attention = bool(data.get("sage_attention", self.project.sage_attention))
                 self.project.spectrum = bool(data.get("spectrum", self.project.spectrum))
                 self.project.randomize_reference_characters = bool(data.get("randomize_reference_characters", self.project.randomize_reference_characters))
@@ -3410,6 +3459,7 @@ class MiniMaxMusicClipWidget(QWidget):
                 "vram_residency_warmup_blocks": self.project.vram_residency_warmup_blocks,
                 "vram_residency_refill_interval": self.project.vram_residency_refill_interval,
                 "turbo_lora_path": self.project.turbo_lora_path, "turbo_lora_strength": self.project.turbo_lora_strength,
+                "use_hybrid_model": self.project.use_hybrid_model, "hybrid_model_path": self.project.hybrid_model_path,
                 "sage_attention": self.project.sage_attention, "spectrum": self.project.spectrum,
                 "randomize_reference_characters": self.project.randomize_reference_characters,
             }
