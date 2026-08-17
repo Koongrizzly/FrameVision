@@ -960,7 +960,8 @@ def _creative_pool_items(value: str, *, allow_commas: bool = False) -> List[str]
         " then ", " followed by ", " before ", " after ", " while ",
         " from ", " through ", " into ", " to the ", " and then ", "->", "→",
     )
-    low = f" {re.sub(r'\\s+', ' ', raw).lower()} "
+    normalized = re.sub(r"\s+", " ", raw).lower()
+    low = f" {normalized} "
     connected_sequence = any(marker in low for marker in sequence_markers)
 
     parts = re.split(r"[\r\n;|]+", raw)

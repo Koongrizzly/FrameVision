@@ -17083,7 +17083,16 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             pass
 
-        self.tabs.addTab(_scroll_tab_page(page_main), "Normal")
+        # Keep stable references to each workflow page.  The creator selector in
+        # OneClickVideoClipTab rebuilds the visible tab set from these objects, so
+        # users never see Normal and LTX pages mixed together.
+        self._tab_normal = _scroll_tab_page(page_main)
+        self._tab_ltx_workflow = _scroll_tab_page(page_ltx_workflow) if page_ltx_workflow is not None else None
+        self._tab_ltx_review = page_ltx_review if page_ltx_review is not None else None
+        self._tab_settings = _scroll_tab_page(page_settings)
+        self._creator_mode = "normal"
+
+        self.tabs.addTab(self._tab_normal, "Normal")
 
         # Music timeline tab lives in a separate helper module so it can grow
         # without bloating this file too much. Do not wrap this tab in a
@@ -17117,13 +17126,9 @@ class AutoMusicSyncWidget(QWidget):
         # normal-workflow timeline to users who only use the LTX workflow.
         self._timeline_tab_visible = False
         self._timeline_tab_title = "Timeline"
-        if page_ltx_workflow is not None:
-            self.tabs.addTab(_scroll_tab_page(page_ltx_workflow), "LTX workflow")
-        if page_ltx_review is not None:
-            # LTX Review already contains its own scroll area plus a fixed bottom
-            # action bar, so do not wrap the whole tab in another scroll area.
-            self.tabs.addTab(page_ltx_review, "LTX Review")
-        self.tabs.addTab(_scroll_tab_page(page_settings), "Settings")
+        # Startup mode is deliberately Normal-only.  LTX pages are inserted only
+        # when the top creator selector is switched to LTX Clip Creator.
+        self.tabs.addTab(self._tab_settings, "Settings")
 
         # The sticky footer follows the active sub-tab. Review keeps only the
         # logger/progress bar; Settings deliberately exposes both workflow rows.
@@ -24946,6 +24951,60 @@ class AutoMusicSyncWidget(QWidget):
         except Exception as exc:
             return {"ok": False, "message": f"LTX review recreate failed: {exc}"}
 
+    def set_creator_mode(self, mode: str) -> None:
+        """Show only the tabs belonging to the selected creator workflow.
+
+        ``normal`` -> Normal (+ session Timeline) + Settings
+        ``ltx``    -> LTX workflow + LTX Review + Settings
+
+        MiniMax is hosted by the outer OneClickVideoClipTab and therefore hides
+        this entire widget instead of becoming another tab here.
+        """
+        mode = str(mode or "normal").strip().lower()
+        if mode not in {"normal", "ltx"}:
+            mode = "normal"
+        self._creator_mode = mode
+
+        tabs = getattr(self, "tabs", None)
+        if tabs is None:
+            return
+
+        # Removing a tab does not destroy its page, so the complete state of both
+        # workflows survives switching the selector back and forth.
+        while tabs.count():
+            tabs.removeTab(0)
+
+        if mode == "ltx":
+            ltx = getattr(self, "_tab_ltx_workflow", None)
+            review = getattr(self, "_tab_ltx_review", None)
+            if ltx is not None:
+                tabs.addTab(ltx, "LTX workflow")
+            if review is not None:
+                tabs.addTab(review, "LTX Review")
+            tabs.addTab(self._tab_settings, "Settings")
+            try:
+                self.timeline_panel.hide()
+            except Exception:
+                pass
+        else:
+            tabs.addTab(self._tab_normal, "Normal")
+            if bool(getattr(self, "_timeline_tab_visible", False)):
+                panel = getattr(self, "timeline_panel", None)
+                if panel is not None:
+                    try:
+                        panel.setParent(tabs)
+                    except Exception:
+                        pass
+                    tabs.addTab(panel, getattr(self, "_timeline_tab_title", "Timeline"))
+                    try:
+                        panel.show()
+                    except Exception:
+                        pass
+            tabs.addTab(self._tab_settings, "Settings")
+
+        tabs.setCurrentIndex(0)
+        self._update_footer_for_active_tab(0)
+
     def _update_footer_for_active_tab(self, index: int = -1) -> None:
         """Show only the workflow actions relevant to the active sub-tab.
 
@@ -24960,17 +25019,13 @@ class AutoMusicSyncWidget(QWidget):
         except Exception:
             title = "normal"
 
-        if title == "settings":
-            show_normal = True
-            show_ltx = True
-        elif title == "ltx workflow":
+        creator_mode = str(getattr(self, "_creator_mode", "normal") or "normal").lower()
+        if creator_mode == "ltx":
             show_normal = False
-            show_ltx = True
-        elif title == "ltx review":
-            show_normal = False
-            show_ltx = False
+            show_ltx = title != "ltx review"
         else:
-            # Normal and its optional Timeline page use the normal workflow row.
+            # Normal and its optional Timeline page use only the normal workflow
+            # actions, including on the shared Settings page.
             show_normal = True
             show_ltx = False
 
@@ -28574,6 +28629,12 @@ class AutoMusicSyncWidget(QWidget):
 
             index = tabs.indexOf(panel)
             if visible:
+                self._timeline_tab_visible = True
+                # The timeline belongs to Normal only.  If analysis code asks to
+                # reveal it while another creator is selected, remember that it
+                # is available but do not inject a Normal tab into the LTX view.
+                if str(getattr(self, "_creator_mode", "normal") or "normal").lower() != "normal":
+                    return
                 if index == -1:
                     insert_at = 1 if tabs.count() >= 1 else tabs.count()
                     try:
@@ -30109,24 +30170,90 @@ class OneClickVideoClipTab(QWidget):
         outer.addWidget(banner_wrap)
         outer.addSpacing(4)
 
-        # Keep the Music Clip Creator's own tab bar fixed at the top.
-        # Each content page now owns one normal vertical scroller, so sections
-        # stay readable without making the tab row disappear while scrolling.
+        # Creator selector: this is intentionally a dropdown instead of another
+        # tab.  Each creator gets its own clean workspace so a new user does not
+        # have to infer that the Normal workflow is unrelated to LTX.
+        selector_wrap = QWidget(self)
+        selector_row = QHBoxLayout(selector_wrap)
+        selector_row.setContentsMargins(6, 0, 6, 2)
+        selector_row.setSpacing(8)
+        selector_label = QLabel("Clip creator:", selector_wrap)
+        selector_label.setStyleSheet("font-weight: 700;")
+        self.creator_selector = QComboBox(selector_wrap)
+        self.creator_selector.addItem("Normal clip creator", "normal")
+        self.creator_selector.addItem("LTX clip creator", "ltx")
+        self.creator_selector.addItem("MiniMax clip creator", "minimax")
+        self.creator_selector.setMinimumWidth(260)
+        self.creator_selector.setToolTip(
+            "Choose one complete music-clip workflow. Only tabs belonging to that creator are shown."
+        )
+        selector_row.addWidget(selector_label)
+        selector_row.addWidget(self.creator_selector)
+        selector_row.addStretch(1)
+        outer.addWidget(selector_wrap)
+
+        # Normal/LTX host.  AutoMusicSyncWidget itself filters its tab set based
+        # on the selector so Normal shows Normal + Settings and LTX shows only
+        # LTX workflow + LTX Review + Settings.
         self.inner = AutoMusicSyncWidget(parent=self, sticky_footer=True)
         outer.addWidget(self.inner, 1)
 
-        # Sticky footer: keep the main action buttons visible while scrolling.
+        # MiniMax is already an embeddable QWidget.  Load it lazily from the same
+        # helpers directory, but keep FrameVision usable if that optional helper
+        # is missing or has an import error.
+        self.minimax_widget = None
+        self.minimax_error_widget = None
         try:
-            div = QFrame(self)
-            div.setFrameShape(QFrame.HLine)
-            div.setFrameShadow(QFrame.Sunken)
-            outer.addWidget(div)
-        except Exception:
-            pass
-        try:
-            outer.addWidget(self.inner.footer_bar, 0)
-        except Exception:
-            pass
+            try:
+                from .minimax_music_clip import MiniMaxMusicClipWidget
+            except Exception:
+                mm_path = Path(__file__).resolve().with_name("minimax_music_clip.py")
+                spec = importlib.util.spec_from_file_location("framevision_minimax_music_clip", str(mm_path))
+                if spec is None or spec.loader is None:
+                    raise RuntimeError(f"Could not load {mm_path.name}")
+                mm_module = importlib.util.module_from_spec(spec)
+                sys.modules.setdefault(spec.name, mm_module)
+                spec.loader.exec_module(mm_module)
+                MiniMaxMusicClipWidget = mm_module.MiniMaxMusicClipWidget
+            self.minimax_widget = MiniMaxMusicClipWidget(parent=self)
+            self.minimax_widget.hide()
+            outer.addWidget(self.minimax_widget, 1)
+        except Exception as exc:
+            self.minimax_error_widget = QLabel(
+                "MiniMax Music Clip Creator could not be loaded.\n" + str(exc), self
+            )
+            self.minimax_error_widget.setWordWrap(True)
+            self.minimax_error_widget.setAlignment(Qt.AlignCenter)
+            self.minimax_error_widget.hide()
+            outer.addWidget(self.minimax_error_widget, 1)
+
+        # Sticky footer: keep the currently selected Normal/LTX action row visible.
+        self.footer_divider = QFrame(self)
+        self.footer_divider.setFrameShape(QFrame.HLine)
+        self.footer_divider.setFrameShadow(QFrame.Sunken)
+        outer.addWidget(self.footer_divider)
+        outer.addWidget(self.inner.footer_bar, 0)
+
+        self.creator_selector.currentIndexChanged.connect(self._on_creator_selection_changed)
+        self._on_creator_selection_changed(self.creator_selector.currentIndex())
+
+    def _on_creator_selection_changed(self, _index: int = -1) -> None:
+        mode = str(self.creator_selector.currentData() or "normal")
+        is_minimax = mode == "minimax"
+
+        # MiniMax replaces the complete old creator body.  The selector itself
+        # stays visible so switching back is always one click away.
+        self.inner.setVisible(not is_minimax)
+        self.inner.footer_bar.setVisible(not is_minimax)
+        self.footer_divider.setVisible(not is_minimax)
+        if self.minimax_widget is not None:
+            self.minimax_widget.setVisible(is_minimax)
+        if self.minimax_error_widget is not None:
+            self.minimax_error_widget.setVisible(is_minimax and self.minimax_widget is None)
+
+        if not is_minimax:
+            self.inner.set_creator_mode(mode)
+
 
 # ------------------------- integration entry point -------------------------
 

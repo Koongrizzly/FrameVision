@@ -815,7 +815,12 @@ class MainWindow(QMainWindow):
         self._build_generation_tab()
         self._build_prompt_builder_tab()
         self._build_queue_tab()
-        self._build_music_clip_tab()
+        # FrameVision has its own Music Clip Creator location. Keep the MiniMax
+        # Music Clip Creator available only in the standalone application.
+        if not self._embedded:
+            self._build_music_clip_tab()
+        else:
+            self.music_clip_tab_index = -1
         self._build_settings_tab()
 
         # Fixed bottom bar: remains visible on every tab and while tab contents scroll.

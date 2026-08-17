@@ -240,6 +240,7 @@ class Wan22Pane(QWidget):
         self._hide_hiar = ("hiar" in _hidden)
         self._hide_bernini = ("bernini_r_1p3b" in _hidden) or ("bernini" in _hidden)
         self._hide_ltx23 = ("ltx23" in _hidden) or ("ltx" in _hidden)
+        self._hide_minimax_h3 = ("minimax_h3" in _hidden) or ("minimax" in _hidden)
         self._all_engines_hidden = bool(
             self._hide_wan22
             and self._hide_wan22_turbo
@@ -247,6 +248,7 @@ class Wan22Pane(QWidget):
             and self._hide_hiar
             and self._hide_bernini
             and self._hide_ltx23
+            and self._hide_minimax_h3
         )
 
         if not self._hide_wan22:
@@ -261,6 +263,8 @@ class Wan22Pane(QWidget):
             self.cmb_engine.addItem("Bernini R 1.3B", "bernini_r_1p3b")
         if not self._hide_ltx23:
             self.cmb_engine.addItem("LTX 2.3", "ltx23")
+        if not self._hide_minimax_h3:
+            self.cmb_engine.addItem("MiniMax H3", "minimax_h3")
         if self.cmb_engine.count() == 0:
             # Keep UI stable even if both engines are hidden.
             self.cmb_engine.addItem("All engines hidden by user", "none")
@@ -1142,6 +1146,29 @@ class Wan22Pane(QWidget):
         except Exception:
             pass
 
+        # MiniMax H3 page (optional).  IMPORTANT: do not import or construct the
+        # MiniMax GUI while FrameVision itself is starting.  Its standalone GUI
+        # performs substantial Qt/application setup in MainWindow.__init__, so an
+        # eager construction here can block FrameVision startup.  The real GUI is
+        # created only after the user explicitly selects MiniMax H3.
+        self._minimax_page = QWidget()
+        minimax_layout = QVBoxLayout(self._minimax_page)
+        minimax_layout.setContentsMargins(0, 0, 0, 0)
+        minimax_layout.setSpacing(0)
+        self._minimax_widget = None
+        lbl = QLabel(
+            "MiniMax H3 is hidden by user."
+            if getattr(self, "_hide_minimax_h3", False)
+            else "MiniMax H3 will load when selected."
+        )
+        lbl.setWordWrap(True)
+        minimax_layout.addWidget(lbl)
+
+        try:
+            self._engine_stack.addWidget(self._minimax_page)
+        except Exception:
+            pass
+
         # Mode toggling
         self.cmb_mode.currentTextChanged.connect(self._update_mode)
         self._update_mode()
@@ -1236,6 +1263,19 @@ class Wan22Pane(QWidget):
         # Now that the UI is set up, persist engine changes immediately
         try:
             self.cmb_engine.currentIndexChanged.connect(self._on_engine_changed)
+            # User activation still lazy-loads MiniMax when switching engines later.
+            self.cmb_engine.activated.connect(self._on_engine_activated)
+        except Exception:
+            pass
+
+        # Settings restoration happens before the engine signals above are connected.
+        # If MiniMax H3 was the saved startup engine, _sync_engine_view() correctly
+        # selects its page but the old user-only lazy-load rule left the placeholder
+        # visible until the user switched away and back.  Keep startup non-blocking,
+        # but load MiniMax on the next Qt event-loop turn once FrameVision's UI exists.
+        try:
+            if self._wan_engine_key() == "minimax_h3":
+                QTimer.singleShot(0, self._ensure_minimax_loaded)
         except Exception:
             pass
 
@@ -2110,8 +2150,8 @@ class Wan22Pane(QWidget):
                 pass
 
 
-    def _hidden_engine_flags(self) -> tuple[bool, bool, bool, bool, bool, bool]:
-        """Return hidden flags for Wan normal/Wan Turbo/Hunyuan/HiAR/Bernini/LTX from remove_hide state."""
+    def _hidden_engine_flags(self) -> tuple[bool, bool, bool, bool, bool, bool, bool]:
+        """Return hidden flags for Wan normal/Wan Turbo/Hunyuan/HiAR/Bernini/LTX/MiniMax."""
         try:
             hidden = _optional_hidden_ids()
         except Exception:
@@ -2123,6 +2163,7 @@ class Wan22Pane(QWidget):
             "hiar" in hidden,
             ("bernini_r_1p3b" in hidden) or ("bernini" in hidden),
             ("ltx23" in hidden) or ("ltx" in hidden),
+            ("minimax_h3" in hidden) or ("minimax" in hidden),
         )
 
     def _populate_engine_combo_from_hidden_state(self, preserve_key: str | None = None) -> None:
@@ -2134,14 +2175,15 @@ class Wan22Pane(QWidget):
                     preserve_key = self._wan_engine_key()
                 except Exception:
                     preserve_key = None
-            hide_wan22, hide_wan22_turbo, hide_hunyuan15, hide_hiar, hide_bernini, hide_ltx23 = self._hidden_engine_flags()
+            hide_wan22, hide_wan22_turbo, hide_hunyuan15, hide_hiar, hide_bernini, hide_ltx23, hide_minimax_h3 = self._hidden_engine_flags()
             self._hide_wan22 = hide_wan22
             self._hide_wan22_turbo = hide_wan22_turbo
             self._hide_hunyuan15 = hide_hunyuan15
             self._hide_hiar = hide_hiar
             self._hide_bernini = hide_bernini
             self._hide_ltx23 = hide_ltx23
-            self._all_engines_hidden = bool(hide_wan22 and hide_wan22_turbo and hide_hunyuan15 and hide_hiar and hide_bernini and hide_ltx23)
+            self._hide_minimax_h3 = hide_minimax_h3
+            self._all_engines_hidden = bool(hide_wan22 and hide_wan22_turbo and hide_hunyuan15 and hide_hiar and hide_bernini and hide_ltx23 and hide_minimax_h3)
 
             try:
                 self.cmb_engine.blockSignals(True)
@@ -2161,6 +2203,8 @@ class Wan22Pane(QWidget):
                     self.cmb_engine.addItem("Bernini R 1.3B", "bernini_r_1p3b")
                 if not hide_ltx23:
                     self.cmb_engine.addItem("LTX 2.3", "ltx23")
+                if not hide_minimax_h3:
+                    self.cmb_engine.addItem("MiniMax H3", "minimax_h3")
                 if self.cmb_engine.count() == 0:
                     self.cmb_engine.addItem("All engines hidden by user", "none")
                     try:
@@ -2216,6 +2260,34 @@ class Wan22Pane(QWidget):
             layout.addWidget(lbl)
         except Exception:
             pass
+
+    def _build_minimax_widget(self, parent: QWidget):
+        """Create MiniMax H3 in FrameVision-safe embedded import mode."""
+        # MiniMax standalone imports Qt WebEngine/Multimedia before QApplication.
+        # FrameVision is already running its QApplication when this engine is
+        # selected, so tell the module to skip those native subsystems and use
+        # its browser/system-player fallbacks instead.
+        _env_key = "FRAMEVISION_MINIMAX_EMBEDDED_IMPORT"
+        _old_env = os.environ.get(_env_key)
+        os.environ[_env_key] = "1"
+        try:
+            try:
+                from helpers.minimax_h3_gui import MainWindow as MiniMaxH3MainWindow  # type: ignore
+            except Exception:
+                from minimax_h3_gui import MainWindow as MiniMaxH3MainWindow  # type: ignore
+        finally:
+            if _old_env is None:
+                os.environ.pop(_env_key, None)
+            else:
+                os.environ[_env_key] = _old_env
+
+        widget = MiniMaxH3MainWindow(parent=parent, embedded=True)
+        try:
+            widget.setMinimumSize(0, 0)
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        except Exception:
+            pass
+        return widget
 
     def _refresh_embedded_optional_pages(self) -> None:
         """Rebuild optional embedded pages when they are unhidden live."""
@@ -2317,6 +2389,18 @@ class Wan22Pane(QWidget):
         except Exception:
             pass
 
+        # MiniMax H3 stays lazy here as well.  A hide/unhide refresh must never
+        # instantiate the heavyweight MiniMax window behind the user's back.
+        try:
+            if getattr(self, "_minimax_page", None) is not None:
+                if getattr(self, "_hide_minimax_h3", False):
+                    self._minimax_widget = None
+                    self._set_page_message(self._minimax_page, "MiniMax H3 is hidden by user.")
+                elif getattr(self, "_minimax_widget", None) is None:
+                    self._set_page_message(self._minimax_page, "MiniMax H3 will load when selected.")
+        except Exception:
+            pass
+
     def refresh_hidden_tools(self) -> None:
         """Refresh Wan engine visibility live after remove/hide changes."""
         try:
@@ -2364,7 +2448,7 @@ class Wan22Pane(QWidget):
             key = "wan22"
 
         # If all engines are hidden, a placeholder item with data "none" is shown.
-        if key not in ("wan22", "wan22_turbo", "hunyuan15", "hiar", "bernini_r_1p3b", "ltx23"):
+        if key not in ("wan22", "wan22_turbo", "hunyuan15", "hiar", "bernini_r_1p3b", "ltx23", "minimax_h3"):
             try:
                 if getattr(self, "_engine_stack", None) is not None:
                     self._engine_stack.setCurrentIndex(0)
@@ -2393,6 +2477,8 @@ class Wan22Pane(QWidget):
                     idx = 3
                 elif key == "ltx23":
                     idx = 4
+                elif key == "minimax_h3":
+                    idx = 5
                 else:
                     idx = 0
                 self._engine_stack.setCurrentIndex(idx)
@@ -2412,6 +2498,8 @@ class Wan22Pane(QWidget):
                 self.banner.setText("Bernini-R 1.3B image/video generation and edits")
             elif key == "ltx23":
                 self.banner.setText("Video Creation with LTX 2.3")
+            elif key == "minimax_h3":
+                self.banner.setText("Video Creation with MiniMax H3")
             else:
                 self.banner.setText("Video Creation")
         except Exception:
@@ -2427,6 +2515,43 @@ class Wan22Pane(QWidget):
                 self._save_settings()
             except Exception:
                 pass
+
+    def _ensure_minimax_loaded(self) -> None:
+        """Instantiate MiniMax only after an explicit user selection."""
+        if getattr(self, "_hide_minimax_h3", False):
+            return
+        if getattr(self, "_minimax_widget", None) is not None:
+            return
+        page = getattr(self, "_minimax_page", None)
+        if page is None:
+            return
+        layout = page.layout() or QVBoxLayout(page)
+        self._clear_layout_widgets(layout)
+        try:
+            self._minimax_widget = self._build_minimax_widget(page)
+            layout.addWidget(self._minimax_widget, 1)
+            # The page may have been selected before the lazy widget existed. Force
+            # one geometry/update pass so the newly inserted GUI paints immediately.
+            page.updateGeometry()
+            page.update()
+            if getattr(self, "_engine_stack", None) is not None:
+                self._engine_stack.updateGeometry()
+                self._engine_stack.update()
+            QTimer.singleShot(0, lambda: self._minimax_widget.update() if self._minimax_widget is not None else None)
+        except Exception as exc:
+            self._minimax_widget = None
+            self._set_page_message(
+                page,
+                f"MiniMax H3 UI not available (missing/incompatible minimax_h3_gui.py): {type(exc).__name__}: {exc}",
+            )
+
+    def _on_engine_activated(self, *_):
+        """Handle an engine choice made by the user (not settings restoration)."""
+        try:
+            if self._wan_engine_key() == "minimax_h3":
+                self._ensure_minimax_loaded()
+        except Exception:
+            pass
 
     def _on_engine_changed(self, *_):
         # QComboBox already points at the new engine here, so keep our own
@@ -3021,6 +3146,8 @@ class Wan22Pane(QWidget):
                 if not cand.exists():
                     cand = APP_ROOT / "output"
                 folder = cand
+            elif "minimax" in key:
+                folder = APP_ROOT / "output"
             else:
                 folder = self._wan_outputs_dir()
         except Exception:
