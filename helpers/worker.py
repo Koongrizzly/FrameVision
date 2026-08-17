@@ -13,7 +13,7 @@ def _infer_image_format_from_input(job_args):
         pass
     return None
 # FrameVision worker - NCNN wiring
-import json, time, subprocess, os, re, shutil, sys
+import json, time, subprocess, os, re, shutil, sys, uuid
 from pathlib import Path
 try:
     from PIL import Image
@@ -2256,6 +2256,87 @@ def tools_ffmpeg(job, cfg, mani):
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
 
+        # MiniMax jobs are queued by FrameVision but must *not* inherit the
+        # worker's active Python/Conda environment.  The interpreter in cmd[0]
+        # belongs to environments/.minimax_h3_int4; build a clean child
+        # environment around that interpreter while retaining ordinary Windows
+        # system/application PATH entries.
+        _minimax_env_diag = ""
+        try:
+            _engine = str(args.get("engine") or job.get("engine") or "").strip().lower()
+            _clean_mm = bool(args.get("clean_python_env")) or _engine == "minimax_h3"
+            if _clean_mm and isinstance(cmd, (list, tuple)) and cmd:
+                _py = pathlib.Path(str(cmd[0])).resolve()
+                _prefix = _py.parent
+
+                # Remove variables which can make one Python installation load
+                # packages/DLLs from another one.  Keep normal Windows/user
+                # variables (TEMP, SystemRoot, CUDA driver variables, etc.).
+                for _k in (
+                    "PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT",
+                    "CONDA_PREFIX", "CONDA_PREFIX_1", "CONDA_PREFIX_2",
+                    "CONDA_DEFAULT_ENV", "CONDA_PROMPT_MODIFIER", "CONDA_EXE",
+                    "_CE_CONDA", "_CE_M", "CONDA_PYTHON_EXE",
+                ):
+                    env.pop(_k, None)
+
+                _old_path = str(env.get("PATH", ""))
+                _kept = []
+                _target_norm = str(_prefix).replace("/", "\\").rstrip("\\").lower()
+                for _entry in _old_path.split(_os.pathsep):
+                    _entry = str(_entry or "").strip().strip('"')
+                    if not _entry:
+                        continue
+                    _norm = _entry.replace("/", "\\").rstrip("\\").lower()
+                    # Drop Python/Conda environment folders inherited from the
+                    # FrameVision worker.  Do not drop the MiniMax env itself.
+                    if _norm.startswith(_target_norm):
+                        continue
+                    if "\\environments\\" in _norm or "\\conda" in _norm or "\\miniconda" in _norm or "\\anaconda" in _norm:
+                        continue
+                    _kept.append(_entry)
+
+                _mm_path = [
+                    str(_prefix),
+                    str(_prefix / "Scripts"),
+                    str(_prefix / "Library" / "bin"),
+                    str(_prefix / "Library" / "usr" / "bin"),
+                    str(_prefix / "Library" / "mingw-w64" / "bin"),
+                ]
+                env["PATH"] = _os.pathsep.join(_mm_path + _kept)
+                env["CONDA_PREFIX"] = str(_prefix)
+                env["CONDA_DEFAULT_ENV"] = _prefix.name
+                env["CONDA_SHLVL"] = "1"
+                env["PYTHONNOUSERSITE"] = "1"
+                env["PYTHONUTF8"] = "1"
+                env["PYTHONIOENCODING"] = "utf-8"
+
+                # Probe using the exact environment that generation will get.
+                try:
+                    _probe = _sp.run(
+                        [str(_py), "-c", "import sys; print(sys.executable); print(sys.prefix); print(sys.base_prefix)"],
+                        cwd=cwd, env=env, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                        text=True, encoding="utf-8", errors="replace", timeout=15, check=False,
+                    )
+                    _plines = [x.strip() for x in str(_probe.stdout or "").splitlines() if x.strip()]
+                    _exe_actual = _plines[0] if len(_plines) > 0 else str(_py)
+                    _prefix_actual = _plines[1] if len(_plines) > 1 else str(_prefix)
+                    _base_actual = _plines[2] if len(_plines) > 2 else ""
+                    _minimax_env_diag = (
+                        "[worker] MiniMax isolated runtime\n"
+                        f"MiniMax Python: {_exe_actual}\n"
+                        f"MiniMax sys.prefix: {_prefix_actual}\n"
+                        f"MiniMax sys.base_prefix: {_base_actual}\n"
+                        f"MiniMax CONDA_PREFIX: {env.get('CONDA_PREFIX','')}"
+                    )
+                    print(_minimax_env_diag, flush=True)
+                except Exception as _probe_err:
+                    _minimax_env_diag = f"[worker] MiniMax runtime probe failed: {_probe_err}; requested Python: {_py}; prefix: {_prefix}"
+                    print(_minimax_env_diag, flush=True)
+        except Exception as _mm_env_err:
+            _minimax_env_diag = f"[worker] MiniMax clean-environment setup failed: {_mm_env_err}"
+            print(_minimax_env_diag, flush=True)
+
         # Optional env overrides from job args (useful for tools that need custom PATH/vars)
         try:
             extra_env = args.get("env")
@@ -2319,6 +2400,8 @@ def tools_ffmpeg(job, cfg, mani):
                         _qa = args.get("hunyuan15_python_rewrite_checked") or args.get("hunyuan15_python_rewrite_error") or ""
                         if _qa:
                             lf.write("[queue_adapter] Hunyuan Python checked: " + str(_qa) + "\n")
+                        if _minimax_env_diag:
+                            lf.write(str(_minimax_env_diag).rstrip() + "\n")
                     except Exception:
                         pass
                     lf.write("\n")
@@ -6929,6 +7012,117 @@ def qwentts_generate(job, cfg, mani):
         pass
     return 0
 
+def _minimax_lanczos_scale_2x(output_path):
+    """Atomically replace a MiniMax output with a 2× Lanczos-scaled MP4."""
+    src = Path(str(output_path or ""))
+    if not src.is_file():
+        return False, f"Lanczos scaling source is missing: {src}"
+    tmp = src.with_name(f".{src.stem}.lanczos2x.{uuid.uuid4().hex[:8]}.mp4")
+    cmd = [
+        FFMPEG, "-y", "-i", str(src),
+        "-map", "0:v:0", "-map", "0:a?",
+        "-vf", "scale=iw*2:ih*2:flags=lanczos",
+        "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+        "-c:a", "copy", "-movflags", "+faststart", str(tmp),
+    ]
+    try:
+        print("[worker] MiniMax: applying 2x Lanczos scaling to final output", flush=True)
+        code = run(cmd)
+        if code != 0 or not tmp.is_file() or tmp.stat().st_size <= 0:
+            try: tmp.unlink(missing_ok=True)
+            except Exception: pass
+            return False, f"Lanczos scaling failed with FFmpeg exit code {code}."
+        os.replace(str(tmp), str(src))
+        print("[worker] MiniMax: Lanczos scaling complete", flush=True)
+        return True, ""
+    except Exception as exc:
+        try: tmp.unlink(missing_ok=True)
+        except Exception: pass
+        return False, f"Lanczos scaling failed: {exc}"
+
+def minimax_h3_generate(job, cfg, mani):
+    """Run an exact MiniMax GUI-built command, resolving queued continuation safely."""
+    args = job.get('args') or {}
+    cmd = [str(x) for x in (args.get('cmd') or [])]
+    if not cmd:
+        _mark_error(job, 'MiniMax queue job has no command.')
+        return 2
+
+    continue_source = str(args.get('manual_continue_video') or '').strip()
+    dep_id = str(args.get('continue_from_job_id') or '').strip() if args.get('continue_last_result') else ''
+    if dep_id:
+        found = None
+        found_state = ''
+        # FIFO normally means the dependency is already in done/failed. Search all
+        # queue states so a missing/deleted dependency is diagnosed explicitly.
+        for state in ('done','failed','running','pending'):
+            folder = JOBS.get(state)
+            if not folder:
+                continue
+            try:
+                files = list(Path(folder).glob('*.json'))
+            except Exception:
+                files = []
+            for jp in files:
+                if jp.name.endswith('.progress.json') or jp.name.startswith('_'):
+                    continue
+                try:
+                    data = json.loads(jp.read_text(encoding='utf-8'))
+                except Exception:
+                    continue
+                a = data.get('args') or {}
+                ids = {str(data.get('id') or ''), str(a.get('minimax_source_job_id') or '')}
+                if dep_id in ids:
+                    found = data; found_state = state; break
+            if found is not None:
+                break
+        if found is None:
+            _mark_error(job, f'MiniMax continuation dependency {dep_id} no longer exists in the FrameVision queue history.')
+            return 2
+        if found_state == 'failed':
+            _mark_error(job, f'MiniMax continuation dependency {dep_id} failed; continuation stopped.')
+            return 2
+        if found_state != 'done':
+            _mark_error(job, f'MiniMax continuation dependency {dep_id} is not finished yet ({found_state}).')
+            return 2
+        fa = found.get('args') or {}
+        continue_source = str(found.get('produced') or found.get('output') or fa.get('outfile') or fa.get('out_file') or '').strip()
+        if not continue_source or not Path(continue_source).is_file():
+            _mark_error(job, f'MiniMax continuation dependency {dep_id} finished but its output file is missing.')
+            return 2
+
+    if continue_source:
+        cmd += ['--continue-video', continue_source, '--continue-context-frames', str(int(args.get('continue_context_frames') or 39))]
+        if dep_id and bool(args.get('continue_audio_memory')):
+            cmd += ['--continue-audio-memory']
+        if bool(args.get('glue_results')):
+            cmd += ['--glue-source', continue_source]
+        try:
+            _patch_running_json({'resolved_continue_source': continue_source})
+        except Exception:
+            pass
+
+    args['cmd'] = cmd
+    job['args'] = args
+    code = tools_ffmpeg(job, cfg, mani)
+    out = str(args.get('outfile') or args.get('out_file') or '')
+    if code == 0 and bool(args.get('lanczos_scale_2x')) and Path(out).is_file():
+        try:
+            _patch_running_json({'stage': 'Lanczos scaling 2x'})
+        except Exception:
+            pass
+        ok, scale_error = _minimax_lanczos_scale_2x(out)
+        if not ok:
+            _mark_error(job, scale_error)
+            return 2
+    try:
+        if Path(out).is_file():
+            job['produced'] = out
+            job['files'] = [out]
+    except Exception:
+        pass
+    return code
+
 def handle_job(jpath: Path):
     job = json.loads(jpath.read_text(encoding="utf-8"))
     cfg = load_config(); mani = manifest()
@@ -6977,8 +7171,10 @@ def handle_job(jpath: Path):
         if t=="upscale_video": code = upscale_video(job, cfg, mani)
         elif t=="upscale_photo": code = upscale_photo(job, cfg, mani)
         elif t=='tools_ffmpeg': code = tools_ffmpeg(job, cfg, mani)
+        elif t in ('minimax_h3_generate','minimax_h3'):
+            code = minimax_h3_generate(job, cfg, mani)
         elif t in ('ltx23_generate','ltx23','ltx23_tools'):
-            # LTX 2.5 is queued as a normal external command. No special worker
+            # LTX 2.5.4 is queued as a normal external command. No special worker
             # launch mode, no detached process, no LTX-specific subprocess tricks.
             code = tools_ffmpeg(job, cfg, mani)
         # SeedVR2: external CLI runner (python inference_cli.py ...)
@@ -7159,7 +7355,7 @@ def handle_job(jpath: Path):
         return 1
 
 def main():
-    print("FrameVision Worker V2.5.2 Waiting for jobs in", JOBS["pending"])
+    print("FrameVision Worker V2.5.4 Waiting for jobs in", JOBS["pending"])
     try:
         n = cleanup_stale_running_jobs(quiet=False)
         if n:
