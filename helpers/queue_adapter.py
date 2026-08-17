@@ -1931,6 +1931,76 @@ def enqueue_wan22_from_widget(inner) -> bool:
             pass
         return False
 
+def enqueue_minimax_h3_job(minimax_job: dict):
+    """Enqueue the complete job already built by the MiniMax H3 GUI.
+
+    MiniMax owns argument construction.  FrameVision stores that exact command and
+    only resolves a queued Continue-last-result dependency when the worker runs it.
+    """
+    try:
+        from helpers.job_helper import make_job_json
+    except Exception:
+        from job_helper import make_job_json
+    d = jobs_dirs()
+    src = dict(minimax_job or {})
+    base_args = [str(x) for x in (src.get('args') or [])]
+    if not base_args:
+        raise RuntimeError('MiniMax job has no inference arguments.')
+    root = _base_root()
+    py = root / 'environments' / '.minimax_h3_int4' / 'python.exe'
+    if not py.is_file():
+        raise RuntimeError(f'MiniMax Python environment not found: {py}')
+    out_file = str(src.get('output') or '').strip()
+    if not out_file:
+        raise RuntimeError('MiniMax job has no output path.')
+    prompt = str(src.get('prompt') or '').strip()
+    mode_name = str(src.get('mode_name') or 'MiniMax H3').strip()
+    label = 'MiniMax H3: ' + (prompt.replace('\n',' ')[:80] or mode_name)
+    marker = Path(out_file).parent / f".minimax_h3_job_{src.get('id') or int(_time.time())}.txt"
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text((prompt or mode_name)[:2000], encoding='utf-8')
+        input_path = str(marker)
+    except Exception:
+        input_path = ''
+    args = {
+        'label': label,
+        'engine': 'minimax_h3',
+        'cmd': [str(py)] + base_args,
+        # MiniMax must run in its own isolated runtime even though the job is
+        # executed by FrameVision's worker process.  worker.py uses this flag
+        # to scrub inherited Python/Conda/DLL environment state before launch.
+        'clean_python_env': True,
+        'cmd': [str(py)] + base_args,
+        'cwd': str(root),
+        'outfile': out_file,
+        'out_file': out_file,
+        'prompt': prompt,
+        'seed': src.get('seed'),
+        'frames': src.get('frames'),
+        'steps': src.get('steps'),
+        'resolution': src.get('resolution'),
+        'mode': src.get('mode'),
+        'mode_name': mode_name,
+        'model_label': src.get('model_label'),
+        'minimax_source_job_id': src.get('id'),
+        'continue_last_result': bool(src.get('continue_last_result')),
+        'continue_from_job_id': src.get('continue_from_job_id'),
+        'continue_from_job_number': src.get('continue_from_job_number'),
+        'manual_continue_video': str(src.get('manual_continue_video') or ''),
+        'continue_context_frames': src.get('continue_context_frames'),
+        'glue_results': bool(src.get('glue_results')),
+        'continue_audio_memory': bool(src.get('continue_audio_memory')),
+        'lanczos_scale_2x': bool(src.get('lanczos_scale_2x')),
+        'runner': 'minimax_h3_exact_command',
+        'env': {'PYTHONIOENCODING':'utf-8','PYTHONUTF8':'1'},
+    }
+    # Keep the original MiniMax id as the FrameVision id so chained jobs can point
+    # at the exact source before it has finished. make_job_json is expected to
+    # return the queue id; the source id is retained separately regardless.
+    qid = make_job_json('minimax_h3_generate', input_path, str(Path(out_file).parent), args, str(d['pending']), priority=550)
+    return qid
+
 def default_ace_outdir() -> str:
     from pathlib import Path
     base = Path('.').resolve()
