@@ -815,7 +815,12 @@ class MainWindow(QMainWindow):
         self._build_generation_tab()
         self._build_prompt_builder_tab()
         self._build_queue_tab()
-        self._build_music_clip_tab()
+        # FrameVision has its own Music Clip Creator location. Keep the MiniMax
+        # Music Clip Creator available only in the standalone application.
+        if not self._embedded:
+            self._build_music_clip_tab()
+        else:
+            self.music_clip_tab_index = -1
         self._build_settings_tab()
 
         # Fixed bottom bar: remains visible on every tab and while tab contents scroll.
@@ -2166,7 +2171,20 @@ class MainWindow(QMainWindow):
                 if is_music else "Add the current MiniMax generation job to the queue."
             )
 
+    def _flash_generate_click(self):
+        """Give immediate visual confirmation that the fixed Generate button was clicked."""
+        if not hasattr(self, "gen"):
+            return
+        is_music = (
+            getattr(self, "music_clip_widget", None) is not None
+            and getattr(self, "music_clip_tab_index", -1) == self.tabs.currentIndex()
+        )
+        self.gen.setText("Create video clip ✓" if is_music else "Generate ✓")
+        # Restore the normal context-sensitive label shortly after the click.
+        QTimer.singleShot(700, self._sync_main_generate_button)
+
     def _main_generate_action(self):
+        self._flash_generate_click()
         if (
             getattr(self, "music_clip_widget", None) is not None
             and getattr(self, "music_clip_tab_index", -1) == self.tabs.currentIndex()
@@ -2270,8 +2288,13 @@ class MainWindow(QMainWindow):
 
         self.sage_attention_enabled = QCheckBox("Enable SageAttention")
         self.sage_attention_enabled.setChecked(False)
-        self.sage_attention_enabled.setToolTip("This affects transformer attention during sampling only; isolated video/audio VAE workers keep their normal attention path. Default: Off.")
+        self.sage_attention_enabled.setToolTip("Transformer attention acceleration during sampling. Can be used together with Comfy Kitchen. Default: Off.")
         v.addWidget(self.sage_attention_enabled)
+
+        self.comfy_kitchen_enabled = QCheckBox("Enable Comfy Kitchen W4A8 acceleration")
+        self.comfy_kitchen_enabled.setChecked(True)
+        self.comfy_kitchen_enabled.setToolTip("Uses Comfy Kitchen CUDA kernels for supported quantized W4A8 / ConvRot operations. This is separate from SageAttention and both may be enabled together. Default: On.")
+        v.addWidget(self.comfy_kitchen_enabled)
 
         self.spectrum_enabled = QCheckBox("Enable Spectrum feature forecasting")
         self.spectrum_enabled.setChecked(False)
@@ -2324,10 +2347,10 @@ class MainWindow(QMainWindow):
         mnote.setWordWrap(True); mf.addRow(mnote)
         self.use_hybrid_model = QCheckBox("Use hybrid model")
         self.use_hybrid_model.setChecked(False)
-        self.use_hybrid_model.setToolTip("When enabled, use the selected hybrid MiniMax H3 checkpoint for T2VA/FL2VA and Ref2VA generation instead of the separate FL2VA and Ref2VA diffusion checkpoints. This setting is remembered after restart.")
-        self.hybrid_model = ModelPathRow("Select hybrid MiniMax H3 .safetensors checkpoint")
+        self.use_hybrid_model.setToolTip(
+            "When enabled, the app ignores the separate FL2VA and Ref2VA checkpoint overrides and scans the MiniMax H3 model folders recursively for a .safetensors file with 'hybrid' in its filename. The same hybrid checkpoint is then used for T2VA/FL2VA and Ref2VA jobs."
+        )
         mf.addRow(self.use_hybrid_model)
-        mf.addRow("Hybrid checkpoint", self.hybrid_model)
         self.fl2va_model = ModelPathRow("Blank = auto-scan diffusion_models for FL2VA")
         self.ref2va_model = ModelPathRow("Blank = auto-scan diffusion_models for Ref2VA")
         self.text_encoder_model = ModelPathRow("Blank = auto-scan text_encoders")
@@ -2338,8 +2361,8 @@ class MainWindow(QMainWindow):
         mf.addRow("Text encoder", self.text_encoder_model)
         mf.addRow("Video VAE", self.video_vae_model)
         mf.addRow("Audio VAE", self.audio_vae_model)
-        self.use_hybrid_model.toggled.connect(self._sync_hybrid_model_ui)
-        self._sync_hybrid_model_ui(self.use_hybrid_model.isChecked())
+        self.use_hybrid_model.toggled.connect(self._sync_hybrid_model_controls)
+        self._sync_hybrid_model_controls(self.use_hybrid_model.isChecked())
         v.addWidget(models)
 
         vg = QGroupBox("VRAM Lab / Manager"); vf = QFormLayout(vg)
@@ -2755,12 +2778,6 @@ class MainWindow(QMainWindow):
                 keep.append(line)
         if keep: self.append_log("\n".join(keep) + "\n")
 
-    def _sync_hybrid_model_ui(self, enabled):
-        enabled = bool(enabled)
-        self.hybrid_model.setEnabled(enabled)
-        self.fl2va_model.setEnabled(not enabled)
-        self.ref2va_model.setEnabled(not enabled)
-
     def settings_dict(self):
         return {
             "mode": self.mode.currentIndex(), "aspect": self.aspect.currentText(), "resolution": self.res_class.currentText(), "lanczos_scale_2x": self.lanczos_scale_2x.isChecked(), "frames": self._frame_count(), "experimental_long_duration": self.experimental_long_duration.isChecked(),
@@ -2779,6 +2796,8 @@ class MainWindow(QMainWindow):
             "play_result_queue_player": self.play_result_queue_player.isChecked(),
             "spectrum_enabled": self.spectrum_enabled.isChecked(),
             "sage_attention_enabled": self.sage_attention_enabled.isChecked(),
+            "comfy_kitchen_enabled": self.comfy_kitchen_enabled.isChecked(),
+            "use_hybrid_model": self.use_hybrid_model.isChecked(),
             "vram_manager_enabled": self.vram_manager_enabled.isChecked(), "vram_manager_auto_bypass": self.vram_manager_auto_bypass.isChecked(), "vram_residency_engine": self.vram_residency_engine.currentData(), "vram_runtime_free_gb": self.vram_runtime_free.value(),
             "vram_text_headroom_gb": self.vram_text_headroom.value(), "vram_diffusion_headroom_gb": self.vram_diffusion_headroom.value(),
             "vram_offload_chunk_mb": self.vram_offload_chunk.value(), "vram_max_resident_weights_gb": self.vram_max_weights.value(),
@@ -2787,7 +2806,6 @@ class MainWindow(QMainWindow):
             "vram_block_check_interval": self.vram_block_interval.value(), "vram_async_streams": self.vram_async_streams.value(),
             "vram_video_vae_reserve_gb": self.vram_video_vae_reserve.value(), "vram_audio_vae_reserve_gb": self.vram_audio_vae_reserve.value(),
             "vram_video_vae_tile_size": self.vram_video_vae_tile_size.value(), "vram_video_vae_tile_overlap": self.vram_video_vae_tile_overlap.value(),
-            "use_hybrid_model": self.use_hybrid_model.isChecked(), "hybrid_model": self.hybrid_model.path(),
             "fl2va_model": self.fl2va_model.path(), "ref2va_model": self.ref2va_model.path(), "text_encoder_model": self.text_encoder_model.path(),
             "video_vae_model": self.video_vae_model.path(), "audio_vae_model": self.audio_vae_model.path(),
             "loras": [{"path": row.path(), "strength": strength.value()} for row, strength in self.lora_rows],
@@ -2833,6 +2851,9 @@ class MainWindow(QMainWindow):
             self._sync_queue_preview_setting_visibility()
             self.spectrum_enabled.setChecked(bool(d.get("spectrum_enabled", False)))
             self.sage_attention_enabled.setChecked(bool(d.get("sage_attention_enabled", False)))
+            self.comfy_kitchen_enabled.setChecked(bool(d.get("comfy_kitchen_enabled", True)))
+            self.use_hybrid_model.setChecked(bool(d.get("use_hybrid_model", False)))
+            self._sync_hybrid_model_controls(self.use_hybrid_model.isChecked())
             self._set_system_hud_visible(False if self._embedded else self.system_hud_toggle.isChecked())
             self._set_framevision_queue_mode(self._framevision_queue_mode())
             self.vram_manager_enabled.setChecked(bool(d.get("vram_manager_enabled", True)))
@@ -2855,7 +2876,6 @@ class MainWindow(QMainWindow):
             self.vram_audio_vae_reserve.setValue(float(d.get("vram_audio_vae_reserve_gb", 1.0)))
             self.vram_video_vae_tile_size.setValue(int(d.get("vram_video_vae_tile_size", 256)))
             self.vram_video_vae_tile_overlap.setValue(int(d.get("vram_video_vae_tile_overlap", 128)))
-            self.use_hybrid_model.setChecked(bool(d.get("use_hybrid_model", False))); self.hybrid_model.edit.setText(d.get("hybrid_model", ""))
             self.fl2va_model.edit.setText(d.get("fl2va_model", "")); self.ref2va_model.edit.setText(d.get("ref2va_model", "")); self.text_encoder_model.edit.setText(d.get("text_encoder_model", "")); self.video_vae_model.edit.setText(d.get("video_vae_model", "")); self.audio_vae_model.edit.setText(d.get("audio_vae_model", ""))
             saved_loras = d.get("loras", []) or []
             for i, (row, strength) in enumerate(self.lora_rows):
@@ -2863,7 +2883,6 @@ class MainWindow(QMainWindow):
                 row.edit.setText(str(item.get("path", ""))); strength.setValue(float(item.get("strength", 1.0)))
         except Exception as e:
             self.append_log(f"Preset warning: {e}\n")
-        self._sync_hybrid_model_ui(self.use_hybrid_model.isChecked())
         self._sync_resolution(); self._sync_mode()
 
     def save_last(self):
@@ -2893,23 +2912,77 @@ class MainWindow(QMainWindow):
                 args += ["--lora", path, "--lora-strength", str(value)]
         return args
 
-    def model_override_args(self, mode=None):
+    def _sync_hybrid_model_controls(self, enabled):
+        # Keep the saved FL2VA/Ref2VA locations visible, but make it clear they are ignored
+        # while the single hybrid diffusion checkpoint is active.
+        self.fl2va_model.setEnabled(not bool(enabled))
+        self.ref2va_model.setEnabled(not bool(enabled))
+
+    def _find_hybrid_checkpoint(self):
+        """Return the preferred MiniMax H3 hybrid .safetensors checkpoint, or an empty string."""
+        roots = []
+
+        # Custom diffusion locations already entered by the user are valid search roots.
+        for raw in (self.fl2va_model.path(), self.ref2va_model.path()):
+            if not raw:
+                continue
+            candidate = Path(raw).expanduser()
+            if candidate.is_file():
+                if candidate.suffix.lower() == ".safetensors" and "hybrid" in candidate.name.lower():
+                    return str(candidate.resolve())
+                candidate = candidate.parent
+            if candidate.is_dir() and candidate not in roots:
+                roots.append(candidate)
+
+        default_root = ROOT / "models" / "minimax_h3"
+        diffusion_root = default_root / "diffusion_models"
+        for candidate in (diffusion_root, default_root):
+            if candidate.is_dir() and candidate not in roots:
+                roots.append(candidate)
+
+        matches = []
+        seen = set()
+        for root in roots:
+            try:
+                for path in root.rglob("*.safetensors"):
+                    if "hybrid" not in path.name.lower():
+                        continue
+                    key = str(path.resolve()).lower()
+                    if key not in seen:
+                        seen.add(key)
+                        matches.append(path)
+            except (OSError, PermissionError):
+                continue
+
+        if not matches:
+            return ""
+
+        # Prefer diffusion_models and shallow paths, then use alphabetical order so selection
+        # stays deterministic if the user has more than one hybrid checkpoint installed.
+        def sort_key(path):
+            try:
+                rel = path.resolve().relative_to(diffusion_root.resolve())
+                return (0, len(rel.parts), path.name.lower(), str(path).lower())
+            except Exception:
+                try:
+                    rel = path.resolve().relative_to(default_root.resolve())
+                    return (1, len(rel.parts), path.name.lower(), str(path).lower())
+                except Exception:
+                    return (2, len(path.parts), path.name.lower(), str(path).lower())
+
+        matches.sort(key=sort_key)
+        return str(matches[0].resolve())
+
+    def model_override_args(self):
+        hybrid = self._find_hybrid_checkpoint() if self.use_hybrid_model.isChecked() else ""
+        pairs = [
+            ("--fl2va-checkpoint", hybrid if hybrid else self.fl2va_model.path()),
+            ("--ref2va-checkpoint", hybrid if hybrid else self.ref2va_model.path()),
+            ("--text-encoder", self.text_encoder_model.path()), ("--video-vae", self.video_vae_model.path()), ("--audio-vae", self.audio_vae_model.path()),
+        ]
         args = []
-        hybrid = self.hybrid_model.path().strip() if self.use_hybrid_model.isChecked() else ""
-        if hybrid:
-            if mode == 2:
-                args += ["--ref2va-checkpoint", hybrid]
-            elif mode in (0, 1):
-                args += ["--fl2va-checkpoint", hybrid]
-            else:
-                args += ["--fl2va-checkpoint", hybrid, "--ref2va-checkpoint", hybrid]
-        else:
-            for flag, value in (("--fl2va-checkpoint", self.fl2va_model.path()), ("--ref2va-checkpoint", self.ref2va_model.path())):
-                if value:
-                    args += [flag, value]
-        for flag, value in (("--text-encoder", self.text_encoder_model.path()), ("--video-vae", self.video_vae_model.path()), ("--audio-vae", self.audio_vae_model.path())):
-            if value:
-                args += [flag, value]
+        for flag, value in pairs:
+            if value: args += [flag, value]
         return args
 
     def _minimax_bootstrap_ready(self):
@@ -2963,9 +3036,6 @@ class MainWindow(QMainWindow):
         if not rel or rel.endswith("/"):
             return False
         low = rel.lower()
-        # These two files are FrameVision-owned and must never be replaced by the standalone repository.
-        if low in {"helpers/minimax_h3_gui.py", "helpers/minimax_music_clip.py", "minimax_h3_gui.py", "minimax_music_clip.py"}:
-            return False
         # Never touch FrameVision's imported MiniMax helper/queue integration.
         if low == "helpers" or low.startswith("helpers/"):
             return False
@@ -3042,7 +3112,7 @@ class MainWindow(QMainWindow):
         proc.finished.connect(self._bootstrap_environment_finished)
         proc.start()
         if not proc.waitForStarted(5000):
-            self._bootstrap_install_failed("Could not start presets\\extra_env\\install.bat")
+            self._bootstrap_install_failed("Could not start presets\\extra_env\\install_minimax_h3.bat")
 
     def _bootstrap_process_output(self):
         proc = self._bootstrap_proc
@@ -3138,7 +3208,9 @@ print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
         if not parts or parts[0].lower() in {x.lower() for x in APP_UPDATE_EXCLUDED_TOP}:
             return False
         low = rel.lower()
-        if low in {"helpers/minimax_h3_gui.py", "helpers/minimax_music_clip.py", "minimax_h3_gui.py", "minimax_music_clip.py"}:
+        # FrameVision owns these two GUI integration files. Never replace them
+        # with standalone-repository copies during an application update.
+        if low in {"helpers/minimax_h3_gui.py", "helpers/minimax_music_clip.py"}:
             return False
         if any(low == p.lower() or low.startswith(p.lower() + "/") for p in APP_UPDATE_EXCLUDED_PREFIXES):
             return False
@@ -3344,14 +3416,9 @@ print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
 
     def validate_install(self):
         if not PYTHON.is_file(): self.status.setText("Environment missing"); return
-        mode = self.mode.currentIndex()
-        if self.use_hybrid_model.isChecked():
-            hybrid = self.hybrid_model.path().strip()
-            if not hybrid or not Path(hybrid).is_file():
-                QMessageBox.warning(self, "Hybrid model missing", "Use hybrid model is enabled, but the selected hybrid .safetensors file was not found.")
-                return
         self.status.setText("Validating…")
-        args = ["-m", "runtime.validate_models"] + self.model_override_args(mode)
+        args = ["-m", "runtime.validate_models"] + self.model_override_args()
+        mode = self.mode.currentIndex()
         args += ["--mode", "ref2va" if mode == 2 else "fl2va"]
         p = QProcess(self); p.setWorkingDirectory(str(ROOT)); p.setProgram(str(PYTHON)); p.setArguments(args); p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         buf = []
@@ -3406,7 +3473,18 @@ print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
         prompt=self.prompt.toPlainText().strip()
         if not prompt: QMessageBox.warning(self,"Prompt required","Enter a prompt before adding the job to the queue."); return
         if not PYTHON.is_file(): QMessageBox.critical(self,"Environment missing",f"Missing {PYTHON}"); return
-        mode=self.mode.currentIndex(); w,h=RESOLUTION_PRESETS[self.res_class.currentText()][self.aspect.currentText()]; frames=self._frame_count()
+        mode=self.mode.currentIndex()
+        hybrid_checkpoint = ""
+        if self.use_hybrid_model.isChecked():
+            hybrid_checkpoint = self._find_hybrid_checkpoint()
+            if not hybrid_checkpoint:
+                QMessageBox.critical(
+                    self,
+                    "Hybrid model not found",
+                    "Use hybrid model is enabled, but no .safetensors checkpoint with 'hybrid' in its filename was found in the MiniMax H3 model folders.\n\nPlace the hybrid checkpoint under models\\minimax_h3 (normally diffusion_models), or point one of the FL2VA/Ref2VA checkpoint fields at the folder containing it before enabling hybrid mode."
+                )
+                return
+        w,h=RESOLUTION_PRESETS[self.res_class.currentText()][self.aspect.currentText()]; frames=self._frame_count()
         long_mode = self.experimental_long_duration.isChecked()
         max_frames = EXPERIMENTAL_FRAME_MAX if long_mode else NORMAL_FRAME_MAX
         if frames > max_frames:
@@ -3458,7 +3536,7 @@ print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
             for pth in self.ref_images.paths(): args += ["--ref-image",pth]
             for pth in self.ref_videos.paths(): args += ["--ref-video",pth]
             for pth in self.ref_audios.paths(): args += ["--ref-audio",pth]
-        args += self.model_override_args(mode)
+        args += self.model_override_args()
         args += self.lora_args()
         if self.vram_manager_enabled.isChecked():
             args += ["--vram-manager-auto" if self.vram_manager_auto_bypass.isChecked() else "--vram-manager"]
@@ -3466,6 +3544,7 @@ print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
             args += ["--vram-residency-fill" if self.vram_residency_fill.isChecked() else "--no-vram-residency-fill"]
         if self.spectrum_enabled.isChecked(): args += ["--spectrum"]
         if self.sage_attention_enabled.isChecked(): args += ["--sage-attention"]
+        if not self.comfy_kitchen_enabled.isChecked(): args += ["--disable-comfy-kitchen"]
         # Video-VAE tiling is independent from sampling-side VRAM Manager activation.
         # Keep the proven 256/128 defaults unless the user deliberately changes them for testing.
         tile_size = int(self.vram_video_vae_tile_size.value())
@@ -3487,10 +3566,8 @@ print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
             out=base.with_name(f"{base.stem}_{n:03d}{base.suffix}"); n+=1
         args += ["--output",str(out)]
         if self.use_hybrid_model.isChecked():
-            model_path = self.hybrid_model.path()
-            if not model_path or not Path(model_path).is_file():
-                QMessageBox.critical(self, "Hybrid model missing", "Use hybrid model is enabled, but the selected hybrid .safetensors file was not found."); return
-            model_label = f"Hybrid: {Path(model_path).name}"
+            model_path = hybrid_checkpoint or self._find_hybrid_checkpoint()
+            model_label = f"Hybrid: {Path(model_path).name}" if model_path else "Hybrid model"
         else:
             model_path=self.ref2va_model.path() if mode==2 else self.fl2va_model.path()
             model_label=Path(model_path).name if model_path else ("Ref2VA INT4 (default)" if mode==2 else "FL2VA INT4 (default)")
