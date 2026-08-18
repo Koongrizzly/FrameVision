@@ -21,6 +21,7 @@ small project JSON and calls the existing helpers/generate_ref.py backend.
 """
 
 import json
+import hashlib
 import concurrent.futures
 import math
 import os
@@ -106,6 +107,67 @@ MUSIC_FRAME_MIN = 124
 MUSIC_FRAME_DEFAULT_MAX = 396
 MUSIC_FRAME_GRID = tuple(range(MUSIC_FRAME_MIN, MUSIC_FRAME_DEFAULT_MAX + 1, 17))
 FPS = 24.0
+
+
+def _music_project_identity(title: str, audio_path: str) -> str:
+    """Stable identity: same project title + same master track means same project folder."""
+    title_key = re.sub(r"\s+", " ", (title or "").strip()).casefold()
+    audio_key = ""
+    if audio_path:
+        try:
+            audio_key = str(Path(audio_path).expanduser().resolve()).casefold()
+        except Exception:
+            audio_key = str(audio_path).strip().casefold()
+    if not title_key and not audio_key:
+        return ""
+    return hashlib.sha1((title_key + "\n" + audio_key).encode("utf-8", "ignore")).hexdigest()
+
+
+def _cleanup_music_clip_temp_artifacts() -> None:
+    """Remove stale scratch data without touching rendered raw clips or final videos."""
+    now = time.time()
+    try:
+        temp_root = Path(tempfile.gettempdir())
+        for child in temp_root.glob("fv_minimax_music_an_*"):
+            try:
+                if child.is_dir() and now - child.stat().st_mtime > 3600:
+                    shutil.rmtree(child, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    for folder, max_age in ((OUTPUT_ROOT / "_temp", 3600), (OUTPUT_ROOT / "_preview_cache", 7 * 86400)):
+        try:
+            if not folder.is_dir():
+                continue
+            for child in folder.iterdir():
+                try:
+                    if now - child.stat().st_mtime > max_age:
+                        if child.is_dir():
+                            shutil.rmtree(child, ignore_errors=True)
+                        else:
+                            child.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            try:
+                if not any(folder.iterdir()):
+                    folder.rmdir()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    try:
+        if OUTPUT_ROOT.is_dir():
+            for folder in OUTPUT_ROOT.rglob("_assembly"):
+                try:
+                    if folder.is_dir() and now - folder.stat().st_mtime > 6 * 3600:
+                        shutil.rmtree(folder, ignore_errors=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 RESOLUTION_PRESETS: Dict[str, Dict[str, Tuple[int, int]]] = {
     "576 × 320": {"16:9": (576, 320), "9:16": (320, 576), "1:1": (320, 320)},
@@ -318,6 +380,7 @@ class MusicProject:
     version: int = 1
     audio_path: str = ""
     output_dir: str = ""
+    output_identity: str = ""
     title: str = ""
     main_idea: str = ""
     style_theme: str = ""
@@ -1657,11 +1720,17 @@ def _whisper_task(progress, audio_path: str) -> List[LyricSegment]:
             progress(f"Whisper.cpp complete: {len(lyrics)} cleaned lyric phrases{suffix}.")
         return lyrics
     finally:
-        for cleanup in (wav_path, result_json):
+        # whisper.cpp may create sidecar files next to the requested JSON prefix.
+        for cleanup in [wav_path, *payload_dir.glob(result_prefix.name + "*")]:
             try:
                 cleanup.unlink(missing_ok=True)
             except Exception:
                 pass
+        try:
+            if payload_dir.is_dir() and not any(payload_dir.iterdir()):
+                payload_dir.rmdir()
+        except Exception:
+            pass
 
 def _extract_audio_slice(audio: str, out_path: Path, start: float, duration: float) -> None:
     ffmpeg = ffmpeg_path()
@@ -1951,6 +2020,14 @@ def _assembly_task(progress, project: MusicProject) -> str:
     if cp.returncode != 0 or not final.is_file():
         raise RuntimeError("Final mux failed:\n" + (cp.stderr or cp.stdout or ""))
     progress(f"Saved final music video: {final}")
+    # These are disposable project work folders. Keep raw_clips + final output,
+    # but do not accumulate assembly/audio/queue scratch after a successful build.
+    for disposable in (temp_dir, out_dir / "audio_chunks", out_dir / "_queue"):
+        try:
+            if disposable.is_dir():
+                shutil.rmtree(disposable, ignore_errors=True)
+        except Exception:
+            pass
     return str(final)
 
 
@@ -1968,6 +2045,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.worker: Optional[FunctionWorker] = None
         self._autosave_last_text = ""
         self._one_click_active = False
+        _cleanup_music_clip_temp_artifacts()
         self._build_ui()
         # Restore the complete working session first. The older small settings file
         # remains only as a fallback for installs that do not have a session save yet.
@@ -2006,6 +2084,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self._build_director_tab()
         self._build_generate_tab()
         self._build_settings_tab()
+        self._build_global_action_bar(outer)
 
         footer = QHBoxLayout()
         self.progress = QProgressBar(self)
@@ -2016,6 +2095,47 @@ class MiniMaxMusicClipWidget(QWidget):
         footer.addWidget(self.progress, 1)
         footer.addWidget(self.status, 2)
         outer.addLayout(footer)
+
+    def _build_global_action_bar(self, outer: QVBoxLayout) -> None:
+        """Keep the primary music-clip actions visible on every tab."""
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+
+        self.btn_create_video_clip = QPushButton("Create video clip", self)
+        self.btn_create_video_clip.setToolTip(
+            "One-click workflow: analyze the selected song, use Whisper lyric timing when enabled, "
+            "build/direct the complete shot list, add all missing MiniMax clips to the FrameVision queue, "
+            "then queue final trim and assembly."
+        )
+        self.btn_generate_selected = QPushButton("Generate selected shot", self)
+        self.btn_generate_all = QPushButton("Generate all missing shots", self)
+        self.btn_stop_generation = QPushButton("Stop generation", self)
+        self.btn_stop_generation.setEnabled(False)
+        self.btn_stop_generation.setToolTip(
+            "Stops the current direct MiniMax clip. When FrameVision queue mode is active, "
+            "cancel or requeue running jobs from FrameVision's main Queue tab."
+        )
+        self.btn_assemble = QPushButton("Assemble final music video", self)
+        self.btn_open_output = QPushButton("Open output folder", self)
+
+        for button in (
+            self.btn_create_video_clip,
+            self.btn_generate_selected,
+            self.btn_generate_all,
+            self.btn_stop_generation,
+            self.btn_assemble,
+            self.btn_open_output,
+        ):
+            bar.addWidget(button)
+        bar.addStretch(1)
+        outer.addLayout(bar)
+
+        self.btn_create_video_clip.clicked.connect(self.create_video_clip)
+        self.btn_generate_selected.clicked.connect(self._generate_selected)
+        self.btn_generate_all.clicked.connect(self._generate_all)
+        self.btn_stop_generation.clicked.connect(self._stop_generation)
+        self.btn_assemble.clicked.connect(self._assemble)
+        self.btn_open_output.clicked.connect(self._open_output_folder)
 
     def _scrollable_tab_body(self, page: QWidget) -> tuple[QVBoxLayout, QWidget, QVBoxLayout]:
         """Create a vertically scrollable tab body plus a fixed bottom area.
@@ -2232,23 +2352,6 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _build_generate_tab(self) -> None:
         outer, body, lay = self._scrollable_tab_body(self.page_generate)
-        row = QHBoxLayout()
-        self.btn_create_video_clip = QPushButton("Create video clip", self.page_generate)
-        self.btn_create_video_clip.setToolTip(
-            "One-click workflow: analyze the selected song, use Whisper lyric timing when enabled, "
-            "build/direct the complete shot list, add all missing MiniMax clips to the FrameVision queue, "
-            "then queue final trim and assembly."
-        )
-        self.btn_generate_selected = QPushButton("Generate selected shot", self.page_generate)
-        self.btn_generate_all = QPushButton("Generate all missing shots", self.page_generate)
-        self.btn_stop_generation = QPushButton("Stop generation", self.page_generate)
-        self.btn_stop_generation.setEnabled(False)
-        self.btn_stop_generation.setToolTip("Stops the current direct MiniMax clip. When embedded in the standalone app, use the main Queue tab to cancel/requeue jobs.")
-        if callable(getattr(self, "queue_adapter", None)):
-            self.btn_stop_generation.setVisible(False)
-        self.btn_assemble = QPushButton("Assemble final music video", self.page_generate)
-        self.btn_open_output = QPushButton("Open output folder", self.page_generate)
-        row.addWidget(self.btn_create_video_clip); row.addWidget(self.btn_generate_selected); row.addWidget(self.btn_generate_all); row.addWidget(self.btn_stop_generation); row.addWidget(self.btn_assemble); row.addWidget(self.btn_open_output); row.addStretch(1)
         self.label_job_seed = QLabel("Job seed: auto (first generation locks one random seed for the whole job). Edit a shot's Seed value below to override it for retries.", body)
         self.label_job_seed.setWordWrap(True)
         lay.addWidget(self.label_job_seed)
@@ -2282,14 +2385,6 @@ class MiniMaxMusicClipWidget(QWidget):
         preview_actions.addWidget(self.btn_play_clip); preview_actions.addWidget(self.btn_open_clip_folder); preview_actions.addStretch(1)
         preview_lay.addLayout(preview_actions)
         lay.addWidget(preview_box)
-        outer.addLayout(row)
-
-        self.btn_create_video_clip.clicked.connect(self.create_video_clip)
-        self.btn_generate_selected.clicked.connect(self._generate_selected)
-        self.btn_generate_all.clicked.connect(self._generate_all)
-        self.btn_stop_generation.clicked.connect(self._stop_generation)
-        self.btn_assemble.clicked.connect(self._assemble)
-        self.btn_open_output.clicked.connect(self._open_output_folder)
         self.btn_play_clip.clicked.connect(self._play_selected_clip)
         self.btn_open_clip_folder.clicked.connect(self._open_selected_clip_folder)
         self.review_table.itemSelectionChanged.connect(self._show_selected_clip_preview)
@@ -2462,6 +2557,62 @@ class MiniMaxMusicClipWidget(QWidget):
         p.shots = [MusicShot(**x) for x in data.get("shots", []) if isinstance(x, dict)]
         return p
 
+    def _ensure_project_output_folder(self, reset_generated_state: bool = True) -> Path:
+        """Bind output to the current title+track pair so unrelated projects never share clips."""
+        title = self.edit_title.text().strip() if hasattr(self, "edit_title") else self.project.title
+        audio = self.edit_audio.text().strip() if hasattr(self, "edit_audio") else self.project.audio_path
+        identity = _music_project_identity(title, audio)
+        if not identity:
+            return Path(self.project.output_dir or OUTPUT_ROOT)
+
+        if self.project.output_identity == identity and self.project.output_dir:
+            return Path(self.project.output_dir)
+
+        label = _safe_stem(title or (Path(audio).stem if audio else "music_project")) or "music_project"
+        track_label = _safe_stem(Path(audio).stem) if audio else ""
+        if track_label and track_label.casefold() != label.casefold():
+            label = f"{label}__{track_label}"
+
+        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+        base = OUTPUT_ROOT / label
+        candidate = base
+        serial = 2
+        marker_name = ".minimax_music_project.json"
+        while candidate.exists():
+            marker = candidate / marker_name
+            try:
+                if marker.is_file():
+                    data = json.loads(marker.read_text(encoding="utf-8"))
+                    if str(data.get("identity") or "") == identity:
+                        break
+                elif not any(candidate.iterdir()):
+                    break
+            except Exception:
+                pass
+            candidate = Path(str(base) + f"_{serial}")
+            serial += 1
+
+        old_identity = self.project.output_identity
+        candidate.mkdir(parents=True, exist_ok=True)
+        try:
+            (candidate / marker_name).write_text(json.dumps({
+                "identity": identity, "title": title, "audio_path": audio
+            }, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+        self.project.output_identity = identity
+        self.project.output_dir = str(candidate)
+        if hasattr(self, "edit_output"):
+            self.edit_output.setText(str(candidate))
+
+        if reset_generated_state and old_identity and old_identity != identity:
+            for shot in self.project.shots:
+                shot.output_path = ""
+                if shot.status == "Generated":
+                    shot.status = "Planned"
+        return candidate
+
     # ---- project file operations ----
     def _new_project(self) -> None:
         # Keep user generation preferences when starting a new project. Project-specific
@@ -2484,6 +2635,7 @@ class MiniMaxMusicClipWidget(QWidget):
         ):
             setattr(self.project, name, getattr(old, name))
         self.project_path = ""
+        _cleanup_music_clip_temp_artifacts()
         self._sync_ui_from_project()
         self.status.setText("New project.")
         self._save_settings()
@@ -2494,8 +2646,18 @@ class MiniMaxMusicClipWidget(QWidget):
         if path:
             self.edit_audio.setText(path)
             if not self.edit_title.text().strip(): self.edit_title.setText(Path(path).stem)
-            if self.edit_output.text().strip() in ("", str(OUTPUT_ROOT)):
-                self.edit_output.setText(str(OUTPUT_ROOT / _safe_stem(path)))
+            # A newly selected track invalidates the old project's output binding.
+            # Do not create the replacement folder yet: the user may still rename the
+            # project before Analyze/Create plan. That avoids leaving empty test folders.
+            self.project.audio_path = path
+            self.project.title = self.edit_title.text().strip()
+            self.project.output_identity = ""
+            self.project.output_dir = str(OUTPUT_ROOT)
+            self.edit_output.setText(str(OUTPUT_ROOT))
+            for shot in self.project.shots:
+                shot.output_path = ""
+                if shot.status == "Generated":
+                    shot.status = "Planned"
             dur = probe_duration(path)
             self.label_duration.setText(f"Duration: {_fmt_time(dur)} ({dur:.2f} s)" if dur else "Duration: unknown")
 
@@ -2602,12 +2764,11 @@ class MiniMaxMusicClipWidget(QWidget):
             self.edit_audio.setText(path)
             if not self.edit_title.text().strip():
                 self.edit_title.setText(Path(path).stem)
-            if self.edit_output.text().strip() in ("", str(OUTPUT_ROOT)):
-                self.edit_output.setText(str(OUTPUT_ROOT / _safe_stem(path)))
             audio = path
 
         self._pull_ui()
         self.project.audio_path = audio
+        self._ensure_project_output_folder(reset_generated_state=True)
         self._one_click_active = True
         # Show the stage that is actually running; the user can still inspect/change tabs.
         self.tabs.setCurrentIndex(2)
@@ -2669,6 +2830,7 @@ class MiniMaxMusicClipWidget(QWidget):
     def _one_click_build_plan_and_queue(self) -> None:
         self.tabs.setCurrentIndex(3)
         self._pull_ui()
+        self._ensure_project_output_folder(reset_generated_state=True)
         if self.project.analysis.duration <= 0:
             self.project.analysis.duration = probe_duration(self.project.audio_path)
         try:
@@ -2775,7 +2937,7 @@ class MiniMaxMusicClipWidget(QWidget):
     def _start_analysis(self) -> None:
         audio = self._require_audio()
         if not audio: return
-        self._pull_ui(); self._set_busy("Analyzing track..."); self._run_worker(_analysis_task, self._analysis_done, audio, self.spin_sensitivity.value())
+        self._pull_ui(); self._ensure_project_output_folder(reset_generated_state=True); self._set_busy("Analyzing track..."); self._run_worker(_analysis_task, self._analysis_done, audio, self.spin_sensitivity.value())
 
     def _analysis_done(self, result: AnalysisResult) -> None:
         self.project.analysis = result; self._populate_analysis(); self._set_ready("Music analysis complete.")
@@ -2832,6 +2994,7 @@ class MiniMaxMusicClipWidget(QWidget):
         audio = self._require_audio()
         if not audio: return
         self._pull_ui()
+        self._ensure_project_output_folder(reset_generated_state=True)
         if self.project.analysis.duration <= 0:
             self.project.analysis.duration = probe_duration(audio)
         try:
@@ -3082,6 +3245,7 @@ class MiniMaxMusicClipWidget(QWidget):
             raise RuntimeError("MiniMax Ref2VA launcher not found: helpers/generate_ref.py")
         if not Path(self.project.audio_path).is_file():
             raise RuntimeError("The project song file is missing.")
+        self._ensure_project_output_folder(reset_generated_state=True)
         out_dir = Path(self.project.output_dir or OUTPUT_ROOT / _safe_stem(self.project.audio_path)).resolve()
         raw_dir = out_dir / "raw_clips"
         audio_dir = out_dir / "audio_chunks"
@@ -3254,6 +3418,7 @@ class MiniMaxMusicClipWidget(QWidget):
         _GENERATION_CANCEL.clear()
         self.btn_stop_generation.setEnabled(True)
         self._pull_ui()
+        self._ensure_project_output_folder(reset_generated_state=True)
         base_seed = self._prepare_generation_seeds(indices)
         selected_index = indices[0] if len(indices) == 1 else None
         self._populate_review(select_index=selected_index)
@@ -3304,7 +3469,9 @@ class MiniMaxMusicClipWidget(QWidget):
         QMessageBox.information(self, "Finished", f"Final music video saved:\n{path}")
 
     def _open_output_folder(self) -> None:
-        path = Path(self.edit_output.text().strip() or OUTPUT_ROOT); path.mkdir(parents=True, exist_ok=True); QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+        self._pull_ui()
+        path = self._ensure_project_output_folder(reset_generated_state=False)
+        path.mkdir(parents=True, exist_ok=True); QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
     def _sync_hybrid_model_controls(self, enabled: bool) -> None:
         enabled = bool(enabled)
