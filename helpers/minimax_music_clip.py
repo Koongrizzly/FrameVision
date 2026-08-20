@@ -42,8 +42,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
-    from PySide6.QtCore import QThread, Qt, Signal, QUrl, QTimer
-    from PySide6.QtGui import QDesktopServices, QPixmap
+    from PySide6.QtCore import QThread, Qt, Signal, QUrl, QTimer, QEvent
+    from PySide6.QtGui import QDesktopServices, QPixmap, QPalette
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -2143,6 +2143,12 @@ class MiniMaxMusicClipWidget(QWidget):
         self._build_settings_tab()
         self._build_global_action_bar(outer)
 
+        # QTableWidget headers can fall back to the native Windows style even
+        # when FrameVision has already themed the table viewport.  Apply a tiny
+        # palette-derived fallback after Qt has polished the widgets so those
+        # headers/corner cells track the host theme instead of turning white.
+        QTimer.singleShot(0, self._apply_host_theme_fallbacks)
+
         footer = QHBoxLayout()
         self.progress = QProgressBar(self)
         self.progress.setRange(0, 1)
@@ -2152,6 +2158,73 @@ class MiniMaxMusicClipWidget(QWidget):
         footer.addWidget(self.progress, 1)
         footer.addWidget(self.status, 2)
         outer.addLayout(footer)
+
+    @staticmethod
+    def _css_color(color) -> str:
+        """Return a Qt stylesheet-safe ARGB/RGB color string."""
+        return color.name()
+
+    def _apply_host_theme_fallbacks(self) -> None:
+        """Keep native table chrome aligned with FrameVision's active theme.
+
+        FrameVision styles the table viewport globally, but on some Windows Qt
+        styles QHeaderView and the top-left corner button can still be painted by
+        the native light theme.  We sample each table's *effective* palette after
+        host styling and only style that native chrome.  No fixed MiniMax colors
+        are used, so light/dark/custom FrameVision themes remain authoritative.
+        """
+        tables = [
+            getattr(self, "refs_table", None),
+            getattr(self, "lyrics_table", None),
+            getattr(self, "shot_table", None),
+            getattr(self, "review_table", None),
+        ]
+        for table in tables:
+            if table is None:
+                continue
+            # The viewport is the best source when a host stylesheet targets
+            # QAbstractItemView/QTableWidget rather than QApplication's palette.
+            pal = table.viewport().palette()
+            base = self._css_color(pal.color(QPalette.ColorRole.Base))
+            text = self._css_color(pal.color(QPalette.ColorRole.Text))
+            border = self._css_color(pal.color(QPalette.ColorRole.Mid))
+            alt = self._css_color(pal.color(QPalette.ColorRole.AlternateBase))
+            highlight = self._css_color(pal.color(QPalette.ColorRole.Highlight))
+            highlighted_text = self._css_color(pal.color(QPalette.ColorRole.HighlightedText))
+            qss = f"""
+                QHeaderView {{ background: {base}; color: {text}; }}
+                QHeaderView::section {{
+                    background: {base}; color: {text}; border: 0px;
+                    border-right: 1px solid {border};
+                    border-bottom: 1px solid {border}; padding: 4px;
+                }}
+                QHeaderView::section:hover {{ background: {alt}; }}
+                QHeaderView::section:checked {{ background: {highlight}; color: {highlighted_text}; }}
+                QTableCornerButton::section {{
+                    background: {base}; border: 0px;
+                    border-right: 1px solid {border};
+                    border-bottom: 1px solid {border};
+                }}
+            """
+            table.horizontalHeader().setStyleSheet(qss)
+            table.verticalHeader().setStyleSheet(qss)
+            # Corner button belongs to QTableWidget rather than either header.
+            # Append only this narrow fallback; existing host rules still style
+            # the table body, selection, grid, scrollbars, etc.
+            table.setStyleSheet(table.styleSheet() + f"""
+                QTableWidget QTableCornerButton::section {{
+                    background: {base}; border: 0px;
+                    border-right: 1px solid {border};
+                    border-bottom: 1px solid {border};
+                }}
+            """)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.StyleChange):
+            # Theme switches can happen while FrameVision is running. Delay until
+            # the host style has finished propagating to child viewports.
+            QTimer.singleShot(0, self._apply_host_theme_fallbacks)
 
     def _build_global_action_bar(self, outer: QVBoxLayout) -> None:
         """Keep the primary music-clip actions visible on every tab."""
@@ -2216,10 +2289,10 @@ class MiniMaxMusicClipWidget(QWidget):
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background:#11151b; border:none; } QScrollArea > QWidget > QWidget { background:#11151b; }")
-        scroll.viewport().setStyleSheet("background:#11151b;")
+        # Do not paint a private dark theme here.  This widget is embedded in
+        # FrameVision, so the host application's global stylesheet/palette must
+        # remain authoritative (and standalone mode should inherit Qt/app style).
         body = QWidget(scroll)
-        body.setStyleSheet("background:#11151b;")
         body.setMinimumWidth(0)
         body.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
         body_layout = QVBoxLayout(body)
@@ -2438,11 +2511,9 @@ class MiniMaxMusicClipWidget(QWidget):
         self.review_preview.setAlignment(Qt.AlignCenter)
         self.review_preview.setMinimumHeight(180)
         self.review_preview.setMaximumHeight(280)
-        # Do not use palette(base) here: when embedded, Qt's native palette may still
-        # be light even though the standalone GUI uses a dark stylesheet.
-        self.review_preview.setStyleSheet(
-            "QLabel { border:1px solid #334556; background:#0b0f14; color:#9ab8d8; border-radius:5px; }"
-        )
+        # Let the host theme draw this panel instead of forcing MiniMax-specific
+        # dark colors that can clash with FrameVision themes.
+        self.review_preview.setFrameShape(QFrame.Shape.StyledPanel)
         preview_lay.addWidget(self.review_preview, 1)
         preview_actions = QHBoxLayout()
         self.btn_play_clip = QPushButton("Play selected clip", preview_box)
