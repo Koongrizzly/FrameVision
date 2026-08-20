@@ -24969,41 +24969,73 @@ class AutoMusicSyncWidget(QWidget):
         if tabs is None:
             return
 
+        # Build the exact page list first.  At application startup AutoMusicSyncWidget
+        # has already installed Normal + Settings.  Re-removing and re-adding those
+        # same QScrollArea instances before the parent window is shown can leave Qt
+        # with stale viewport geometry until the creator selector is changed once.
+        # If the requested creator is already represented by the current tab set, do
+        # not touch the tab ownership/layout at all.
+        if mode == "ltx":
+            desired_tabs = []
+            ltx = getattr(self, "_tab_ltx_workflow", None)
+            review = getattr(self, "_tab_ltx_review", None)
+            if ltx is not None:
+                desired_tabs.append((ltx, "LTX workflow"))
+            if review is not None:
+                desired_tabs.append((review, "LTX Review"))
+            desired_tabs.append((self._tab_settings, "Settings"))
+        else:
+            desired_tabs = [(self._tab_normal, "Normal")]
+            if bool(getattr(self, "_timeline_tab_visible", False)):
+                panel = getattr(self, "timeline_panel", None)
+                if panel is not None:
+                    desired_tabs.append((panel, getattr(self, "_timeline_tab_title", "Timeline")))
+            desired_tabs.append((self._tab_settings, "Settings"))
+
+        current_widgets = [tabs.widget(i) for i in range(tabs.count())]
+        desired_widgets = [widget for widget, _title in desired_tabs]
+        if current_widgets == desired_widgets:
+            self._update_footer_for_active_tab(tabs.currentIndex())
+            try:
+                tabs.updateGeometry()
+                tabs.update()
+            except Exception:
+                pass
+            return
+
         # Removing a tab does not destroy its page, so the complete state of both
-        # workflows survives switching the selector back and forth.
+        # workflows survives genuine creator switches.
         while tabs.count():
             tabs.removeTab(0)
 
         if mode == "ltx":
-            ltx = getattr(self, "_tab_ltx_workflow", None)
-            review = getattr(self, "_tab_ltx_review", None)
-            if ltx is not None:
-                tabs.addTab(ltx, "LTX workflow")
-            if review is not None:
-                tabs.addTab(review, "LTX Review")
-            tabs.addTab(self._tab_settings, "Settings")
             try:
                 self.timeline_panel.hide()
             except Exception:
                 pass
-        else:
-            tabs.addTab(self._tab_normal, "Normal")
-            if bool(getattr(self, "_timeline_tab_visible", False)):
-                panel = getattr(self, "timeline_panel", None)
-                if panel is not None:
-                    try:
-                        panel.setParent(tabs)
-                    except Exception:
-                        pass
-                    tabs.addTab(panel, getattr(self, "_timeline_tab_title", "Timeline"))
-                    try:
-                        panel.show()
-                    except Exception:
-                        pass
-            tabs.addTab(self._tab_settings, "Settings")
+
+        for widget, title in desired_tabs:
+            if mode == "normal" and widget is getattr(self, "timeline_panel", None):
+                try:
+                    widget.setParent(tabs)
+                except Exception:
+                    pass
+            tabs.addTab(widget, title)
+            if mode == "normal" and widget is getattr(self, "timeline_panel", None):
+                try:
+                    widget.show()
+                except Exception:
+                    pass
 
         tabs.setCurrentIndex(0)
         self._update_footer_for_active_tab(0)
+        # Force one post-switch geometry pass.  This is cheap when the window is
+        # visible and avoids stale QScrollArea viewport sizes after a real switch.
+        try:
+            QTimer.singleShot(0, tabs.updateGeometry)
+            QTimer.singleShot(0, tabs.update)
+        except Exception:
+            pass
 
     def _update_footer_for_active_tab(self, index: int = -1) -> None:
         """Show only the workflow actions relevant to the active sub-tab.

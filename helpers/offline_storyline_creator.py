@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import math
+import difflib
 import queue
 import random
 import re
@@ -11,7 +13,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -154,6 +156,10 @@ class StoryProject:
     text_to_image_prompts: List[str]
     image_to_video_prompts: List[str]
     metadata: Dict[str, Any]
+    # V2 planning layers. Defaults keep old saved projects/loaders compatible.
+    story_bible: List[str] = field(default_factory=list)
+    narrative_beats: List[str] = field(default_factory=list)
+    shot_plan: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -1802,6 +1808,235 @@ Output rules:
             "visible cause, consequence, and reaction instead of repeating poses or mood."
         )
 
+    @staticmethod
+    def _v2_narrative_beat_count(shot_count: int) -> int:
+        """Keep plot beats larger than shots so the story can breathe."""
+        shots = max(1, int(shot_count or 1))
+        if shots <= 4:
+            return shots
+        # Roughly 2-3 shots per meaningful story beat. Cap the first-pass
+        # outline so long videos do not force the writer to invent filler.
+        return max(4, min(shots, min(18, int(round(shots / 2.5)))))
+
+    @staticmethod
+    def _parse_v2_shot_plan(lines: List[str], expected_count: int) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        valid_sections = {"hook", "setup", "build", "turn", "climax", "resolve", "resolution"}
+        for idx, raw in enumerate(list(lines or [])[:expected_count], start=1):
+            text = re.sub(r"\s+", " ", str(raw or "").strip())
+            parts: Dict[str, str] = {}
+            for chunk in text.split(" | "):
+                if "=" not in chunk:
+                    continue
+                key, value = chunk.split("=", 1)
+                parts[key.strip().upper()] = value.strip()
+            visual = parts.get("VISUAL") or text
+            purpose = parts.get("PURPOSE") or "Advance the current story beat with one readable visual event."
+            change = parts.get("CHANGE") or "The visible situation advances from the previous shot."
+            section = (parts.get("SECTION") or "build").strip().lower()
+            if section not in valid_sections:
+                section = "build"
+            if section == "resolution":
+                section = "resolve"
+            try:
+                beat_index = max(1, int(re.sub(r"[^0-9]", "", parts.get("BEAT", "")) or idx))
+            except Exception:
+                beat_index = idx
+            out.append({
+                "index": idx,
+                "beat_index": beat_index,
+                "section": section,
+                "purpose": purpose,
+                "visual": visual,
+                "change": change,
+            })
+        return out
+
+    @staticmethod
+    def _v3_section_count(shot_count: int) -> int:
+        """Number of major story parts; deliberately much smaller than shot count."""
+        shots = max(1, int(shot_count or 1))
+        if shots <= 4:
+            return shots
+        return max(5, min(9, int(round(shots / 3.5))))
+
+    @staticmethod
+    def _parse_story_sections(lines: List[str], expected_count: int) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        default_names = ["Opening", "Setup", "Inciting incident", "Build", "Escalation", "Turn", "Climax", "Resolution", "Outro"]
+        for idx, raw in enumerate(list(lines or [])[:expected_count], start=1):
+            text = re.sub(r"\s+", " ", str(raw or "").strip())
+            parts: Dict[str, str] = {}
+            for chunk in text.split(" | "):
+                if "=" in chunk:
+                    k, v = chunk.split("=", 1)
+                    parts[k.strip().upper()] = v.strip()
+            name = parts.get("PART") or parts.get("SECTION") or (default_names[idx-1] if idx-1 < len(default_names) else f"Part {idx}")
+            summary = parts.get("STORY") or parts.get("SUMMARY") or parts.get("EVENT") or text
+            try:
+                weight = float(re.sub(r"[^0-9.]", "", parts.get("WEIGHT", "")) or 1.0)
+            except Exception:
+                weight = 1.0
+            out.append({"index": idx, "name": name.strip(), "summary": summary.strip(), "weight": max(0.2, min(5.0, weight))})
+        return out
+
+    @staticmethod
+    def _allocate_section_shots(sections: List[Dict[str, Any]], shot_count: int, total_duration_sec: float = 0.0) -> List[Dict[str, Any]]:
+        """Allocate exact shots (and approximate seconds) across story sections by weight."""
+        if not sections:
+            return []
+        n = len(sections)
+        shots = max(n, int(shot_count or n))
+        weights = [max(0.2, float(s.get("weight") or 1.0)) for s in sections]
+        total_w = sum(weights) or float(n)
+        # Start with one shot per section so no story part disappears.
+        counts = [1] * n
+        remain = shots - n
+        if remain > 0:
+            raw = [remain * w / total_w for w in weights]
+            floors = [int(math.floor(x)) for x in raw]
+            counts = [1 + f for f in floors]
+            leftover = shots - sum(counts)
+            order = sorted(range(n), key=lambda i: (raw[i] - floors[i], weights[i]), reverse=True)
+            for i in order[:leftover]:
+                counts[i] += 1
+        total_sec = float(total_duration_sec or 0.0)
+        if total_sec <= 0:
+            total_sec = float(shots) * 5.0
+        result: List[Dict[str, Any]] = []
+        for i, sec in enumerate(sections):
+            item = dict(sec)
+            item["shot_count"] = int(counts[i])
+            item["duration_sec"] = round(total_sec * (weights[i] / total_w), 2)
+            result.append(item)
+        # Seconds should sum exactly to requested total after rounding.
+        delta = round(total_sec - sum(float(x["duration_sec"]) for x in result), 2)
+        if result and abs(delta) >= 0.01:
+            result[-1]["duration_sec"] = round(float(result[-1]["duration_sec"]) + delta, 2)
+        return result
+
+    @staticmethod
+    def _prompt_similarity(a: str, b: str) -> float:
+        aa = re.sub(r"[^a-z0-9 ]+", " ", str(a or "").lower())
+        bb = re.sub(r"[^a-z0-9 ]+", " ", str(b or "").lower())
+        aa = " ".join(aa.split())
+        bb = " ".join(bb.split())
+        if not aa or not bb:
+            return 0.0
+        return difflib.SequenceMatcher(None, aa, bb).ratio()
+
+    @classmethod
+    def _has_near_duplicate_prompts(cls, prompts: List[str], threshold: float = 0.82) -> bool:
+        clean = [str(x or "").strip() for x in prompts if str(x or "").strip()]
+        for i in range(len(clean)):
+            for j in range(i):
+                if cls._prompt_similarity(clean[i], clean[j]) >= threshold:
+                    return True
+        return False
+
+    @staticmethod
+    def _parse_section_shots(lines: List[str], expected_count: int, section_index: int, section_name: str) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for idx, raw in enumerate(list(lines or [])[:expected_count], start=1):
+            text = re.sub(r"\s+", " ", str(raw or "").strip())
+            parts: Dict[str, str] = {}
+            for chunk in text.split(" | "):
+                if "=" in chunk:
+                    k, v = chunk.split("=", 1)
+                    parts[k.strip().upper()] = v.strip()
+            visual = parts.get("VISUAL") or parts.get("PROMPT") or text
+            out.append({
+                "index": idx,
+                "beat_index": section_index,
+                "section": section_name,
+                "purpose": parts.get("PURPOSE") or "Advance this story section with a distinct visible event.",
+                "visual": visual.strip(),
+                "change": parts.get("CHANGE") or "The situation visibly advances toward the next shot.",
+            })
+        return out
+
+    @staticmethod
+    def _clean_section_visuals(items: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[int]]:
+        """Validate the actual VISUAL fields before a section is accepted.
+
+        Structured PURPOSE|VISUAL|CHANGE lines can be syntactically valid while the extracted
+        VISUAL itself still contains protocol/meta text or a truncated sentence.  Catch that here
+        so the finished movie cannot silently shrink later during T2I cleanup.
+        """
+        cleaned_items: List[Dict[str, Any]] = []
+        bad_indices: List[int] = []
+        for idx, item in enumerate(list(items or [])):
+            cloned = dict(item)
+            visual = _clean_generated_list_item(str(cloned.get("visual") or ""))
+            if not visual:
+                bad_indices.append(idx)
+                cloned["visual"] = ""
+            else:
+                cloned["visual"] = visual
+            cleaned_items.append(cloned)
+        return cleaned_items, bad_indices
+
+    def _repair_missing_section_visuals(
+        self,
+        *,
+        system_prompt: str,
+        section_name: str,
+        section_summary: str,
+        duration_sec: float,
+        items: List[Dict[str, Any]],
+        bad_indices: List[int],
+        style_hint: str,
+        t2i_model_hint: str,
+        director_brief: str,
+    ) -> List[Dict[str, Any]]:
+        """Ask only for invalid/missing section shots; never clone/pad existing prompts."""
+        if not bad_indices:
+            return items
+        repaired = [dict(x) for x in items]
+        valid_context = []
+        for idx, item in enumerate(repaired, start=1):
+            visual = str(item.get("visual") or "").strip()
+            if visual:
+                valid_context.append(f"Shot {idx}: {visual}")
+        missing_numbers = [i + 1 for i in bad_indices]
+        prompt = f"""
+Repair only the missing/invalid final image prompts for this ONE story section.
+
+SECTION: {section_name}
+STORY EVENT: {section_summary}
+SCREEN-TIME BUDGET: about {float(duration_sec):.2f} seconds
+TOTAL SHOTS IN SECTION: {len(repaired)}
+MISSING SHOT NUMBERS: {', '.join(str(x) for x in missing_numbers)}
+
+ALREADY ACCEPTED SHOTS (do not repeat or paraphrase them):
+{chr(10).join(valid_context) if valid_context else 'none'}
+
+Global visual style: {style_hint.strip() or 'none'}
+Target text-to-image model: {t2i_model_hint or 'none'}
+Directing approach: {director_brief}
+
+Return exactly {len(missing_numbers)} numbered lines, one for each missing shot IN THE SAME ORDER as MISSING SHOT NUMBERS.
+Each returned line must be ONLY the finished rich TEXT-TO-IMAGE prompt for that missing shot.
+Do not include PURPOSE, CHANGE, labels, explanations, the full movie premise, or markdown.
+Make each replacement a distinct chronological moment that fits between the already accepted neighboring shots.
+Do not introduce recurring characters, animals, vehicles or props unless this section actually needs them.
+Keep the global visual medium/style locked.
+""".strip()
+        replacements = self._generate_numbered_list_with_retry(
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            expected_count=len(missing_numbers),
+            temperature=0.55,
+            max_tokens=max(900, len(missing_numbers) * 240),
+            item_kind=f"replacement prompts for {section_name}",
+        )
+        replacements = [_clean_generated_list_item(x) for x in replacements]
+        if len(replacements) != len(missing_numbers) or any(not x for x in replacements):
+            raise RuntimeError(f"Could not repair all missing prompts in section '{section_name}'.")
+        for bad_idx, visual in zip(bad_indices, replacements):
+            repaired[bad_idx]["visual"] = visual
+        return repaired
+
     def generate_project(
         self,
         *,
@@ -1817,6 +2052,8 @@ Output rules:
         use_object_bible: bool,
         t2i_model_hint: str,
         i2v_model_hint: str,
+        predefined_character_bibles: Optional[List[str]] = None,
+        target_duration_sec: float = 0.0,
     ) -> StoryProject:
         if shot_count < 1:
             raise ValueError("Shot count must be at least 1.")
@@ -1825,8 +2062,11 @@ Output rules:
         if not (generate_t2i or generate_i2v):
             raise ValueError("Enable at least text-to-image or image-to-video.")
 
-        story_outline: List[str] = []
-        character_bibles: List[str] = []
+        story_outline: List[str] = []  # V2 compatibility: exact shot-level visual events
+        story_bible: List[str] = []
+        narrative_beats: List[str] = []
+        shot_plan: List[Dict[str, Any]] = []
+        character_bibles: List[str] = self._clean_character_bible_entries(list(predefined_character_bibles or []))
         object_bibles: List[str] = []
         t2i_prompts: List[str] = []
         i2v_prompts: List[str] = []
@@ -1857,205 +2097,363 @@ Output rules:
         self._log(f"Image-to-video model: {i2v_model_hint or 'none'}")
         self._log(f"Character bible: {'on' if use_character_bible else 'off'}")
 
+        # V3 pipeline:
+        # 1) The user's idea is used ONLY to author the short major story sections.
+        # 2) Runtime/shot budget is distributed over those sections.
+        # 3) Each section is expanded by its own LLM call into its final connected visual prompts.
+        # There is intentionally no global "write all N shots" call and no later creative T2I rewrite.
+        story_sections: List[Dict[str, Any]] = []
         if include_story_outline:
-            self._log("Generating story outline...")
-            outline_prompt = f"""
-Create exactly {shot_count} numbered story beats for a visual story.
+            section_count = self._v3_section_count(shot_count)
+            self._log(f"V3: creating {section_count} major story sections from the user's idea...")
+            section_prompt = f"""
+Turn the user's idea into exactly {section_count} major STORY PARTS. This is the complete high-level movie structure, not individual shots.
 
-User idea: {idea.strip()}
-Style notes: {style_hint.strip() or 'none'}
+USER IDEA:
+{idea.strip()}
+
+Global visual style: {style_hint.strip() or 'none'}
 Negative notes to avoid: {negative_hint.strip() or 'none'}
-Target text-to-image model: {t2i_model_hint or 'none'}
-Target image-to-video model: {i2v_model_hint or 'none'}
-
 Directing approach: {director_brief}
 
-Rules:
-- Write exactly {shot_count} numbered beats.
-- Treat the user's idea as a story seed: expand it into concrete visible events without replacing its concept.
-- Every beat must have a distinct visual purpose; do not repeat the same situation, pose, action, scale, or reaction with different wording.
-- Every beat must be standalone: repeat the stable subject name/label instead of starting with ambiguous pronouns such as she, he, it, or they.
-- A named non-human/creature subject must keep its semantic type/species in the wording when the name alone would be meaningless to an image model.
-- Build actual progression from beginning to ending. Each beat should cause, reveal, worsen, solve, or react to something.
-- Favor cause -> effect -> reaction chains: if someone acts on a person or object, state who does what, what physically changes, and the readable consequence when relevant.
-- Keep geography understandable: preserve who is where, what they are facing, and screen/travel direction when continuity matters.
-- Escalate action, comedy, danger, emotion, or discovery when the story calls for it; do not plateau in the middle.
-- Give important characters active behavior and readable reactions instead of merely placing them in the scene.
-- Use specific physical verbs and interactions. Avoid vague phrases such as "they struggle", "chaos happens", "things intensify", or "an emotional moment" when a visible action can be stated.
-- Do not invent disposable props, crowds, scenery, or effects merely to make a beat sound cinematic.
-- Avoid generic filler, repeated mood labels, adjective stacks, and poetic padding.
-- Avoid camera language unless the user asked for it; this pass plans events, not camera movement.
-- No commentary before or after the list.
-""".strip()
-            story_outline = self._generate_numbered_list_with_retry(
-                system_prompt=system,
-                user_prompt=outline_prompt,
-                expected_count=shot_count,
-                temperature=0.7,
-                max_tokens=shot_count * 120,
-                item_kind="story beats",
-            )
-            self._log(self._format_lines_for_log("Story outline", story_outline))
-
-        seed_text = "\n".join(f"{idx+1}. {beat}" for idx, beat in enumerate(story_outline)) if story_outline else idea.strip()
-
-        if generate_t2i:
-            self._log("Generating text-to-image prompts...")
-            t2i_prompt = f"""
-Using the source below, create exactly {shot_count} numbered prompts for text-to-image.
-
-Source:
-{seed_text}
-
-Global style hint: {style_hint.strip() or 'none'}
-Negative notes to avoid: {negative_hint.strip() or 'none'}
-Target text-to-image model: {t2i_model_hint or 'none'}
-
-Directing approach: {director_brief}
+Every line must use exactly:
+PART=<short part name> | STORY=<one short concrete description of what happens in this part> | WEIGHT=<0.5 to 3.0>
 
 Rules:
-- Each prompt must describe one strong, immediately readable image from its matching beat.
-- Treat the matching beat as authoritative. Stage it; do not replace it with a different event, discovery, prop, outcome, or action.
-- Every prompt must stand alone. Repeat the stable subject label/type needed to identify who or what is visible; never rely on previous prompts for identity.
-- Focus on subject, setting, the exact visible action, physical relationships, composition, and only important details.
-- Make consecutive prompts visually purposeful rather than interchangeable: vary useful framing/scale/composition when the story supports it, while keeping continuity intact.
-- When characters interact, identify the actor, target, contact/action, and visible result clearly enough that the image model cannot easily swap roles.
-- Show consequences and reactions when they are the point of the beat: displaced objects, changed body position, damage, expression, crowd response, environmental response, etc.
-- Preserve established geography, identities, wardrobe, recurring objects, vehicle direction, and environment unless the story explicitly changes them.
-- Keep each prompt direct and usable.
-- Static camera/framing language is allowed when it improves composition (wide shot, medium shot, close-up, low angle, overhead), but do not write camera movement.
-- Do not mention previous or next prompts or use workflow language.
-- Do not invent decorative props/effects simply for variety.
-- Avoid repeated filler such as "the mood is", generic cinematic adjectives, or multiple shots that are basically people standing and looking.
-- Return only the {shot_count} numbered prompts.
+- This is the ONLY stage that receives the user's original idea. Expand it into a coherent beginning-to-ending story.
+- Return exactly {section_count} parts in chronological order.
+- Treat the parts like the structural sections of a song: opening/setup, build, turns/escalations, climax, ending as appropriate. Do not force those exact labels if the story needs different ones.
+- Each STORY field must be short: one or two sentences describing the main event/change of that part, not finished image prompts.
+- Each part must lead causally into the next.
+- Give more WEIGHT to sections that deserve more screen time, such as an action chase, confrontation, discovery, or climax; give less to short transitions/openings/endings.
+- Keep the cast, important objects, geography, and chronology coherent.
+- Do not repeat the same situation in several parts with slightly different wording.
+- Do not invent decorative subplots just to fill the list.
+- Do not write camera directions or image-generation wording.
+- Return only the numbered structured lines.
 """.strip()
-            t2i_prompts = self._generate_numbered_list_with_retry(
+            raw_sections = self._generate_numbered_list_with_retry(
                 system_prompt=system,
-                user_prompt=t2i_prompt,
-                expected_count=shot_count,
-                temperature=0.65,
-                max_tokens=shot_count * 180,
-                item_kind="text-to-image prompts",
+                user_prompt=section_prompt,
+                expected_count=section_count,
+                temperature=0.62,
+                max_tokens=max(900, section_count * 150),
+                item_kind="major story sections",
             )
-            # Do not send good shot prompts through a second creative rewrite pass.
-            # The first T2I pass is the author; later passes may only inject stable
-            # identities/objects or normalize formatting.
-            t2i_prompts = self._clean_prompt_list_items(t2i_prompts, story_outline if story_outline else [idea.strip()] * shot_count)
-            if use_character_bible:
-                self._log("Generating character bible...")
+            story_sections = self._parse_story_sections(raw_sections, section_count)
+            if len(story_sections) != section_count:
+                raise RuntimeError(f"V3 story structure returned {len(story_sections)} sections; expected {section_count}.")
+
+            story_sections = self._allocate_section_shots(story_sections, shot_count, float(target_duration_sec or 0.0))
+            story_bible = [
+                f"{sec['name']}: {sec['summary']} [{sec['duration_sec']:.2f}s, {sec['shot_count']} shots]"
+                for sec in story_sections
+            ]
+            narrative_beats = [str(sec["summary"]) for sec in story_sections]
+            self._log(self._format_lines_for_log("Story sections", story_bible))
+
+            # Build recurring identity bibles from the authored story structure, never from the raw user idea.
+            structure_text = " ".join(str(sec["summary"]) for sec in story_sections)
+            if use_character_bible and not character_bibles:
+                self._log("V3: establishing character bible from the story structure...")
                 character_bibles = self._generate_character_bibles(
-                    idea=idea,
-                    story_outline=story_outline,
-                    draft_prompts=t2i_prompts,
+                    idea=structure_text,
+                    story_outline=narrative_beats,
+                    draft_prompts=[],
                     shot_count=shot_count,
                     style_hint=style_hint,
                     t2i_model_hint=t2i_model_hint,
                 )
                 self._log(self._format_lines_for_log("Character bible", character_bibles))
-                if character_bibles:
-                    self._log("Injecting character bible into text-to-image prompts...")
-                    t2i_prompts = self._inject_character_bibles_into_t2i(
-                        story_outline=story_outline if story_outline else [idea.strip()] * shot_count,
-                        draft_prompts=t2i_prompts,
-                        character_bibles=character_bibles,
-                        shot_count=shot_count,
-                        style_hint=style_hint,
-                        negative_hint=negative_hint,
-                        t2i_model_hint=t2i_model_hint,
+
+            character_block = "\n".join(f"- {line}" for line in character_bibles) if character_bibles else "none"
+            whole_structure = "\n".join(
+                f"{i+1}. {sec['name']}: {sec['summary']}"
+                for i, sec in enumerate(story_sections)
+            )
+
+            global_index = 1
+            previous_ending = "The movie has not started yet."
+            final_visual_prompts: List[str] = []
+
+            for sec_idx, sec in enumerate(story_sections, start=1):
+                count = int(sec["shot_count"])
+                duration = float(sec["duration_sec"])
+                next_summary = story_sections[sec_idx]["summary"] if sec_idx < len(story_sections) else "This is the final story section."
+                self._log(f"V3: expanding section {sec_idx}/{len(story_sections)} '{sec['name']}' into {count} connected prompts ({duration:.2f}s)...")
+
+                section_expand_prompt = f"""
+Create exactly {count} connected FINAL TEXT-TO-IMAGE SHOT PROMPTS for ONE story section.
+
+COMPLETE STORY STRUCTURE:
+{whole_structure}
+
+CURRENT PART:
+Name: {sec['name']}
+Story event: {sec['summary']}
+Screen-time budget: about {duration:.2f} seconds
+Shots required: {count}
+
+PREVIOUS PART ENDED WITH:
+{previous_ending}
+
+NEXT PART WILL BE:
+{next_summary}
+
+Established character identities:
+{character_block}
+
+Global visual style: {style_hint.strip() or 'none'}
+Target text-to-image model: {t2i_model_hint or 'none'}
+Directing approach: {director_brief}
+
+Every line must use exactly:
+PURPOSE=<why this shot exists> | VISUAL=<the full rich generation prompt for this one image> | CHANGE=<what becomes different by the end of this shot>
+
+Rules:
+- Work ONLY on the CURRENT PART. Do not summarize or repeat the complete movie premise in each VISUAL.
+- Return exactly {count} genuinely different, chronological shots that together show this part unfolding.
+- The shots must belong together as one sequence: establish what is needed, show actions/consequences/reactions, and hand off naturally to the next part.
+- Do not create {count} paraphrases of the same image. Each shot must depict a different visible moment, viewpoint, subject focus, action, reaction, exterior/interior coverage, or consequence that is useful to this story part.
+- A protagonist does NOT need to appear in every shot. Use exterior action, pursuers, environment, vehicles, objects, reaction shots, wide geography, overhead/aerial coverage, or other subjects when the story part requires them.
+- A recurring character/animal/object may appear ONLY when that specific shot needs it. Recurring means visually consistent when present, not present everywhere.
+- VISUAL is the actual final image-generation prompt. Make it rich, concrete and immediately renderable: visible subjects, location, action, spatial relationships, relevant environment, time/weather, and useful composition/framing.
+- Keep one visual style for the entire sequence: {style_hint.strip() or 'use one coherent cinematic visual medium and never switch medium'}.
+- Do not switch between realistic, anime, cartoon, 3D animation, illustration, or other media unless the global style explicitly says to do so.
+- Preserve identities, wardrobe, vehicles, important props, locations, damage, direction of travel, time, and other continuity facts.
+- Do not introduce a new recurring animal, child, companion, important prop, or named character unless the CURRENT PART explicitly requires it.
+- No workflow wording, no labels inside VISUAL, no discussion of previous/next prompts.
+- Return only the numbered structured lines.
+""".strip()
+
+                section_lines: List[str] = []
+                parsed_section: List[Dict[str, Any]] = []
+                last_error = ""
+                for attempt in range(2):
+                    section_lines = self._generate_numbered_list_with_retry(
+                        system_prompt=system,
+                        user_prompt=section_expand_prompt + (
+                            "\n\nRETRY REQUIREMENT: The previous attempt contained near-duplicate images. Make every VISUAL materially different in event/composition/subject coverage while preserving continuity."
+                            if attempt else ""
+                        ),
+                        expected_count=count,
+                        temperature=0.66 if attempt == 0 else 0.72,
+                        max_tokens=max(900, count * 240),
+                        item_kind=f"section {sec_idx} final shot prompts",
                     )
-                    t2i_prompts = self._clean_prompt_list_items(t2i_prompts, story_outline if story_outline else [idea.strip()] * shot_count)
+                    parsed_section = self._parse_section_shots(section_lines, count, sec_idx, str(sec["name"]))
+                    parsed_section, bad_visual_indices = self._clean_section_visuals(parsed_section)
+                    visuals = [str(x.get("visual") or "") for x in parsed_section]
+                    if len(parsed_section) == count and not bad_visual_indices and not self._has_near_duplicate_prompts(visuals, threshold=0.92):
+                        break
+                    if bad_visual_indices:
+                        last_error = f"section {sec_idx} had {len(bad_visual_indices)} invalid final VISUAL prompt(s)"
+                    else:
+                        last_error = f"section {sec_idx} had duplicate/near-duplicate prompts"
+                    # Retry the full small section once; unlike the old pipeline this never regenerates the whole movie.
+                    parsed_section = []
+                if len(parsed_section) != count:
+                    # If the section response structurally succeeded but a few VISUAL fields were rejected,
+                    # repair only those exact shot slots instead of padding, cloning, or aborting the movie.
+                    candidate = self._parse_section_shots(section_lines, count, sec_idx, str(sec["name"]))
+                    candidate, bad_visual_indices = self._clean_section_visuals(candidate)
+                    if len(candidate) == count and bad_visual_indices:
+                        candidate = self._repair_missing_section_visuals(
+                            system_prompt=system,
+                            section_name=str(sec["name"]),
+                            section_summary=str(sec["summary"]),
+                            duration_sec=duration,
+                            items=candidate,
+                            bad_indices=bad_visual_indices,
+                            style_hint=style_hint,
+                            t2i_model_hint=t2i_model_hint,
+                            director_brief=director_brief,
+                        )
+                        candidate, remaining_bad = self._clean_section_visuals(candidate)
+                        candidate_visuals = [str(x.get("visual") or "") for x in candidate]
+                        if not remaining_bad and not self._has_near_duplicate_prompts(candidate_visuals, threshold=0.92):
+                            parsed_section = candidate
+                    if len(parsed_section) != count:
+                        raise RuntimeError(last_error or f"V3 section {sec_idx} did not return {count} usable unique prompts.")
+
+                per_shot_duration = float(duration) / float(max(1, count))
+                for local_idx, item in enumerate(parsed_section, start=1):
+                    item["index"] = global_index
+                    item["duration_sec"] = round(per_shot_duration, 2)
+                    shot_plan.append(item)
+                    visual = str(item.get("visual") or "").strip()
+                    story_outline.append(visual)
+                    final_visual_prompts.append(visual)
+                    global_index += 1
+                previous_ending = str(parsed_section[-1].get("change") or parsed_section[-1].get("visual") or sec["summary"]).strip()
+
+            if len(shot_plan) != shot_count or len(final_visual_prompts) != shot_count:
+                raise RuntimeError(f"V3 assembled {len(final_visual_prompts)} final prompts; expected {shot_count}.")
+
+            # Cross-section duplicate guard before any image generation starts.
+            if self._has_near_duplicate_prompts(final_visual_prompts, threshold=0.94):
+                raise RuntimeError(
+                    "V3 storyline planning produced near-duplicate final image prompts across story sections. "
+                    "Planning stopped before image generation."
+                )
+
             if use_object_bible:
-                self._log("Generating recurring object bible...")
+                self._log("V3: establishing recurring object bible from the final planned shots...")
                 object_bibles = self._generate_object_bibles(
-                    idea=idea,
+                    idea=structure_text,
                     story_outline=story_outline,
-                    draft_prompts=t2i_prompts,
+                    draft_prompts=final_visual_prompts,
                     shot_count=shot_count,
                     style_hint=style_hint,
                     t2i_model_hint=t2i_model_hint,
                 )
                 self._log(self._format_lines_for_log("Object bible", object_bibles))
-                if object_bibles:
-                    self._log("Injecting recurring object bible into text-to-image prompts...")
-                    t2i_prompts = self._inject_object_bibles_into_t2i(
-                        story_outline=story_outline if story_outline else [idea.strip()] * shot_count,
-                        draft_prompts=t2i_prompts,
-                        object_bibles=object_bibles,
-                        shot_count=shot_count,
-                        style_hint=style_hint,
-                        negative_hint=negative_hint,
-                        t2i_model_hint=t2i_model_hint,
-                    )
-                    t2i_prompts = self._clean_prompt_list_items(t2i_prompts, story_outline if story_outline else [idea.strip()] * shot_count)
+        else:
+            # Compatibility path only; the normal FrameVision planner enables story structure.
+            story_outline = [idea.strip()] * shot_count
+            shot_plan = [{
+                "index": i + 1,
+                "beat_index": i + 1,
+                "section": "build",
+                "purpose": "Depict the requested visual idea clearly.",
+                "visual": idea.strip(),
+                "change": "The requested visual action progresses.",
+            } for i in range(shot_count)]
+            final_visual_prompts = list(story_outline)
+
+        if generate_t2i:
+            # V3 section expansion already authored the real T2I prompts.
+            # Do NOT send all shots through another global creative rewrite.
+            self._log("V3: using section-authored prompts directly as text-to-image prompts...")
+            t2i_prompts = self._clean_prompt_list_items(
+                list(final_visual_prompts),
+                story_outline if story_outline else [idea.strip()] * shot_count,
+            )
+            if len(t2i_prompts) != shot_count:
+                raise RuntimeError(f"V3 retained {len(t2i_prompts)} T2I prompts; expected {shot_count}.")
+
+            # Existing deterministic bible injection remains a consistency safety net.
+            # It may only add identity/object anchors to matching shots; it must not creatively rewrite scenes.
+            if use_character_bible and character_bibles:
+                self._log("Injecting character bible into matching text-to-image prompts...")
+                t2i_prompts = self._inject_character_bibles_into_t2i(
+                    story_outline=story_outline,
+                    draft_prompts=t2i_prompts,
+                    character_bibles=character_bibles,
+                    shot_count=shot_count,
+                    style_hint=style_hint,
+                    negative_hint=negative_hint,
+                    t2i_model_hint=t2i_model_hint,
+                )
+                t2i_prompts = self._clean_prompt_list_items(t2i_prompts, story_outline)
+            if use_object_bible and object_bibles:
+                self._log("Injecting recurring object bible into matching text-to-image prompts...")
+                t2i_prompts = self._inject_object_bibles_into_t2i(
+                    story_outline=story_outline,
+                    draft_prompts=t2i_prompts,
+                    object_bibles=object_bibles,
+                    shot_count=shot_count,
+                    style_hint=style_hint,
+                    negative_hint=negative_hint,
+                    t2i_model_hint=t2i_model_hint,
+                )
+                t2i_prompts = self._clean_prompt_list_items(t2i_prompts, story_outline)
             if use_character_bible and character_bibles:
                 t2i_prompts = self._expand_known_two_character_groups(t2i_prompts, character_bibles)
+
+            # Style lock is deterministic and global. No model may choose a different medium shot-to-shot.
             t2i_prompts = self._apply_style_to_prompt_list(t2i_prompts, style_hint)
-            t2i_prompts = self._clean_prompt_list_items(t2i_prompts, story_outline if story_outline else [idea.strip()] * shot_count)
+            t2i_prompts = self._clean_prompt_list_items(t2i_prompts, story_outline)
+            if len(t2i_prompts) != shot_count:
+                raise RuntimeError(f"V3 final T2I prompt count is {len(t2i_prompts)}; expected {shot_count}.")
+            if self._has_near_duplicate_prompts(t2i_prompts, threshold=0.95):
+                raise RuntimeError("V3 final T2I prompts contain near-duplicates. Planning stopped before image generation.")
             self._log(self._format_lines_for_log("Text-to-image prompts", t2i_prompts))
 
         if generate_i2v:
-            self._log("Generating image-to-video prompts...")
+            self._log("V3: generating image-to-video prompts one story section at a time...")
             source_for_i2v = t2i_prompts if t2i_prompts else story_outline
             if not source_for_i2v:
                 source_for_i2v = [idea.strip()] * shot_count
 
-            i2v_seed = "\n".join(f"{idx+1}. {item}" for idx, item in enumerate(source_for_i2v))
-            i2v_prompt = f"""
-Use the same scene order below to create exactly {shot_count} numbered prompts for image-to-video.
+            i2v_prompts = []
+            cursor = 0
+            if story_sections:
+                for sec_idx, sec in enumerate(story_sections, start=1):
+                    count = int(sec.get("shot_count") or 0)
+                    section_sources = source_for_i2v[cursor:cursor + count]
+                    cursor += count
+                    if len(section_sources) != count:
+                        raise RuntimeError(f"V3 I2V section {sec_idx} source count mismatch.")
+                    source_block = "\n".join(f"{i+1}. {item}" for i, item in enumerate(section_sources))
+                    i2v_prompt = f"""
+Create exactly {count} numbered IMAGE-TO-VIDEO motion prompts for this ONE already-planned story section.
 
-Source prompts:
-{i2v_seed}
+SECTION:
+{sec.get('name')}: {sec.get('summary')}
 
-Global style hint: {style_hint.strip() or 'none'}
+SOURCE IMAGES / SHOT PROMPTS:
+{source_block}
+
 Target image-to-video model: {i2v_model_hint or 'none'}
-
 Directing approach: {director_brief}
 
 Rules:
-- This is for image-to-video, not text-to-image. Start from an already existing image and describe how it animates.
-- Each line must describe what actually changes or moves in the shot.
-- Keep the same main subject, setting, geography, identities, and visible recurring objects from the source prompt.
-- Focus on visible action first, not appearance or pose.
-- Build a short physical micro-event when useful: action -> immediate effect -> readable reaction, but do not overload the clip with unrelated actions.
-- Name the acting subject and target when an interaction could be ambiguous; make contact and resulting motion explicit.
-- Use one dominant action chain, plus at most one small secondary motion if it supports that action.
-- Add only useful camera motion, keep it simple and unambiguous, and choose movement that supports the physical action rather than decorating the shot.
-- Across the sequence, avoid repeating the same camera behavior or the same character motion unless repetition is intentional.
-- Preserve screen direction/travel direction across adjacent action shots when relevant.
-- Use direct positive motion sentences. Describe only what should visibly happen.
-- Never include workflow instructions such as start from the image, keep the same, preserve, avoid, do not, next beat, transition, payoff, build tension, reveal, or force a decision.
-- Keep every recurring subject that is visible in the source image visible during the shot.
-- Any camera move must keep all visible subjects in frame and must not reveal a new location.
-- Do not write poster captions, pose descriptions, heroic pose language, or still-image wording like illustration caption.
-- Do not add poetic filler, emotional commentary, repeated mood labels, or story-writing terminology.
-- Do not pad with lighting essays or cinematic wording unless it affects visible motion.
-- Return one compact motion prompt per line.
-- Return only the {shot_count} numbered prompts.
+- Keep the exact order and meaning of the source shots.
+- Each line animates its matching source image; do not rewrite the story or introduce new subjects/locations.
+- Describe only the visible movement/action during that clip.
+- Use one dominant physical action chain plus at most one useful secondary motion.
+- Keep identities, geography, vehicle direction, objects and continuity intact.
+- Use simple camera movement only when it supports the existing action.
+- Do not repeat the same generic motion across the section.
+- Do not use workflow language such as preserve, keep the same, source image, next beat, transition, payoff, or reveal.
+- Return only the {count} numbered motion prompts.
 """.strip()
-            i2v_prompts = self._generate_numbered_list_with_retry(
-                system_prompt=system,
-                user_prompt=i2v_prompt,
-                expected_count=shot_count,
-                temperature=0.65,
-                max_tokens=shot_count * 140,
-                item_kind="image-to-video prompts",
-            )
-            self._log("Refining image-to-video prompts for beat accuracy and stronger action...")
-            i2v_prompts = self._refine_prompt_list(
-                kind="i2v",
-                source_beats=story_outline if story_outline else source_for_i2v,
-                draft_prompts=i2v_prompts,
-                shot_count=shot_count,
-                style_hint=style_hint,
-                negative_hint=negative_hint,
-                t2i_model_hint=t2i_model_hint,
-                i2v_model_hint=i2v_model_hint,
-            )
-            i2v_prompts = self._clean_prompt_list_items(i2v_prompts, story_outline if story_outline else source_for_i2v)
-            # Style belongs in the source image prompt. Appending it to literal I2V
-            # motion prompts encourages redraws and scene changes.
-            i2v_prompts = [self._clean_direct_i2v_prompt(p) for p in i2v_prompts]
-            i2v_prompts = self._clean_prompt_list_items(i2v_prompts, story_outline if story_outline else source_for_i2v)
+                    part: List[str] = []
+                    for motion_attempt in range(3):
+                        motion_request = i2v_prompt + (
+                            "\n\nRETRY REQUIREMENT: The previous motion list contained an invalid, static, meta, or unusable line. "
+                            "Regenerate this small section only. Every line must describe visible motion for its matching image."
+                            if motion_attempt else ""
+                        )
+                        raw_part = self._generate_numbered_list_with_retry(
+                            system_prompt=system,
+                            user_prompt=motion_request,
+                            expected_count=count,
+                            temperature=0.62 if motion_attempt == 0 else 0.52,
+                            max_tokens=max(700, count * 150),
+                            item_kind=f"section {sec_idx} image-to-video prompts",
+                        )
+                        # Never substitute a text-to-image source description for a rejected motion prompt.
+                        # If motion cleanup loses an item, retry this small section instead.
+                        candidate_part = [self._clean_direct_i2v_prompt(p) for p in raw_part]
+                        candidate_part = self._clean_prompt_list_items(candidate_part)
+                        if len(candidate_part) == count:
+                            part = candidate_part
+                            break
+                    if len(part) != count:
+                        raise RuntimeError(f"V3 I2V section {sec_idx} returned {len(part)} usable motion prompts; expected {count} after section retries.")
+                    i2v_prompts.extend(part)
+            else:
+                # Compatibility-only fallback when story sections are disabled.
+                source_block = "\n".join(f"{i+1}. {item}" for i, item in enumerate(source_for_i2v))
+                i2v_prompt = f"""
+Create exactly {shot_count} numbered image-to-video motion prompts matching these source images in order:
+{source_block}
+Return only direct visible motion, one line per source image.
+""".strip()
+                i2v_prompts = self._generate_numbered_list_with_retry(
+                    system_prompt=system,
+                    user_prompt=i2v_prompt,
+                    expected_count=shot_count,
+                    temperature=0.62,
+                    max_tokens=max(900, shot_count * 140),
+                    item_kind="image-to-video prompts",
+                )
+                i2v_prompts = [self._clean_direct_i2v_prompt(p) for p in i2v_prompts]
+
+            if len(i2v_prompts) != shot_count:
+                raise RuntimeError(f"V3 assembled {len(i2v_prompts)} I2V prompts; expected {shot_count}.")
             self._log(self._format_lines_for_log("Image-to-video prompts", i2v_prompts))
 
         metadata = {
@@ -2074,6 +2472,12 @@ Rules:
             "use_object_bible": use_object_bible,
             "t2i_model_hint": t2i_model_hint,
             "i2v_model_hint": i2v_model_hint,
+            "storyline_v2": True,
+            "storyline_v3": True,
+            "target_duration_sec": float(target_duration_sec or 0.0),
+            "story_section_count": len(story_sections),
+            "narrative_beat_count": len(narrative_beats),
+            "predefined_character_bible_count": len(list(predefined_character_bibles or [])),
         }
 
         return StoryProject(
@@ -2086,6 +2490,9 @@ Rules:
             text_to_image_prompts=t2i_prompts,
             image_to_video_prompts=i2v_prompts,
             metadata=metadata,
+            story_bible=story_bible,
+            narrative_beats=narrative_beats,
+            shot_plan=shot_plan,
         )
 
 
@@ -2112,6 +2519,9 @@ def load_project_json(path: str) -> StoryProject:
         text_to_image_prompts=list(data.get("text_to_image_prompts") or []),
         image_to_video_prompts=list(data.get("image_to_video_prompts") or []),
         metadata=dict(data.get("metadata") or {}),
+        story_bible=list(data.get("story_bible") or []),
+        narrative_beats=list(data.get("narrative_beats") or []),
+        shot_plan=list(data.get("shot_plan") or []),
     )
 
 

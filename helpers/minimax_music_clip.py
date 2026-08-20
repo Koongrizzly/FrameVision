@@ -428,6 +428,7 @@ class MusicProject:
     turbo_lora_path: str = ""
     turbo_lora_strength: float = 1.0
     randomize_reference_characters: bool = False
+    use_framevision_queue: bool = False
     reference_random_seed: int = -1
     references: List[ReferenceAsset] = field(default_factory=list)
     lyrics: List[LyricSegment] = field(default_factory=list)
@@ -1329,7 +1330,7 @@ def build_generation_prompt(project: MusicProject, shot: MusicShot, selected_ref
 def _randomized_character_reference_names(project: MusicProject, shot: MusicShot, enabled: Sequence[ReferenceAsset]) -> List[str]:
     """Return a stable per-shot random character subset when the feature is enabled.
 
-    Only enabled Character references participate. One to five characters are selected
+    Only enabled Character references participate. One or two characters are selected
     per shot (or fewer when fewer are available). The project-level seed is refreshed
     when the plan/prompts are rebuilt, then saved with the project so retries keep the
     same shot-to-reference mapping.
@@ -1339,7 +1340,7 @@ def _randomized_character_reference_names(project: MusicProject, shot: MusicShot
     chars = [r for r in enabled if _normalise_reference_kind(r.kind) == "Character" and r.name]
     if not chars:
         return []
-    max_count = min(5, len(chars))
+    max_count = min(2, len(chars))
     try:
         base_seed = int(getattr(project, "reference_random_seed", -1))
     except Exception:
@@ -1364,7 +1365,7 @@ def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
 
     Users can edit the assignment in the shot table. This avoids sending all nine references
     blindly while still giving the director useful defaults. When random character refs are
-    enabled, one to five Character references are chosen per shot while non-character
+    enabled, one or two Character references are chosen per shot while non-character
     context (background/style plus explicitly named props/anchors) stays stable.
     """
     enabled = [r for r in project.references if r.enabled and Path(r.path).is_file()]
@@ -1388,8 +1389,25 @@ def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
             if name not in chosen:
                 chosen.append(name)
     elif not any(_normalise_reference_kind(r.kind) == "Character" and r.name in chosen for r in enabled):
-        chars = [r.name for r in enabled if _normalise_reference_kind(r.kind) == "Character"]
-        chosen.extend(x for x in chars[:2] if x not in chosen)
+        # Non-random mode must still use the whole enabled character pool over the
+        # course of a music video.  The old fallback always selected chars[:2],
+        # which meant references 3..N could never reach MiniMax unless their names
+        # were explicitly written into a shot prompt.  Use a stable round-robin
+        # pair instead: shot 1 -> refs 1+2, shot 2 -> refs 3+4, shot 3 -> refs 5+1,
+        # etc.  This keeps retries/rebuilds deterministic while giving every enabled
+        # character a turn.  A single available character is simply reused.
+        chars = [r.name for r in enabled if _normalise_reference_kind(r.kind) == "Character" and r.name]
+        if chars:
+            try:
+                shot_index = max(1, int(getattr(shot, "index", 1) or 1))
+            except Exception:
+                shot_index = 1
+            pair_count = min(2, len(chars))
+            start = ((shot_index - 1) * pair_count) % len(chars)
+            for offset in range(pair_count):
+                name = chars[(start + offset) % len(chars)]
+                if name not in chosen:
+                    chosen.append(name)
     # Objects/props and picture/composition anchors remain opt-in by name/purpose so an
     # unrelated prop or storyboard image is not injected into every shot automatically.
     return chosen[:9]
@@ -1888,25 +1906,13 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
         # Ref2VA only requires at least one reference. The song chunk already fills that requirement.
         stamp = time.strftime("%Y%m%d_%H%M%S")
         log_path = logs_dir / f"minimax_music_clip_{stamp}_shot{shot.index:03d}.log"
-        cp = subprocess.Popen(
-            cmd,
-            cwd=str(ROOT),
-            # Match the already-working MiniMax GUI launch behavior: use the
-            # dedicated MiniMax Python executable, but inherit the normal process
-            # environment unchanged. Do not sanitize PYTHONPATH/user-site/PATH here;
-            # the standalone MiniMax GUI does not do that and its Ref2VA runtime is
-            # already proven on this install.
-            env=os.environ.copy(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        with _ACTIVE_GENERATION_LOCK:
-            _ACTIVE_GENERATION_PROCESS = cp
-        tail: List[str] = []
-        assert cp.stdout is not None
+        original_seed = int(shot.seed)
+        attempt_seed = original_seed
+        success = False
+        last_rc = None
+        last_tail: List[str] = []
+        cancelled_attempt = False
+
         with log_path.open("w", encoding="utf-8", errors="replace") as log:
             log.write("MiniMax Music Clip Creator - Ref2VA shot log\n")
             log.write(f"Shot: {shot.index}\n")
@@ -1914,24 +1920,73 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             log.write(f"Working directory: {ROOT}\n")
             log.write(f"Audio chunk: {audio_chunk}\n")
             log.write(f"Output: {out_path}\n")
-            log.write("Command: " + subprocess.list2cmdline(cmd) + "\n\n")
             log.flush()
-            for line in cp.stdout:
-                if _GENERATION_CANCEL.is_set() and cp.poll() is None:
-                    _terminate_generation_process_tree()
-                log.write(line)
+
+            for attempt in (1, 2):
+                if attempt == 2:
+                    if _GENERATION_CANCEL.is_set():
+                        cancelled_attempt = True
+                        break
+                    attempt_seed = random.SystemRandom().randint(0, 2_147_483_647)
+                    shot.seed = int(attempt_seed)
+                    try:
+                        out_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    # Replace the existing CLI seed without rebuilding the complete command.
+                    try:
+                        seed_pos = cmd.index("--seed") + 1
+                        cmd[seed_pos] = str(attempt_seed)
+                    except Exception:
+                        pass
+                    progress(f"Shot {shot.index}: first attempt failed; retrying once with random seed {attempt_seed}...")
+                    log.write(f"\n===== AUTOMATIC RETRY 1/1 | new seed {attempt_seed} =====\n")
+
+                log.write(f"Attempt {attempt}/2 seed: {attempt_seed}\n")
+                log.write("Command: " + subprocess.list2cmdline(cmd) + "\n\n")
                 log.flush()
-                text = line.rstrip()
-                if text:
-                    tail.append(text)
-                    tail = tail[-40:]
-                    if "step" in text.lower() or "saved" in text.lower() or "error" in text.lower():
-                        progress(f"Shot {shot.index}: {text}")
-        rc = cp.wait()
-        with _ACTIVE_GENERATION_LOCK:
-            if _ACTIVE_GENERATION_PROCESS is cp:
-                _ACTIVE_GENERATION_PROCESS = None
-        if _GENERATION_CANCEL.is_set():
+                cp = subprocess.Popen(
+                    cmd,
+                    cwd=str(ROOT),
+                    env=os.environ.copy(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                with _ACTIVE_GENERATION_LOCK:
+                    _ACTIVE_GENERATION_PROCESS = cp
+                tail: List[str] = []
+                assert cp.stdout is not None
+                for line in cp.stdout:
+                    if _GENERATION_CANCEL.is_set() and cp.poll() is None:
+                        _terminate_generation_process_tree()
+                    log.write(line)
+                    log.flush()
+                    text = line.rstrip()
+                    if text:
+                        tail.append(text)
+                        tail = tail[-40:]
+                        if "step" in text.lower() or "saved" in text.lower() or "error" in text.lower():
+                            progress(f"Shot {shot.index}: {text}")
+                rc = cp.wait()
+                last_rc = rc
+                last_tail = list(tail)
+                log.write(f"\n[Music Clip] attempt {attempt}/2 exited with code {rc}; output_exists={out_path.is_file()}\n")
+                log.flush()
+                with _ACTIVE_GENERATION_LOCK:
+                    if _ACTIVE_GENERATION_PROCESS is cp:
+                        _ACTIVE_GENERATION_PROCESS = None
+
+                if _GENERATION_CANCEL.is_set():
+                    cancelled_attempt = True
+                    break
+                if rc == 0 and out_path.is_file():
+                    success = True
+                    break
+
+        if cancelled_attempt or _GENERATION_CANCEL.is_set():
             if out_path.is_file():
                 results.append({"index": shot.index, "ok": True, "output_path": str(out_path), "log_path": str(log_path)})
                 progress(f"__MINIMAX_SHOT_DONE__|{shot.index}|{out_path}")
@@ -1939,16 +1994,18 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
                 results.append({"index": shot.index, "ok": False, "cancelled": True, "message": "Cancelled", "log_path": str(log_path)})
             progress("Generation stopped. Completed clips were kept.")
             break
-        if rc != 0 or not out_path.is_file():
+
+        if not success:
             results.append({
                 "index": shot.index,
                 "ok": False,
-                "message": ("\n".join(tail) or f"Exit code {rc}") + f"\n\nLog: {log_path}",
+                "message": ("\n".join(last_tail) or f"Exit code {last_rc}") + f"\n\nAutomatic retry with a new random seed also failed.\nLog: {log_path}",
                 "log_path": str(log_path),
             })
             progress(f"__MINIMAX_SHOT_FAILED__|{shot.index}|{log_path}")
             continue
-        results.append({"index": shot.index, "ok": True, "output_path": str(out_path), "log_path": str(log_path)})
+
+        results.append({"index": shot.index, "ok": True, "output_path": str(out_path), "log_path": str(log_path), "seed": int(attempt_seed), "retried": attempt_seed != original_seed})
         progress(f"__MINIMAX_SHOT_DONE__|{shot.index}|{out_path}")
     return results
 
@@ -2127,6 +2184,13 @@ class MiniMaxMusicClipWidget(QWidget):
             self.btn_open_output,
         ):
             bar.addWidget(button)
+        self.check_framevision_queue = QCheckBox("Use FrameVision queue", self)
+        self.check_framevision_queue.setToolTip(
+            "When enabled, MiniMax Music Clip shots and final assembly are submitted to FrameVision's shared queue/worker. "
+            "When disabled, this helper generates clips directly as before. Failed queued shots retry once with a new random seed before being marked failed."
+        )
+        self.check_framevision_queue.toggled.connect(self._framevision_queue_toggled)
+        bar.addWidget(self.check_framevision_queue)
         bar.addStretch(1)
         outer.addLayout(bar)
 
@@ -2231,8 +2295,9 @@ class MiniMaxMusicClipWidget(QWidget):
         self.check_randomize_ref_characters = QCheckBox("Randomize reference characters per clip", body)
         self.check_randomize_ref_characters.setToolTip(
             "When enabled, each shot automatically picks a random subset of enabled Character references. "
-            "The shot uses between 1 and 5 character refs at a time (or fewer when fewer are available). "
-            "Backgrounds, style refs and other non-character references keep their normal behavior. Rebuild prompts or create a new plan to refresh the random combinations."
+            "The shot uses either 1 or 2 character refs at a time (or fewer when fewer are available). "
+            "When disabled, character references are still rotated in a stable round-robin order so later references are not ignored. "
+            "Backgrounds, style refs and other non-character references keep their normal behavior. Rebuild prompts or create a new plan to refresh assignments."
         )
         lay.addWidget(self.check_randomize_ref_characters)
         self.refs_table = QTableWidget(0, 6, body)
@@ -2511,6 +2576,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.sage_attention = self.check_sage.isChecked()
         self.project.spectrum = self.check_spectrum.isChecked()
         self.project.randomize_reference_characters = bool(self.check_randomize_ref_characters.isChecked())
+        self.project.use_framevision_queue = bool(self.check_framevision_queue.isChecked())
         self.project.references = self._refs_from_table()
 
     def _sync_ui_from_project(self) -> None:
@@ -2533,6 +2599,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.edit_hybrid_model.setText(str(getattr(p, "hybrid_model_path", "") or ""))
         self.check_vram_manager.setChecked(bool(p.vram_manager_enabled)); self.check_vram_auto_bypass.setChecked(bool(p.vram_auto_bypass)); self.check_sage.setChecked(p.sage_attention); self.check_spectrum.setChecked(p.spectrum)
         self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
+        self.check_framevision_queue.setChecked(bool(getattr(p, "use_framevision_queue", False)))
         self._populate_refs(); self._populate_analysis(); self._populate_shots(); self._populate_review(); self._update_frame_label()
 
     def _project_dict(self) -> Dict[str, Any]:
@@ -3232,8 +3299,59 @@ class MiniMaxMusicClipWidget(QWidget):
             QMessageBox.information(self, "No clip", "Select a generated shot first."); return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(shot.output_path).resolve().parent)))
 
+    def _framevision_queue_toggled(self, enabled: bool) -> None:
+        self.project.use_framevision_queue = bool(enabled)
+        if enabled:
+            try:
+                self._ensure_framevision_queue_adapter()
+                self.status.setText("FrameVision queue enabled. New Music Clip jobs will be added to the shared queue.")
+            except Exception as exc:
+                self.check_framevision_queue.blockSignals(True)
+                self.check_framevision_queue.setChecked(False)
+                self.check_framevision_queue.blockSignals(False)
+                self.project.use_framevision_queue = False
+                QMessageBox.warning(self, "FrameVision queue unavailable", str(exc))
+        else:
+            self.status.setText("Direct generation enabled. Music Clip jobs will run immediately in this helper.")
+        try:
+            self._save_settings()
+            self._write_autosave(force=True)
+        except Exception:
+            pass
+
+    def _ensure_framevision_queue_adapter(self):
+        """Resolve FrameVision's shared queue from inside this helper.
+
+        Hosts may still inject an adapter, but the normal FrameVision helper does not
+        need its importer/host patched just to use the queue.
+        """
+        if callable(self.queue_adapter):
+            return self.queue_adapter
+        try:
+            from helpers.queue_adapter import enqueue_minimax_h3_job
+        except Exception:
+            try:
+                from queue_adapter import enqueue_minimax_h3_job
+            except Exception as exc:
+                raise RuntimeError(f"FrameVision queue adapter is unavailable: {exc}") from exc
+
+        def _submit(spec: Dict[str, Any]):
+            qid = enqueue_minimax_h3_job(spec)
+            if not qid:
+                raise RuntimeError("FrameVision queue did not accept the MiniMax Music Clip job.")
+            return qid
+
+        self.queue_adapter = _submit
+        return self.queue_adapter
+
     def _queue_mode_active(self) -> bool:
-        return callable(self.queue_adapter)
+        if not bool(getattr(self, "check_framevision_queue", None) and self.check_framevision_queue.isChecked()):
+            return False
+        try:
+            self._ensure_framevision_queue_adapter()
+            return True
+        except Exception:
+            return False
 
     def _prepare_shot_queue_job(self, shot: MusicShot) -> Dict[str, Any]:
         # A retry/recreate must use what is visible in Director right now, not a
@@ -3331,7 +3449,12 @@ class MiniMaxMusicClipWidget(QWidget):
             "resolution": f"{width} × {height}",
             "prompt": generation_prompt,
             "music_prompt_file": str(prompt_sidecar),
+            "music_clip_job": True,
             "music_shot_index": int(shot.index),
+            # The worker owns one immediate retry for Music Clip shots. Keeping the
+            # retry inside the same queue item preserves FIFO order: final assembly
+            # cannot overtake a retry and start while a required clip is still missing.
+            "music_retry_once": True,
             "music_project_output": str(out_dir),
             "music_recreated_to_new_name": bool(used_retry_name),
         }
@@ -3444,6 +3567,11 @@ class MiniMaxMusicClipWidget(QWidget):
             if not shot: continue
             if result.get("ok"):
                 shot.output_path = str(result.get("output_path") or ""); shot.status = "Generated"
+                if result.get("seed") is not None:
+                    try:
+                        shot.seed = int(result.get("seed"))
+                    except Exception:
+                        pass
             elif result.get("cancelled"):
                 shot.status = "Planned"
                 cancelled = True
@@ -3601,6 +3729,7 @@ class MiniMaxMusicClipWidget(QWidget):
                 self.project.sage_attention = bool(data.get("sage_attention", self.project.sage_attention))
                 self.project.spectrum = bool(data.get("spectrum", self.project.spectrum))
                 self.project.randomize_reference_characters = bool(data.get("randomize_reference_characters", self.project.randomize_reference_characters))
+                self.project.use_framevision_queue = bool(data.get("use_framevision_queue", getattr(self.project, "use_framevision_queue", False)))
         except Exception:
             pass
 
@@ -3629,6 +3758,7 @@ class MiniMaxMusicClipWidget(QWidget):
                 "use_hybrid_model": self.project.use_hybrid_model, "hybrid_model_path": self.project.hybrid_model_path,
                 "sage_attention": self.project.sage_attention, "spectrum": self.project.spectrum,
                 "randomize_reference_characters": self.project.randomize_reference_characters,
+                "use_framevision_queue": bool(getattr(self.project, "use_framevision_queue", False)),
             }
             SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:

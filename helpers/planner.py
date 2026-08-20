@@ -12701,13 +12701,38 @@ class PipelineWorker(QThread):
                     _target = 0.0
                 if _target <= 0.0:
                     _target = float(len(_shots)) * max(1.0, float(_min_s))
-                each = max(float(_min_s), min(float(_max_s), float(_target) / float(max(1, len(_shots)))))
-                durs = [each for _ in _shots]
-                cur = float(sum(durs))
-                diff = float(_target) - cur
-                if abs(diff) > 0.02 and durs:
-                    step = diff / float(len(durs))
-                    durs = [max(float(_min_s), min(float(_max_s), float(d) + float(step))) for d in durs]
+
+                # V3 may already contain story-section duration allocation.
+                # Preserve those relative weights instead of flattening all shots
+                # to identical durations.
+                planned = []
+                for _sh in _shots:
+                    try:
+                        planned.append(max(0.01, float(_sh.get("duration_sec") or 0.0)))
+                    except Exception:
+                        planned.append(0.0)
+                if not any(v > 0.01 for v in planned):
+                    planned = [1.0 for _ in _shots]
+
+                total_w = sum(planned) or float(len(_shots))
+                durs = [float(_target) * (w / total_w) for w in planned]
+                durs = [max(float(_min_s), min(float(_max_s), d)) for d in durs]
+
+                # Redistribute remaining time among shots that still have room.
+                for _ in range(8):
+                    diff = float(_target) - float(sum(durs))
+                    if abs(diff) <= 0.02:
+                        break
+                    if diff > 0:
+                        eligible = [i for i, d in enumerate(durs) if d < float(_max_s) - 1e-6]
+                    else:
+                        eligible = [i for i, d in enumerate(durs) if d > float(_min_s) + 1e-6]
+                    if not eligible:
+                        break
+                    step = diff / float(len(eligible))
+                    for i in eligible:
+                        durs[i] = max(float(_min_s), min(float(_max_s), durs[i] + step))
+
                 for _sh, _dur in zip(_shots, durs):
                     _sh["duration_sec"] = round(float(_dur), 2)
 
@@ -12784,6 +12809,8 @@ class PipelineWorker(QThread):
                         use_object_bible=True,
                         t2i_model_hint=t2i_model_hint,
                         i2v_model_hint=i2v_model_hint,
+                        predefined_character_bibles=list(_own_prompts) if bool(_own_active) else None,
+                        target_duration_sec=float(max(1.0, float(getattr(self.job, "approx_duration_sec", 0) or 0.0))),
                     )
                 finally:
                     try:
@@ -12792,6 +12819,9 @@ class PipelineWorker(QThread):
                         pass
 
                 beats = list(getattr(project, 'story_outline', None) or [])
+                narrative_beats = list(getattr(project, 'narrative_beats', None) or [])
+                story_bible = list(getattr(project, 'story_bible', None) or [])
+                directed_shot_plan = list(getattr(project, 'shot_plan', None) or [])
                 t2i_prompts = _offline_force_style_and_strip_negative(list(getattr(project, 'text_to_image_prompts', None) or []), style_hint, negative_hint)
                 i2v_prompts = _offline_force_style_and_strip_negative(list(getattr(project, 'image_to_video_prompts', None) or []), '', negative_hint)
                 if not beats or not t2i_prompts or not i2v_prompts:
@@ -12814,8 +12844,11 @@ class PipelineWorker(QThread):
                         "Planner must not rewrite returned text-to-image or image-to-video prompts.",
                         "Only the optional random camera effects suffix may be appended to image-to-video prompts.",
                     ],
-                    "beats": [{"index": int(i + 1), "text": str(bt)} for i, bt in enumerate(beats)],
-                    "source": "offline_storyline_creator_backend",
+                    "beats": [{"index": int(i + 1), "text": str(bt)} for i, bt in enumerate(narrative_beats or beats)],
+                    "story_bible": story_bible,
+                    "narrative_beats": [{"index": int(i + 1), "text": str(bt)} for i, bt in enumerate(narrative_beats)],
+                    "directed_shot_plan": directed_shot_plan,
+                    "source": "offline_storyline_creator_backend_v2" if directed_shot_plan else "offline_storyline_creator_backend",
                     "metadata": {
                         "llm_model_path": model_path,
                         "t2i_model_hint": t2i_model_hint,
@@ -12832,25 +12865,39 @@ class PipelineWorker(QThread):
                 out_shots: List[Dict[str, Any]] = []
                 for i, beat in enumerate(beats, start=1):
                     sid = f"S{i:02d}"
+                    directed = directed_shot_plan[i - 1] if (i - 1) < len(directed_shot_plan) and isinstance(directed_shot_plan[i - 1], dict) else {}
+                    section_raw = str(directed.get("section") or _phase_for_index(i, len(beats)))
+                    purpose_raw = str(directed.get("purpose") or "").strip()
+                    change_raw = str(directed.get("change") or "").strip()
+                    visual_raw = str(directed.get("visual") or beat).strip()
+                    beat_index_raw = int(directed.get("beat_index") or i) if directed else i
+                    progression = {
+                        "different_now": change_raw,
+                        "harder_now": change_raw if _story_section_key(section_raw) in ("escalation", "setback", "climax") else "",
+                        "revealed_now": change_raw if _story_section_key(section_raw) in ("discovery", "setback") else "",
+                        "prepares_payoff": purpose_raw if _story_section_key(section_raw) not in ("ending",) else change_raw,
+                    }
                     out_shots.append({
                         "id": sid,
                         "index": int(i),
                         "phase": _phase_for_index(i, len(beats)),
-                        "seed": str(beat),
-                        "seed_int": int(_planner_seed_int_for_job(str(beat), (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
+                        "seed": visual_raw,
+                        "seed_int": int(_planner_seed_int_for_job(visual_raw, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
                         "camera": "",
                         "mood": "",
                         "lighting": "",
-                        "notes": "offline storyline creator",
-                        "stage_directions": {},
-                        "visual_description": str(beat),
+                        "notes": f"offline storyline creator v2; parent narrative beat {beat_index_raw}",
+                        "stage_directions": {"purpose": purpose_raw, "continuity_change": change_raw, "parent_beat": beat_index_raw},
+                        "visual_description": visual_raw,
                         "subjects": [],
-                        "story_section": "",
-                        "section_change": "",
-                        "shot_purpose": "",
-                        "story_progression": {},
-                        "story_role": str(_phase_for_index(i, len(beats))),
-                        "duration_sec": 0.0,
+                        "story_section": section_raw,
+                        "story_section_key": _story_section_key(section_raw),
+                        "section_change": change_raw,
+                        "shot_purpose": purpose_raw,
+                        "story_progression": progression,
+                        "story_role": purpose_raw or str(_phase_for_index(i, len(beats))),
+                        "parent_narrative_beat": beat_index_raw,
+                        "duration_sec": float(directed.get("duration_sec") or 0.0),
                         "gen_fps": int(gen_profile.get("fps", 20)),
                         "gen_res": str(gen_profile.get("res", "384p")),
                         "steps": int(gen_profile.get("steps", 9)),
@@ -12894,10 +12941,15 @@ class PipelineWorker(QThread):
                     if not i2v_prompt:
                         i2v_prompt = "animate the visible scene with natural motion" 
                     rec = shot_map.get(sid) if isinstance(shot_map.get(sid), dict) else {}
+                    directed = directed_shot_plan[i - 1] if (i - 1) < len(directed_shot_plan) and isinstance(directed_shot_plan[i - 1], dict) else {}
                     rec.update({
                         "id": sid,
-                        "prompt_authority": "offline_storyline_creator",
-                        "seed": str(beat),
+                        "prompt_authority": "offline_storyline_creator_v2" if directed_shot_plan else "offline_storyline_creator",
+                        "seed": str(directed.get("visual") or beat),
+                        "parent_narrative_beat": int(directed.get("beat_index") or i) if directed else i,
+                        "story_section": str(directed.get("section") or ""),
+                        "shot_purpose": str(directed.get("purpose") or ""),
+                        "continuity_change": str(directed.get("change") or ""),
                         "seed_int": int(_planner_seed_int_for_job(str(beat), (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
                         "phase": str(_phase_for_index(i, len(beats))),
                         "prompt_spec": t2i_prompt,
@@ -12962,6 +13014,9 @@ class PipelineWorker(QThread):
 
                 manifest.setdefault("project", {})["offline_storyline"] = {
                     "outline": beats,
+                    "story_bible": story_bible,
+                    "narrative_beats": narrative_beats,
+                    "directed_shot_plan": directed_shot_plan,
                     "character_bibles": _offline_character_bibles,
                     "object_bibles": list(getattr(project, 'object_bibles', None) or []),
                     "metadata": dict(getattr(project, 'metadata', None) or {}),

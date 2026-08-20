@@ -1992,6 +1992,16 @@ def enqueue_minimax_h3_job(minimax_job: dict):
         'glue_results': bool(src.get('glue_results')),
         'continue_audio_memory': bool(src.get('continue_audio_memory')),
         'lanczos_scale_2x': bool(src.get('lanczos_scale_2x')),
+        # Music Clip metadata is consumed by worker.py. In particular, a shot can
+        # retry once in-place with a new random seed so queue ordering is preserved
+        # and the assembly job behind it cannot run too early.
+        'music_clip_job': bool(src.get('music_clip_job')),
+        'music_shot_index': src.get('music_shot_index'),
+        'music_retry_once': bool(src.get('music_retry_once')),
+        'music_project_output': src.get('music_project_output'),
+        'music_prompt_file': src.get('music_prompt_file'),
+        'music_recreated_to_new_name': bool(src.get('music_recreated_to_new_name')),
+        'music_assembly': bool(src.get('music_assembly')),
         'runner': 'minimax_h3_exact_command',
         'env': {'PYTHONIOENCODING':'utf-8','PYTHONUTF8':'1'},
     }

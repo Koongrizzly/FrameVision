@@ -7104,8 +7104,77 @@ def minimax_h3_generate(job, cfg, mani):
 
     args['cmd'] = cmd
     job['args'] = args
-    code = tools_ffmpeg(job, cfg, mani)
     out = str(args.get('outfile') or args.get('out_file') or '')
+
+    code = tools_ffmpeg(job, cfg, mani)
+
+    # Music Clip shots get one immediate retry inside the same queue item. Do not
+    # enqueue a second job behind the assembly item: keeping the retry here means
+    # FIFO ordering remains correct and assembly cannot overtake the missing shot.
+    _mode_name = str(args.get('mode_name') or job.get('mode_name') or '').lower()
+    _cmd_text = ' '.join(str(x) for x in cmd).lower().replace('\\', '/')
+    # Be backward-compatible with hosts that predate the explicit retry metadata:
+    # Music Clip Creator shot jobs are also recognisable by mode + generate_ref.py.
+    is_music_shot = (
+        (bool(args.get('music_clip_job')) and not bool(args.get('music_assembly')))
+        or ('music clip creator' in _mode_name and 'generate_ref.py' in _cmd_text)
+    )
+    retry_enabled = bool(args.get('music_retry_once')) or ('music clip creator' in _mode_name and 'generate_ref.py' in _cmd_text)
+    if code != 0 and is_music_shot and retry_enabled:
+        try:
+            import random as _music_retry_random
+            retry_seed = _music_retry_random.SystemRandom().randint(0, 2_147_483_647)
+            retry_cmd = list(cmd)
+            try:
+                seed_i = retry_cmd.index('--seed')
+                if seed_i + 1 < len(retry_cmd):
+                    retry_cmd[seed_i + 1] = str(retry_seed)
+                else:
+                    retry_cmd += ['--seed', str(retry_seed)]
+            except ValueError:
+                retry_cmd += ['--seed', str(retry_seed)]
+
+            # A failed native/CUDA process can leave a partial container behind.
+            # Remove only the intended output before retrying the same shot.
+            try:
+                if out:
+                    Path(out).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            print(f"[worker] Music Clip shot {args.get('music_shot_index') or job.get('music_shot_index') or '?'} failed (code={code}); automatic retry 1/1 with seed {retry_seed}", flush=True)
+            try:
+                _patch_running_json({
+                    'stage': f"Music Clip retry 1/1 (seed {retry_seed})",
+                    'music_retry_attempt': 1,
+                    'music_retry_seed': int(retry_seed),
+                    'seed': int(retry_seed),
+                })
+            except Exception:
+                pass
+
+            # Clear first-attempt error state so a successful retry finishes as Done.
+            job['error'] = ''
+            args['cmd'] = retry_cmd
+            args['seed'] = int(retry_seed)
+            args['music_retry_attempt'] = 1
+            args['music_retry_seed'] = int(retry_seed)
+            job['args'] = args
+            job['seed'] = int(retry_seed)
+            code = tools_ffmpeg(job, cfg, mani)
+            if code == 0 and out and Path(out).is_file():
+                print(f"[worker] Music Clip shot {args.get('music_shot_index') or job.get('music_shot_index') or '?'} retry succeeded with seed {retry_seed}", flush=True)
+                try:
+                    _patch_running_json({'stage': 'Music Clip retry succeeded', 'music_retry_succeeded': True})
+                except Exception:
+                    pass
+            else:
+                print(f"[worker] Music Clip shot {args.get('music_shot_index') or job.get('music_shot_index') or '?'} retry also failed (code={code})", flush=True)
+                if not str(job.get('error') or '').strip():
+                    _mark_error(job, f"Music Clip shot {args.get('music_shot_index')} failed twice; retry seed {retry_seed}, exit code {code}.")
+        except Exception as retry_exc:
+            print(f"[worker] Music Clip automatic retry could not start: {type(retry_exc).__name__}: {retry_exc}", flush=True)
+
     if code == 0 and bool(args.get('lanczos_scale_2x')) and Path(out).is_file():
         try:
             _patch_running_json({'stage': 'Lanczos scaling 2x'})
