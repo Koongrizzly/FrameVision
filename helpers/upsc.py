@@ -2999,6 +2999,80 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success, **_kwargs):
         pass
 
 
+    # HYPIR must preserve its exact command. The generic 4-argument upscale
+    # signature would silently turn it into a normal Real-ESRGAN-style job.
+    try:
+        eng_label = str(getattr(getattr(self, "combo_engine", None), "currentText", lambda: "")() or "").lower()
+    except Exception:
+        eng_label = ""
+    try:
+        hypir_cmd = any("hypir_runner.py" in " ".join(map(str, c)).lower() for c in (cmds or []) if isinstance(c, (list, tuple)))
+    except Exception:
+        hypir_cmd = False
+    if "hypir" in eng_label or hypir_cmd:
+        try:
+            import json as _json
+            import sys as _sys
+            from pathlib import Path as _Path
+            root = _Path(globals().get("ROOT", ".")).resolve()
+            out_file = str(getattr(self, "_last_outfile", "") or "")
+            out_path = _Path(out_file) if out_file else None
+            hjob = {
+                "name": "Upscale (HYPIR Video)" if len(cmds) > 1 else "Upscale (HYPIR)",
+                "label": "Upscale (HYPIR Video)" if len(cmds) > 1 else "Upscale (HYPIR)",
+                "category": "upscale",
+                "engine": "hypir",
+                "input": str(input_path or ""),
+                "out_dir": str(out_path.parent if out_path else out_dir or ""),
+                "output": out_file,
+                "outfile": out_file,
+                "cwd": str(_kwargs.get("cwd") or root),
+                "open_on_success": bool(open_on_success),
+            }
+            if _kwargs.get("env"):
+                hjob["env"] = _kwargs.get("env")
+
+            if len(cmds) > 1:
+                cleanup_dirs = _kwargs.get("cleanup_dirs") or []
+                work = _Path(cleanup_dirs[0]).resolve() if cleanup_dirs else None
+                if work is None:
+                    raise RuntimeError("HYPIR queued video is missing its temporary work directory")
+                work.mkdir(parents=True, exist_ok=True)
+                payload = work / "_hypir_queue_chain.json"
+                payload_data = {
+                    "cmds": [[str(x) for x in c] for c in cmds],
+                    "cwd": hjob["cwd"],
+                    "cleanup_dir": str(work),
+                    # worker passes the stored env to the wrapper; keep this here
+                    # as a second safety path for direct wrapper execution.
+                    "env": _kwargs.get("env") or {},
+                }
+                payload.write_text(_json.dumps(payload_data, ensure_ascii=False, indent=2), encoding="utf-8")
+                chain_runner = root / "helpers" / "hypir_queue_chain.py"
+                if not chain_runner.exists():
+                    raise FileNotFoundError(f"HYPIR queue chain runner missing: {chain_runner}")
+                # Use HYPIR's own Python when available (cmds[1] is the HYPIR
+                # stage in extract->HYPIR->encode), otherwise current Python.
+                py = str(cmds[1][0]) if len(cmds) > 1 and isinstance(cmds[1], (list, tuple)) and cmds[1] else _sys.executable
+                hjob["cmd"] = [py, "-X", "utf8", str(chain_runner), "--payload", str(payload)]
+                hjob["cleanup_dir"] = str(work)
+            else:
+                hjob["cmd"] = [str(x) for x in cmds[0]]
+
+            enq(hjob)
+            try:
+                self._append_log(f"Queued {'HYPIR video as one job' if len(cmds) > 1 else 'HYPIR image'} via {where_label}.")
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            try:
+                self._append_log(f"Queue error (HYPIR) via {where_label}: {e}")
+            except Exception:
+                pass
+            return False
+
+
 # If signature wants plain args, call with those
     if sig:
         params = list(sig.parameters.keys())
@@ -3049,7 +3123,7 @@ try:
         def _patched_run_cmd(self, cmds, open_on_success: bool = False, cleanup_dirs=None, **_kwargs):
             enq, where = _fv_find_enqueue(self)
             if callable(enq) and cmds:
-                if _fv_call_enqueue(self, enq, where, cmds, open_on_success, **_kwargs):
+                if _fv_call_enqueue(self, enq, where, cmds, open_on_success, cleanup_dirs=cleanup_dirs, **_kwargs):
                     return
             # Fallback to original implementation
             if callable(_orig_run_cmd):
@@ -4016,3 +4090,675 @@ except Exception:
     pass
 # --- END FRAMEVISION_HIDE_ENCODER_STYLE_IN_REALESRGAN ---
 
+
+
+# --- FRAMEVISION_HYPIR_AI_RESTORE_PATCH (2026-08-22) ---
+# Adds HYPIR as a first-class image restoration/upscale engine.
+# HYPIR runs in its own Python environment through helpers/hypir_runner.py,
+# so its Torch/Diffusers stack never imports into the main FrameVision process.
+try:
+    HYPIR_ENV_PY = ROOT / "environments" / ".hypir" / ("python.exe" if os.name == "nt" else "bin/python")
+    HYPIR_REPO_DIR = ROOT / "presets" / "extra_env" / "hypir_src" / "HYPIR"
+    HYPIR_MODEL_DIR = ROOT / "models" / "hypir"
+    HYPIR_WEIGHT = HYPIR_MODEL_DIR / "HYPIR_sd2.pth"
+    HYPIR_RUNNER = ROOT / "helpers" / "hypir_runner.py"
+    HYPIR_INSTALLER = ROOT / "presets" / "extra_env" / "install_hypir.bat"
+except Exception:
+    _fv_hypir_root = Path(__file__).resolve().parents[1]
+    HYPIR_ENV_PY = _fv_hypir_root / "environments" / ".hypir" / ("python.exe" if os.name == "nt" else "bin/python")
+    HYPIR_REPO_DIR = _fv_hypir_root / "presets" / "extra_env" / "hypir_src" / "HYPIR"
+    HYPIR_MODEL_DIR = _fv_hypir_root / "models" / "hypir"
+    HYPIR_WEIGHT = HYPIR_MODEL_DIR / "HYPIR_sd2.pth"
+    HYPIR_RUNNER = _fv_hypir_root / "helpers" / "hypir_runner.py"
+    HYPIR_INSTALLER = _fv_hypir_root / "presets" / "extra_env" / "install_hypir.bat"
+
+
+def _fv_hypir_find_local_sd2() -> Path | None:
+    """Find a local Diffusers-format Stable Diffusion 2.1 base model."""
+    candidates = [
+        HYPIR_MODEL_DIR / "stable-diffusion-2-1-base",
+        HYPIR_MODEL_DIR / "sd2-community" / "stable-diffusion-2-1-base",
+        HYPIR_MODEL_DIR / "stabilityai" / "stable-diffusion-2-1-base",
+        HYPIR_MODEL_DIR / "sd2_diffusers",
+    ]
+    try:
+        env_path = (os.environ.get("FRAMEVISION_HYPIR_BASE_MODEL") or "").strip()
+        if env_path:
+            candidates.insert(0, Path(env_path))
+    except Exception:
+        pass
+    for cand in candidates:
+        try:
+            if cand.exists() and cand.is_dir():
+                # A Diffusers pipeline normally has model_index.json. Accept a
+                # component directory too so custom local layouts can work.
+                if (cand / "model_index.json").exists() or (cand / "unet").exists():
+                    return cand
+        except Exception:
+            pass
+    return candidates[0]
+
+
+def _fv_hypir_missing_components():
+    """Return only components installed by the HYPIR dependency installer.
+
+    FrameVision's hypir_runner.py is part of the application patch, not part of
+    the optional HYPIR runtime installer.  Keeping it out of this list prevents
+    a successful runtime install from being reported as incomplete merely
+    because an app/helper file is missing or resolved through another layout.
+    """
+    missing = []
+    if not HYPIR_ENV_PY.exists():
+        missing.append(("Python environment", HYPIR_ENV_PY))
+
+    # Match the installer's own repository marker rather than only checking the
+    # parent folder.  The downloaded repo contains package HYPIR/enhancer/sd2.py.
+    repo_marker = HYPIR_REPO_DIR / "HYPIR" / "enhancer" / "sd2.py"
+    if not repo_marker.exists():
+        missing.append(("HYPIR repository", HYPIR_REPO_DIR))
+
+    try:
+        weight_ok = HYPIR_WEIGHT.exists() and HYPIR_WEIGHT.stat().st_size > 100_000_000
+    except Exception:
+        weight_ok = False
+    if not weight_ok:
+        missing.append(("HYPIR weights", HYPIR_WEIGHT))
+
+    base_model = _fv_hypir_find_local_sd2()
+    try:
+        # Use the same minimum completion test as install_hypir.py.
+        base_ok = (
+            base_model.exists()
+            and base_model.is_dir()
+            and (base_model / "model_index.json").exists()
+            and (base_model / "unet").exists()
+        )
+    except Exception:
+        base_ok = False
+    if not base_ok:
+        missing.append(("Stable Diffusion 2.1 base model", HYPIR_MODEL_DIR / "stable-diffusion-2-1-base"))
+    return missing, base_model
+
+
+def _fv_hypir_integration_missing():
+    """Return FrameVision-side files, which are not installed by Install HYPIR."""
+    missing = []
+    if not HYPIR_RUNNER.exists():
+        missing.append(("FrameVision HYPIR runner", HYPIR_RUNNER))
+    return missing
+
+
+def _fv_hypir_runtime_ready():
+    missing, _base = _fv_hypir_missing_components()
+    return not missing
+
+# Keep HYPIR visible in the engine selector even before its optional runtime is
+# installed. The HYPIR run path gives a precise missing-component message.
+try:
+    _fv_hypir_prev_detect_engines = detect_engines  # type: ignore
+    def detect_engines():  # type: ignore
+        try:
+            out = list(_fv_hypir_prev_detect_engines())
+        except Exception:
+            out = []
+        if not any("hypir" in (label or "").lower() for label, _exe in out):
+            out.append(("HYPIR AI Restore", str(HYPIR_ENV_PY)))
+        return out
+except Exception:
+    pass
+
+
+try:
+    _PaneH = UpscPane  # type: ignore  # noqa: F821
+    if not hasattr(_PaneH, "_fv_hypir_patch_20260822"):
+        _PaneH._fv_hypir_patch_20260822 = True
+
+        _fv_hypir_orig_gather = _PaneH._gather_settings
+        def _fv_hypir_gather_settings(self):
+            d = _fv_hypir_orig_gather(self)
+            try:
+                d["engine_name"] = self.combo_engine.currentText()
+            except Exception:
+                pass
+            try:
+                if "hypir" in (self.combo_engine.currentText() or "").lower():
+                    self._hypir_last_scale = int(round(float(self.spin_scale.value())))
+                d["hypir_scale"] = int(getattr(self, "_hypir_last_scale", 4))
+            except Exception:
+                d["hypir_scale"] = 4
+            try: d["hypir_prompt"] = self.edit_hypir_prompt.text()
+            except Exception: pass
+            try: d["hypir_seed"] = int(self.spin_hypir_seed.value())
+            except Exception: pass
+            try: d["hypir_patch_size"] = int(self.spin_hypir_patch.value())
+            except Exception: pass
+            try: d["hypir_overlap"] = int(self.spin_hypir_overlap.value())
+            except Exception: pass
+            try: d["hypir_video_experimental"] = bool(self.chk_hypir_video.isChecked())
+            except Exception: pass
+            return d
+        _PaneH._gather_settings = _fv_hypir_gather_settings
+
+        _fv_hypir_orig_run_one = _PaneH._run_one
+        def _fv_hypir_run_one(self, src: Path):
+            try:
+                eng = (self.combo_engine.currentText() or "").lower()
+            except Exception:
+                eng = ""
+            # SeedVR2 remains an explicit override, exactly as before.
+            try:
+                if getattr(self, "chk_seedvr2", None) is not None and self.chk_seedvr2.isChecked():
+                    return _fv_hypir_orig_run_one(self, src)
+            except Exception:
+                pass
+            if "hypir" not in eng:
+                return _fv_hypir_orig_run_one(self, src)
+
+            try:
+                self._last_infile = src
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "edit_input"):
+                    self.edit_input.setText(str(src))
+            except Exception:
+                pass
+
+            ext = src.suffix.lower()
+            is_video = ext in _VIDEO_EXTS
+            is_image = ext in _IMAGE_EXTS
+            if is_video:
+                allow_video = False
+                try:
+                    allow_video = bool(self.chk_hypir_video.isChecked())
+                except Exception:
+                    allow_video = False
+                if not allow_video:
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        "HYPIR - experimental video",
+                        "HYPIR video upscale is disabled by default.\n\n"
+                        "Enable the checkbox \"Enable experimental HYPIR video upscale\" on the HYPIR page to allow video processing.\n\n"
+                        "Warning: because HYPIR restores each frame generatively, video can show temporal flicker or shimmer between frames.",
+                    )
+                    self._append_log("HYPIR selected for video - blocked because experimental video toggle is OFF.")
+                    return
+            elif not is_image:
+                QtWidgets.QMessageBox.warning(self, "HYPIR", "Please select a supported image or video file.")
+                return
+
+            missing_pairs, base_model = _fv_hypir_missing_components()
+            if missing_pairs:
+                missing = [f"{label}:\n  {path}" for label, path in missing_pairs]
+                box = QtWidgets.QMessageBox(self)
+                box.setWindowTitle("HYPIR runtime missing")
+                box.setIcon(QtWidgets.QMessageBox.Information)
+                box.setText(
+                    "HYPIR is available in the engine list, but its optional runtime is not installed yet.\n\n"
+                    + "\n\n".join(missing)
+                )
+                install_btn = None
+                if HYPIR_INSTALLER.exists():
+                    install_btn = box.addButton("Install HYPIR", QtWidgets.QMessageBox.AcceptRole)
+                box.addButton(QtWidgets.QMessageBox.Close)
+                box.exec()
+                for item in missing:
+                    self._append_log("HYPIR missing: " + item.replace("\n", " "))
+                if install_btn is not None and box.clickedButton() is install_btn:
+                    try:
+                        self._fv_hypir_start_installer()
+                    except Exception as exc:
+                        QtWidgets.QMessageBox.critical(self, "HYPIR installer", f"Could not start HYPIR installer:\n{exc}")
+                return
+
+            scale = max(1, min(8, int(round(float(self.spin_scale.value())))))
+            self._hypir_last_scale = scale
+            outd = Path(self.edit_outdir.text().strip()) if self.edit_outdir.text().strip() else (OUT_VIDEOS if is_video else OUT_SHOTS)
+            outfile = self._build_outfile(src, outd, scale)
+            self._last_outfile = outfile
+
+            prompt = ""
+            seed = -1
+            patch_size = 512
+            overlap = 256
+            try: prompt = self.edit_hypir_prompt.text().strip()
+            except Exception: pass
+            try: seed = int(self.spin_hypir_seed.value())
+            except Exception: pass
+            try: patch_size = int(self.spin_hypir_patch.value())
+            except Exception: pass
+            try: overlap = int(self.spin_hypir_overlap.value())
+            except Exception: pass
+            patch_size = max(512, min(1024, patch_size))
+            overlap = max(0, min(patch_size - 128, overlap))
+            stride = max(128, patch_size - overlap)
+
+            env = os.environ.copy()
+            env.setdefault("PYTHONUTF8", "1")
+            env.setdefault("PYTHONIOENCODING", "utf-8")
+            # Never let an offline FrameVision run silently fetch a different SD2 model.
+            env.setdefault("HF_HUB_OFFLINE", "1")
+            env.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+            if is_video:
+                fps = _parse_fps(src) or "30"
+                work = outd / f"{src.stem}_hypir_x{scale}_work"
+                in_dir = work / "in"
+                out_dir = work / "out"
+                in_dir.mkdir(parents=True, exist_ok=True)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                seq_in = in_dir / "f_%08d.png"
+                seq_out = out_dir / "f_%08d.png"
+
+                pre = self._build_pre_filters()
+                cmd_extract = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y", "-i", str(src), "-map", "0:v:0"]
+                if pre:
+                    cmd_extract += ["-vf", pre]
+                cmd_extract += ["-fps_mode", "vfr", str(seq_in)]
+
+                cmd_upscale = [
+                    str(HYPIR_ENV_PY), "-X", "utf8", str(HYPIR_RUNNER),
+                    "--repo", str(HYPIR_REPO_DIR),
+                    "--base-model", str(base_model),
+                    "--weight", str(HYPIR_WEIGHT),
+                    "--input", str(in_dir),
+                    "--output", str(out_dir),
+                    "--scale", str(scale),
+                    "--prompt", prompt,
+                    "--seed", str(seed),
+                    "--patch-size", str(patch_size),
+                    "--stride", str(stride),
+                    "--device", "cuda",
+                ]
+
+                post = self._build_post_filters()
+                cmd_encode = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-y", "-framerate", fps, "-i", str(seq_out), "-i", str(src), "-map", "0:v:0"]
+                if self.radio_a_mute.isChecked():
+                    pass
+                else:
+                    cmd_encode += ["-map", "1:a?"]
+                vcodec = self.combo_vcodec.currentText()
+                cmd_encode += ["-c:v", vcodec, "-pix_fmt", "yuv420p"]
+                cmd_encode += ["-vsync", "cfr"]
+                if self.rad_crf.isChecked():
+                    cmd_encode += ["-crf", str(self.spin_crf.value())]
+                else:
+                    cmd_encode += ["-b:v", f"{self.spin_bitrate.value()}k"]
+                preset = self.combo_preset.currentText()
+                if preset:
+                    cmd_encode += ["-preset", preset]
+                if int(self.spin_keyint.value() or 0) > 0:
+                    cmd_encode += ["-g", str(int(self.spin_keyint.value()))]
+                if post:
+                    cmd_encode += ["-vf", post]
+                if self.radio_a_mute.isChecked():
+                    cmd_encode += ["-an"]
+                elif self.radio_a_copy.isChecked():
+                    cmd_encode += ["-c:a", "copy"]
+                else:
+                    cmd_encode += ["-c:a", self.combo_acodec.currentText(), "-b:a", f"{self.combo_abitrate.currentText()}k"]
+                cmd_encode += ["-r", fps, "-shortest", str(outfile)]
+
+                self._append_log("Engine: HYPIR AI Restore (experimental video)")
+                self._append_log(f"Python: {HYPIR_ENV_PY}")
+                self._append_log(f"HYPIR repo: {HYPIR_REPO_DIR}")
+                self._append_log(f"Weights: {HYPIR_WEIGHT}")
+                self._append_log(f"SD2 base: {base_model}")
+                self._append_log(f"Scale: x{scale}")
+                self._append_log(f"Seed: {seed}")
+                self._append_log(f"Tile: {patch_size}, overlap: {overlap}, stride: {stride}")
+                self._append_log(f"Prompt: {prompt if prompt else '(empty)'}")
+                self._append_log(f"FPS: {fps}")
+                self._append_log(f"Work dir: {work}")
+                self._append_log(f"Input: {src}")
+                self._append_log(f"Output: {outfile}")
+                self._append_log("Warning: HYPIR video mode is experimental and may flicker between frames.")
+                self._run_cmd([cmd_extract, cmd_upscale, cmd_encode], open_on_success=True, cleanup_dirs=[work], cwd=HYPIR_REPO_DIR, env=env)
+            else:
+                cmd = [
+                    str(HYPIR_ENV_PY), "-X", "utf8", str(HYPIR_RUNNER),
+                    "--repo", str(HYPIR_REPO_DIR),
+                    "--base-model", str(base_model),
+                    "--weight", str(HYPIR_WEIGHT),
+                    "--input", str(src),
+                    "--output", str(outfile),
+                    "--scale", str(scale),
+                    "--prompt", prompt,
+                    "--seed", str(seed),
+                    "--patch-size", str(patch_size),
+                    "--stride", str(stride),
+                    "--device", "cuda",
+                ]
+                self._append_log("Engine: HYPIR AI Restore")
+                self._append_log(f"Python: {HYPIR_ENV_PY}")
+                self._append_log(f"HYPIR repo: {HYPIR_REPO_DIR}")
+                self._append_log(f"Weights: {HYPIR_WEIGHT}")
+                self._append_log(f"SD2 base: {base_model}")
+                self._append_log(f"Scale: x{scale}")
+                self._append_log(f"Seed: {seed}")
+                self._append_log(f"Tile: {patch_size}, overlap: {overlap}, stride: {stride}")
+                self._append_log(f"Prompt: {prompt if prompt else '(empty)'}")
+                self._append_log(f"Input: {src}")
+                self._append_log(f"Output: {outfile}")
+                self._run_cmd([cmd], open_on_success=True, cwd=HYPIR_REPO_DIR, env=env)
+        _PaneH._run_one = _fv_hypir_run_one
+
+        _fv_hypir_orig_init = _PaneH.__init__
+        def _fv_hypir_init(self, *a, **k):
+            _fv_hypir_orig_init(self, *a, **k)
+
+            # HYPIR controls page. It is added after all legacy model pages so
+            # old page indices remain untouched.
+            pg = QtWidgets.QWidget(self)
+            grid = QtWidgets.QGridLayout(pg)
+            grid.setContentsMargins(4, 4, 4, 4)
+            grid.setHorizontalSpacing(10)
+            grid.setVerticalSpacing(6)
+
+            self.lbl_hypir_note = QtWidgets.QLabel(
+                "Single-pass generative restoration/upscale. Prompt is optional. Video support is available through an experimental toggle.", self
+            )
+            self.lbl_hypir_note.setWordWrap(True)
+            self.lbl_hypir_note.setStyleSheet("color:#9fb3c8;font-size:12px;")
+            grid.addWidget(self.lbl_hypir_note, 0, 0, 1, 4)
+
+            grid.addWidget(QtWidgets.QLabel("Prompt:", self), 1, 0)
+            self.edit_hypir_prompt = QtWidgets.QLineEdit(self)
+            self.edit_hypir_prompt.setPlaceholderText("Optional - leave empty for source-led restoration")
+            grid.addWidget(self.edit_hypir_prompt, 1, 1, 1, 3)
+
+            grid.addWidget(QtWidgets.QLabel("Seed:", self), 2, 0)
+            self.spin_hypir_seed = QtWidgets.QSpinBox(self)
+            self.spin_hypir_seed.setRange(-1, 2147483647)
+            self.spin_hypir_seed.setValue(-1)
+            self.spin_hypir_seed.setToolTip("-1 = random seed")
+            grid.addWidget(self.spin_hypir_seed, 2, 1)
+
+            grid.addWidget(QtWidgets.QLabel("Tile size:", self), 2, 2)
+            self.spin_hypir_patch = QtWidgets.QSpinBox(self)
+            self.spin_hypir_patch.setRange(512, 1024)
+            self.spin_hypir_patch.setSingleStep(128)
+            self.spin_hypir_patch.setValue(512)
+            self.spin_hypir_patch.setToolTip("HYPIR patch size. Official default: 512.")
+            grid.addWidget(self.spin_hypir_patch, 2, 3)
+
+            grid.addWidget(QtWidgets.QLabel("Tile overlap:", self), 3, 0)
+            self.spin_hypir_overlap = QtWidgets.QSpinBox(self)
+            self.spin_hypir_overlap.setRange(0, 896)
+            self.spin_hypir_overlap.setSingleStep(128)
+            self.spin_hypir_overlap.setValue(256)
+            self.spin_hypir_overlap.setToolTip("Overlap between HYPIR tiles. 256 with a 512 tile matches the official stride=256 default.")
+            grid.addWidget(self.spin_hypir_overlap, 3, 1)
+
+            self.lbl_hypir_stride = QtWidgets.QLabel("Effective stride: 256", self)
+            self.lbl_hypir_stride.setStyleSheet("color:#9fb3c8;font-size:12px;")
+            grid.addWidget(self.lbl_hypir_stride, 3, 2, 1, 2)
+
+            self.chk_hypir_video = QtWidgets.QCheckBox("Enable experimental HYPIR video upscale", self)
+            self.chk_hypir_video.setChecked(False)
+            self.chk_hypir_video.setToolTip("When enabled, videos are processed frame-by-frame through HYPIR. This can cause temporal flicker or shimmer.")
+            grid.addWidget(self.chk_hypir_video, 4, 0, 1, 4)
+
+            self.lbl_hypir_video_note = QtWidgets.QLabel("Experimental: video is processed frame-by-frame and may flicker/shimmer between frames.", self)
+            self.lbl_hypir_video_note.setWordWrap(True)
+            self.lbl_hypir_video_note.setStyleSheet("color:#ffcc66;font-size:12px;")
+            grid.addWidget(self.lbl_hypir_video_note, 5, 0, 1, 4)
+
+            self.lbl_hypir_runtime = QtWidgets.QLabel("", self)
+            self.lbl_hypir_runtime.setWordWrap(True)
+            self.lbl_hypir_runtime.setStyleSheet("color:#ffcc66;font-size:12px;")
+            grid.addWidget(self.lbl_hypir_runtime, 6, 0, 1, 3)
+            self.btn_hypir_install = QtWidgets.QPushButton("Install HYPIR", self)
+            self.btn_hypir_install.setToolTip("Install HYPIR into FrameVision/environments/.hypir and download its local models.")
+            grid.addWidget(self.btn_hypir_install, 6, 3)
+            grid.setColumnStretch(3, 1)
+
+            self._hypir_page_index = self.stk_models.addWidget(pg)
+            self._hypir_last_scale = 4
+            self._hypir_was_active = False
+            self._hypir_scale_before = float(self.spin_scale.value())
+
+            def _hypir_refresh_runtime_ui(*_args):
+                try:
+                    runtime_missing, _base = _fv_hypir_missing_components()
+                    integration_missing = _fv_hypir_integration_missing()
+                    runtime_ready = not runtime_missing
+
+                    # The install button is strictly for optional runtime/model
+                    # dependencies.  FrameVision helper files are supplied by
+                    # the app patch and must never make this button reappear.
+                    self.btn_hypir_install.setVisible(not runtime_ready)
+
+                    if runtime_missing:
+                        details = "\n".join(f"• {label}: {path}" for label, path in runtime_missing)
+                        self.lbl_hypir_runtime.setText("HYPIR runtime not complete:\n" + details)
+                        self.lbl_hypir_runtime.setVisible(True)
+                    elif integration_missing:
+                        details = "\n".join(f"• {label}: {path}" for label, path in integration_missing)
+                        self.lbl_hypir_runtime.setText(
+                            "HYPIR runtime is installed, but a FrameVision integration file is missing:\n" + details
+                        )
+                        self.lbl_hypir_runtime.setVisible(True)
+                    else:
+                        self.lbl_hypir_runtime.setText("")
+                        self.lbl_hypir_runtime.setVisible(False)
+                    return runtime_ready
+                except Exception as exc:
+                    self.btn_hypir_install.setVisible(True)
+                    self.lbl_hypir_runtime.setVisible(True)
+                    self.lbl_hypir_runtime.setText(f"HYPIR runtime check failed: {exc}")
+                    return False
+
+            def _hypir_start_installer(*_args):
+                if not HYPIR_INSTALLER.exists():
+                    QtWidgets.QMessageBox.warning(self, "HYPIR installer missing", f"Installer not found:\n{HYPIR_INSTALLER}")
+                    return
+                try:
+                    flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+                    subprocess.Popen(["cmd.exe", "/c", str(HYPIR_INSTALLER)], cwd=str(HYPIR_INSTALLER.parent), creationflags=flags)
+                    self._append_log(f"Started HYPIR installer: {HYPIR_INSTALLER}")
+                    self.btn_hypir_install.setEnabled(False)
+                    self.btn_hypir_install.setText("Installing HYPIR...")
+                    if not hasattr(self, "_hypir_install_timer"):
+                        self._hypir_install_timer = QtCore.QTimer(self)
+                        self._hypir_install_timer.setInterval(2500)
+                        def _poll_hypir_install():
+                            if _hypir_refresh_runtime_ui():
+                                self._hypir_install_timer.stop()
+                                self.btn_hypir_install.setEnabled(True)
+                                self.btn_hypir_install.setText("Install HYPIR")
+                                self._append_log("HYPIR runtime detected: installation is complete.")
+                        self._hypir_install_timer.timeout.connect(_poll_hypir_install)
+                    self._hypir_install_timer.start()
+                except Exception:
+                    self.btn_hypir_install.setEnabled(True)
+                    self.btn_hypir_install.setText("Install HYPIR")
+                    raise
+
+            self._fv_hypir_refresh_runtime_ui = _hypir_refresh_runtime_ui
+            self._fv_hypir_start_installer = _hypir_start_installer
+            try: self.btn_hypir_install.clicked.connect(_hypir_start_installer)
+            except Exception: pass
+
+            def _hypir_sync_tile_controls(*_args):
+                try:
+                    patch = int(self.spin_hypir_patch.value())
+                    max_overlap = max(0, patch - 128)
+                    self.spin_hypir_overlap.setMaximum(max_overlap)
+                    overlap = min(int(self.spin_hypir_overlap.value()), max_overlap)
+                    stride = max(128, patch - overlap)
+                    self.lbl_hypir_stride.setText(f"Effective stride: {stride}")
+                except Exception:
+                    pass
+
+            def _hypir_apply_engine_ui(*_args):
+                try:
+                    active = "hypir" in (self.combo_engine.currentText() or "").lower()
+                except Exception:
+                    active = False
+                if active:
+                    if not getattr(self, "_hypir_was_active", False):
+                        try:
+                            self._hypir_scale_before = float(self.spin_scale.value())
+                        except Exception:
+                            pass
+                    self._hypir_was_active = True
+                    try: self.stk_models.setCurrentIndex(self._hypir_page_index)
+                    except Exception: pass
+                    # A later legacy patch hides scale for every engine except
+                    # Waifu2x. HYPIR explicitly owns a free 1x-8x scale, so
+                    # restore the control regardless of the previous engine.
+                    try:
+                        self.spin_scale.blockSignals(True)
+                        self.spin_scale.setDecimals(0)
+                        self.spin_scale.setRange(1.0, 8.0)
+                        self.spin_scale.setSingleStep(1.0)
+                        self.spin_scale.setValue(float(max(1, min(8, int(getattr(self, "_hypir_last_scale", 4))))))
+                        self.spin_scale.blockSignals(False)
+                    except Exception:
+                        pass
+                    try:
+                        self.slider_scale.blockSignals(True)
+                        self.slider_scale.setRange(10, 80)
+                        self.slider_scale.setSingleStep(10)
+                        self.slider_scale.setPageStep(10)
+                        self.slider_scale.setValue(int(round(float(self.spin_scale.value()))) * 10)
+                        self.slider_scale.blockSignals(False)
+                    except Exception:
+                        pass
+                    try: self._w_scale.setVisible(True)
+                    except Exception: pass
+                    try: self.spin_scale.setVisible(True)
+                    except Exception: pass
+                    try: self.slider_scale.setVisible(True)
+                    except Exception: pass
+                    try:
+                        lbl = getattr(self, "_fv_lbl_scale", None)
+                        if lbl is None:
+                            for lab in self.findChildren(QtWidgets.QLabel):
+                                if (lab.text() or "").strip().lower() == "scale:":
+                                    lbl = lab
+                                    self._fv_lbl_scale = lab
+                                    break
+                        if lbl is not None: lbl.setVisible(True)
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(self, "lbl_model_hint"):
+                            self.lbl_model_hint.setText("HYPIR restores detail with SD2.1 score priors; strong restoration can synthesize plausible texture.")
+                        if hasattr(self, "lbl_model_badge"):
+                            self.lbl_model_badge.setText("AI Restore")
+                    except Exception:
+                        pass
+                else:
+                    if getattr(self, "_hypir_was_active", False):
+                        try:
+                            self._hypir_last_scale = int(round(float(self.spin_scale.value())))
+                        except Exception:
+                            pass
+                        self._hypir_was_active = False
+                        try:
+                            self.spin_scale.blockSignals(True)
+                            self.spin_scale.setDecimals(1)
+                            self.spin_scale.setRange(1.0, 8.0)
+                            self.spin_scale.setSingleStep(0.5)
+                            self.spin_scale.setValue(float(getattr(self, "_hypir_scale_before", 2.0)))
+                            self.spin_scale.blockSignals(False)
+                            self.slider_scale.blockSignals(True)
+                            self.slider_scale.setSingleStep(5)
+                            self.slider_scale.setPageStep(5)
+                            self.slider_scale.setValue(int(round(self.spin_scale.value() * 10)))
+                            self.slider_scale.blockSignals(False)
+                        except Exception:
+                            pass
+                    # Reapply the existing engine's own fixed/free scale rules
+                    # after restoring the pre-HYPIR generic value.
+                    try:
+                        if "_fv_apply_scale_ui" in globals():
+                            globals()["_fv_apply_scale_ui"](self)
+                    except Exception:
+                        pass
+
+            self._hypir_apply_engine_ui = _hypir_apply_engine_ui
+            self._hypir_sync_tile_controls = _hypir_sync_tile_controls
+
+            try: self.combo_engine.currentTextChanged.connect(_hypir_apply_engine_ui)
+            except Exception: pass
+            try: self.spin_hypir_patch.valueChanged.connect(_hypir_sync_tile_controls)
+            except Exception: pass
+            try: self.spin_hypir_overlap.valueChanged.connect(_hypir_sync_tile_controls)
+            except Exception: pass
+
+            # Persist HYPIR values through the same presets/setsave/upsc_settings.json.
+            for obj, signal_name in (
+                (self.edit_hypir_prompt, "textChanged"),
+                (self.spin_hypir_seed, "valueChanged"),
+                (self.spin_hypir_patch, "valueChanged"),
+                (self.spin_hypir_overlap, "valueChanged"),
+                (self.chk_hypir_video, "toggled"),
+            ):
+                try:
+                    getattr(obj, signal_name).connect(self._auto_save_if_enabled)
+                except Exception:
+                    pass
+
+            # Load HYPIR-specific values and the safer engine-name key after the
+            # page exists. Legacy engine_index remains supported by the old loader.
+            try:
+                sp = self._settings_path()
+                if sp.exists():
+                    with open(sp, "r", encoding="utf-8") as fh:
+                        saved = json.load(fh)
+                    self._hypir_last_scale = max(1, min(8, int(saved.get("hypir_scale", 4))))
+                    try: self.edit_hypir_prompt.setText(str(saved.get("hypir_prompt", "") or ""))
+                    except Exception: pass
+                    try: self.spin_hypir_seed.setValue(int(saved.get("hypir_seed", -1)))
+                    except Exception: pass
+                    try: self.spin_hypir_patch.setValue(int(saved.get("hypir_patch_size", 512)))
+                    except Exception: pass
+                    try: self.spin_hypir_overlap.setValue(int(saved.get("hypir_overlap", 256)))
+                    except Exception: pass
+                    try: self.chk_hypir_video.setChecked(bool(saved.get("hypir_video_experimental", False)))
+                    except Exception: pass
+                    engine_name = str(saved.get("engine_name", "") or "").strip()
+                    if engine_name:
+                        idx = self.combo_engine.findText(engine_name)
+                        if idx >= 0:
+                            self.combo_engine.setCurrentIndex(idx)
+            except Exception:
+                pass
+
+            _hypir_sync_tile_controls()
+            _hypir_apply_engine_ui()
+            _hypir_refresh_runtime_ui()
+
+            # Prevent accidental mouse-wheel changes across value controls unless
+            # the user has explicitly focused the control.
+            try:
+                class _FVWheelFocusGuard(QtCore.QObject):
+                    def eventFilter(_guard_self, obj, event):
+                        try:
+                            if event.type() == QtCore.QEvent.Wheel and not obj.hasFocus():
+                                event.ignore()
+                                return True
+                        except Exception:
+                            pass
+                        return False
+                self._fv_wheel_focus_guard = _FVWheelFocusGuard(self)
+                guarded = []
+                guarded.extend(self.findChildren(QtWidgets.QComboBox))
+                guarded.extend(self.findChildren(QtWidgets.QAbstractSpinBox))
+                guarded.extend(self.findChildren(QtWidgets.QSlider))
+                for w in guarded:
+                    try: w.installEventFilter(self._fv_wheel_focus_guard)
+                    except Exception: pass
+            except Exception:
+                pass
+
+        _PaneH.__init__ = _fv_hypir_init
+except Exception as _fv_hypir_patch_error:
+    try:
+        print("[HYPIR FrameVision patch] non-fatal:", _fv_hypir_patch_error)
+    except Exception:
+        pass
+# --- END FRAMEVISION_HYPIR_AI_RESTORE_PATCH ---

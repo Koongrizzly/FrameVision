@@ -135,6 +135,8 @@ def enqueue(job_type, input_path=None, out_dir=None, factor=None, model=None, fm
                 cmd_txt = ''
             if eng == 'seedvr2' or ('seedvr2' in cmd_txt) or ('inference_cli.py' in cmd_txt and 'seedvr2' in cmd_txt):
                 return enqueue_seedvr2(job)
+            if eng == 'hypir' or ('hypir_runner.py' in cmd_txt) or ('hypir_queue_chain.py' in cmd_txt):
+                return enqueue_hypir(job)
         except Exception:
             pass
         # Default: treat as external command job
@@ -1289,6 +1291,39 @@ def enqueue_seedvr2(job: dict):
     if job.get('env') is not None:
         args['env'] = job.get('env')
     return make_job_json('seedvr2', inp, out_dir, args, str(d['pending']), priority=500)
+def enqueue_hypir(job: dict):
+    """Enqueue HYPIR as a first-class visible queue entry using tools_ffmpeg.
+
+    Preserves the exact HYPIR command instead of converting it into the generic
+    Real-ESRGAN upscale_photo/upscale_video signature.  Existing source media is
+    kept as job input so the Queue UI can show the real file/thumbnail.
+    """
+    from helpers.job_helper import make_job_json
+    import os as _os
+    d = jobs_dirs()
+    args = dict(job) if isinstance(job, dict) else {'job': job}
+    cmd = args.get('cmd') or args.get('command') or args.get('ffmpeg_cmd')
+    if not cmd:
+        raise RuntimeError('enqueue_hypir: missing job["cmd"]')
+    inp = str(args.get('input') or '').strip()
+    out_file = str(args.get('output') or args.get('outfile') or args.get('out_file') or '').strip()
+    out_dir = str(args.get('out_dir') or '').strip()
+    if not out_dir and out_file:
+        out_dir = _os.path.dirname(out_file)
+    if not out_dir:
+        out_dir = default_outdir(bool(str(inp).lower().endswith(('.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpg','.mpeg','.wmv','.gif'))), 'upscale')
+    args.setdefault('engine', 'hypir')
+    args.setdefault('label', 'Upscale (HYPIR)')
+    args.setdefault('outfile', out_file)
+    args.setdefault('output', out_file)
+    args.setdefault('cwd', job.get('cwd'))
+    if job.get('env') is not None:
+        args['env'] = job.get('env')
+    # Avoid copying top-level routing fields redundantly.
+    args.pop('input', None)
+    args.pop('out_dir', None)
+    return make_job_json('tools_ffmpeg', inp, out_dir, args, str(d['pending']), priority=500)
+
 def enqueue_external(job: dict):
     """Enqueue a single external command job via tools_ffmpeg.
     Expected job keys include:

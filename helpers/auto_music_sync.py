@@ -6765,6 +6765,21 @@ def run_ltx_full_queue_payload(payload_path: str) -> int:
                 print(f"[musicclip_ltx_queue] ERROR: {msg}", flush=True)
                 return 12
             final_output = str(assembly_result.get("final_output_path") or "")
+            if final_output and (bool(payload.get("use_hypir_x1_upscale", False)) or bool(payload.get("use_lanczos_x2_upsampling", False))):
+                try:
+                    try:
+                        from helpers.musicclip_postprocess import postprocess_music_video
+                    except Exception:
+                        from musicclip_postprocess import postprocess_music_video
+                    postprocess_music_video(
+                        final_output,
+                        use_hypir_x1=bool(payload.get("use_hypir_x1_upscale", False)),
+                        use_lanczos_x2=bool(payload.get("use_lanczos_x2_upsampling", False)),
+                        progress=_progress,
+                    )
+                except Exception as exc:
+                    print(f"[musicclip_ltx_queue] ERROR: final video upscale/restoration failed: {exc}", flush=True)
+                    return 14
 
         queue_output_file = str(payload.get("queue_output_file") or "").strip()
         if queue_output_file:
@@ -6831,6 +6846,8 @@ def run_queue_payload(payload_path: str) -> int:
         intro_fade = bool(payload.get("intro_fade", True))
         outro_fade = bool(payload.get("outro_fade", True))
         keep_source_bitrate = bool(payload.get("keep_source_bitrate", False))
+        use_hypir_x1_upscale = bool(payload.get("use_hypir_x1_upscale", False))
+        use_lanczos_x2_upsampling = bool(payload.get("use_lanczos_x2_upsampling", False))
         use_visual_overlay = bool(payload.get("use_visual_overlay", False))
         visual_strategy = int(payload.get("visual_strategy") or 0)
         visual_section_overrides = payload.get("visual_section_overrides") or None
@@ -6926,6 +6943,8 @@ def run_queue_payload(payload_path: str) -> int:
         intro_fade=intro_fade,
         outro_fade=outro_fade,
         keep_source_bitrate=keep_source_bitrate,
+        use_hypir_x1_upscale=use_hypir_x1_upscale,
+        use_lanczos_x2_upsampling=use_lanczos_x2_upsampling,
         use_visual_overlay=use_visual_overlay,
         visual_strategy=visual_strategy,
         visual_section_overrides=visual_section_overrides,
@@ -10033,6 +10052,8 @@ class RenderWorker(QThread):
         intro_fade: bool,
         outro_fade: bool,
         keep_source_bitrate: bool = False,
+        use_hypir_x1_upscale: bool = False,
+        use_lanczos_x2_upsampling: bool = False,
         use_visual_overlay: bool = False,
         visual_strategy: int = 0,
         visual_section_overrides: Optional[Dict[str, Optional[str]]] = None,
@@ -10056,6 +10077,8 @@ class RenderWorker(QThread):
         self.intro_fade = intro_fade
         self.outro_fade = outro_fade
         self.keep_source_bitrate = bool(keep_source_bitrate)
+        self.use_hypir_x1_upscale = bool(use_hypir_x1_upscale)
+        self.use_lanczos_x2_upsampling = bool(use_lanczos_x2_upsampling)
         # When True, render a music-player visual track and overlay it.
         self.use_visual_overlay = bool(use_visual_overlay)
         # 0 = single visual, 1 = per segment, 2 = per section type
@@ -13571,6 +13594,25 @@ class RenderWorker(QThread):
             if code != 0 or not os.path.exists(out_final):
                 raise RuntimeError("Failed to mux video and audio:\n" + out)
 
+            if self.use_hypir_x1_upscale or self.use_lanczos_x2_upsampling:
+                try:
+                    try:
+                        from helpers.musicclip_postprocess import postprocess_music_video
+                    except Exception:
+                        from musicclip_postprocess import postprocess_music_video
+                    def _post_progress(text):
+                        self.progress.emit(98, str(text or "Post-processing final video..."))
+                    postprocess_music_video(
+                        out_final,
+                        use_hypir_x1=self.use_hypir_x1_upscale,
+                        use_lanczos_x2=self.use_lanczos_x2_upsampling,
+                        ffmpeg=self.ffmpeg,
+                        ffprobe=self.ffprobe,
+                        progress=_post_progress,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(f"Final video upscale/restoration failed: {exc}") from exc
+
             self.progress.emit(100, "Done.")
             self.finished_ok.emit(out_final)
         finally:
@@ -14102,6 +14144,30 @@ class AutoMusicSyncWidget(QWidget):
         row_br.addWidget(self.check_keep_source_bitrate)
         row_br.addStretch(1)
         gen_settings_lay.addLayout(row_br)
+
+        # final assembled video restoration / upscale
+        post_box = QGroupBox("Final video upscale / restoration", self.box_generation_settings)
+        post_lay = QVBoxLayout(post_box)
+        post_lay.setContentsMargins(8, 6, 8, 6)
+        post_lay.setSpacing(4)
+        self.check_hypir_x1_upscale = QCheckBox("Use HyPiR x1 Upscale", post_box)
+        self.check_hypir_x1_upscale.setToolTip(
+            "Runs HyPiR at 1x on the assembled final music video. Resolution stays the same, "
+            "but restored/generated detail may slightly change face details."
+        )
+        hypir_note = QLabel("May slightly change face details.", post_box)
+        hypir_note.setWordWrap(True)
+        self.check_lanczos_x2_upsampling = QCheckBox("Use Lanczos x2 upsampling", post_box)
+        self.check_lanczos_x2_upsampling.setToolTip(
+            "Upsamples the assembled final music video to 2x width and 2x height with FFmpeg Lanczos scaling."
+        )
+        order_note = QLabel("If both are selected, HyPiR x1 is applied first and Lanczos x2 second.", post_box)
+        order_note.setWordWrap(True)
+        post_lay.addWidget(self.check_hypir_x1_upscale)
+        post_lay.addWidget(hypir_note)
+        post_lay.addWidget(self.check_lanczos_x2_upsampling)
+        post_lay.addWidget(order_note)
+        gen_settings_lay.addWidget(post_box)
 
         # frame fit mode
         row_fit = QHBoxLayout()
@@ -20853,6 +20919,8 @@ class AutoMusicSyncWidget(QWidget):
             "ltx_avoid_short_start_end": bool((getattr(self, "check_ltx_avoid_short_start_end", None) is None) or self.check_ltx_avoid_short_start_end.isChecked()),
             "character_reference": self._planner_bridge_character_reference_payload(),
             "assemble_after": bool(assemble_after),
+            "use_hypir_x1_upscale": bool(getattr(self, "check_hypir_x1_upscale", None) and self.check_hypir_x1_upscale.isChecked()),
+            "use_lanczos_x2_upsampling": bool(getattr(self, "check_lanczos_x2_upsampling", None) and self.check_lanczos_x2_upsampling.isChecked()),
             "use_int8_text_encoder": bool(self._ltx_musicclip_use_int8_text_encoder_enabled()),
             "ltx_use_int8_text_encoder": bool(self._ltx_musicclip_use_int8_text_encoder_enabled()),
             "locations_world": self._planner_bridge_text("edit_bridge_locations_world"),
@@ -22446,6 +22514,32 @@ class AutoMusicSyncWidget(QWidget):
             result = {"ok": False, "message": "LTX assembly returned an invalid result."}
         msg = str(result.get("message") or "LTX music video assembly finished.")
         out_path = str(result.get("final_output_path") or "").strip()
+        if out_path and os.path.isfile(out_path) and (
+            bool(getattr(self, "check_hypir_x1_upscale", None) and self.check_hypir_x1_upscale.isChecked())
+            or bool(getattr(self, "check_lanczos_x2_upsampling", None) and self.check_lanczos_x2_upsampling.isChecked())
+        ):
+            try:
+                try:
+                    from helpers.musicclip_postprocess import postprocess_music_video
+                except Exception:
+                    from musicclip_postprocess import postprocess_music_video
+                def _post_progress(text):
+                    self._set_planner_bridge_status(f"Planner Bridge: {text}")
+                    try:
+                        self.progress.setFormat(str(text or "Post-processing final video..."))
+                    except Exception:
+                        pass
+                postprocess_music_video(
+                    out_path,
+                    use_hypir_x1=bool(getattr(self, "check_hypir_x1_upscale", None) and self.check_hypir_x1_upscale.isChecked()),
+                    use_lanczos_x2=bool(getattr(self, "check_lanczos_x2_upsampling", None) and self.check_lanczos_x2_upsampling.isChecked()),
+                    ffmpeg=self._ffmpeg,
+                    ffprobe=self._ffprobe,
+                    progress=_post_progress,
+                )
+                msg += " Final video post-processing complete."
+            except Exception as exc:
+                msg += f" Final video upscale/restoration failed: {exc}"
         if out_path and out_path not in msg:
             msg += f" Output: {out_path}"
         self._set_planner_bridge_status(f"Planner Bridge: {msg}")
@@ -25224,6 +25318,10 @@ class AutoMusicSyncWidget(QWidget):
         try:
             if hasattr(self, "check_keep_source_bitrate"):
                 self.check_keep_source_bitrate.setChecked(True)
+            if hasattr(self, "check_hypir_x1_upscale"):
+                self.check_hypir_x1_upscale.setChecked(False)
+            if hasattr(self, "check_lanczos_x2_upsampling"):
+                self.check_lanczos_x2_upsampling.setChecked(False)
         except Exception:
             pass
         try:
@@ -26588,6 +26686,10 @@ class AutoMusicSyncWidget(QWidget):
         self.combo_fit.setCurrentIndex(int(s.get("fit_mode", self.combo_fit.currentIndex())))
         if hasattr(self, "check_keep_source_bitrate"):
             self.check_keep_source_bitrate.setChecked(bool(int(s.get("keep_source_bitrate", int(self.check_keep_source_bitrate.isChecked())))))
+        if hasattr(self, "check_hypir_x1_upscale"):
+            self.check_hypir_x1_upscale.setChecked(bool(int(s.get("use_hypir_x1_upscale", 0))))
+        if hasattr(self, "check_lanczos_x2_upsampling"):
+            self.check_lanczos_x2_upsampling.setChecked(bool(int(s.get("use_lanczos_x2_upsampling", 0))))
 
         self.slider_sens.setValue(int(s.get("beat_sensitivity", self.slider_sens.value())))
         self.spin_beats_per_seg.setValue(int(s.get("beats_per_segment", self.spin_beats_per_seg.value())))
@@ -26947,6 +27049,8 @@ class AutoMusicSyncWidget(QWidget):
         _set("use_seed", _checked("check_use_seed", 0))
         _set("res_mode", _combo_index("combo_res", 3))
         _set("keep_source_bitrate", _checked("check_keep_source_bitrate", 1))
+        _set("use_hypir_x1_upscale", _checked("check_hypir_x1_upscale", 0))
+        _set("use_lanczos_x2_upsampling", _checked("check_lanczos_x2_upsampling", 0))
         _set("fit_mode", _combo_index("combo_fit", 0))
         _set("intro_fade", _checked("check_intro_fade", 1))
         _set("outro_fade", _checked("check_outro_fade", 1))
@@ -27240,6 +27344,10 @@ class AutoMusicSyncWidget(QWidget):
         s.set("fit_mode", self.combo_fit.currentIndex())
         if hasattr(self, "check_keep_source_bitrate"):
             s.set("keep_source_bitrate", int(self.check_keep_source_bitrate.isChecked()))
+        if hasattr(self, "check_hypir_x1_upscale"):
+            s.set("use_hypir_x1_upscale", int(self.check_hypir_x1_upscale.isChecked()))
+        if hasattr(self, "check_lanczos_x2_upsampling"):
+            s.set("use_lanczos_x2_upsampling", int(self.check_lanczos_x2_upsampling.isChecked()))
 
         s.set("beat_sensitivity", self.slider_sens.value())
         s.set("beats_per_segment", self.spin_beats_per_seg.value())
@@ -29838,6 +29946,8 @@ class AutoMusicSyncWidget(QWidget):
             intro_fade=self.check_intro_fade.isChecked(),
             outro_fade=self.check_outro_fade.isChecked(),
             keep_source_bitrate=bool(getattr(self, "check_keep_source_bitrate", None) and self.check_keep_source_bitrate.isChecked()),
+            use_hypir_x1_upscale=bool(getattr(self, "check_hypir_x1_upscale", None) and self.check_hypir_x1_upscale.isChecked()),
+            use_lanczos_x2_upsampling=bool(getattr(self, "check_lanczos_x2_upsampling", None) and self.check_lanczos_x2_upsampling.isChecked()),
             use_visual_overlay=bool(getattr(self, "check_visual_overlay", None) and self.check_visual_overlay.isChecked()),
             visual_strategy=visual_strategy,
             visual_section_overrides=getattr(self, "_visual_section_overrides", None) if visual_strategy == 2 else None,
@@ -29914,6 +30024,8 @@ class AutoMusicSyncWidget(QWidget):
             "intro_fade": bool(self.check_intro_fade.isChecked()),
             "outro_fade": bool(self.check_outro_fade.isChecked()),
             "keep_source_bitrate": bool(getattr(self, "check_keep_source_bitrate", None) and self.check_keep_source_bitrate.isChecked()),
+            "use_hypir_x1_upscale": bool(getattr(self, "check_hypir_x1_upscale", None) and self.check_hypir_x1_upscale.isChecked()),
+            "use_lanczos_x2_upsampling": bool(getattr(self, "check_lanczos_x2_upsampling", None) and self.check_lanczos_x2_upsampling.isChecked()),
             "use_visual_overlay": bool(use_visual_overlay),
             "visual_strategy": int(visual_strategy),
             "visual_section_overrides": visual_section_overrides,

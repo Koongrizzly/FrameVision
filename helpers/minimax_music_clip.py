@@ -429,6 +429,8 @@ class MusicProject:
     turbo_lora_strength: float = 1.0
     randomize_reference_characters: bool = False
     use_framevision_queue: bool = False
+    use_hypir_x1_upscale: bool = False
+    use_lanczos_x2_upsampling: bool = False
     reference_random_seed: int = -1
     references: List[ReferenceAsset] = field(default_factory=list)
     lyrics: List[LyricSegment] = field(default_factory=list)
@@ -2138,6 +2140,23 @@ def _assembly_task(progress, project: MusicProject) -> str:
     cp = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if cp.returncode != 0 or not final.is_file():
         raise RuntimeError("Final mux failed:\n" + (cp.stderr or cp.stdout or ""))
+
+    if bool(getattr(project, "use_hypir_x1_upscale", False)) or bool(getattr(project, "use_lanczos_x2_upsampling", False)):
+        try:
+            try:
+                from helpers.musicclip_postprocess import postprocess_music_video
+            except Exception:
+                from musicclip_postprocess import postprocess_music_video
+            postprocess_music_video(
+                str(final),
+                use_hypir_x1=bool(getattr(project, "use_hypir_x1_upscale", False)),
+                use_lanczos_x2=bool(getattr(project, "use_lanczos_x2_upsampling", False)),
+                ffmpeg=ffmpeg,
+                progress=progress,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Final video upscale/restoration failed: {exc}") from exc
+
     progress(f"Saved final music video: {final}")
     # These are disposable project work folders. Keep raw_clips + final output,
     # but do not accumulate assembly/audio/queue scratch after a successful build.
@@ -2646,7 +2665,24 @@ class MiniMaxMusicClipWidget(QWidget):
         self.check_spectrum = QCheckBox("Spectrum", gen)
         flags = QHBoxLayout(); flags.addWidget(self.check_vram_manager); flags.addWidget(self.check_vram_auto_bypass); flags.addWidget(self.check_sage); flags.addWidget(self.check_spectrum); flags.addStretch(1)
         form.addRow("Acceleration / VRAM:", flags)
+
+        post = QGroupBox("Final video upscale / restoration", body)
+        post_lay = QVBoxLayout(post)
+        self.check_hypir_x1_upscale = QCheckBox("Use HyPiR x1 Upscale", post)
+        self.check_hypir_x1_upscale.setToolTip("Runs HyPiR at 1x on the assembled final music video. This restores/enhances detail without changing resolution, but it may slightly change face details.")
+        hypir_note = QLabel("May slightly change face details.", post)
+        hypir_note.setWordWrap(True)
+        self.check_lanczos_x2_upsampling = QCheckBox("Use Lanczos x2 upsampling", post)
+        self.check_lanczos_x2_upsampling.setToolTip("Upsamples the assembled final music video to 2x width and 2x height with FFmpeg Lanczos scaling.")
+        order_note = QLabel("If both are enabled: HyPiR x1 runs first, then Lanczos x2.", post)
+        order_note.setWordWrap(True)
+        post_lay.addWidget(self.check_hypir_x1_upscale)
+        post_lay.addWidget(hypir_note)
+        post_lay.addWidget(self.check_lanczos_x2_upsampling)
+        post_lay.addWidget(order_note)
+
         lay.addWidget(gen)
+        lay.addWidget(post)
         explanation = QLabel(
             "Timing rule: the song timeline is authoritative. MiniMax valid frame counts determine how much source footage is generated, "
             "then FFmpeg trims each source clip to its exact edit slot. Small timing mismatches are repaired during assembly instead of aborting.",
@@ -2710,6 +2746,8 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.spectrum = self.check_spectrum.isChecked()
         self.project.randomize_reference_characters = bool(self.check_randomize_ref_characters.isChecked())
         self.project.use_framevision_queue = bool(self.check_framevision_queue.isChecked())
+        self.project.use_hypir_x1_upscale = bool(getattr(self, "check_hypir_x1_upscale", None) and self.check_hypir_x1_upscale.isChecked())
+        self.project.use_lanczos_x2_upsampling = bool(getattr(self, "check_lanczos_x2_upsampling", None) and self.check_lanczos_x2_upsampling.isChecked())
         self.project.references = self._refs_from_table()
 
     def _sync_ui_from_project(self) -> None:
@@ -2733,6 +2771,10 @@ class MiniMaxMusicClipWidget(QWidget):
         self.check_vram_manager.setChecked(bool(p.vram_manager_enabled)); self.check_vram_auto_bypass.setChecked(bool(p.vram_auto_bypass)); self.check_sage.setChecked(p.sage_attention); self.check_spectrum.setChecked(p.spectrum)
         self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
         self.check_framevision_queue.setChecked(bool(getattr(p, "use_framevision_queue", False)))
+        if getattr(self, "check_hypir_x1_upscale", None) is not None:
+            self.check_hypir_x1_upscale.setChecked(bool(getattr(p, "use_hypir_x1_upscale", False)))
+        if getattr(self, "check_lanczos_x2_upsampling", None) is not None:
+            self.check_lanczos_x2_upsampling.setChecked(bool(getattr(p, "use_lanczos_x2_upsampling", False)))
         self._populate_refs(); self._populate_analysis(); self._populate_shots(); self._populate_review(); self._update_frame_label()
 
     def _project_dict(self) -> Dict[str, Any]:
@@ -3863,6 +3905,8 @@ class MiniMaxMusicClipWidget(QWidget):
                 self.project.spectrum = bool(data.get("spectrum", self.project.spectrum))
                 self.project.randomize_reference_characters = bool(data.get("randomize_reference_characters", self.project.randomize_reference_characters))
                 self.project.use_framevision_queue = bool(data.get("use_framevision_queue", getattr(self.project, "use_framevision_queue", False)))
+                self.project.use_hypir_x1_upscale = bool(data.get("use_hypir_x1_upscale", getattr(self.project, "use_hypir_x1_upscale", False)))
+                self.project.use_lanczos_x2_upsampling = bool(data.get("use_lanczos_x2_upsampling", getattr(self.project, "use_lanczos_x2_upsampling", False)))
         except Exception:
             pass
 
@@ -3892,6 +3936,8 @@ class MiniMaxMusicClipWidget(QWidget):
                 "sage_attention": self.project.sage_attention, "spectrum": self.project.spectrum,
                 "randomize_reference_characters": self.project.randomize_reference_characters,
                 "use_framevision_queue": bool(getattr(self.project, "use_framevision_queue", False)),
+                "use_hypir_x1_upscale": bool(getattr(self.project, "use_hypir_x1_upscale", False)),
+                "use_lanczos_x2_upsampling": bool(getattr(self.project, "use_lanczos_x2_upsampling", False)),
             }
             SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:

@@ -287,8 +287,10 @@ def run_cleanup(
                     pass
 
     if clean_temp:
-        # Project temp/work folders (keeps folder itself)
-        for d in (base / "output" / "_temp", base / "work"):
+        # Explicit temp cleanup: completely empty all FrameVision temp/work
+        # folders, including nested subfolders, while keeping the top-level
+        # folders themselves so callers can continue using them immediately.
+        for d in (base / "temp", base / "output" / "_temp", base / "work"):
             if d.exists() and d.is_dir():
                 removed["temp"] += _clear_dir_contents(d)
 
@@ -312,7 +314,7 @@ if __name__ == "__main__":
     ap.add_argument("--no-thumbs", action="store_true", help="Do not remove thumbnail/cache/temp folders")
     ap.add_argument("--no-qt", action="store_true", help="Do not remove Qt cache dirs under the user profile")
     ap.add_argument("--clean-hf-cache", action="store_true", help="Also remove HuggingFace cache (can be large)")
-    ap.add_argument("--clean-temp", action="store_true", help="Also remove project temp folders (output/_temp, work) and FrameVision temp in OS temp")
+    ap.add_argument("--clean-temp", action="store_true", help="Completely empty project temp folders (temp, output/_temp, work) and remove FrameVision temp in OS temp")
     ap.add_argument("--json", action="store_true", help="Print result as JSON")
 
     args = ap.parse_args()
