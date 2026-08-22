@@ -3,14 +3,14 @@
 </p>
 
  <p align="center">                                  
-✨  FrameVision 2.5.4  ✨
+✨  FrameVision 2.5.5  ✨
  <p align="center">     
 All-in-one Sound/Image/Video Tool 
   <p align="center">     
 Create, Edit, Upscale, Play 
                               
 
--> Small update v2.5.4 brings MiniMax H3 and a new music clip creator that uses minimax h3
+-> Small update v2.5.5 brings LTX 2.5
 
 ---
 - Comes with a simple setup menu and a one click installer for the main app,
