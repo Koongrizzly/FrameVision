@@ -427,6 +427,10 @@ class MusicProject:
     vram_residency_refill_interval: int = 1
     turbo_lora_path: str = ""
     turbo_lora_strength: float = 1.0
+    extra_lora1_path: str = ""
+    extra_lora1_strength: float = 1.0
+    extra_lora2_path: str = ""
+    extra_lora2_strength: float = 1.0
     randomize_reference_characters: bool = False
     use_framevision_queue: bool = False
     use_hypir_x1_upscale: bool = False
@@ -1477,6 +1481,21 @@ def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
     return chosen[:9]
 
 
+def _append_optional_music_loras(cmd: List[str], project: MusicProject) -> None:
+    """Append the two user-selectable LoRAs after the creator's existing Turbo/4-step LoRA."""
+    slots = (
+        ("Extra LoRA 1", str(getattr(project, "extra_lora1_path", "") or "").strip(), float(getattr(project, "extra_lora1_strength", 1.0))),
+        ("Extra LoRA 2", str(getattr(project, "extra_lora2_path", "") or "").strip(), float(getattr(project, "extra_lora2_strength", 1.0))),
+    )
+    for label, path_text, strength in slots:
+        if not path_text or strength == 0.0:
+            continue
+        path = Path(path_text)
+        if not path.is_file():
+            raise RuntimeError(f"{label} not found: {path_text}")
+        cmd += ["--lora", str(path.resolve()), "--lora-strength", str(float(strength))]
+
+
 # ----------------------------- worker threads ------------------------------
 
 
@@ -1965,6 +1984,7 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             if not turbo_path.is_file():
                 raise RuntimeError(f"Turbo LoRA not found: {turbo_lora}")
             cmd += ["--lora", str(turbo_path.resolve()), "--lora-strength", str(float(project.turbo_lora_strength))]
+        _append_optional_music_loras(cmd, project)
         for ref in selected:
             cmd += ["--ref-image", ref.path]
         # Ref2VA only requires at least one reference. The song chunk already fills that requirement.
@@ -2646,6 +2666,33 @@ class MiniMaxMusicClipWidget(QWidget):
         lora_row.addWidget(self.edit_turbo_lora, 1); lora_row.addWidget(self.btn_turbo_lora); lora_row.addWidget(QLabel("Strength:", gen)); lora_row.addWidget(self.spin_turbo_lora)
         form.addRow("Turbo / speed LoRA:", lora_row)
         self.btn_turbo_lora.clicked.connect(self._browse_turbo_lora)
+
+        extra_note = QLabel("Two optional MiniMax H3 LoRAs can be stacked on top of the existing Turbo / 4-step LoRA. Maximum total: 3 LoRAs. Strength 0 disables an extra slot.", gen)
+        extra_note.setWordWrap(True)
+        form.addRow(extra_note)
+
+        extra1_row = QHBoxLayout()
+        self.edit_extra_lora1 = QLineEdit(gen); self.edit_extra_lora1.setPlaceholderText("Optional extra MiniMax H3 LoRA 1 (.safetensors)")
+        self.btn_extra_lora1 = QPushButton("Browse...", gen)
+        self.btn_clear_extra_lora1 = QPushButton("Clear", gen)
+        self.spin_extra_lora1 = QDoubleSpinBox(gen); self.spin_extra_lora1.setRange(-10.0, 10.0); self.spin_extra_lora1.setSingleStep(0.05); self.spin_extra_lora1.setDecimals(2); self.spin_extra_lora1.setValue(1.0)
+        self.spin_extra_lora1.setToolTip("LoRA strength. 1.0 = trained strength; 0 disables this slot; negative values are allowed for compatible LoRAs.")
+        extra1_row.addWidget(self.edit_extra_lora1, 1); extra1_row.addWidget(self.btn_extra_lora1); extra1_row.addWidget(self.btn_clear_extra_lora1); extra1_row.addWidget(QLabel("Strength:", gen)); extra1_row.addWidget(self.spin_extra_lora1)
+        form.addRow("Extra LoRA 1:", extra1_row)
+        self.btn_extra_lora1.clicked.connect(lambda: self._browse_extra_lora(1))
+        self.btn_clear_extra_lora1.clicked.connect(self.edit_extra_lora1.clear)
+
+        extra2_row = QHBoxLayout()
+        self.edit_extra_lora2 = QLineEdit(gen); self.edit_extra_lora2.setPlaceholderText("Optional extra MiniMax H3 LoRA 2 (.safetensors)")
+        self.btn_extra_lora2 = QPushButton("Browse...", gen)
+        self.btn_clear_extra_lora2 = QPushButton("Clear", gen)
+        self.spin_extra_lora2 = QDoubleSpinBox(gen); self.spin_extra_lora2.setRange(-10.0, 10.0); self.spin_extra_lora2.setSingleStep(0.05); self.spin_extra_lora2.setDecimals(2); self.spin_extra_lora2.setValue(1.0)
+        self.spin_extra_lora2.setToolTip("LoRA strength. 1.0 = trained strength; 0 disables this slot; negative values are allowed for compatible LoRAs.")
+        extra2_row.addWidget(self.edit_extra_lora2, 1); extra2_row.addWidget(self.btn_extra_lora2); extra2_row.addWidget(self.btn_clear_extra_lora2); extra2_row.addWidget(QLabel("Strength:", gen)); extra2_row.addWidget(self.spin_extra_lora2)
+        form.addRow("Extra LoRA 2:", extra2_row)
+        self.btn_extra_lora2.clicked.connect(lambda: self._browse_extra_lora(2))
+        self.btn_clear_extra_lora2.clicked.connect(self.edit_extra_lora2.clear)
+
         self.check_hybrid_model = QCheckBox("Use hybrid model", gen)
         self.check_hybrid_model.setToolTip("Use one hybrid MiniMax H3 diffusion checkpoint for these Ref2VA music clips instead of the normal Ref2VA checkpoint. This choice is remembered after restart.")
         hybrid_row = QHBoxLayout()
@@ -2738,6 +2785,10 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.ref_image_size = self.combo_ref_size.currentText()
         self.project.turbo_lora_path = self.edit_turbo_lora.text().strip()
         self.project.turbo_lora_strength = self.spin_turbo_lora.value()
+        self.project.extra_lora1_path = self.edit_extra_lora1.text().strip()
+        self.project.extra_lora1_strength = self.spin_extra_lora1.value()
+        self.project.extra_lora2_path = self.edit_extra_lora2.text().strip()
+        self.project.extra_lora2_strength = self.spin_extra_lora2.value()
         self.project.use_hybrid_model = self.check_hybrid_model.isChecked()
         self.project.hybrid_model_path = self.edit_hybrid_model.text().strip()
         self.project.vram_manager_enabled = self.check_vram_manager.isChecked()
@@ -2765,7 +2816,11 @@ class MiniMaxMusicClipWidget(QWidget):
         self.spin_steps.setValue(p.steps); self.spin_cfg.setValue(p.cfg); self.spin_shift.setValue(p.shift); self.spin_audio_shift.setValue(p.audio_shift)
         self.combo_ref_size.setCurrentText(p.ref_image_size if p.ref_image_size in ("match", "max") else "match")
         self.edit_turbo_lora.setText(p.turbo_lora_path or "")
-        self.spin_turbo_lora.setValue(float(p.turbo_lora_strength or 1.0))
+        self.spin_turbo_lora.setValue(float(p.turbo_lora_strength if p.turbo_lora_strength is not None else 1.0))
+        self.edit_extra_lora1.setText(str(getattr(p, "extra_lora1_path", "") or ""))
+        self.spin_extra_lora1.setValue(float(getattr(p, "extra_lora1_strength", 1.0)))
+        self.edit_extra_lora2.setText(str(getattr(p, "extra_lora2_path", "") or ""))
+        self.spin_extra_lora2.setValue(float(getattr(p, "extra_lora2_strength", 1.0)))
         self.check_hybrid_model.setChecked(bool(getattr(p, "use_hybrid_model", False)))
         self.edit_hybrid_model.setText(str(getattr(p, "hybrid_model_path", "") or ""))
         self.check_vram_manager.setChecked(bool(p.vram_manager_enabled)); self.check_vram_auto_bypass.setChecked(bool(p.vram_auto_bypass)); self.check_sage.setChecked(p.sage_attention); self.check_spectrum.setChecked(p.spectrum)
@@ -2866,6 +2921,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "resolution", "aspect", "max_frames", "head_padding", "tail_padding",
             "phrase_snap_tolerance", "steps", "cfg", "shift", "audio_shift",
             "ref_image_size", "turbo_lora_path", "turbo_lora_strength",
+            "extra_lora1_path", "extra_lora1_strength", "extra_lora2_path", "extra_lora2_strength",
             "use_hybrid_model", "hybrid_model_path",
             "vram_manager_enabled", "vram_auto_bypass", "vram_residency_engine",
             "vram_runtime_free_gb", "vram_text_headroom_gb", "vram_diffusion_headroom_gb",
@@ -3610,6 +3666,7 @@ class MiniMaxMusicClipWidget(QWidget):
             if not turbo_path.is_file():
                 raise RuntimeError(f"Turbo LoRA not found: {turbo_lora}")
             args += ["--lora", str(turbo_path.resolve()), "--lora-strength", str(float(self.project.turbo_lora_strength))]
+        _append_optional_music_loras(args, self.project)
         for ref in selected:
             args += ["--ref-image", ref.path]
         shot.output_path = str(out_path)
@@ -3798,6 +3855,18 @@ class MiniMaxMusicClipWidget(QWidget):
         if path:
             self.edit_turbo_lora.setText(path)
 
+    def _browse_extra_lora(self, slot: int) -> None:
+        edit = self.edit_extra_lora1 if int(slot) == 1 else self.edit_extra_lora2
+        start = edit.text().strip()
+        if start and Path(start).is_file():
+            start = str(Path(start).parent)
+        if not start:
+            start = str(ROOT / "models" / "minimax_h3" / "loras")
+        path, _ = QFileDialog.getOpenFileName(self, f"Select MiniMax Extra LoRA {int(slot)}", start, "LoRA files (*.safetensors *.pt *.bin);;All files (*.*)")
+        if path:
+            edit.setText(path)
+            self._pull_ui(); self._save_settings()
+
     # ---- working-session autosave ----
     def _autosave_payload(self, pull_ui: bool = True) -> Dict[str, Any]:
         """Return the complete recoverable working state.
@@ -3882,6 +3951,10 @@ class MiniMaxMusicClipWidget(QWidget):
                 self.project.steps = int(data.get("steps") or self.project.steps)
                 self.project.turbo_lora_path = str(data.get("turbo_lora_path") or self.project.turbo_lora_path)
                 self.project.turbo_lora_strength = float(data.get("turbo_lora_strength", self.project.turbo_lora_strength))
+                self.project.extra_lora1_path = str(data.get("extra_lora1_path") or self.project.extra_lora1_path)
+                self.project.extra_lora1_strength = float(data.get("extra_lora1_strength", self.project.extra_lora1_strength))
+                self.project.extra_lora2_path = str(data.get("extra_lora2_path") or self.project.extra_lora2_path)
+                self.project.extra_lora2_strength = float(data.get("extra_lora2_strength", self.project.extra_lora2_strength))
                 # Migration: older Music Clip Creator builds stored one vram_auto flag.
                 if "vram_manager_enabled" in data:
                     self.project.vram_manager_enabled = bool(data.get("vram_manager_enabled"))
@@ -3932,6 +4005,8 @@ class MiniMaxMusicClipWidget(QWidget):
                 "vram_residency_warmup_blocks": self.project.vram_residency_warmup_blocks,
                 "vram_residency_refill_interval": self.project.vram_residency_refill_interval,
                 "turbo_lora_path": self.project.turbo_lora_path, "turbo_lora_strength": self.project.turbo_lora_strength,
+                "extra_lora1_path": self.project.extra_lora1_path, "extra_lora1_strength": self.project.extra_lora1_strength,
+                "extra_lora2_path": self.project.extra_lora2_path, "extra_lora2_strength": self.project.extra_lora2_strength,
                 "use_hybrid_model": self.project.use_hybrid_model, "hybrid_model_path": self.project.hybrid_model_path,
                 "sage_attention": self.project.sage_attention, "spectrum": self.project.spectrum,
                 "randomize_reference_characters": self.project.randomize_reference_characters,

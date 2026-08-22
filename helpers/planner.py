@@ -2298,12 +2298,24 @@ def _load_planner_settings() -> Dict[str, Any]:
     return {}
 
 def _save_planner_settings(obj: Dict[str, Any]) -> None:
+    """Persist Planner settings atomically so a forced app close cannot corrupt them."""
+    tmp_path = _PLANNER_SETTINGS_PATH.with_name(_PLANNER_SETTINGS_PATH.name + ".tmp")
     try:
         _PLANNER_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(_PLANNER_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=2, ensure_ascii=False)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(str(tmp_path), str(_PLANNER_SETTINGS_PATH))
     except Exception:
-        pass
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
 
 
 def _planner_last_frame_chain_enabled(enc: Optional[Dict[str, Any]]) -> bool:
@@ -3167,6 +3179,57 @@ def _parse_own_storyline_prompts(text: str) -> Tuple[List[Dict[str, Any]], str]:
     #   [01] ... , (01) ... , [prompt 01] ... , (prompt 01) ...
     # Also accepts common variants that users paste:
     #   [S01] ... (or [s01] ...) and double-open brackets like [[01] ...
+    # MiniMax H3 official timestamped-shot mode:
+    #   [Shot 1] At 00:00.000, ...
+    # Keep the global Ref2VA sections attached to every parsed shot so each
+    # standalone clip retains subject definitions, soundscape and music context.
+    shot_ts_re = re.compile(
+        r"^\s*\[\s*shot\s+(\d{1,3})\s*\]\s*at\s+(\d{1,2}):(\d{2})(?:[\.:](\d{1,3}))?\s*[,;:\-–—]?\s*(.*)$",
+        re.IGNORECASE,
+    )
+    _ts_hits = []
+    for _li, _ln in enumerate(lines):
+        _m = shot_ts_re.match(_ln)
+        if _m:
+            try:
+                _ms = int((_m.group(4) or '0').ljust(3, '0')[:3])
+                _sec = int(_m.group(2)) * 60 + int(_m.group(3)) + (_ms / 1000.0)
+            except Exception:
+                _sec = 0.0
+            _ts_hits.append((_li, int(_m.group(1)), float(_sec), str(_m.group(5) or '').strip()))
+    if len(_ts_hits) >= 2:
+        # Everything before the first [Shot N] line is global context. Remove a
+        # trailing detailed_description: header because the individual shot body
+        # is reintroduced below for each clip.
+        _global = "\n".join(lines[:_ts_hits[0][0]]).strip()
+        _global = re.sub(r"(?is)\n?\s*detailed_description\s*:\s*$", "", _global).strip()
+        _tail_start = len(lines)
+        # Find global sections that follow the final shot.
+        for _j in range(_ts_hits[-1][0] + 1, len(lines)):
+            if re.match(r"^\s*(?:overall_soundscape|non_diegetic_music)\s*:\s*", lines[_j], flags=re.I):
+                _tail_start = _j
+                break
+        _tail = "\n".join(lines[_tail_start:]).strip() if _tail_start < len(lines) else ""
+        _out = []
+        for _k, (_li, _num, _sec, _first) in enumerate(_ts_hits):
+            _end = _ts_hits[_k + 1][0] if _k + 1 < len(_ts_hits) else _tail_start
+            _body_lines = []
+            if _first:
+                _body_lines.append(_first)
+            _body_lines.extend(lines[_li + 1:_end])
+            _body = "\n".join(_body_lines).strip()
+            _full = []
+            if _global:
+                _full.append(_global)
+            _full.append(f"detailed_description:\n[Shot {_num}] At {int(_sec)//60:02d}:{(_sec%60):06.3f}, {_body}".rstrip())
+            if _tail:
+                _full.append(_tail)
+            _item = {"index": int(_num), "text": "\n".join(_full).strip(), "timestamp_sec": float(_sec)}
+            if _k + 1 < len(_ts_hits):
+                _item["duration_sec"] = max(0.01, float(_ts_hits[_k + 1][2] - _sec))
+            _out.append(_item)
+        return _out, "minimax_timestamped"
+
     marker_re = re.compile(
         r"^\s*[\[\(]{1,2}\s*(?:prompt\s*)?(?:s\s*)?(\d{1,3})\s*[\]\)]\s*[:\-–—]?\s*(.*)$",
         re.IGNORECASE,
@@ -3614,6 +3677,59 @@ _WAN22_PRESETS = {
     },
 }
 
+
+_LTX25_PRESETS = {
+    # LTX 2.5 is a separate backend. Do not copy LTX 2.3 sampler/LoRA jargon here.
+    # Planner quality controls resolution only for now; runtime defaults come from ltx25_helper.py.
+    "low": {"model":"ltx25", "engine":"framevision_ltx25", "quality":"low", "res":"832x480",
+            "res_landscape":"832x480", "res_portrait":"480x832", "res_square":"480x480",
+            "fps":24, "min_sec":3.0, "max_sec":10.0, "max_frames":241, "label":"480p"},
+    "medium": {"model":"ltx25", "engine":"framevision_ltx25", "quality":"medium", "res":"1280x704",
+            "res_landscape":"1280x704", "res_portrait":"704x1280", "res_square":"704x704",
+            "fps":24, "min_sec":3.0, "max_sec":10.0, "max_frames":241, "label":"704p"},
+    "high": {"model":"ltx25", "engine":"framevision_ltx25", "quality":"high", "res":"1920x1088",
+            "res_landscape":"1920x1088", "res_portrait":"1088x1920", "res_square":"1088x1088",
+            "fps":24, "min_sec":3.0, "max_sec":10.0, "max_frames":241, "label":"1088p"},
+}
+
+_MINIMAX_H3_PRESETS = {
+    # MiniMax H3 has its own quality ladder; do not reuse the three-tier LTX mapping.
+    "low": {"model":"minimax_h3", "engine":"framevision_minimax_h3", "quality":"low",
+            "res":"832x480", "res_landscape":"832x480", "res_portrait":"480x832", "res_square":"480x480",
+            "fps":24, "steps":15, "min_sec":5.0, "max_sec":60.0, "max_frames":1433, "label":"480p"},
+    "default": {"model":"minimax_h3", "engine":"framevision_minimax_h3", "quality":"default",
+            "res":"960x544", "res_landscape":"960x544", "res_portrait":"544x960", "res_square":"544x544",
+            "fps":24, "steps":15, "min_sec":5.0, "max_sec":60.0, "max_frames":1433, "label":"Default 960x544"},
+    "medium": {"model":"minimax_h3", "engine":"framevision_minimax_h3", "quality":"medium",
+            "res":"1280x704", "res_landscape":"1280x704", "res_portrait":"704x1280", "res_square":"704x704",
+            "fps":24, "steps":15, "min_sec":5.0, "max_sec":60.0, "max_frames":1433, "label":"704p"},
+    "high": {"model":"minimax_h3", "engine":"framevision_minimax_h3", "quality":"high",
+            "res":"1344x768", "res_landscape":"1344x768", "res_portrait":"768x1344", "res_square":"768x768",
+            "fps":24, "steps":15, "min_sec":5.0, "max_sec":60.0, "max_frames":1433, "label":"High 1344x768"},
+    "ultra": {"model":"minimax_h3", "engine":"framevision_minimax_h3", "quality":"ultra",
+            "res":"1920x1088", "res_landscape":"1920x1088", "res_portrait":"1088x1920", "res_square":"1088x1088",
+            "fps":24, "steps":15, "min_sec":5.0, "max_sec":60.0, "max_frames":1433, "label":"Ultra 1088p"},
+}
+
+def _planner_native_h3_frames(frames: int, max_frames: int = 1433) -> int:
+    # MiniMax H3 uses its own native frame ladder. 124 frames is the first
+    # usable size (the UI can still call this 5 seconds); longer sizes advance
+    # in 17-frame increments. Keep 480 as an accepted GUI-compatible size.
+    vals = sorted(set(list(range(124, min(1433, int(max_frames or 1433)) + 1, 17)) + ([480] if int(max_frames or 1433) >= 480 else [])))
+    if not vals:
+        return 124
+    try:
+        n = int(frames)
+    except Exception:
+        n = 124
+    return int(min(vals, key=lambda x: abs(x - n)))
+
+def _planner_ltx25_frames(frames: int, max_frames: int = 241) -> int:
+    try:
+        n = max(9, min(int(max_frames or 241), int(frames)))
+    except Exception:
+        n = 121
+    return int(max(9, n - ((n - 1) % 8)))
 
 _LTX23_PRESETS = {
     # Public FrameVision-native LTX 2.3 presets.
@@ -8151,6 +8267,10 @@ def _assemble_shot_prompt(
 
 def _video_model_key(label: str) -> str:
     l = (label or '').lower()
+    if "ltx" in l and "2.5" in l:
+        return "ltx25"
+    if "minimax" in l and ("h3" in l or "video" in l):
+        return "minimax_h3"
     if "ltx" in l and "2.3" in l:
         return "ltx23"
     if "wan" in l and "2.2" in l:
@@ -8178,6 +8298,28 @@ def _resolve_generation_profile(video_model_label: str, gen_quality_label: str, 
         if gk not in _WAN22_PRESETS:
             gk = "low"
         return dict(_WAN22_PRESETS[gk])
+    if mk == "ltx25":
+        if gk not in _LTX25_PRESETS:
+            gk = "medium"
+        return dict(_LTX25_PRESETS[gk])
+    if mk == "minimax_h3":
+        if gk not in _MINIMAX_H3_PRESETS:
+            gk = "default"
+        prof = dict(_MINIMAX_H3_PRESETS[gk])
+        try:
+            src = planner_upscale_settings if isinstance(planner_upscale_settings, dict) else {}
+            override = src.get("minimax_h3_clip_length_sec", None)
+            if override is not None:
+                sec = max(5.0, min(60.0, float(override)))
+                fps = max(1, int(prof.get("fps") or 24))
+                hard_max_frames = int(_MINIMAX_H3_PRESETS.get(gk, {}).get("max_frames") or 1433)
+                native_frames = _planner_native_h3_frames(int(round(sec * fps)), hard_max_frames)
+                prof["max_sec"] = float(sec)
+                prof["max_frames"] = int(native_frames)
+                prof["video_length"] = int(native_frames)
+        except Exception:
+            pass
+        return prof
     if mk == "ltx23":
         if gk not in _LTX23_PRESETS:
             gk = "medium"
@@ -12035,7 +12177,10 @@ class PipelineWorker(QThread):
 
             ref_files = []
             try:
-                ref_files = (at.get("ref_images") or []) or (at.get("images") or [])
+                if _video_model_key((self.job.encoding or {}).get("video_model") or "") == "minimax_h3" and (at.get("minimax_video_refs") or []):
+                    ref_files = list(at.get("minimax_video_refs") or [])[:9]
+                else:
+                    ref_files = (at.get("ref_images") or []) or (at.get("images") or [])
             except Exception:
                 ref_files = []
 
@@ -12535,7 +12680,7 @@ class PipelineWorker(QThread):
             # Run / skip reference guidance step
             try:
                 _refs_prev = (manifest.get("steps") or {}).get("Refs (Qwen3-VL Describe)") or {}
-                _need_refs_step = (_ref_strategy == "qwen3vl_describe" and bool(_copied_refs))
+                _need_refs_step = (_ref_strategy in ("qwen3vl_describe", "minimax_video_refs") and bool(_copied_refs))
                 if not _need_refs_step:
                     _skip("Refs (Qwen3-VL Describe)", "No reference strategy A selected (or no refs).")
                 else:
@@ -12648,7 +12793,7 @@ class PipelineWorker(QThread):
 
             _offline_storyline_client_cls, _offline_storyline_gen_cls, _offline_storyline_backend_path = _planner_load_offline_storyline_backend()
             try:
-                _offline_auto_cb_toggle = bool(self.job.encoding.get("character_bible_enabled", True))
+                _offline_auto_cb_toggle = bool(self.job.encoding.get("character_bible_enabled", False))
             except Exception:
                 _offline_auto_cb_toggle = True
             # Keep the Offline Storyline Creator active for automated storymode even when
@@ -13440,12 +13585,21 @@ class PipelineWorker(QThread):
                     plist = _own_storyline_prompts if isinstance(_own_storyline_prompts, list) else []
                     clean_prompts: List[str] = []
                     clean_prompt_items: List[Tuple[int, str]] = []
+                    _own_storyline_duration_by_source: Dict[int, float] = {}
+                    _own_storyline_timestamp_mode = str(_own_storyline_parser_mode or '').strip().lower() == "minimax_timestamped"
                     for _src_i, it in enumerate(plist, start=1):
                         raw_txt = _own_storyline_extract_text(it)
                         raw_txt = _clean_own_story_prompt(raw_txt)
                         if raw_txt:
                             clean_prompts.append(raw_txt)
                             clean_prompt_items.append((int(_src_i), raw_txt))
+                            if isinstance(it, dict):
+                                try:
+                                    _d0 = float(it.get("duration_sec") or 0.0)
+                                    if _d0 > 0:
+                                        _own_storyline_duration_by_source[int(_src_i)] = _d0
+                                except Exception:
+                                    pass
 
                     # Narrow relaxed mode: LTX + split Own Storymode + end images.
                     # Here the I2V prompt list defines the shot/clip list. The T2I list is
@@ -13497,6 +13651,57 @@ class PipelineWorker(QThread):
                             clean_prompt_items.append((int(_i2v_src_idx), _visual_prompt))
                         try:
                             self.signals.log.emit(f"[RUN] LTX split Own Storymode: I2V prompts drive {len(clean_prompt_items)} shots")
+                        except Exception:
+                            pass
+
+                    # MiniMax is a direct video backend: when the legacy split prompt lane is
+                    # enabled, the VIDEO prompt lane is authoritative. The image/T2I lane must
+                    # never decide how many MiniMax clips are created, and missing video prompts
+                    # are never recycled merely to fill duration.
+                    try:
+                        _minimax_split_drives_shots = bool(
+                            _own_storyline_split_i2v_enabled
+                            and _video_model_key(str(self.job.encoding.get("video_model") or "")) == "minimax_h3"
+                        )
+                    except Exception:
+                        _minimax_split_drives_shots = False
+                    if bool(_minimax_split_drives_shots):
+                        try:
+                            _mm_src_list = (self.job.encoding or {}).get("own_storyline_i2v_prompts") or []
+                        except Exception:
+                            _mm_src_list = []
+                        _mm_mode = "paragraph"
+                        if not isinstance(_mm_src_list, list) or not _mm_src_list:
+                            try:
+                                _mm_txt0 = str((self.job.encoding or {}).get("own_storyline_i2v_text") or '')
+                                _mm_src_list, _mm_mode = _parse_own_storyline_prompts(_mm_txt0)
+                            except Exception:
+                                _mm_src_list, _mm_mode = [], "paragraph"
+                        _mm_items: List[Tuple[int, str]] = []
+                        _mm_duration_by_source: Dict[int, float] = {}
+                        for _mm_i, _mm_it in enumerate(list(_mm_src_list or []), start=1):
+                            try:
+                                _mm_body = _clean_own_story_prompt(_own_storyline_extract_text(_mm_it))
+                            except Exception:
+                                _mm_body = ""
+                            if not _mm_body:
+                                continue
+                            _mm_items.append((int(_mm_i), _mm_body))
+                            if isinstance(_mm_it, dict):
+                                try:
+                                    _mm_d0 = float(_mm_it.get("duration_sec") or 0.0)
+                                    if _mm_d0 > 0:
+                                        _mm_duration_by_source[int(_mm_i)] = _mm_d0
+                                except Exception:
+                                    pass
+                        if not _mm_items:
+                            raise RuntimeError("MiniMax Own Storyline needs at least 1 usable video prompt.")
+                        clean_prompt_items = list(_mm_items)
+                        clean_prompts = [str(x[1]) for x in _mm_items]
+                        _own_storyline_duration_by_source = dict(_mm_duration_by_source)
+                        _own_storyline_timestamp_mode = str(_mm_mode or '').strip().lower() == "minimax_timestamped"
+                        try:
+                            self.signals.log.emit(f"[RUN] MiniMax Own Storyline: video prompts drive {len(clean_prompt_items)} clip(s); prompt recycling disabled")
                         except Exception:
                             pass
 
@@ -13643,7 +13848,12 @@ class PipelineWorker(QThread):
                     for i, (_own_src_idx, prompt_txt) in enumerate(prompts_used_items, start=1):
                         sid = f"S{i:02d}"
                         # Base duration: stable but within bounds
-                        if _needs_time_fit and shortened:
+                        _timestamp_dur = float(_own_storyline_duration_by_source.get(int(_own_src_idx), 0.0) or 0.0)
+                        if _timestamp_dur > 0:
+                            # Official MiniMax timestamped storylines define their own clip
+                            # boundaries. The MiniMax slider remains the hard maximum.
+                            dur = min(float(_max_s), max(float(_min_s), float(_timestamp_dur)))
+                        elif _needs_time_fit and shortened:
                             dur = float(_max_s)
                         else:
                             try:
@@ -13672,8 +13882,17 @@ class PipelineWorker(QThread):
                         })
 
                     # If not shortened, try to fit durations to the selected target duration (within bounds).
-                    if _needs_time_fit and (not shortened):
+                    if _needs_time_fit and (not shortened) and (not _own_storyline_timestamp_mode):
                         _fit_durations_total_own(out_shots, float(eff_target), float(_min_s), float(_max_s))
+                    elif _own_storyline_timestamp_mode and out_shots:
+                        # Give the final timestamped shot the remaining project duration,
+                        # clamped by the selected MiniMax maximum clip length.
+                        try:
+                            _used_before_last = sum(float(x.get("duration_sec") or 0.0) for x in out_shots[:-1])
+                            _remain = max(float(_min_s), float(target_total) - float(_used_before_last))
+                            out_shots[-1]["duration_sec"] = round(min(float(_max_s), _remain), 2)
+                        except Exception:
+                            pass
 
                     # Debug raw file: keep a copy of the user prompts (for resume/repair)
                     try:
@@ -14265,7 +14484,7 @@ class PipelineWorker(QThread):
             # - Own Character Bible (manual 1–2) is allowed even in Own Storyline.
             # - "Use Character Bible" for downstream prompt injection means: auto OR manual.
             try:
-                _auto_cb_toggle = bool(self.job.encoding.get("character_bible_enabled", True))
+                _auto_cb_toggle = bool(self.job.encoding.get("character_bible_enabled", False))
             except Exception:
                 _auto_cb_toggle = True
 
@@ -17456,18 +17675,22 @@ class PipelineWorker(QThread):
                     except Exception:
                         pass
 
-            # Skip if images already exist for all shots
-            try:
-                _shots_n = len(_load_shots_list(shots_path))
-                _existing = []
-                for _ext in ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"):
-                    _existing.extend(list(Path(images_dir).glob(_ext)))
-                if _shots_n > 0 and len(_existing) >= _shots_n:
-                    _skip("Images (all shots)", f"{len(_existing)}/{_shots_n} images already exist")
-                else:
+            # MiniMax H3 can generate clips directly from text + optional video references.
+            # Do not force it through the planner's still-image staging pipeline.
+            if _video_model_key((self.job.encoding or {}).get("video_model") or "") == "minimax_h3":
+                _skip("Images (all shots)", "MiniMax H3 direct video workflow does not require generated start images")
+            else:
+                try:
+                    _shots_n = len(_load_shots_list(shots_path))
+                    _existing = []
+                    for _ext in ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"):
+                        _existing.extend(list(Path(images_dir).glob(_ext)))
+                    if _shots_n > 0 and len(_existing) >= _shots_n:
+                        _skip("Images (all shots)", f"{len(_existing)}/{_shots_n} images already exist")
+                    else:
+                        _run("Images (all shots)", step_render_all_images, 52)
+                except Exception:
                     _run("Images (all shots)", step_render_all_images, 52)
-            except Exception:
-                _run("Images (all shots)", step_render_all_images, 52)
 
 
 
@@ -17478,7 +17701,7 @@ class PipelineWorker(QThread):
             _allow_post_image_review = bool((self.job.encoding or {}).get("allow_edit_while_running"))
             _resume_wants_image_review = bool((self.job.encoding or {}).get("planner_resume_review_existing"))
             _resume_pre_review_images_done = bool((self.job.encoding or {}).get("planner_resume_pre_review_images_done")) or _resume_pre_review_images_done
-            if ((_allow_post_image_review or _resume_wants_image_review) and not _resume_pre_review_images_done):
+            if (_video_model_key((self.job.encoding or {}).get("video_model") or "") != "minimax_h3" and (_allow_post_image_review or _resume_wants_image_review) and not _resume_pre_review_images_done):
                 self._image_review_gate(
                     output_dir=self.out_dir,
                     manifest_path=manifest_path,
@@ -17568,9 +17791,19 @@ class PipelineWorker(QThread):
                             if 0 <= _prompt_idx < len(split_i2v_clean):
                                 raw_prompt = str(split_i2v_clean[_prompt_idx]).strip()
                             else:
-                                _cycle_idx = int(idx) % max(1, len(split_i2v_clean))
-                                raw_prompt = str(split_i2v_clean[_cycle_idx]).strip()
-                                _reused = True
+                                try:
+                                    _is_mm_split0 = _video_model_key(str((enc0 or {}).get("video_model") or "")) == "minimax_h3"
+                                except Exception:
+                                    _is_mm_split0 = False
+                                if _is_mm_split0:
+                                    # Safety fallback only. MiniMax shot construction should already
+                                    # have matched the video-prompt count, so do not recycle prompt 1.
+                                    raw_prompt = str((sh.get("visual_description") if isinstance(sh, dict) else "") or "").strip()
+                                    _reused = False
+                                else:
+                                    _cycle_idx = int(idx) % max(1, len(split_i2v_clean))
+                                    raw_prompt = str(split_i2v_clean[_cycle_idx]).strip()
+                                    _reused = True
                             i2v_prompt = raw_prompt
                             i2v_negative = neg
                             schema = {
@@ -17627,6 +17860,233 @@ class PipelineWorker(QThread):
                         "negative": i2v_negative,
                         "schema": schema,
                     })
+
+                # MiniMax H3 deterministic prompt-builder pass.
+                # Story creation remains authoritative for WHAT happens.  The H3 builder only decides
+                # HOW the already-created beat is filmed: one project-wide visual preset, duration-aware
+                # internal shot timing, shot-flow/camera preset, native sound formatting and Ref2VA subjects.
+                _is_minimax_i2v = _video_model_key(str((enc0 or {}).get("video_model") or "")) == "minimax_h3"
+                if _is_minimax_i2v and out_list:
+                    try:
+                        from planner_minimax_prompt_builder import (
+                            build_prompt as _mm_build_prompt,
+                            infer_project_style as _mm_infer_project_style,
+                        )
+                    except Exception:
+                        from helpers.planner_minimax_prompt_builder import (
+                            build_prompt as _mm_build_prompt,
+                            infer_project_style as _mm_infer_project_style,
+                        )
+
+                    try:
+                        _refs_meta = (((manifest.get("project") or {}).get("references") or {}))
+                        _copy_map = list(_refs_meta.get("copy_map") or [])
+                    except Exception:
+                        _copy_map = []
+                    try:
+                        _ref_desc_text = (_safe_read_text(refs_guidance_path) or "").strip()
+                    except Exception:
+                        _ref_desc_text = ""
+                    _desc_by_idx = {}
+                    try:
+                        _parts = re.split(r"(?im)^###\s+REF_(\d+)\s*:\s*[^\n]*\n", _ref_desc_text)
+                        for _pi in range(1, len(_parts), 2):
+                            try:
+                                _desc_by_idx[int(_parts[_pi])] = str(_parts[_pi + 1] or "").strip()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                    _catalog = []
+                    for _ri, _cm in enumerate(_copy_map, start=1):
+                        if not isinstance(_cm, dict) or not bool(_cm.get("ok", False)):
+                            continue
+                        _src = str(_cm.get("src") or "")
+                        _name = Path(_src).stem.strip() or f"Reference {_ri}"
+                        _catalog.append({
+                            "subject_number": int(_ri),
+                            "name": _name,
+                            "original_filename": os.path.basename(_src),
+                            "description": str(_desc_by_idx.get(_ri, ""))[:2400],
+                        })
+
+                    def _mm_norm_name(_s):
+                        try:
+                            return re.sub(r"[^a-z0-9]+", " ", str(_s or "").lower()).strip()
+                        except Exception:
+                            return str(_s or "").lower().strip()
+
+                    def _mm_refs_for_text(_text):
+                        _chosen = []
+                        _hay = " " + _mm_norm_name(_text) + " "
+                        try:
+                            for _m in re.finditer(r"<Subject\s+(\d+)>", str(_text or ""), re.I):
+                                _n = int(_m.group(1))
+                                if any(int(c.get("subject_number") or 0) == _n for c in _catalog) and _n not in _chosen:
+                                    _chosen.append(_n)
+                        except Exception:
+                            pass
+                        for _c in _catalog:
+                            try:
+                                _n = int(_c.get("subject_number") or 0)
+                            except Exception:
+                                continue
+                            if _n <= 0 or _n in _chosen:
+                                continue
+                            _aliases = {
+                                _mm_norm_name(_c.get("name") or ""),
+                                _mm_norm_name(Path(str(_c.get("original_filename") or "")).stem),
+                            }
+                            for _a in list(_aliases):
+                                if _a.startswith("mr "): _aliases.add(_a[3:])
+                                if _a.startswith("the "): _aliases.add(_a[4:])
+                            if any((" " + _a + " ") in _hay for _a in _aliases if len(_a) >= 3):
+                                _chosen.append(_n)
+                            if len(_chosen) >= 3:
+                                break
+                        return _chosen[:3]
+
+                    def _mm_cat(_num):
+                        for _c in _catalog:
+                            try:
+                                if int(_c.get("subject_number") or 0) == int(_num):
+                                    return _c
+                            except Exception:
+                                pass
+                        return None
+
+                    _project_style = str(((manifest.get("settings") or {}).get("minimax_prompt_builder_style") or "")).strip()
+                    if not _project_style:
+                        _project_style = _mm_infer_project_style(str(self.job.prompt or ""))
+                    manifest.setdefault("settings", {})["minimax_prompt_builder_style"] = _project_style
+                    manifest.setdefault("settings", {})["minimax_prompt_conversion"] = "h3_prompt_builder_deterministic_v3"
+
+                    _debug = []
+                    _new_txt = []
+                    for _it in out_list:
+                        if not isinstance(_it, dict):
+                            continue
+                        _sid = str(_it.get("id") or "")
+                        _shrec = shot_map.get(_sid) if isinstance(shot_map.get(_sid), dict) else {}
+                        _shot_obj = None
+                        for _sx in shots:
+                            if str((_sx or {}).get("id") or "") == _sid:
+                                _shot_obj = _sx or {}
+                                break
+                        _shot_obj = _shot_obj or {}
+
+                        try:
+                            _dur = float(_shot_obj.get("duration_sec") or _shrec.get("duration_sec") or 0.0)
+                        except Exception:
+                            _dur = 0.0
+                        if _dur <= 0:
+                            try:
+                                _dur = float(_planner_minimax_clip_length_sec(enc0))
+                            except Exception:
+                                _dur = 8.0
+
+                        # The story event is authoritative for MiniMax.  In some Planner paths
+                        # visual_description can contain user instructions (for example "build a real story...")
+                        # instead of the actual shot event, so never prefer it over assigned_event.
+                        _beat_core = str(
+                            _shot_obj.get("assigned_event")
+                            or _shot_obj.get("event")
+                            or _shot_obj.get("description")
+                            or _shrec.get("assigned_event")
+                            or _shrec.get("event")
+                            or _shot_obj.get("visual_description")
+                            or _shrec.get("visual_description")
+                            or _it.get("prompt")
+                            or ""
+                        ).strip()
+                        _prog = _shot_obj.get("story_progression") if isinstance(_shot_obj.get("story_progression"), dict) else {}
+                        _purpose = str(_shot_obj.get("shot_purpose") or _shot_obj.get("story_role") or "").strip()
+                        _context_bits = []
+                        if _purpose:
+                            _context_bits.append(f"Shot purpose: {_purpose}.")
+                        for _pk, _label in (("different_now", "Visible change"), ("harder_now", "Escalation"), ("revealed_now", "Revelation"), ("prepares_payoff", "Payoff setup")):
+                            _pv = str((_prog or {}).get(_pk) or "").strip()
+                            if _pv:
+                                _context_bits.append(f"{_label}: {_pv}.")
+                        _beat = _beat_core
+                        if _context_bits:
+                            _beat = (_beat_core.rstrip(" .") + ". " + " ".join(_context_bits)).strip()
+                        # Reference matching must use the real story event, not the generic prompt wrapper.
+                        _ref_nums = _mm_refs_for_text(_beat_core + "\n" + _beat)
+                        _subjects = [x for x in (_mm_cat(n) for n in _ref_nums) if isinstance(x, dict)]
+
+                        _ratio_label = str((enc0 or {}).get("format") or (enc0 or {}).get("aspect_ratio") or "16:9")
+                        _quality_label = str((enc0 or {}).get("gen_quality_preset") or "default")
+                        try:
+                            _gp = _resolve_generation_profile(
+                                (enc0 or {}).get("video_model") or "",
+                                (enc0 or {}).get("gen_quality_preset") or "",
+                                (enc0 or {}).get("planner_upscale"),
+                            )
+                            _w = int((_gp or {}).get("width") or 0)
+                            _h = int((_gp or {}).get("height") or 0)
+                            _res_label = f"{_w}x{_h}" if _w and _h else _quality_label
+                        except Exception:
+                            _res_label = _quality_label
+
+                        _built = _mm_build_prompt(
+                            project_idea=str(self.job.prompt or ""),
+                            beat_text=_beat,
+                            duration_sec=_dur,
+                            ratio=_ratio_label,
+                            resolution=_res_label,
+                            subjects=_subjects,
+                            project_style=_project_style,
+                            story_role=str(_shot_obj.get("story_role") or _shrec.get("story_role") or ""),
+                            section_key=str(_shot_obj.get("story_section_key") or _shrec.get("story_section_key") or ""),
+                            sound_enabled=True,
+                        )
+                        _cp = str((_built or {}).get("prompt") or _beat)
+                        _it["prompt"] = _cp
+                        _it["minimax_ref_indices"] = list(_ref_nums)
+                        _it["schema"] = {
+                            "schema_version": int(_PLANNER_I2V_SCHEMA_VERSION),
+                            "mode": "minimax_h3_prompt_builder_v3",
+                            "reference_subject_numbers": list(_ref_nums),
+                            "wrapper_disabled": True,
+                            "builder_style": str((_built or {}).get("style") or _project_style),
+                            "builder_flow": str((_built or {}).get("flow") or ""),
+                            "builder_camera": str((_built or {}).get("camera") or ""),
+                            "builder_duration_sec": float((_built or {}).get("duration_sec") or _dur),
+                        }
+                        _shrec["i2v_prompt"] = _cp
+                        _shrec["minimax_ref_indices"] = list(_ref_nums)
+                        _shrec["i2v_schema"] = dict(_it["schema"])
+                        _shrec["i2v_schema_version"] = int(_PLANNER_I2V_SCHEMA_VERSION)
+                        shot_map[_sid] = _shrec
+                        _new_txt.append(f"{_sid}:\n{_cp}")
+                        _debug.append({
+                            "id": _sid,
+                            "duration_sec": _dur,
+                            "style": _it["schema"].get("builder_style"),
+                            "flow": _it["schema"].get("builder_flow"),
+                            "camera": _it["schema"].get("builder_camera"),
+                            "reference_subject_numbers": list(_ref_nums),
+                            "source_beat": _beat,
+                        })
+
+                    if _new_txt:
+                        out_txt = _new_txt
+                    _mm_debug_path = os.path.join(story_dir, "minimax_prompt_builder_debug.json")
+                    try:
+                        _safe_write_json(_mm_debug_path, {
+                            "project_style": _project_style,
+                            "source": "root/h3_prompt_builder presets + Planner story beats",
+                            "shots": _debug,
+                        })
+                        manifest.setdefault("paths", {})["minimax_prompt_builder_debug_json"] = _mm_debug_path
+                    except Exception:
+                        pass
+                    self.signals.log.emit(
+                        f"[minimax-h3] H3 Prompt Builder assembled {len(_debug)} prompt(s); "
+                        f"project style={_project_style}; no per-shot prompt-rewrite LLM pass"
+                    )
 
                 _safe_write_text(i2v_prompts_path, "\n\n".join(out_txt).strip() + "\n")
                 _safe_write_json(i2v_prompts_json, {"schema_version": int(_PLANNER_I2V_SCHEMA_VERSION), "shots": out_list})
@@ -17718,6 +18178,212 @@ class PipelineWorker(QThread):
                     args += ["--seed", str(int(seed))]
                 # Run
                 subprocess.run(args, cwd=str(_root()), check=True)
+
+            def _planner_profile_wh(prof: Dict[str, Any]) -> Tuple[int, int]:
+                aspect_mode = str((self.job.encoding or {}).get("aspect_mode") or "landscape")
+                if aspect_mode == "portrait": key = "res_portrait"
+                elif aspect_mode == "square": key = "res_square"
+                else: key = "res_landscape"
+                raw = str(prof.get(key) or prof.get("res") or "832x480").lower().replace("*", "x").replace(" ", "")
+                try:
+                    w, h = raw.split("x", 1); return int(w), int(h)
+                except Exception:
+                    return (832, 480)
+
+            def _planner_direct_video_seed(sid: str, rec: Dict[str, Any]) -> int:
+                try:
+                    if rec.get("clip_seed") is not None:
+                        return int(rec.get("clip_seed"))
+                except Exception:
+                    pass
+                return int(_planner_seed_int_for_job(sid, (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="video") or 0)
+
+            def step_video_clips_ltx25() -> None:
+                shots = _load_shots_list(shots_path)
+                if not shots: raise RuntimeError("shots.json is empty; cannot generate LTX 2.5 clips")
+                _vram_release("before ltx25")
+                prof = _resolve_generation_profile(self.job.encoding.get("video_model") or "", self.job.encoding.get("gen_quality_preset") or "", self.job.encoding.get("planner_upscale"))
+                w, h = _planner_profile_wh(prof); fps = int(prof.get("fps") or 24); max_frames = int(prof.get("max_frames") or 241)
+                shot_map = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
+                clips_out=[]; cli=(_root()/"helpers"/"planner_ltx25_cli.py").resolve()
+                if not cli.is_file(): raise RuntimeError(f"Missing LTX 2.5 planner CLI: {cli}")
+                id_to_img={}
+                for it in ((manifest.get("paths") or {}).get("images") or []):
+                    if isinstance(it,dict) and it.get("id") and it.get("file"): id_to_img[str(it["id"])]=str(it["file"])
+                for i, sh in enumerate(shots, start=1):
+                    sid=str((sh or {}).get("id") or f"S{i:02d}"); rec=shot_map.get(sid) if isinstance(shot_map.get(sid),dict) else {}
+                    prompt=str(rec.get("i2v_prompt") or rec.get("prompt") or (sh or {}).get("prompt") or '').strip()
+                    if not prompt: prompt=str((sh or {}).get("description") or self.job.prompt or '').strip()
+                    try: dsec=float((sh or {}).get("duration_sec") or 5.0)
+                    except Exception: dsec=5.0
+                    dsec=max(float(prof.get("min_sec") or 3.0),min(float(prof.get("max_sec") or 10.0),dsec))
+                    frames=_planner_ltx25_frames(int(round(dsec*fps))+1,max_frames); seed=_planner_direct_video_seed(sid,rec)
+                    out_file=os.path.join(clips_dir,f"{self.job.job_id}_{sid}.mp4")
+                    args=[sys.executable,str(cli),"--prompt",prompt,"--output",out_file,"--width",str(w),"--height",str(h),"--frames",str(frames),"--fps",str(fps),"--seed",str(seed)]
+                    img=id_to_img.get(sid,'')
+                    if img and os.path.isfile(img): args += ["--image",img]
+                    self.signals.stage.emit(f"Clips (LTX 2.5) — {sid} ({i}/{len(shots)})")
+                    self.signals.log.emit(f"[ltx25] {sid}: {w}x{h}, {frames} frames @ {fps}fps, image={'yes' if img else 'no'}")
+                    subprocess.run(args,cwd=str(_root()),check=True)
+                    if not os.path.isfile(out_file) or os.path.getsize(out_file)<1024: raise RuntimeError(f"LTX 2.5 output missing/too small: {out_file}")
+                    item={"id":sid,"file":out_file,"frames":frames,"fps":fps,"duration_sec":round(frames/fps,2),"seed":seed,"resolution":f"{w}x{h}","model_key":"ltx25","video_model":"ltx25"}
+                    clips_out.append(item); rec.update({"clip_file":out_file,"clip_seed":seed,"video_model":"ltx25","model_key":"ltx25"}); shot_map[sid]=rec
+                    manifest.setdefault("paths",{})["clips"]=clips_out; manifest["paths"]["clips_dir"]=clips_dir; manifest["shots"]=shot_map
+                    manifest.setdefault("settings",{})["video_engine"]="ltx25"; manifest["settings"]["video_model"]="ltx25"; manifest["settings"]["video_profile"]=prof; _safe_write_json(manifest_path,manifest)
+                    try: self.signals.asset_created.emit(out_file)
+                    except Exception: pass
+                _safe_write_json(clips_manifest_path,{"clips":clips_out,"profile":prof,"engine":"ltx25"})
+
+            def step_video_clips_minimax_h3() -> None:
+                shots=_load_shots_list(shots_path)
+                if not shots: raise RuntimeError("shots.json is empty; cannot generate MiniMax H3 clips")
+                _vram_release("before minimax h3")
+                prof=_resolve_generation_profile(self.job.encoding.get("video_model") or "",self.job.encoding.get("gen_quality_preset") or "",self.job.encoding.get("planner_upscale"))
+                w,h=_planner_profile_wh(prof); fps=24; max_frames=int(prof.get("max_frames") or 1433)
+                shot_map=manifest.get("shots") if isinstance(manifest.get("shots"),dict) else {}; clips_out=[]
+                cli=(_root()/"helpers"/"planner_minimax_h3_cli.py").resolve()
+                if not cli.is_file(): raise RuntimeError(f"Missing MiniMax H3 planner CLI: {cli}")
+                try: refs=list((((manifest.get("project") or {}).get("references") or {}).get("copied_files") or []))[:9]
+                except Exception: refs=[]
+                chain_on=bool(_planner_last_frame_chain_enabled(self.job.encoding))
+                chain_dir=os.path.join(self.out_dir,"minimax_chain_frames")
+                try: os.makedirs(chain_dir,exist_ok=True)
+                except Exception: pass
+                prev_clip=""
+                seen_subjects=set()
+                _subject_re=re.compile(r"<\s*Subject\s+(\d+)\s*>",re.I)
+                for i,sh in enumerate(shots,start=1):
+                    sid=str((sh or {}).get("id") or f"S{i:02d}"); rec=shot_map.get(sid) if isinstance(shot_map.get(sid),dict) else {}
+                    prompt=str(rec.get("i2v_prompt") or rec.get("prompt") or (sh or {}).get("prompt") or '').strip()
+                    if not prompt: prompt=str((sh or {}).get("description") or (sh or {}).get("visual_description") or self.job.prompt or '').strip()
+                    try:dsec=float((sh or {}).get("duration_sec") or 5.2)
+                    except Exception:dsec=5.2
+                    dsec=max(float(prof.get("min_sec") or 5.0),min(float(prof.get("max_sec") or 60.0),dsec))
+                    frames=_planner_native_h3_frames(int(round(dsec*fps)),max_frames); seed=_planner_direct_video_seed(sid,rec)
+                    out_file=os.path.join(clips_dir,f"{self.job.job_id}_{sid}.mp4")
+                    args=[sys.executable,str(cli),"--prompt",prompt,"--output",out_file,"--width",str(w),"--height",str(h),"--frames",str(frames),"--seed",str(seed)]
+
+                    # Map <Subject N> to the Nth loaded MiniMax reference. This keeps
+                    # each Ref2VA shot at 1-2 refs in normal use and never above 3.
+                    # Subject definitions are repeated in every standalone MiniMax
+                    # clip prompt, so only inspect the detailed_description body when
+                    # deciding which character refs this specific shot needs.
+                    _shot_subject_text=prompt
+                    try:
+                        _mm=re.search(r"(?is)detailed_description\s*:\s*(.*?)(?:\n\s*(?:overall_soundscape|non_diegetic_music)\s*:|$)",prompt)
+                        if _mm:
+                            _shot_subject_text=str(_mm.group(1) or '')
+                    except Exception:
+                        pass
+                    used_subjects=[]
+                    for _m in _subject_re.findall(_shot_subject_text):
+                        try:
+                            _n=int(_m)
+                        except Exception:
+                            continue
+                        if _n not in used_subjects:
+                            used_subjects.append(_n)
+
+                    # Resolve <Subject N> to a reference filename by its semantic
+                    # name when possible (neo.png -> Subject defined as Neo). Fall
+                    # back to reference-list order for older prompts.
+                    _subject_name_by_num={}
+                    try:
+                        for _sm in re.finditer(r"(?im)^\s*<\s*Subject\s+(\d+)\s*>\s+is\s+([^,\n.]+)",prompt):
+                            _subject_name_by_num[int(_sm.group(1))]=str(_sm.group(2) or '').strip()
+                    except Exception:
+                        pass
+                    def _norm_ref_name(_v):
+                        try:
+                            return re.sub(r"[^a-z0-9]+","",str(_v or '').lower())
+                        except Exception:
+                            return ""
+                    shot_refs=[]
+                    for _n in used_subjects:
+                        _rp=""
+                        _wanted=_norm_ref_name(_subject_name_by_num.get(_n,""))
+                        if _wanted:
+                            for _cand in refs:
+                                if not os.path.isfile(_cand):
+                                    continue
+                                _stem=_norm_ref_name(Path(_cand).stem)
+                                if _stem and (_wanted in _stem or _stem in _wanted):
+                                    _rp=_cand; break
+                        if not _rp:
+                            _idx=_n-1
+                            if 0 <= _idx < len(refs) and os.path.isfile(refs[_idx]):
+                                _rp=refs[_idx]
+                        if _rp and _rp not in shot_refs:
+                            shot_refs.append(_rp)
+                        if len(shot_refs)>=2:
+                            break
+                    # New MiniMax conversion pass stores exact reference indices per shot.
+                    # Prefer those explicit bindings over prompt-text guessing.
+                    try:
+                        _explicit_ref_indices = list((rec or {}).get("minimax_ref_indices") or [])
+                    except Exception:
+                        _explicit_ref_indices = []
+                    if _explicit_ref_indices:
+                        _explicit_refs = []
+                        _explicit_subjects = []
+                        for _eri in _explicit_ref_indices[:3]:
+                            try:
+                                _enum = int(_eri)
+                                _eidx = _enum - 1
+                            except Exception:
+                                continue
+                            if 0 <= _eidx < len(refs):
+                                _erp = refs[_eidx]
+                                if os.path.isfile(_erp) and _erp not in _explicit_refs:
+                                    _explicit_refs.append(_erp)
+                                    _explicit_subjects.append(_enum)
+                        if _explicit_refs:
+                            shot_refs = _explicit_refs[:3]
+                            # Explicit converter bindings are authoritative for both
+                            # ref selection and hybrid continuation mode.
+                            used_subjects = list(_explicit_subjects[:3])
+
+                    # Never inject arbitrary references merely because this is the first
+                    # MiniMax shot. An older fallback used refs[0:2] here, which could
+                    # turn a text-only/failed-conversion shot into unrelated characters
+                    # (for example a Merovingian glass leaking into a Neo scene).
+
+                    # In chain mode the hybrid checkpoint can switch per shot:
+                    # - no newly introduced subjects => native FL2VA continue-video
+                    # - refs needed/new subject => Ref2VA with the previous last frame
+                    #   as continuity context + up to two character refs (max 3 refs).
+                    new_subjects={n for n in used_subjects if n not in seen_subjects}
+                    continuity_frame=""
+                    native_continue=bool(chain_on and prev_clip and not new_subjects)
+                    if native_continue:
+                        args += ["--continue-video",prev_clip]
+                    else:
+                        if chain_on and prev_clip:
+                            continuity_frame=os.path.join(chain_dir,f"{sid}_from_prev.png")
+                            if _planner_extract_last_frame_to_image(prev_clip,continuity_frame):
+                                args += ["--ref-image",continuity_frame]
+                            else:
+                                continuity_frame=""
+                        # Previous-frame continuity consumes one of H3's three reference slots.
+                        # Otherwise allow the converter's hard maximum of three character refs.
+                        _char_ref_cap = 2 if continuity_frame else 3
+                        for rp in shot_refs[:_char_ref_cap]:
+                            args += ["--ref-image",rp]
+
+                    self.signals.stage.emit(f"Clips (MiniMax H3) — {sid} ({i}/{len(shots)})")
+                    _mode_note="FL2VA native continuation" if native_continue else ("Ref2VA + previous last frame" if continuity_frame else "Ref2VA")
+                    self.signals.log.emit(f"[minimax-h3] {sid}: {w}x{h}, {frames} frames @ 24fps, refs={len(shot_refs)}; {_mode_note}; hybrid preferred automatically")
+                    subprocess.run(args,cwd=str(_root()),check=True)
+                    if not os.path.isfile(out_file) or os.path.getsize(out_file)<1024: raise RuntimeError(f"MiniMax H3 output missing/too small: {out_file}")
+                    seen_subjects.update(used_subjects)
+                    prev_clip=out_file
+                    item={"id":sid,"file":out_file,"frames":frames,"fps":24,"duration_sec":round(frames/24.0,2),"seed":seed,"resolution":f"{w}x{h}","model_key":"minimax_h3","video_model":"minimax_h3","reference_images":list(shot_refs),"continued_from_previous":bool(chain_on and i>1),"continuation_mode":("native_video" if native_continue else ("last_frame_ref" if continuity_frame else "none"))}
+                    clips_out.append(item); rec.update({"clip_file":out_file,"clip_seed":seed,"video_model":"minimax_h3","model_key":"minimax_h3","reference_images":list(shot_refs),"continued_from_previous":bool(chain_on and i>1),"continuation_mode":item["continuation_mode"]}); shot_map[sid]=rec
+                    manifest.setdefault("paths",{})["clips"]=clips_out; manifest["paths"]["clips_dir"]=clips_dir; manifest["shots"]=shot_map
+                    manifest.setdefault("settings",{})["video_engine"]="minimax_h3"; manifest["settings"]["video_model"]="minimax_h3"; manifest["settings"]["video_profile"]=prof; _safe_write_json(manifest_path,manifest)
+                    try:self.signals.asset_created.emit(out_file)
+                    except Exception:pass
+                _safe_write_json(clips_manifest_path,{"clips":clips_out,"profile":prof,"engine":"minimax_h3","reference_images":refs,"last_frame_chain":chain_on})
 
             def step_video_clips_hunyuan15() -> None:
                 shots = _load_shots_list(shots_path)
@@ -19694,6 +20360,10 @@ class PipelineWorker(QThread):
                 _run("Video clips (HunyuanVideo 1.5)", step_video_clips_hunyuan15, 95)
             elif mk == "ltx23":
                 _run("Video clips (LTX 2.3)", step_video_clips_ltx23, 95)
+            elif mk == "ltx25":
+                _run("Video clips (LTX 2.5)", step_video_clips_ltx25, 95)
+            elif mk == "minimax_h3":
+                _run("Video clips (MiniMax H3)", step_video_clips_minimax_h3, 95)
             else:
                 _skip("Video clips", "Video model not wired yet")
 
@@ -19735,6 +20405,10 @@ class PipelineWorker(QThread):
                             _run("Video clips (HunyuanVideo 1.5 resume)", step_video_clips_hunyuan15, 95)
                         elif mk == "ltx23":
                             _run("Video clips (LTX 2.3 resume)", step_video_clips_ltx23, 95)
+                        elif mk == "ltx25":
+                            _run("Video clips (LTX 2.5 resume)", step_video_clips_ltx25, 95)
+                        elif mk == "minimax_h3":
+                            _run("Video clips (MiniMax H3 resume)", step_video_clips_minimax_h3, 95)
             except Exception as _chain_resume_err:
                 try:
                     self.signals.log.emit(f"[CHAIN] Resume-after-review check failed: {_chain_resume_err}")
@@ -19778,6 +20452,8 @@ class PipelineWorker(QThread):
                     "crf": self.job.encoding.get("crf"),
                     "bitrate_kbps": self.job.encoding.get("bitrate_kbps"),
                 },
+                # v2: MiniMax H3 source audio is preserved during normalization/concat.
+                "assembly_audio_policy": "minimax_embedded_audio_v2",
             }, sort_keys=True))
 
             _assemble_step_name = "Assemble final video (timeline → final_cut)"
@@ -19825,6 +20501,13 @@ class PipelineWorker(QThread):
                 ffprobe = _tool("ffprobe")
                 ffmpeg = _tool("ffmpeg")
 
+                # MiniMax H3 generates useful diegetic/dialogue audio inside each source clip.
+                # Preserve that embedded audio through the visual assembly unless the user
+                # explicitly selected Silent.  Later Planner music/narration steps can still
+                # replace/mix this assembled audio when those features are enabled.
+                _assembly_model_key = _video_model_key((self.job.encoding or {}).get("video_model") or "")
+                _preserve_embedded_audio = bool(_assembly_model_key == "minimax_h3" and not bool(getattr(self.job, "silent", False)))
+
                 def _run_cmd(args: List[str]) -> None:
                     if _LOGGER.enabled:
                         _LOGGER.log_job(self.job.job_id, "[ffmpeg] " + " ".join([str(a) for a in args]))
@@ -19840,6 +20523,16 @@ class PipelineWorker(QThread):
                         return obj if isinstance(obj, dict) else {}
                     except Exception:
                         return {}
+
+                def _has_audio_stream(media_path: str) -> bool:
+                    try:
+                        info = _probe_json(str(media_path))
+                        for st in (info.get("streams") or []):
+                            if isinstance(st, dict) and st.get("codec_type") == "audio":
+                                return True
+                    except Exception:
+                        pass
+                    return False
 
                 def _parse_rate(s: str) -> float:
                     # "20/1" -> 20.0
@@ -19943,26 +20636,40 @@ class PipelineWorker(QThread):
 
                     out_norm = os.path.join(norm_dir, f"clip_{idx:03d}_{sid}.mp4")
 
-                    # If exists and newer than source, keep it (simple resume)
+                    # If exists and newer than source, keep it (simple resume).
+                    # For MiniMax audio-preserving assembly, an old silent normalized clip
+                    # is deliberately invalidated so jobs created before this fix rebuild once.
                     try:
-                        if os.path.isfile(out_norm) and os.path.getmtime(out_norm) >= os.path.getmtime(src) and os.path.getsize(out_norm) > 1024:
+                        _norm_resume_ok = bool(os.path.isfile(out_norm) and os.path.getmtime(out_norm) >= os.path.getmtime(src) and os.path.getsize(out_norm) > 1024)
+                        if _norm_resume_ok and _preserve_embedded_audio and not _has_audio_stream(out_norm):
+                            _norm_resume_ok = False
+                        if _norm_resume_ok:
                             log_lines.append(f"[skip] {sid} → {os.path.basename(out_norm)} (already normalized)")
                         else:
                             vf = f"scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th},fps={target_fps}"
-                            args = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
-                                    "-t", f"{desired:.3f}",
-                                    "-vf", vf,
-                                    "-an",
-                                    "-pix_fmt", "yuv420p",
-                                    "-movflags", "+faststart",
-                                    "-preset", "veryfast"]
+                            _src_has_audio = bool(_has_audio_stream(src)) if _preserve_embedded_audio else False
+                            args = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src)]
+                            if _preserve_embedded_audio and not _src_has_audio:
+                                # Keep concat topology stable if an individual H3 clip happens
+                                # to contain no audio stream: create silence only for that clip.
+                                args += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+                            args += ["-t", f"{desired:.3f}", "-vf", vf]
+                            if _preserve_embedded_audio:
+                                args += ["-map", "0:v:0", "-map", ("0:a:0" if _src_has_audio else "1:a:0")]
+                            else:
+                                args += ["-an"]
+                            args += ["-pix_fmt", "yuv420p", "-movflags", "+faststart", "-preset", "veryfast"]
                             if mode == "bitrate":
                                 args += ["-b:v", f"{bitrate_kbps}k", "-maxrate", f"{bitrate_kbps}k", "-bufsize", f"{bitrate_kbps*2}k"]
                             else:
                                 args += ["-crf", str(crf)]
-                            args += ["-c:v", "libx264", str(out_norm)]
+                            args += ["-c:v", "libx264"]
+                            if _preserve_embedded_audio:
+                                args += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
+                            args += [str(out_norm)]
                             _run_cmd(args)
-                            log_lines.append(f"[norm] {sid}: {os.path.basename(src)} → {os.path.basename(out_norm)} (t={desired:.3f}s)")
+                            _audio_note = " + embedded audio" if _preserve_embedded_audio else ""
+                            log_lines.append(f"[norm] {sid}: {os.path.basename(src)} → {os.path.basename(out_norm)} (t={desired:.3f}s{_audio_note})")
                     except subprocess.CalledProcessError as e:
                         raise RuntimeError(f"ffmpeg normalize failed for {sid}: {src}\n{e}") from e
 
@@ -20007,7 +20714,7 @@ class PipelineWorker(QThread):
                     "timeline": timeline,
                     "audio": {
                         "music_file": str((manifest.get("paths") or {}).get("music_file") or ''),
-                        "note": "Audio muxing not done yet"
+                        "note": ("MiniMax embedded clip audio preserved in assembly" if _preserve_embedded_audio else "Planner audio muxing not done yet")
                     },
                 })
                 _safe_write_text(concat_list_path, "\n".join(concat_lines).strip() + "\n")
@@ -20016,16 +20723,22 @@ class PipelineWorker(QThread):
                 try:
                     args = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                             "-f", "concat", "-safe", "0",
-                            "-i", str(concat_list_path),
-                            "-an",
-                            "-pix_fmt", "yuv420p",
+                            "-i", str(concat_list_path)]
+                    if _preserve_embedded_audio:
+                        args += ["-map", "0:v:0", "-map", "0:a:0"]
+                    else:
+                        args += ["-an"]
+                    args += ["-pix_fmt", "yuv420p",
                             "-movflags", "+faststart",
                             "-preset", "veryfast"]
                     if mode == "bitrate":
                         args += ["-b:v", f"{bitrate_kbps}k", "-maxrate", f"{bitrate_kbps}k", "-bufsize", f"{bitrate_kbps*2}k"]
                     else:
                         args += ["-crf", str(crf)]
-                    args += ["-c:v", "libx264", str(final_video)]
+                    args += ["-c:v", "libx264"]
+                    if _preserve_embedded_audio:
+                        args += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
+                    args += [str(final_video)]
                     _run_cmd(args)
                 except subprocess.CalledProcessError as e:
                     raise RuntimeError(f"ffmpeg concat failed. See assembly_log: {assembly_log}\n{e}") from e
@@ -20068,7 +20781,7 @@ class PipelineWorker(QThread):
                 srec.update({
                     "fingerprint": _assembly_fingerprint,
                     "debug": {"timeline": timeline_json, "assembly_log": assembly_log},
-                    "note": "Hard-cut concat (no audio yet).",
+                    "note": ("Hard-cut concat preserving MiniMax embedded audio." if _preserve_embedded_audio else "Hard-cut concat (video-only base)."),
                     "ts": time.time(),
                 })
                 manifest["steps"][_assemble_step_name] = srec
@@ -21853,7 +22566,9 @@ class PipelineWorker(QThread):
                 have_narr = bool(narr_wav_ready and os.path.exists(narration_wav))
 
                 if not have_music and not have_narr:
-                    # Nothing to do; keep visual-only final
+                    # No Planner replacement audio requested.  For MiniMax H3 this copies
+                    # the assembled video WITH its original generated clip sound intact.
+                    # Other video backends retain their existing behavior.
                     try:
                         import shutil as _shutil
                         _shutil.copy2(final_video, final_cut_mp4)
@@ -24677,12 +25392,12 @@ class PlannerPane(QWidget):
         super().__init__(parent)
 
         # Queue mode (Settings → Use FrameVision Queue)
-        # Default ON to preserve current behavior.
+        # Default OFF. User selection is persisted immediately.
         try:
             _s = _load_planner_settings()
-            self._use_framevision_queue = bool(_s.get("use_framevision_queue", True))
+            self._use_framevision_queue = bool(_s.get("use_framevision_queue", False))
         except Exception:
-            self._use_framevision_queue = True
+            self._use_framevision_queue = False
 
         # Planner state
         self._music_file_path = ""
@@ -25513,6 +26228,26 @@ class PlannerPane(QWidget):
         self.ref_block.setVisible(False)
         lay.addWidget(self.ref_block)
 
+        # MiniMax H3 video references are deliberately separate from image-model references.
+        self.minimax_video_ref_box = QGroupBox("MiniMax H3 video references (optional, up to 9 images)")
+        mm_lay = QVBoxLayout(self.minimax_video_ref_box)
+        mm_row = QHBoxLayout()
+        self.btn_minimax_ref_add = QPushButton("Add MiniMax refs…")
+        self.btn_minimax_ref_remove = QPushButton("Remove selected")
+        self.btn_minimax_ref_clear = QPushButton("Clear")
+        self.btn_minimax_ref_add.clicked.connect(self._on_add_minimax_video_refs_clicked)
+        self.btn_minimax_ref_remove.clicked.connect(self._remove_selected_minimax_video_refs)
+        self.btn_minimax_ref_clear.clicked.connect(self._clear_minimax_video_refs)
+        mm_row.addWidget(self.btn_minimax_ref_add); mm_row.addWidget(self.btn_minimax_ref_remove); mm_row.addWidget(self.btn_minimax_ref_clear); mm_row.addStretch(1)
+        mm_lay.addLayout(mm_row)
+        self.minimax_video_ref_list = QListWidget(); self.minimax_video_ref_list.setMinimumHeight(85)
+        self.minimax_video_ref_list.setToolTip("References are described for the storyline and are passed directly to MiniMax H3 Ref2VA/hybrid generation.")
+        mm_lay.addWidget(self.minimax_video_ref_list)
+        self.lbl_minimax_ref_mode = QLabel("Hybrid model is preferred automatically; Ref2VA is the fallback when hybrid is not installed.")
+        self.lbl_minimax_ref_mode.setWordWrap(True); mm_lay.addWidget(self.lbl_minimax_ref_mode)
+        self.minimax_video_ref_box.setVisible(False)
+        lay.addWidget(self.minimax_video_ref_box)
+
         # -------------------------
         # Add or create music (Chunk 7A)
         # -------------------------
@@ -25661,7 +26396,7 @@ class PlannerPane(QWidget):
         lay = QVBoxLayout(box)
         lay.setSpacing(8)
 
-        # Queue mode (default ON): use FrameVision internal queue lock behavior.
+        # Queue mode (default OFF): opt in to the FrameVision worker queue.
         q_row = QWidget()
         ql = QHBoxLayout(q_row)
         ql.setContentsMargins(0, 0, 0, 0)
@@ -25676,9 +26411,9 @@ class PlannerPane(QWidget):
             pass
 
         try:
-            self.chk_use_framevision_queue.setChecked(bool(getattr(self, "_use_framevision_queue", True)))
+            self.chk_use_framevision_queue.setChecked(bool(getattr(self, "_use_framevision_queue", False)))
         except Exception:
-            self.chk_use_framevision_queue.setChecked(True)
+            self.chk_use_framevision_queue.setChecked(False)
 
         self.lbl_queue_mode_note = QLabel("")
         try:
@@ -25706,10 +26441,10 @@ class PlannerPane(QWidget):
             "When enabled, the pipeline pauses after images (and later after clips) so you can inspect outputs, "
             "edit per-shot prompts, regenerate individual images, then continue."
         )
-        self.chk_allow_edit_while_running.setChecked(False)
+        self.chk_allow_edit_while_running.setChecked(True)
         try:
             s = _load_planner_settings()
-            self.chk_allow_edit_while_running.setChecked(bool(s.get("allow_edit_while_running", False)))
+            self.chk_allow_edit_while_running.setChecked(bool(s.get("allow_edit_while_running", True)))
         except Exception:
             pass
         try:
@@ -25733,10 +26468,10 @@ class PlannerPane(QWidget):
         # Preview toggle (header thumbnails)
         self.chk_preview = QCheckBox("Preview last results")
         self.chk_preview.setToolTip("When enabled, show up to 5 thumbnails in the header for the last created images/clips.\nClick a thumbnail to open a bigger preview (videos loop until closed).")
-        self.chk_preview.setChecked(False)
+        self.chk_preview.setChecked(True)
         try:
             s = _load_planner_settings()
-            self.chk_preview.setChecked(bool(s.get("preview_enabled", False)))
+            self.chk_preview.setChecked(bool(s.get("preview_enabled", True)))
         except Exception:
             pass
         try:
@@ -25748,16 +26483,16 @@ class PlannerPane(QWidget):
         self.chk_preview.toggled.connect(self._on_toggle_preview)
         lay.addWidget(self.chk_preview)
 
-        # Character Bible toggle (default ON). Turn OFF when using animals/non-human characters.
+        # Character Bible toggle (default OFF). Enable only when wanted for the project.
         self.chk_character_bible = QCheckBox("Enable Character bible")
         self.chk_character_bible.setToolTip(
             "When enabled, the planner creates a Character Bible and injects identity-lock details for shots that mention character names.\n"
             "Turn this OFF when your shots use animals or other non-human characters, to prevent the model from drifting into humans."
         )
-        self.chk_character_bible.setChecked(True)
+        self.chk_character_bible.setChecked(False)
         try:
             s = _load_planner_settings()
-            self.chk_character_bible.setChecked(bool(s.get("character_bible_enabled", True)))
+            self.chk_character_bible.setChecked(bool(s.get("character_bible_enabled", False)))
         except Exception:
             pass
         try:
@@ -26155,7 +26890,8 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
 
-        grid.addWidget(QLabel("Image model"), 0, 0)
+        self.lbl_image_model = QLabel("Image model")
+        grid.addWidget(self.lbl_image_model, 0, 0)
         self.cmb_image_model = QComboBox()
         self.cmb_image_model.addItems([
             "Auto (Krea 2)",
@@ -26186,6 +26922,8 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             "WAN 2.2 Turbo",
             "HunyuanVideo 1.5",
             "LTX 2.3",
+            "LTX 2.5",
+            "MiniMax H3",
             "More later",
         ])
         self.cmb_video_model.setCurrentIndex(0)
@@ -26210,7 +26948,38 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             cur = (self.cmb_gen_quality.currentText() or '').strip()
             self.cmb_gen_quality.blockSignals(True)
             self.cmb_gen_quality.clear()
-            if "ltx" in vm and "2.3" in vm:
+            if "minimax" in vm and "h3" in vm:
+                self.cmb_gen_quality.addItems([
+                    "Low (480p)",
+                    "Default (960 x 544)",
+                    "Medium (704p)",
+                    "High (1344 x 768)",
+                    "Ultra (1088p)",
+                ])
+                # A newly selected/restored MiniMax backend starts at its own fast
+                # 960x544 default instead of inheriting another backend's quality.
+                _cur_mm = cur.lower()
+                if _cur_mm.startswith("low (480p"):
+                    self.cmb_gen_quality.setCurrentIndex(0)
+                elif _cur_mm.startswith("default (960"):
+                    self.cmb_gen_quality.setCurrentIndex(1)
+                elif _cur_mm.startswith("medium (704p"):
+                    self.cmb_gen_quality.setCurrentIndex(2)
+                elif _cur_mm.startswith("high (1344"):
+                    self.cmb_gen_quality.setCurrentIndex(3)
+                elif _cur_mm.startswith("ultra (1088p"):
+                    self.cmb_gen_quality.setCurrentIndex(4)
+                else:
+                    self.cmb_gen_quality.setCurrentIndex(1)
+            elif "ltx" in vm and "2.5" in vm:
+                self.cmb_gen_quality.addItems(["Low (480p)", "Medium (704p default)", "High (1088p)"])
+                if cur.lower().startswith("high"):
+                    self.cmb_gen_quality.setCurrentIndex(2)
+                elif cur.lower().startswith("low"):
+                    self.cmb_gen_quality.setCurrentIndex(0)
+                else:
+                    self.cmb_gen_quality.setCurrentIndex(1)
+            elif "ltx" in vm and "2.3" in vm:
                 self.cmb_gen_quality.addItems(["Low", "Medium (default)", "High"])
                 if cur.lower().startswith("high"):
                     self.cmb_gen_quality.setCurrentIndex(2)
@@ -26275,6 +27044,10 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             _refresh_gen_quality()
             try:
                 self._refresh_video_model_dependent_ui()
+            except Exception:
+                pass
+            try:
+                self._sync_minimax_video_refs_visibility()
             except Exception:
                 pass
 
@@ -26416,6 +27189,36 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         grid.addWidget(self.ltx23_clip_length_row, 7, 1)
         try:
             self._refresh_ltx23_clip_length_slider()
+        except Exception:
+            pass
+
+        self.lbl_minimax_h3_clip_length = QLabel("MiniMax maximum clip length")
+        self.minimax_h3_clip_length_row = QWidget()
+        _mm_clip_row = QHBoxLayout(self.minimax_h3_clip_length_row)
+        _mm_clip_row.setContentsMargins(0, 0, 0, 0)
+        _mm_clip_row.setSpacing(8)
+        self.sld_minimax_h3_clip_length = QSlider(Qt.Horizontal)
+        self.sld_minimax_h3_clip_length.setMinimum(5)
+        self.sld_minimax_h3_clip_length.setMaximum(60)
+        self.sld_minimax_h3_clip_length.setSingleStep(1)
+        self.sld_minimax_h3_clip_length.setPageStep(5)
+        self.sld_minimax_h3_clip_length.setTickInterval(5)
+        self.sld_minimax_h3_clip_length.setTickPosition(QSlider.TicksBelow)
+        self.lbl_minimax_h3_clip_length_value = QLabel("8 sec")
+        _mm_clip_tip = "MiniMax H3 only. Sets the maximum requested length of each generated clip. Native MiniMax frame counts are chosen automatically."
+        self.lbl_minimax_h3_clip_length.setToolTip(_mm_clip_tip)
+        self.sld_minimax_h3_clip_length.setToolTip(_mm_clip_tip)
+        self.lbl_minimax_h3_clip_length_value.setToolTip(_mm_clip_tip)
+        _mm_clip_row.addWidget(self.sld_minimax_h3_clip_length, 1)
+        _mm_clip_row.addWidget(self.lbl_minimax_h3_clip_length_value, 0)
+        self.sld_minimax_h3_clip_length.valueChanged.connect(self._on_minimax_h3_clip_length_changed)
+        # Reuse the transition-LoRA row: that control is LTX 2.3-only, so it is
+        # never visible at the same time as MiniMax H3.
+        grid.addWidget(self.lbl_minimax_h3_clip_length, 4, 0)
+        grid.addWidget(self.minimax_h3_clip_length_row, 4, 1)
+        try:
+            self._refresh_minimax_h3_clip_length_slider()
+            self._sync_minimax_h3_controls_visibility()
         except Exception:
             pass
 
@@ -30300,7 +31103,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             idx = int(getattr(self, "cmb_video_model", None).currentIndex()) if getattr(self, "cmb_video_model", None) is not None else -1
         except Exception:
             idx = -1
-        if bool(getattr(self, "_ltx23_unlocked", False)) and idx == 4:
+        if bool(getattr(self, "_ltx23_unlocked", False)) and idx == int(combo.count() - 1):
             return "LTX 2.3 22B Distilled"
         return str(txt or "")
 
@@ -30322,7 +31125,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             idx = -1
             txt = ""
         try:
-            if bool(getattr(self, "_ltx23_unlocked", False)) and idx == 4:
+            if bool(getattr(self, "_ltx23_unlocked", False)) and idx == int(combo.count() - 1):
                 return True
         except Exception:
             pass
@@ -30337,6 +31140,12 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             pass
         try:
             self._refresh_ltx23_clip_length_slider()
+        except Exception:
+            pass
+        try:
+            self._sync_minimax_h3_controls_visibility()
+            self._refresh_minimax_h3_clip_length_slider()
+            self._sync_minimax_image_model_ui()
         except Exception:
             pass
         try:
@@ -30403,7 +31212,14 @@ These prompts override the normal reused Own Storymode prompts for the video sta
                 elif k < int(n):
                     self.lbl_own_storyline_count.setText(f"Detected prompts: {n} → using {k} (Duration fit)")
                 else:
-                    self.lbl_own_storyline_count.setText(f"Detected prompts: {n} → {n} images will be generated")
+                    try:
+                        _mm_preview0 = bool(self._is_minimax_h3_video_model_selected())
+                    except Exception:
+                        _mm_preview0 = False
+                    if _mm_preview0:
+                        self.lbl_own_storyline_count.setText(f"Detected prompts: {n} → {n} MiniMax video prompt{'s' if n != 1 else ''} will be used")
+                    else:
+                        self.lbl_own_storyline_count.setText(f"Detected prompts: {n} → {n} images will be generated")
         except Exception:
             pass
 
@@ -30413,6 +31229,10 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             split_i2v_on = bool(getattr(self, "chk_own_storyline_split_i2v", None) and self.chk_own_storyline_split_i2v.isChecked())
         except Exception:
             split_i2v_on = False
+        try:
+            _minimax_own_story_ui = bool(self._is_minimax_h3_video_model_selected())
+        except Exception:
+            _minimax_own_story_ui = False
         try:
             i2v_txt = (self.own_storyline_i2v_edit.toPlainText() or '') if hasattr(self, "own_storyline_i2v_edit") else ""
         except Exception:
@@ -30445,6 +31265,8 @@ These prompts override the normal reused Own Storymode prompts for the video sta
                 if hasattr(self, "lbl_own_storyline_i2v_count") and self.lbl_own_storyline_i2v_count is not None:
                     if vn <= 0:
                         self.lbl_own_storyline_i2v_count.setText("Detected prompts: 0")
+                    elif bool(_minimax_own_story_ui):
+                        self.lbl_own_storyline_i2v_count.setText(f"Detected prompts: {vn} → {vn} MiniMax clip{'s' if vn != 1 else ''} will use these prompts")
                     elif bool(_relaxed_ltx_split_i2v_ui):
                         self.lbl_own_storyline_i2v_count.setText(f"Detected prompts: {vn} → {vn} LTX clips will be driven by I2V prompts")
                     elif int(k) > 0 and vn < int(k):
@@ -30460,7 +31282,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
                     msgs2: List[str] = []
                     if vn > 0 and str(i2v_mode) == "paragraph":
                         msgs2.append("No markers found — using paragraphs.")
-                    if (not bool(_relaxed_ltx_split_i2v_ui)) and n > 0 and vn > 0 and int(n) != int(vn):
+                    if (not bool(_relaxed_ltx_split_i2v_ui)) and (not bool(_minimax_own_story_ui)) and n > 0 and vn > 0 and int(n) != int(vn):
                         msgs2.append("Prompt counts do not match; Generate will ask before continuing.")
                     if msgs2:
                         self.lbl_own_storyline_i2v_warn.setText("\n".join(msgs2))
@@ -30528,7 +31350,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         try:
             on = bool(self.chk_use_framevision_queue.isChecked())
         except Exception:
-            on = bool(getattr(self, "_use_framevision_queue", True))
+            on = bool(getattr(self, "_use_framevision_queue", False))
         try:
             if on:
                 self.lbl_queue_mode_note.setText("Using the real FrameVision worker queue. Planner jobs run as worker jobs; review popups are skipped in this mode.")
@@ -30550,7 +31372,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         try:
             self._use_framevision_queue = bool(on)
         except Exception:
-            self._use_framevision_queue = True
+            self._use_framevision_queue = False
         try:
             s = _load_planner_settings()
             s["use_framevision_queue"] = bool(on)
@@ -30592,9 +31414,9 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         the worker intentionally skips.
         """
         try:
-            queue_on = bool(getattr(self, "_use_framevision_queue", True))
+            queue_on = bool(getattr(self, "_use_framevision_queue", False))
         except Exception:
-            queue_on = True
+            queue_on = False
         try:
             chk = getattr(self, "chk_allow_edit_while_running", None)
             if chk is not None:
@@ -30929,6 +31751,107 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         except Exception:
             pass
 
+    def _sync_minimax_h3_controls_visibility(self) -> None:
+        try:
+            visible = bool(self._is_minimax_h3_video_model_selected())
+        except Exception:
+            visible = False
+        for _name in ("lbl_minimax_h3_clip_length", "minimax_h3_clip_length_row"):
+            try:
+                _w = getattr(self, _name, None)
+                if _w is not None:
+                    _w.setVisible(bool(visible))
+            except Exception:
+                pass
+
+    def _refresh_minimax_h3_clip_length_slider(self) -> None:
+        # MiniMax clip duration is intentionally session-only. Every Planner restart
+        # begins at 8 seconds, then the user can move it anywhere from 5 to 60.
+        try:
+            cur = int(getattr(self, "_minimax_h3_clip_length_session", 8) or 8)
+        except Exception:
+            cur = 8
+        cur = max(5, min(60, cur))
+        self._minimax_h3_clip_length_session = int(cur)
+        try:
+            sld = getattr(self, "sld_minimax_h3_clip_length", None)
+            if sld is not None:
+                sld.blockSignals(True)
+                sld.setMinimum(5)
+                sld.setMaximum(60)
+                sld.setValue(int(cur))
+                sld.blockSignals(False)
+            lbl = getattr(self, "lbl_minimax_h3_clip_length_value", None)
+            if lbl is not None:
+                lbl.setText(f"{int(cur)} sec")
+        except Exception:
+            pass
+
+    def _on_minimax_h3_clip_length_changed(self, value: int) -> None:
+        cur = max(5, min(60, int(value or 8)))
+        self._minimax_h3_clip_length_session = int(cur)
+        try:
+            self.lbl_minimax_h3_clip_length_value.setText(f"{int(cur)} sec")
+        except Exception:
+            pass
+        try:
+            self._update_own_storyline_prompt_preview()
+        except Exception:
+            pass
+
+    def _sync_minimax_image_model_ui(self) -> None:
+        """Make it obvious that MiniMax does not need a Planner-generated still image."""
+        combo = getattr(self, "cmb_image_model", None)
+        if combo is None:
+            return
+        try:
+            is_mm = bool(self._is_minimax_h3_video_model_selected())
+        except Exception:
+            is_mm = False
+        try:
+            ref_count = int(getattr(self, "minimax_video_ref_list", None).count()) if getattr(self, "minimax_video_ref_list", None) is not None else 0
+        except Exception:
+            ref_count = 0
+        if is_mm:
+            if not hasattr(self, "_minimax_image_model_saved_index"):
+                try:
+                    self._minimax_image_model_saved_index = int(combo.currentIndex())
+                    self._minimax_image_model_saved_text = str(combo.currentText() or "")
+                except Exception:
+                    self._minimax_image_model_saved_index = 0
+                    self._minimax_image_model_saved_text = "Auto (Krea 2)"
+            try:
+                idx = int(getattr(self, "_minimax_image_model_saved_index", 0))
+                idx = max(0, min(combo.count() - 1, idx))
+                display = "Using MiniMax ref images" if ref_count > 0 else "Not used by MiniMax H3"
+                combo.blockSignals(True)
+                combo.setItemText(idx, display)
+                combo.setCurrentIndex(idx)
+                combo.setEnabled(False)
+                combo.blockSignals(False)
+                if getattr(self, "lbl_image_model", None) is not None:
+                    self.lbl_image_model.setEnabled(False)
+            except Exception:
+                pass
+        else:
+            try:
+                if hasattr(self, "_minimax_image_model_saved_index"):
+                    idx = int(getattr(self, "_minimax_image_model_saved_index", 0))
+                    idx = max(0, min(combo.count() - 1, idx))
+                    combo.blockSignals(True)
+                    combo.setItemText(idx, str(getattr(self, "_minimax_image_model_saved_text", "Auto (Krea 2)")))
+                    combo.setCurrentIndex(idx)
+                    combo.setEnabled(True)
+                    combo.blockSignals(False)
+                    delattr(self, "_minimax_image_model_saved_index")
+                    delattr(self, "_minimax_image_model_saved_text")
+                else:
+                    combo.setEnabled(True)
+                if getattr(self, "lbl_image_model", None) is not None:
+                    self.lbl_image_model.setEnabled(True)
+            except Exception:
+                pass
+
     def _sync_end_images_ui(self) -> None:
         try:
             on = bool(getattr(self, "chk_use_end_images_as_last_frames", None) and self.chk_use_end_images_as_last_frames.isChecked())
@@ -31229,6 +32152,54 @@ These prompts override the normal reused Own Storymode prompts for the video sta
     # -------------------------
     # Optional — Reference images (Chunk 4)
     # -------------------------
+
+    def _is_minimax_h3_video_model_selected(self) -> bool:
+        try:
+            return _video_model_key(self._current_video_model_label()) == "minimax_h3"
+        except Exception:
+            return False
+
+    def _sync_minimax_video_refs_visibility(self) -> None:
+        try:
+            self.minimax_video_ref_box.setVisible(bool(self._is_minimax_h3_video_model_selected()))
+        except Exception:
+            pass
+        try:
+            self._sync_minimax_image_model_ui()
+        except Exception:
+            pass
+
+    def _on_add_minimax_video_refs_clicked(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(self, "Add MiniMax H3 reference images", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+        existing = set()
+        for i in range(self.minimax_video_ref_list.count()):
+            d = self.minimax_video_ref_list.item(i).data(Qt.UserRole) or {}; existing.add(str(d.get("path") or ""))
+        for raw in files or []:
+            if self.minimax_video_ref_list.count() >= 9:
+                QMessageBox.information(self, "MiniMax H3 references", "MiniMax H3 supports up to 9 reference images."); break
+            p = str(Path(raw).resolve())
+            if p in existing: continue
+            item = QListWidgetItem(Path(p).name); item.setToolTip(p); item.setData(Qt.UserRole, {"kind":"minimax_video_ref", "path":p})
+            self.minimax_video_ref_list.addItem(item); existing.add(p)
+        try:
+            self._sync_minimax_image_model_ui()
+        except Exception:
+            pass
+
+    def _remove_selected_minimax_video_refs(self) -> None:
+        for item in list(self.minimax_video_ref_list.selectedItems()):
+            self.minimax_video_ref_list.takeItem(self.minimax_video_ref_list.row(item))
+        try:
+            self._sync_minimax_image_model_ui()
+        except Exception:
+            pass
+
+    def _clear_minimax_video_refs(self) -> None:
+        self.minimax_video_ref_list.clear()
+        try:
+            self._sync_minimax_image_model_ui()
+        except Exception:
+            pass
 
     def _toggle_ref_block(self, checked: bool) -> None:
         try:
@@ -32016,7 +32987,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
 
     def _collect_attachments(self) -> Dict[str, List[str]]:
         # Chunk 4: reference images are stored separately, but keep backward-compat with older "images" key.
-        out = {"json": [], "ref_images": [], "images": [], "end_images": [], "videos": [], "music": [], "music_new": [], "text": [], "transcripts": []}
+        out = {"json": [], "ref_images": [], "minimax_video_refs": [], "images": [], "end_images": [], "videos": [], "music": [], "music_new": [], "text": [], "transcripts": []}
 
         # Reference images list (if present)
         try:
@@ -32027,6 +32998,16 @@ These prompts override the normal reused Own Storymode prompts for the video sta
                     p = data.get("path", "")
                     if p:
                         out["ref_images"].append(p)
+        except Exception:
+            pass
+
+        # Dedicated MiniMax video-model references (do not feed these into image renderers).
+        try:
+            if hasattr(self, "minimax_video_ref_list"):
+                for i in range(self.minimax_video_ref_list.count()):
+                    item = self.minimax_video_ref_list.item(i); data = item.data(Qt.UserRole) or {}; p = str(data.get("path") or "").strip()
+                    if p:
+                        out["minimax_video_refs"].append(p)
         except Exception:
             pass
 
@@ -32282,6 +33263,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             "use_20_camera_effects": bool(getattr(self, "chk_use_20_camera_effects", None) and self.chk_use_20_camera_effects.isChecked()),
             "use_transition_lora": bool(getattr(self, "chk_use_transition_lora", None) and self.chk_use_transition_lora.isChecked() and self._is_ltx23_wangp_video_model_selected()),
             "ltx23_clip_length_sec": int((getattr(self, "sld_ltx23_clip_length", None).value() if (getattr(self, "sld_ltx23_clip_length", None) is not None and self._is_ltx23_video_model_selected()) else 0) or 0),
+            "minimax_h3_clip_length_sec": int((getattr(self, "sld_minimax_h3_clip_length", None).value() if (getattr(self, "sld_minimax_h3_clip_length", None) is not None and self._is_minimax_h3_video_model_selected()) else 0) or 0),
             "use_end_images_as_last_frames": bool(getattr(self, "chk_use_end_images_as_last_frames", None) and self.chk_use_end_images_as_last_frames.isChecked()),
             "use_last_frame_as_next_image": bool(getattr(self, "chk_use_last_frame_as_next_image", None) and self.chk_use_last_frame_as_next_image.isChecked()),
             "chain_use_start_image": bool(getattr(self, "chk_chain_use_start_image", None) and self.chk_chain_use_start_image.isChecked()),
@@ -32508,6 +33490,11 @@ These prompts override the normal reused Own Storymode prompts for the video sta
                     _pu["ltx23_clip_length_sec"] = int(enc.get("ltx23_clip_length_sec") or 0)
             except Exception:
                 pass
+            try:
+                if int(enc.get("minimax_h3_clip_length_sec") or 0) > 0:
+                    _pu["minimax_h3_clip_length_sec"] = int(enc.get("minimax_h3_clip_length_sec") or 0)
+            except Exception:
+                pass
             enc["planner_upscale"] = _pu
             enc["generation_profile"] = _resolve_generation_profile(
                 enc.get("video_model", ""),
@@ -32538,7 +33525,15 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         except Exception:
             has_refs = False
 
-        if has_refs and not ref_strategy:
+        try:
+            minimax_refs = list((attachments or {}).get("minimax_video_refs") or [])
+        except Exception:
+            minimax_refs = []
+        if _video_model_key(enc.get("video_model", "")) == "minimax_h3" and minimax_refs:
+            # Describe these for storyline planning, then pass the originals directly to MiniMax at video generation time.
+            ref_strategy = "minimax_video_refs"
+            enc["minimax_video_refs"] = list(minimax_refs[:9])
+        elif has_refs and not ref_strategy:
             # Default path when user cancels the popup: lightweight reuse.
             ref_strategy = "qwenvl_reuse"
 
