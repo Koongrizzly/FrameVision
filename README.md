@@ -27,20 +27,19 @@ Create, Edit, Upscale, Play
 ---
 - 💬 LLM Chat : your own little (offline) chat gpt at home. Load any (gguf) model and start chatting/coding/creating images, video, even music with the installed models.
   Chat memory allows user for the chat to remember something in new chat
+- 🧠 The Planner : from a prompt to a finished storyline long form video in a couple of clicks. Also allows using own prompts, own character bible, reference images, TTS narration, own llama (gguf) models etc for more control.
+- 🎵 (music) videoclip creator : 3 modes : use ready made clips or use ltx workflow to create a clip from scratch with reference images and story mode features (ltx and minimax H3). You can also Use LTX 2.3 with Licon Studio MSR V2.
 - 🎨 TXT → IMG with SD15/SDXL- Z-Image Turbo - Chroma - Lens - Qwen 2512 - Krea 2 - Ideogram 4)
 - 🖌️ Image edit, reference, inpaint, (some also include txt 2 img)... with Qwen2511, Hi-dream studio,  Flux Klein, Boogu image and Fireredit 1.1
-- 🎬 txt/img/video to video with WAN 2.2 5B/ Wan2.2 Turbo 4 step - Hiar (experimental) - HunyuanVideo 1.5 - LTX 2.3 - Bernini R 1.3B (based on wan 2.1 also does image and video editing) 
-- 🧪 Upscaler with model loader (15+ open source upscale models for photo & video) + seed2VR
+- 🎬 txt/img/video to video with WAN 2.2 5B/ Wan2.2 Turbo 4 step - MiniMax H3 - Hiar (experimental) - HunyuanVideo 1.5 - LTX 2.3 - LTX 2.5 - Bernini R 1.3B (based on wan 2.1 also does image and video editing) 
+- 🧪 Upscaler with model loader (15+ open source upscale models for photo & video) + seed2VR & Hypir
 - ⏱️ RIFE Interpolation
-- 📝 Describe in detail, offline chatbot with framevision knowledge and prompt enhancement with Qwen3 VL instruct.
+- 📝 Describe in detail, offline mini chatbot with framevision knowledge and prompt enhancement with Qwen3 VL instruct.
 - 🎙️ Text to speech with Qwen 3 TTS (full model pack includes voice cloning and creating own style voices from a prompt)
 - 🎙️ speech to text or subtitle creation with Whisper
-- 🎵 (music) videoclip creator : 2 modes : use ready made clips or use ltx workflow to create a clip from scratch with reference images and story mode features. New : Use LTX with Licon Studio MSR V2.
 - 🎵 Ace Step 1.5 Music creation, probably the best open source a.i. music creation tool of today.
 - 🎶 Music player with playlist & 250+ beat synced visuals
 - 📁 Media Explorer with Json viewer.
-- 🖌 Remove Background (+ basic (sdXL) inpainting)
-- 🧠 The Planner : from a prompt to a finished storyline long form video in a couple of clicks, it can use all of the above models in an automated workflow.
 - 🎬 video timeline editor : little python based openshot clone (beta test)
 
 
@@ -51,17 +50,21 @@ Create, Edit, Upscale, Play
 
  - Change speed for videos (with audio sync).
  - Reverse video / boomerang
+ - Remove Backgrounds and/or add another one
  - Thumbnail/meme creator for easy adding text with effects to an image
  - Image FX Lab for changing colors or adding effects to images
  - Sound edit (mini audacity)
  - sound mixer for adding extra or new sound/music/speech to a video
  - Resize image/video 
- - Create Gif files : 2 sections -> use currently playing video or load images from a folder
- - Extract/join frames
+ - Create Gif files : 2 modes -> use currently playing video or load images from a folder
+ - Extract/join video frames
  - Trim videos with preview
  - Crop videos/images
  - Multi rename/replace for filenames
  - Metadata/date editor/remover
+ - Video text overlay : add text to video at chosen moments
+ - transition for video clips tool
+ - beatsynced visual tool
    
 ---
  <p align="center"> In App features
