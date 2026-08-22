@@ -7243,8 +7243,11 @@ def handle_job(jpath: Path):
         elif t in ('minimax_h3_generate','minimax_h3'):
             code = minimax_h3_generate(job, cfg, mani)
         elif t in ('ltx23_generate','ltx23','ltx23_tools'):
-            # LTX 2.5.4 is queued as a normal external command. No special worker
-            # launch mode, no detached process, no LTX-specific subprocess tricks.
+            code = tools_ffmpeg(job, cfg, mani)
+        elif t in ('ltx25_generate','ltx25','ltx25_tools'):
+            # LTX 2.5 uses the same robust external-command queue runner:
+            # streamed stdout/logs, cancel markers, active PID, and normal
+            # pending -> running -> done/failed transitions.
             code = tools_ffmpeg(job, cfg, mani)
         # SeedVR2: external CLI runner (python inference_cli.py ...)
         # Queue writes type="seedvr2" with args.cmd + args.outfile.

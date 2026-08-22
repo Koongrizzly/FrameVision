@@ -17092,6 +17092,17 @@ class AutoMusicSyncWidget(QWidget):
         self._tab_settings = _scroll_tab_page(page_settings)
         self._creator_mode = "normal"
 
+        # QScrollArea pages are created with self.tabs as their parent before
+        # they are inserted into QTabWidget. On some Qt/Windows builds an
+        # uninserted page can still paint over the active page until the first
+        # creator switch. Keep inactive workflow pages explicitly hidden.
+        for _inactive_startup_page in (self._tab_ltx_workflow, self._tab_ltx_review):
+            if _inactive_startup_page is not None:
+                try:
+                    _inactive_startup_page.hide()
+                except Exception:
+                    pass
+
         self.tabs.addTab(self._tab_normal, "Normal")
 
         # Music timeline tab lives in a separate helper module so it can grow
@@ -24995,6 +25006,22 @@ class AutoMusicSyncWidget(QWidget):
         current_widgets = [tabs.widget(i) for i in range(tabs.count())]
         desired_widgets = [widget for widget, _title in desired_tabs]
         if current_widgets == desired_widgets:
+            # Make visibility explicit even when no rebuild is needed. This is
+            # important at startup because an uninserted LTX scroll page may
+            # otherwise remain visible as a child of QTabWidget.
+            for _managed_page in (
+                getattr(self, "_tab_normal", None),
+                getattr(self, "_tab_ltx_workflow", None),
+                getattr(self, "_tab_ltx_review", None),
+                getattr(self, "_tab_settings", None),
+                getattr(self, "timeline_panel", None),
+            ):
+                if _managed_page is None:
+                    continue
+                try:
+                    _managed_page.setVisible(_managed_page in desired_widgets)
+                except Exception:
+                    pass
             self._update_footer_for_active_tab(tabs.currentIndex())
             try:
                 tabs.updateGeometry()
@@ -25003,8 +25030,20 @@ class AutoMusicSyncWidget(QWidget):
                 pass
             return
 
-        # Removing a tab does not destroy its page, so the complete state of both
-        # workflows survives genuine creator switches.
+        # Removing a tab does not destroy its page. Hide all managed pages first
+        # so a removed page cannot float above the newly selected workflow.
+        for _managed_page in (
+            getattr(self, "_tab_normal", None),
+            getattr(self, "_tab_ltx_workflow", None),
+            getattr(self, "_tab_ltx_review", None),
+            getattr(self, "_tab_settings", None),
+            getattr(self, "timeline_panel", None),
+        ):
+            if _managed_page is not None:
+                try:
+                    _managed_page.hide()
+                except Exception:
+                    pass
         while tabs.count():
             tabs.removeTab(0)
 
@@ -25021,11 +25060,10 @@ class AutoMusicSyncWidget(QWidget):
                 except Exception:
                     pass
             tabs.addTab(widget, title)
-            if mode == "normal" and widget is getattr(self, "timeline_panel", None):
-                try:
-                    widget.show()
-                except Exception:
-                    pass
+            try:
+                widget.show()
+            except Exception:
+                pass
 
         tabs.setCurrentIndex(0)
         self._update_footer_for_active_tab(0)
@@ -30267,11 +30305,42 @@ class OneClickVideoClipTab(QWidget):
         outer.addWidget(self.inner.footer_bar, 0)
 
         self.creator_selector.currentIndexChanged.connect(self._on_creator_selection_changed)
+
+        # Restore the last selected creator from FrameVision's portable settings.
+        _saved_creator_mode = "normal"
+        try:
+            _creator_cfg_path = os.path.join(
+                _musicclip_project_root(), "presets", "setsave", "framevision_settings.json"
+            )
+            _creator_cfg = _musicclip_read_json_file(_creator_cfg_path)
+            _candidate = str(_creator_cfg.get("musicclip_creator_mode", "normal") or "normal").strip().lower()
+            if _candidate in {"normal", "ltx", "minimax"}:
+                _saved_creator_mode = _candidate
+        except Exception:
+            pass
+        _saved_index = self.creator_selector.findData(_saved_creator_mode)
+        if _saved_index < 0:
+            _saved_index = 0
+        self.creator_selector.setCurrentIndex(_saved_index)
         self._on_creator_selection_changed(self.creator_selector.currentIndex())
+
+    def _save_creator_selection(self, mode: str) -> None:
+        try:
+            _creator_cfg_path = os.path.join(
+                _musicclip_project_root(), "presets", "setsave", "framevision_settings.json"
+            )
+            _creator_cfg = _musicclip_read_json_file(_creator_cfg_path)
+            if not isinstance(_creator_cfg, dict):
+                _creator_cfg = {}
+            _creator_cfg["musicclip_creator_mode"] = str(mode or "normal")
+            _musicclip_write_json_file(_creator_cfg_path, _creator_cfg)
+        except Exception:
+            pass
 
     def _on_creator_selection_changed(self, _index: int = -1) -> None:
         mode = str(self.creator_selector.currentData() or "normal")
         is_minimax = mode == "minimax"
+        self._save_creator_selection(mode)
 
         # MiniMax replaces the complete old creator body.  The selector itself
         # stays visible so switching back is always one click away.

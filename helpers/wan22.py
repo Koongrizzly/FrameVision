@@ -240,6 +240,7 @@ class Wan22Pane(QWidget):
         self._hide_hiar = ("hiar" in _hidden)
         self._hide_bernini = ("bernini_r_1p3b" in _hidden) or ("bernini" in _hidden)
         self._hide_ltx23 = ("ltx23" in _hidden) or ("ltx" in _hidden)
+        self._hide_ltx25 = ("ltx25" in _hidden) or ("ltx_25" in _hidden)
         self._hide_minimax_h3 = ("minimax_h3" in _hidden) or ("minimax" in _hidden)
         self._all_engines_hidden = bool(
             self._hide_wan22
@@ -248,6 +249,7 @@ class Wan22Pane(QWidget):
             and self._hide_hiar
             and self._hide_bernini
             and self._hide_ltx23
+            and self._hide_ltx25
             and self._hide_minimax_h3
         )
 
@@ -263,6 +265,8 @@ class Wan22Pane(QWidget):
             self.cmb_engine.addItem("Bernini R 1.3B", "bernini_r_1p3b")
         if not self._hide_ltx23:
             self.cmb_engine.addItem("LTX 2.3", "ltx23")
+        if not self._hide_ltx25:
+            self.cmb_engine.addItem("LTX 2.5", "ltx25")
         if not self._hide_minimax_h3:
             self.cmb_engine.addItem("MiniMax H3", "minimax_h3")
         if self.cmb_engine.count() == 0:
@@ -1143,6 +1147,36 @@ class Wan22Pane(QWidget):
 
         try:
             self._engine_stack.addWidget(self._ltx_page)
+        except Exception:
+            pass
+
+        # LTX 2.5 page (optional)
+        self._ltx25_page = QWidget()
+        ltx25_layout = QVBoxLayout(self._ltx25_page)
+        ltx25_layout.setContentsMargins(0, 0, 0, 0)
+        ltx25_layout.setSpacing(0)
+        self._ltx25_widget = None
+        if getattr(self, "_hide_ltx25", False):
+            lbl = QLabel("LTX 2.5 is hidden by user.")
+            lbl.setWordWrap(True)
+            ltx25_layout.addWidget(lbl)
+        else:
+            try:
+                try:
+                    from helpers.ltx25_helper import run_gui as _build_ltx25_gui  # type: ignore
+                except Exception:
+                    from ltx25_helper import run_gui as _build_ltx25_gui  # type: ignore
+                self._ltx25_widget = _build_ltx25_gui(parent=self._ltx25_page, embedded=True)
+                if self._ltx25_widget is None:
+                    raise RuntimeError("ltx25_helper.run_gui() returned no widget")
+                ltx25_layout.addWidget(self._ltx25_widget, 1)
+            except Exception as exc:
+                lbl = QLabel(f"LTX 2.5 UI not available (missing ltx25_helper.py): {type(exc).__name__}: {exc}")
+                lbl.setWordWrap(True)
+                ltx25_layout.addWidget(lbl)
+
+        try:
+            self._engine_stack.addWidget(self._ltx25_page)
         except Exception:
             pass
 
@@ -2150,8 +2184,8 @@ class Wan22Pane(QWidget):
                 pass
 
 
-    def _hidden_engine_flags(self) -> tuple[bool, bool, bool, bool, bool, bool, bool]:
-        """Return hidden flags for Wan normal/Wan Turbo/Hunyuan/HiAR/Bernini/LTX/MiniMax."""
+    def _hidden_engine_flags(self) -> tuple[bool, bool, bool, bool, bool, bool, bool, bool]:
+        """Return hidden flags for Wan normal/Wan Turbo/Hunyuan/HiAR/Bernini/LTX2.3/LTX2.5/MiniMax."""
         try:
             hidden = _optional_hidden_ids()
         except Exception:
@@ -2163,6 +2197,7 @@ class Wan22Pane(QWidget):
             "hiar" in hidden,
             ("bernini_r_1p3b" in hidden) or ("bernini" in hidden),
             ("ltx23" in hidden) or ("ltx" in hidden),
+            ("ltx25" in hidden) or ("ltx_25" in hidden),
             ("minimax_h3" in hidden) or ("minimax" in hidden),
         )
 
@@ -2175,15 +2210,16 @@ class Wan22Pane(QWidget):
                     preserve_key = self._wan_engine_key()
                 except Exception:
                     preserve_key = None
-            hide_wan22, hide_wan22_turbo, hide_hunyuan15, hide_hiar, hide_bernini, hide_ltx23, hide_minimax_h3 = self._hidden_engine_flags()
+            hide_wan22, hide_wan22_turbo, hide_hunyuan15, hide_hiar, hide_bernini, hide_ltx23, hide_ltx25, hide_minimax_h3 = self._hidden_engine_flags()
             self._hide_wan22 = hide_wan22
             self._hide_wan22_turbo = hide_wan22_turbo
             self._hide_hunyuan15 = hide_hunyuan15
             self._hide_hiar = hide_hiar
             self._hide_bernini = hide_bernini
             self._hide_ltx23 = hide_ltx23
+            self._hide_ltx25 = hide_ltx25
             self._hide_minimax_h3 = hide_minimax_h3
-            self._all_engines_hidden = bool(hide_wan22 and hide_wan22_turbo and hide_hunyuan15 and hide_hiar and hide_bernini and hide_ltx23 and hide_minimax_h3)
+            self._all_engines_hidden = bool(hide_wan22 and hide_wan22_turbo and hide_hunyuan15 and hide_hiar and hide_bernini and hide_ltx23 and hide_ltx25 and hide_minimax_h3)
 
             try:
                 self.cmb_engine.blockSignals(True)
@@ -2203,6 +2239,8 @@ class Wan22Pane(QWidget):
                     self.cmb_engine.addItem("Bernini R 1.3B", "bernini_r_1p3b")
                 if not hide_ltx23:
                     self.cmb_engine.addItem("LTX 2.3", "ltx23")
+                if not hide_ltx25:
+                    self.cmb_engine.addItem("LTX 2.5", "ltx25")
                 if not hide_minimax_h3:
                     self.cmb_engine.addItem("MiniMax H3", "minimax_h3")
                 if self.cmb_engine.count() == 0:
@@ -2389,6 +2427,32 @@ class Wan22Pane(QWidget):
         except Exception:
             pass
 
+        # LTX 2.5
+        try:
+            if getattr(self, "_ltx25_page", None) is not None:
+                if getattr(self, "_hide_ltx25", False):
+                    self._ltx25_widget = None
+                    self._set_page_message(self._ltx25_page, "LTX 2.5 is hidden by user.")
+                elif getattr(self, "_ltx25_widget", None) is None:
+                    layout = self._ltx25_page.layout() or QVBoxLayout(self._ltx25_page)
+                    self._clear_layout_widgets(layout)
+                    try:
+                        try:
+                            from helpers.ltx25_helper import run_gui as _build_ltx25_gui  # type: ignore
+                        except Exception:
+                            from ltx25_helper import run_gui as _build_ltx25_gui  # type: ignore
+                        self._ltx25_widget = _build_ltx25_gui(parent=self._ltx25_page, embedded=True)
+                        if self._ltx25_widget is None:
+                            raise RuntimeError("ltx25_helper.run_gui() returned no widget")
+                        layout.addWidget(self._ltx25_widget, 1)
+                    except Exception as exc:
+                        self._set_page_message(
+                            self._ltx25_page,
+                            f"LTX 2.5 UI not available (missing ltx25_helper.py): {type(exc).__name__}: {exc}",
+                        )
+        except Exception:
+            pass
+
         # MiniMax H3 stays lazy here as well.  A hide/unhide refresh must never
         # instantiate the heavyweight MiniMax window behind the user's back.
         try:
@@ -2448,7 +2512,7 @@ class Wan22Pane(QWidget):
             key = "wan22"
 
         # If all engines are hidden, a placeholder item with data "none" is shown.
-        if key not in ("wan22", "wan22_turbo", "hunyuan15", "hiar", "bernini_r_1p3b", "ltx23", "minimax_h3"):
+        if key not in ("wan22", "wan22_turbo", "hunyuan15", "hiar", "bernini_r_1p3b", "ltx23", "ltx25", "minimax_h3"):
             try:
                 if getattr(self, "_engine_stack", None) is not None:
                     self._engine_stack.setCurrentIndex(0)
@@ -2477,8 +2541,10 @@ class Wan22Pane(QWidget):
                     idx = 3
                 elif key == "ltx23":
                     idx = 4
-                elif key == "minimax_h3":
+                elif key == "ltx25":
                     idx = 5
+                elif key == "minimax_h3":
+                    idx = 6
                 else:
                     idx = 0
                 self._engine_stack.setCurrentIndex(idx)
@@ -2498,6 +2564,8 @@ class Wan22Pane(QWidget):
                 self.banner.setText("Bernini-R 1.3B image/video generation and edits")
             elif key == "ltx23":
                 self.banner.setText("Video Creation with LTX 2.3")
+            elif key == "ltx25":
+                self.banner.setText("Video Creation with LTX 2.5")
             elif key == "minimax_h3":
                 self.banner.setText("Video Creation with MiniMax H3")
             else:
