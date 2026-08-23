@@ -68,7 +68,7 @@ def main() -> int:
     extra_env = Path(__file__).resolve().parent
     root = extra_env.parent.parent
     models = root / "models" / "hypir"
-    repo_dir = extra_env / "hypir_src" / "HYPIR"
+    repo_dir = models / "HYPIR"
     dl_cache = extra_env / "hypir_installer_cache"
     models.mkdir(parents=True, exist_ok=True)
 

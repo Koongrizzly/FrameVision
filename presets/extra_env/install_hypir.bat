@@ -78,11 +78,10 @@ echo.
 echo ============================================================================
 echo [OK] HYPIR installation complete.
 echo Environment: %ENV%
-echo Repository:  %EXTRA%hypir_src\HYPIR
+echo Repository:  %ROOT%\models\hypir\HYPIR
 echo Models:      %ROOT%\models\hypir
 echo ============================================================================
-echo You can close this window and use HYPIR in FrameVision.
-pause
+echo HYPIR is ready for FrameVision.
 exit /b 0
 
 :fail

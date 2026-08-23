@@ -6,7 +6,7 @@ rem ============================================================
 rem LTX-2.5 DISTILLED - FrameVision UV installer
 rem Layout:
 rem   helpers\ltx25_helper.py
-rem   presets\extra_env\LTX-2
+rem   models\ltx-2.5\LTX-2
 rem   environments\ltx25
 rem   models\ltx-2.5
 rem   models\ltx-2.5\cache
@@ -17,10 +17,10 @@ rem ============================================================
 cd /d "%~dp0"
 for %%I in ("%CD%\..\..") do set "ROOT=%%~fI"
 set "EXTRA=%ROOT%\presets\extra_env"
-set "REPO=%EXTRA%\LTX-2"
 set "ENV=%ROOT%\environments\ltx25"
 set "ENVS=%ROOT%\environments"
 set "MODELS=%ROOT%\models\ltx-2.5"
+set "REPO=%MODELS%\LTX-2"
 set "CACHE=%MODELS%\cache"
 set "TOOLS=%EXTRA%\tools"
 set "UVDIR=%TOOLS%\uv"
@@ -99,17 +99,17 @@ if exist "%REPO%\pyproject.toml" (
     echo.
     echo [2/6] Downloading official Lightricks LTX-2 source...
     if exist "%REPO%" rmdir /s /q "%REPO%"
-    if exist "%EXTRA%\LTX-2-main" rmdir /s /q "%EXTRA%\LTX-2-main"
+    if exist "%MODELS%\LTX-2-main" rmdir /s /q "%MODELS%\LTX-2-main"
     del /q "%REPOZIP%" >nul 2>&1
     curl.exe -L --fail --retry 8 --retry-delay 3 --connect-timeout 30 ^
       -o "%REPOZIP%" ^
       "https://github.com/Lightricks/LTX-2/archive/refs/heads/main.zip"
     if errorlevel 1 goto :repo_download_fail
-    tar.exe -xf "%REPOZIP%" -C "%EXTRA%"
+    tar.exe -xf "%REPOZIP%" -C "%MODELS%"
     if errorlevel 1 goto :repo_extract_fail
     del /q "%REPOZIP%" >nul 2>&1
-    if not exist "%EXTRA%\LTX-2-main\pyproject.toml" goto :repo_extract_fail
-    move "%EXTRA%\LTX-2-main" "%REPO%" >nul
+    if not exist "%MODELS%\LTX-2-main\pyproject.toml" goto :repo_extract_fail
+    move "%MODELS%\LTX-2-main" "%REPO%" >nul
     if errorlevel 1 goto :repo_extract_fail
     echo [OK] LTX-2 source installed.
 )
