@@ -190,6 +190,19 @@ import os
 from datetime import datetime
 from PySide6.QtCore import QUrl, Qt, QTimer, QUrl, Signal, QRect, QEasingCurve, QPropertyAnimation, QByteArray, QEvent
 from PySide6.QtCore import QUrl, QSettings
+
+def _fv_startup_lazy_load_tools_enabled() -> bool:
+    """Settings > Fast startup / load some tools when opened."""
+    try:
+        return bool(QSettings("FrameVision", "FrameVision").value("startup_lazy_load_tools", False, type=bool))
+    except Exception:
+        pass
+    try:
+        from helpers.framevision_app import config as _cfg
+        return bool((_cfg or {}).get("startup_lazy_load_tools", False))
+    except Exception:
+        return False
+
 from PySide6.QtGui import QAction, QPixmap, QImage, QKeySequence, QColor, QDesktopServices, QShortcut
 
 # --- BEGIN: Image allocation limit bump ---
@@ -299,35 +312,37 @@ except Exception as _e:
 
 
 # >>> FRAMEVISION_LLM_CHAT_BEGIN
-# Safe import of the local LLM chat tab; never crash app on failure.
+# Fast-startup mode intentionally avoids importing llama_chat_ui until its tab is opened.
 LlamaChatPane = None
-try:
-    import helpers.llama_chat_ui as _llama_chat_mod
-    for _name in ("LlamaChatPane", "LlamaChatTab", "LlamaChatWidget", "LlamaChatWindow"):
-        LlamaChatPane = getattr(_llama_chat_mod, _name, None)
-        if LlamaChatPane is not None:
-            break
-    if LlamaChatPane is None:
-        print("[framevision] LLM Chat: module imported but no suitable pane/window class found.")
-except Exception as _e:
-    print("[framevision] LLM Chat tab import failed:", _e)
-    LlamaChatPane = None
+if not _fv_startup_lazy_load_tools_enabled():
+    try:
+        import helpers.llama_chat_ui as _llama_chat_mod
+        for _name in ("LlamaChatPane", "LlamaChatTab", "LlamaChatWidget", "LlamaChatWindow"):
+            LlamaChatPane = getattr(_llama_chat_mod, _name, None)
+            if LlamaChatPane is not None:
+                break
+        if LlamaChatPane is None:
+            print("[framevision] LLM Chat: module imported but no suitable pane/window class found.")
+    except Exception as _e:
+        print("[framevision] LLM Chat tab import failed:", _e)
+        LlamaChatPane = None
 # <<< FRAMEVISION_LLM_CHAT_END
 
 # >>> FRAMEVISION_TIMELINE_EDITOR_BEGIN
-# Safe import of the Timeline Editor tab; never crash app on failure.
+# Fast-startup mode intentionally avoids importing timeline_editor until its tab is opened.
 TimelineEditorPane = None
-try:
-    import helpers.timeline_editor as _timeline_editor_mod
-    for _name in ("TimelineEditorPane", "TimelineEditorTab", "TimelineEditorWindow"):
-        TimelineEditorPane = getattr(_timeline_editor_mod, _name, None)
-        if TimelineEditorPane is not None:
-            break
-    if TimelineEditorPane is None:
-        print("[framevision] Timeline Editor: module imported but no suitable pane/window class found.")
-except Exception as _e:
-    print("[framevision] Timeline Editor tab import failed:", _e)
-    TimelineEditorPane = None
+if not _fv_startup_lazy_load_tools_enabled():
+    try:
+        import helpers.timeline_editor as _timeline_editor_mod
+        for _name in ("TimelineEditorPane", "TimelineEditorTab", "TimelineEditorWindow"):
+            TimelineEditorPane = getattr(_timeline_editor_mod, _name, None)
+            if TimelineEditorPane is not None:
+                break
+        if TimelineEditorPane is None:
+            print("[framevision] Timeline Editor: module imported but no suitable pane/window class found.")
+    except Exception as _e:
+        print("[framevision] Timeline Editor tab import failed:", _e)
+        TimelineEditorPane = None
 # <<< FRAMEVISION_TIMELINE_EDITOR_END
 
 # >>> FRAMEVISION_ACE_STEP_15_BEGIN
@@ -5212,72 +5227,29 @@ class MainWindow(QMainWindow):
         self.settings = SettingsPane(self)
 
         # >>> FRAMEVISION_LLM_CHAT_INIT_BEGIN
-        # Create local LLM Chat tab instance if available. It runs in the main FrameVision env.
-        try:
-            if 'LlamaChatPane' in globals() and LlamaChatPane is not None:
-                self.llm_chat = LlamaChatPane()
-                try:
-                    self.llm_chat.setObjectName("tab_llm_chat")
-                except Exception:
-                    pass
-                try:
-                    if hasattr(self.llm_chat, "framevisionFullscreenRequested"):
-                        self.llm_chat.framevisionFullscreenRequested.connect(self.set_llm_chat_splitter_fullscreen)
-                except Exception:
-                    pass
-            else:
-                self.llm_chat = None
-        except Exception as _e:
-            print("[framevision] LLM Chat init failed:", _e)
-            self.llm_chat = QWidget()
-            _lay = QVBoxLayout(self.llm_chat)
-            _lay.setContentsMargins(12, 12, 12, 12)
-            _lab = QLabel(f"LLM Chat failed to load:\n{_e}")
-            _lab.setWordWrap(True)
-            _lay.addWidget(_lab)
-            _lay.addStretch(1)
+        # In Fast startup mode keep only a cheap placeholder. The real helper is
+        # imported and constructed the first time the tab is selected.
+        self._startup_lazy_tabs_enabled = _fv_startup_lazy_load_tools_enabled()
+        self._startup_lazy_tabs_ready = not bool(self._startup_lazy_tabs_enabled)
+        self._startup_lazy_tab_loading = set()
+
+        if self._startup_lazy_tabs_enabled:
+            self.llm_chat = self._make_startup_lazy_placeholder(
+                "tab_llm_chat", "LLM Chat",
+                "LLM Chat is not loaded yet.\nOpen this tab to load it."
+            )
+        else:
+            self.llm_chat = self._build_llm_chat_pane()
         # <<< FRAMEVISION_LLM_CHAT_INIT_END
 
         # >>> FRAMEVISION_TIMELINE_EDITOR_INIT_BEGIN
-        # Create Timeline Editor tab instance if available. It runs inside the main FrameVision env.
-        try:
-            if 'TimelineEditorPane' in globals() and TimelineEditorPane is not None:
-                try:
-                    self.timeline_editor = TimelineEditorPane(self, embedded=True)
-                except TypeError:
-                    # Older standalone-only class signature: create first, then embed as a child widget.
-                    self.timeline_editor = TimelineEditorPane()
-                    try:
-                        self.timeline_editor.setParent(self)
-                    except Exception:
-                        pass
-                try:
-                    self.timeline_editor.setObjectName("tab_timeline_editor")
-                except Exception:
-                    pass
-                try:
-                    self.timeline_editor.setWindowFlags(Qt.Widget)
-                except Exception:
-                    pass
-                try:
-                    self.timeline_editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-                except Exception:
-                    pass
-            else:
-                self.timeline_editor = None
-        except Exception as _e:
-            print("[framevision] Timeline Editor init failed:", _e)
-            self.timeline_editor = QWidget()
-            try:
-                self.timeline_editor.setObjectName("tab_timeline_editor")
-            except Exception:
-                pass
-            _lay = QVBoxLayout(self.timeline_editor)
-            _lay.setContentsMargins(12, 12, 12, 12)
-            _lab = QLabel(f"Timeline Editor failed to load:\n{_e}")
-            _lab.setWordWrap(True)
-            _lay.addWidget(_lab)
-            _lay.addStretch(1)
+        if self._startup_lazy_tabs_enabled:
+            self.timeline_editor = self._make_startup_lazy_placeholder(
+                "tab_timeline_editor", "Timeline Editor",
+                "Timeline Editor is not loaded yet.\nOpen this tab to load it."
+            )
+        else:
+            self.timeline_editor = self._build_timeline_editor_pane()
         # <<< FRAMEVISION_TIMELINE_EDITOR_INIT_END
 
         # >>> FRAMEVISION_MUSICCLIP_INIT_BEGIN
@@ -5731,6 +5703,10 @@ class MainWindow(QMainWindow):
         try:
             from PySide6.QtCore import QTimer
             QTimer.singleShot(0, self._restore_active_tab_by_name)
+            if bool(getattr(self, "_startup_lazy_tabs_enabled", False)):
+                # Do not let session restore import heavy tabs inside MainWindow startup.
+                # Once the window/event loop has settled, a restored current lazy tab may load.
+                QTimer.singleShot(750, self._arm_startup_lazy_tabs)
         except Exception:
             pass
         # Ensure correct active tab after potential tab removals
@@ -6811,7 +6787,154 @@ class MainWindow(QMainWindow):
         except Exception:
             return False
 
+    def _make_startup_lazy_placeholder(self, object_name, title, message):
+        page = QWidget(self)
+        try:
+            page.setObjectName(str(object_name))
+            page.setProperty("fv_startup_lazy_placeholder", True)
+            page.setProperty("fv_startup_lazy_title", str(title))
+        except Exception:
+            pass
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(18, 18, 18, 18)
+        lab = QLabel(str(message), page)
+        lab.setWordWrap(True)
+        lay.addWidget(lab)
+        lay.addStretch(1)
+        return page
+
+    def _build_llm_chat_pane(self):
+        global LlamaChatPane
+        try:
+            if LlamaChatPane is None:
+                import helpers.llama_chat_ui as _llama_chat_mod
+                for _name in ("LlamaChatPane", "LlamaChatTab", "LlamaChatWidget", "LlamaChatWindow"):
+                    LlamaChatPane = getattr(_llama_chat_mod, _name, None)
+                    if LlamaChatPane is not None:
+                        break
+            if LlamaChatPane is None:
+                raise RuntimeError("LLM Chat module has no suitable pane/window class.")
+            pane = LlamaChatPane()
+            pane.setObjectName("tab_llm_chat")
+            try:
+                if hasattr(pane, "framevisionFullscreenRequested"):
+                    pane.framevisionFullscreenRequested.connect(self.set_llm_chat_splitter_fullscreen)
+            except Exception:
+                pass
+            return pane
+        except Exception as _e:
+            print("[framevision] LLM Chat init failed:", _e)
+            page = self._make_startup_lazy_placeholder(
+                "tab_llm_chat", "LLM Chat", f"LLM Chat failed to load:\n{_e}"
+            )
+            try:
+                page.setProperty("fv_startup_lazy_placeholder", False)
+            except Exception:
+                pass
+            return page
+
+    def _build_timeline_editor_pane(self):
+        global TimelineEditorPane
+        try:
+            if TimelineEditorPane is None:
+                import helpers.timeline_editor as _timeline_editor_mod
+                for _name in ("TimelineEditorPane", "TimelineEditorTab", "TimelineEditorWindow"):
+                    TimelineEditorPane = getattr(_timeline_editor_mod, _name, None)
+                    if TimelineEditorPane is not None:
+                        break
+            if TimelineEditorPane is None:
+                raise RuntimeError("Timeline Editor module has no suitable pane/window class.")
+            try:
+                pane = TimelineEditorPane(self, embedded=True)
+            except TypeError:
+                pane = TimelineEditorPane()
+                try:
+                    pane.setParent(self)
+                except Exception:
+                    pass
+            pane.setObjectName("tab_timeline_editor")
+            try:
+                pane.setWindowFlags(Qt.Widget)
+            except Exception:
+                pass
+            try:
+                pane.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            except Exception:
+                pass
+            return pane
+        except Exception as _e:
+            print("[framevision] Timeline Editor init failed:", _e)
+            page = self._make_startup_lazy_placeholder(
+                "tab_timeline_editor", "Timeline Editor", f"Timeline Editor failed to load:\n{_e}"
+            )
+            try:
+                page.setProperty("fv_startup_lazy_placeholder", False)
+            except Exception:
+                pass
+            return page
+
+    def _replace_startup_lazy_tab(self, idx, title, new_widget, attr_name):
+        try:
+            old = self.tabs.widget(idx)
+            self.tabs.removeTab(idx)
+            self.tabs.insertTab(idx, new_widget, title)
+            setattr(self, attr_name, new_widget)
+            self.tabs.setCurrentIndex(idx)
+            try:
+                if old is not None and old is not new_widget:
+                    old.deleteLater()
+            except Exception:
+                pass
+            return True
+        except Exception as _e:
+            print(f"[framevision] lazy tab replacement failed for {title}:", _e)
+            return False
+
+    def _load_startup_lazy_tab(self, idx):
+        if not bool(getattr(self, "_startup_lazy_tabs_enabled", False)):
+            return
+        if not bool(getattr(self, "_startup_lazy_tabs_ready", False)):
+            return
+        try:
+            title = str(self.tabs.tabText(idx)).strip()
+        except Exception:
+            return
+        key = title.lower()
+        if key not in {"llm chat", "timeline editor"}:
+            return
+        loading = getattr(self, "_startup_lazy_tab_loading", set())
+        if key in loading:
+            return
+        try:
+            current = self.tabs.widget(idx)
+            if current is None or not bool(current.property("fv_startup_lazy_placeholder")):
+                return
+        except Exception:
+            return
+        loading.add(key)
+        try:
+            if key == "llm chat":
+                pane = self._build_llm_chat_pane()
+                self._replace_startup_lazy_tab(idx, "LLM Chat", pane, "llm_chat")
+            elif key == "timeline editor":
+                pane = self._build_timeline_editor_pane()
+                self._replace_startup_lazy_tab(idx, "Timeline Editor", pane, "timeline_editor")
+        finally:
+            loading.discard(key)
+
+    def _arm_startup_lazy_tabs(self):
+        self._startup_lazy_tabs_ready = True
+        try:
+            idx = int(self.tabs.currentIndex())
+            self._load_startup_lazy_tab(idx)
+        except Exception:
+            pass
+
     def _on_tab_changed(self, idx):
+        try:
+            self._load_startup_lazy_tab(idx)
+        except Exception:
+            pass
         try:
             name = str(self.tabs.tabText(idx)).strip().lower()
             if name == "queue":

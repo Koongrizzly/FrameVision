@@ -34,6 +34,7 @@ PYTHON = ROOT / "environments" / ".minimax_h3_int4" / "python.exe"
 PRESET_DIR = ROOT / "presets" / "setsave"
 DEFAULT_OUTPUT_DIR = ROOT / "output"
 DEFAULT_LORA_DIR = ROOT / "models" / "minimax_h3" / "loras"
+LORA_STATE_FILE = PRESET_DIR / "minimax_h3_loras.json"
 LOG_DIR = ROOT / "logs"
 
 APP_UPDATE_REPO = "Koongrizzly/MiniMax_H3_Standalone_app"
@@ -726,6 +727,8 @@ class MainWindow(QMainWindow):
         self._build()
         self._apply_style()
         self.load_last()
+        self._load_lora_state()
+        self._connect_lora_persistence()
         self._load_queue_state()
         self._sync_resolution()
         self._sync_mode()
@@ -2440,8 +2443,8 @@ class MainWindow(QMainWindow):
         self.vram_video_vae_tile_size.setToolTip("MiniMax video-VAE spatial tile size. Safe/current default is 256 px. Larger tiles may decode faster but use more VRAM. Test carefully for OOMs and visible tile seams.")
         vf.addRow("Video VAE tile size", self.vram_video_vae_tile_size)
 
-        self.vram_video_vae_tile_overlap = QSpinBox(); self.vram_video_vae_tile_overlap.setRange(0, 512); self.vram_video_vae_tile_overlap.setSingleStep(32); self.vram_video_vae_tile_overlap.setValue(128); self.vram_video_vae_tile_overlap.setSuffix(" px")
-        self.vram_video_vae_tile_overlap.setToolTip("Overlap between MiniMax video-VAE spatial tiles. Safe/current default is 128 px. 64 px is a speed test candidate, but lower overlap can make tile boundaries visible in the final MP4. Overlap must stay smaller than tile size.")
+        self.vram_video_vae_tile_overlap = QSpinBox(); self.vram_video_vae_tile_overlap.setRange(0, 512); self.vram_video_vae_tile_overlap.setSingleStep(32); self.vram_video_vae_tile_overlap.setValue(64); self.vram_video_vae_tile_overlap.setSuffix(" px")
+        self.vram_video_vae_tile_overlap.setToolTip("Overlap between MiniMax video-VAE spatial tiles. Default is 64 px, but lower overlap can make tile boundaries visible in the final MP4. Overlap must stay smaller than tile size.")
         vf.addRow("Video VAE tile overlap", self.vram_video_vae_tile_overlap)
 
         self.vram_audio_vae_reserve = QDoubleSpinBox(); self.vram_audio_vae_reserve.setRange(0.10, 16.0); self.vram_audio_vae_reserve.setDecimals(2); self.vram_audio_vae_reserve.setSingleStep(0.25); self.vram_audio_vae_reserve.setValue(1.0); self.vram_audio_vae_reserve.setSuffix(" GB")
@@ -2875,7 +2878,7 @@ class MainWindow(QMainWindow):
             self.vram_video_vae_reserve.setValue(float(d.get("vram_video_vae_reserve_gb", 2.0)))
             self.vram_audio_vae_reserve.setValue(float(d.get("vram_audio_vae_reserve_gb", 1.0)))
             self.vram_video_vae_tile_size.setValue(int(d.get("vram_video_vae_tile_size", 256)))
-            self.vram_video_vae_tile_overlap.setValue(int(d.get("vram_video_vae_tile_overlap", 128)))
+            self.vram_video_vae_tile_overlap.setValue(int(d.get("vram_video_vae_tile_overlap", 64)))
             self.fl2va_model.edit.setText(d.get("fl2va_model", "")); self.ref2va_model.edit.setText(d.get("ref2va_model", "")); self.text_encoder_model.edit.setText(d.get("text_encoder_model", "")); self.video_vae_model.edit.setText(d.get("video_vae_model", "")); self.audio_vae_model.edit.setText(d.get("audio_vae_model", ""))
             saved_loras = d.get("loras", []) or []
             for i, (row, strength) in enumerate(self.lora_rows):
@@ -2902,6 +2905,49 @@ class MainWindow(QMainWindow):
         if p: self.apply_settings(json.loads(Path(p).read_text(encoding="utf-8")))
     def safe_preset(self):
         self.mode.setCurrentIndex(0); self.res_class.setCurrentText("576 × 320"); self.aspect.setCurrentText("16:9"); self._set_frame_count(124); self.steps.setValue(10); self.cfg.setValue(1.0); self.shift.setValue(12); self.audio_shift.setValue(3); self.sampler.setCurrentText("euler"); self.scheduler.setCurrentText("simple")
+
+    def _lora_state_dict(self):
+        return {
+            "version": 1,
+            "loras": [
+                {"path": row.path(), "strength": float(strength.value())}
+                for row, strength in self.lora_rows
+            ],
+        }
+
+    def _save_lora_state(self, *args):
+        try:
+            PRESET_DIR.mkdir(parents=True, exist_ok=True)
+            LORA_STATE_FILE.write_text(json.dumps(self._lora_state_dict(), indent=2), encoding="utf-8")
+        except Exception as exc:
+            if hasattr(self, "log"):
+                self.append_log(f"LoRA settings save warning: {exc}\n")
+
+    def _load_lora_state(self):
+        # Dedicated LoRA persistence is deliberately loaded after the normal
+        # GUI settings so embedded FrameVision helper recreation cannot clear it.
+        if not LORA_STATE_FILE.is_file():
+            # Migrate the LoRA values already restored by the legacy all-settings file.
+            if any(row.path() for row, _strength in self.lora_rows):
+                self._save_lora_state()
+            return
+        try:
+            data = json.loads(LORA_STATE_FILE.read_text(encoding="utf-8"))
+            saved_loras = data.get("loras", []) if isinstance(data, dict) else []
+            for i, (row, strength) in enumerate(self.lora_rows):
+                item = saved_loras[i] if i < len(saved_loras) and isinstance(saved_loras[i], dict) else {}
+                row.edit.setText(str(item.get("path", "")))
+                strength.setValue(float(item.get("strength", 1.0)))
+        except Exception as exc:
+            if hasattr(self, "log"):
+                self.append_log(f"LoRA settings load warning: {exc}\n")
+
+    def _connect_lora_persistence(self):
+        # Save immediately on every LoRA edit.  FrameVision may destroy/recreate
+        # the embedded helper without delivering this window a normal closeEvent.
+        for row, strength in self.lora_rows:
+            row.edit.textChanged.connect(self._save_lora_state)
+            strength.valueChanged.connect(self._save_lora_state)
 
     def lora_args(self):
         args = []

@@ -8504,6 +8504,39 @@ def _planner_ltx23_append_extra_lora_args(args: List[str], extra_loras: Optional
             continue
         args += ["--extra-lora-file", path, "--extra-lora-multiplier", str(max(0.5, min(1.5, mult)))]
 
+def _planner_minimax_h3_extra_loras_from_encoding(enc: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    src = enc or {}
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for slot in (1, 2):
+        try:
+            enabled = bool(src.get(f"minimax_h3_extra_lora{slot}_enabled", False))
+            path = str(src.get(f"minimax_h3_extra_lora{slot}_path") or "").strip()
+            strength = float(src.get(f"minimax_h3_extra_lora{slot}_strength", 1.0) or 0.0)
+        except Exception:
+            continue
+        if not enabled or not path or strength == 0.0:
+            continue
+        try:
+            rp = str(Path(path).resolve())
+        except Exception:
+            rp = path
+        key = os.path.normcase(rp)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"slot": slot, "path": rp, "strength": max(-10.0, min(10.0, strength))})
+    return out[:2]
+
+def _planner_minimax_h3_append_extra_lora_args(args: List[str], enc: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    selected = _planner_minimax_h3_extra_loras_from_encoding(enc)
+    for item in selected:
+        path = str(item.get("path") or "")
+        if not os.path.isfile(path):
+            raise RuntimeError(f"Selected MiniMax H3 extra LoRA was not found: {path}")
+        args += ["--lora", path, "--lora-strength", str(float(item.get("strength") or 0.0))]
+    return selected
+
 from PySide6.QtCore import Qt, QObject, Signal, Slot, QThread, QSize, QTimer, qInstallMessageHandler, QtMsgType
 from PySide6.QtGui import QFont, QAction, QPixmap, QIcon, QStandardItemModel, QStandardItem, QColor, QPainter, QBrush
 from PySide6.QtWidgets import (
@@ -8548,6 +8581,15 @@ from PySide6.QtWidgets import (
     QFrame,
     QGraphicsDropShadowEffect,
 )
+
+
+class _PlannerNoWheelDoubleSpinBox(QDoubleSpinBox):
+    """Ignore accidental wheel changes unless the user explicitly focused the control."""
+    def wheelEvent(self, event):
+        if not self.hasFocus():
+            event.ignore()
+            return
+        super().wheelEvent(event)
 
 
 
@@ -9733,7 +9775,7 @@ class PipelineWorker(QThread):
             images_dir=images_dir,
         )
 
-        if _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {})) and shots_path:
+        if mk_pre != "minimax_h3" and _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {})) and shots_path:
             try:
                 _shots_all = _load_shots_list(shots_path) or []
             except Exception:
@@ -9763,9 +9805,9 @@ class PipelineWorker(QThread):
                     raise RuntimeError(f"[CHAIN] {sid}: could not refresh start image from previous clip.")
                 img_path = _forced_chain_img
 
-        if not img_path or not os.path.isfile(img_path):
+        if mk_pre != "minimax_h3" and (not img_path or not os.path.isfile(img_path)):
             raise RuntimeError(f"Missing start image for {sid}: {img_path}")
-        if _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {})) and _planner_chain_image_still_placeholder(
+        if mk_pre != "minimax_h3" and _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {})) and _planner_chain_image_still_placeholder(
             sid=sid,
             img_path=img_path,
             shot_map=shot_map,
@@ -9778,7 +9820,10 @@ class PipelineWorker(QThread):
         negative = str(rec.get("i2v_negative") or '').strip()
         prompt = (prompt_override or str(rec.get("i2v_prompt") or '').strip())
         if not prompt:
-            prompt = "Slow camera move, subtle parallax, keep subject stable. Match the image exactly."
+            if mk_pre == "minimax_h3":
+                prompt = str(rec.get("prompt") or self.job.prompt or "Cinematic continuation of the current story beat.").strip()
+            else:
+                prompt = "Slow camera move, subtle parallax, keep subject stable. Match the image exactly."
         if prompt_override:
             # Persist prompt override into the shot record for debugging and future reruns
             try:
@@ -10377,8 +10422,169 @@ class PipelineWorker(QThread):
                     lf.write(" ".join([str(x) for x in args]) + "\n\n")
                     lf.flush()
                     subprocess.run(args, cwd=str(_root()), stdout=lf, stderr=lf, check=True)
+        elif mk == "minimax_h3":
+            # MiniMax H3 direct-video recreate: no Planner start image is required.
+            cli = (_root() / "helpers" / "planner_minimax_h3_cli.py").resolve()
+            if not cli.is_file():
+                raise RuntimeError(f"Missing MiniMax H3 planner CLI: {cli}")
+
+            try:
+                _mm_quality = str((self.job.encoding or {}).get("gen_quality_preset") or (manifest.get("settings") or {}).get("gen_quality_preset") or prof.get("quality") or "default")
+                _mm_prof = _resolve_generation_profile("minimax_h3", _mm_quality, (self.job.encoding or {}).get("planner_upscale"))
+            except Exception:
+                _mm_prof = prof if isinstance(prof, dict) else {}
+            try:
+                _mm_w, _mm_h = _planner_profile_wh(_mm_prof)
+            except Exception:
+                _mm_w, _mm_h = 960, 544
+            try:
+                _saved_res = str((clip_entry or {}).get("resolution") or "")
+                _rm = re.match(r"^\s*(\d+)\s*[xX]\s*(\d+)\s*$", _saved_res)
+                if _rm:
+                    _mm_w, _mm_h = int(_rm.group(1)), int(_rm.group(2))
+            except Exception:
+                pass
+            fps = 24
+            try:
+                frames = _planner_native_h3_frames(int((clip_entry or {}).get("frames") or frames or 192), int(_mm_prof.get("max_frames") or 1433))
+            except Exception:
+                frames = _planner_native_h3_frames(int(frames or 192), 1433)
+            steps = 4
+            if seed is None:
+                seed = _planner_direct_video_seed(sid, rec)
+
+            _mm_pool = []
+            try:
+                _srcs = list((((manifest.get("project") or {}).get("references") or {}).get("copied_files") or []))[:9]
+                _mm_pool = [str(x) for x in _srcs if x and os.path.isfile(str(x))]
+            except Exception:
+                _mm_pool = []
+            if not _mm_pool:
+                try:
+                    _srcs = list((self.job.attachments or {}).get("minimax_video_refs") or [])[:9]
+                    _mm_pool = [str(x) for x in _srcs if x and os.path.isfile(str(x))]
+                except Exception:
+                    _mm_pool = []
+            if not _mm_pool:
+                try:
+                    _srcs = list((self.job.encoding or {}).get("minimax_video_refs") or [])[:9]
+                    _mm_pool = [str(x) for x in _srcs if x and os.path.isfile(str(x))]
+                except Exception:
+                    _mm_pool = []
+
+            _mm_refs = []
+            for _src in ((clip_entry or {}).get("reference_images") or [], rec.get("reference_images") or []):
+                if isinstance(_src, (list, tuple)):
+                    for _rp in _src:
+                        _rp = str(_rp or "")
+                        if _rp and os.path.isfile(_rp) and _rp not in _mm_refs:
+                            _mm_refs.append(_rp)
+                if _mm_refs:
+                    break
+
+            if not _mm_refs:
+                try:
+                    _idxs = list(rec.get("minimax_ref_indices") or (clip_entry or {}).get("minimax_ref_indices") or [])
+                except Exception:
+                    _idxs = []
+                for _n in _idxs[:3]:
+                    try:
+                        _ix = int(_n) - 1
+                    except Exception:
+                        continue
+                    if 0 <= _ix < len(_mm_pool):
+                        _rp = _mm_pool[_ix]
+                        if os.path.isfile(_rp) and _rp not in _mm_refs:
+                            _mm_refs.append(_rp)
+
+            _forced_indices = []
+            try:
+                for _m in re.finditer(r"<\s*picture\s+(\d+)\s*>", str(prompt or ""), re.I):
+                    _n = int(_m.group(1))
+                    if _n > 0 and _n not in _forced_indices:
+                        _forced_indices.append(_n)
+                if not _forced_indices:
+                    for _m in re.finditer(r"<\s*Subject\s+(\d+)\s*>", str(prompt or ""), re.I):
+                        _n = int(_m.group(1))
+                        if _n > 0 and _n not in _forced_indices:
+                            _forced_indices.append(_n)
+            except Exception:
+                _forced_indices = []
+            if _forced_indices and _mm_pool:
+                _forced_refs = []
+                for _n in _forced_indices[:3]:
+                    _ix = _n - 1
+                    if 0 <= _ix < len(_mm_pool) and os.path.isfile(_mm_pool[_ix]) and _mm_pool[_ix] not in _forced_refs:
+                        _forced_refs.append(_mm_pool[_ix])
+                if _forced_refs:
+                    _mm_refs = _forced_refs
+
+            _continue_video = ""
+            _cont_mode = str((clip_entry or {}).get("continuation_mode") or rec.get("continuation_mode") or "").strip().lower()
+            if _cont_mode == "native_video" and shots_path:
+                try:
+                    _all_shots = _load_shots_list(shots_path) or []
+                    _pos = next((i for i, _sh in enumerate(_all_shots) if isinstance(_sh, dict) and str(_sh.get("id") or "").strip() == sid), -1)
+                    if _pos > 0:
+                        _prev_sid = str((_all_shots[_pos - 1] or {}).get("id") or "").strip()
+                        for _ce in clips_list:
+                            if isinstance(_ce, dict) and str(_ce.get("id") or "").strip() == _prev_sid:
+                                _pc = str(_ce.get("file") or "")
+                                if _pc and os.path.isfile(_pc):
+                                    _continue_video = _pc
+                                    break
+                except Exception:
+                    _continue_video = ""
+
+            # Windows media players can keep the existing MP4 open.  If the earlier
+            # backup-to-_takes move could not remove it, never ask MiniMax/ffmpeg to
+            # overwrite the locked file in place.  Generate a new unique current take
+            # and let the manifest point at it instead.
+            if take_path and not os.path.isfile(take_path):
+                take_path = ""
+            if os.path.isfile(out_file):
+                _locked_base = os.path.splitext(os.path.basename(out_file))[0]
+                _locked_ext = os.path.splitext(out_file)[1] or ".mp4"
+                _n = 1
+                while True:
+                    _cand = os.path.join(clips_dir, f"{_locked_base}_recreate{_n:02d}{_locked_ext}")
+                    if not os.path.exists(_cand):
+                        break
+                    _n += 1
+                try:
+                    self.signals.log.emit(
+                        f"[minimax-h3] {sid}: original clip is still present/busy; "
+                        f"writing recreated clip as {os.path.basename(_cand)} instead"
+                    )
+                except Exception:
+                    pass
+                out_file = _cand
+
+            args = [sys.executable, str(cli), "--prompt", str(prompt or ""), "--output", str(out_file),
+                    "--width", str(int(_mm_w)), "--height", str(int(_mm_h)),
+                    "--frames", str(int(frames)), "--seed", str(int(seed if seed is not None else -1))]
+            _mm_recreate_extra_loras = _planner_minimax_h3_append_extra_lora_args(args, self.job.encoding or {})
+            if _continue_video:
+                args += ["--continue-video", _continue_video]
+            else:
+                for _rp in _mm_refs[:3]:
+                    args += ["--ref-image", str(_rp)]
+
+            _ref_names = ", ".join(Path(x).name for x in _mm_refs) if _mm_refs else "none"
+            _regen_lora_note = ", ".join(f"{Path(str(x.get('path') or '')).name}@{float(x.get('strength') or 0):.2f}" for x in (_mm_recreate_extra_loras or [])) or "none"
+            self.signals.log.emit(f"[minimax-h3] recreate {sid}: {_mm_w}x{_mm_h}, {frames} frames @ 24fps, refs={len(_mm_refs)} [{_ref_names}], continuation={bool(_continue_video)}, extra_loras=[{_regen_lora_note}]")
+            subprocess.run(args, cwd=str(_root()), check=True)
+            rec["reference_images"] = list(_mm_refs)
+            rec["video_model"] = "minimax_h3"
+            rec["model_key"] = "minimax_h3"
+            if clip_entry is not None:
+                clip_entry["reference_images"] = list(_mm_refs)
+                clip_entry["video_model"] = "minimax_h3"
+                clip_entry["model_key"] = "minimax_h3"
+                clip_entry["resolution"] = f"{int(_mm_w)}x{int(_mm_h)}"
+
         else:
-            raise RuntimeError("Clip regeneration is only supported for HunyuanVideo 1.5, WAN 2.2 Turbo, and LTX 2.3 in the current build.")
+            raise RuntimeError("Clip regeneration is supported for HunyuanVideo 1.5, WAN 2.2 Turbo, LTX 2.3, and MiniMax H3 in the current build.")
 
         if not os.path.isfile(out_file) or os.path.getsize(out_file) < 1024:
             raise RuntimeError(f"Clip output missing/too small for {sid}: {out_file}")
@@ -17917,11 +18123,61 @@ class PipelineWorker(QThread):
                         except Exception:
                             return str(_s or "").lower().strip()
 
-                    def _mm_refs_for_text(_text):
+                    def _mm_picture_bindings(_text):
+                        """Return explicit <picture N> bindings and optional `as Name` aliases.
+
+                        Own Prompts users may address MiniMax refs directly as <picture 1>,
+                        <Picture 2>, etc.  These are HARD bindings: later semantic/name
+                        matching is never allowed to drop them.
+                        """
+                        _bindings = []
+                        _aliases = {}
+                        _raw = str(_text or "")
+                        try:
+                            for _m in re.finditer(r"<\s*picture\s+(\d+)\s*>", _raw, re.I):
+                                _n = int(_m.group(1))
+                                if not any(int(c.get("subject_number") or 0) == _n for c in _catalog):
+                                    continue
+                                if _n not in _bindings:
+                                    _bindings.append(_n)
+                                # Parse a short semantic alias from constructs such as
+                                # `Use <picture 1> as Marcel and keep his identity...`.
+                                _tail = _raw[_m.end():_m.end()+120]
+                                _am = re.match(
+                                    r"\s+as\s+([A-Za-z][A-Za-z0-9'_-]*(?:\s+[A-Za-z][A-Za-z0-9'_-]*){0,2})",
+                                    _tail,
+                                    re.I,
+                                )
+                                if _am:
+                                    _alias = str(_am.group(1) or "").strip()
+                                    # Common prose immediately following the alias must not
+                                    # accidentally become part of a character name.
+                                    _alias = re.split(
+                                        r"\s+(?:and|who|that|while|then|with|walks?|runs?|stands?|sits?|rides?|drives?|shoots?|fights?|keeps?|keep)\b",
+                                        _alias,
+                                        maxsplit=1,
+                                        flags=re.I,
+                                    )[0].strip(" ,.;:-")
+                                    if _alias:
+                                        _aliases[_n] = _alias
+                        except Exception:
+                            pass
+                        return _bindings[:3], _aliases
+
+                    def _mm_refs_for_text(_text, _forced=None):
+                        # Explicit <picture N> / <Subject N> tokens always win.  Semantic
+                        # filename/name matching may only fill remaining slots.
                         _chosen = []
+                        for _n in list(_forced or []):
+                            try:
+                                _n = int(_n)
+                            except Exception:
+                                continue
+                            if any(int(c.get("subject_number") or 0) == _n for c in _catalog) and _n not in _chosen:
+                                _chosen.append(_n)
                         _hay = " " + _mm_norm_name(_text) + " "
                         try:
-                            for _m in re.finditer(r"<Subject\s+(\d+)>", str(_text or ""), re.I):
+                            for _m in re.finditer(r"<\s*(?:Subject|picture)\s+(\d+)\s*>", str(_text or ""), re.I):
                                 _n = int(_m.group(1))
                                 if any(int(c.get("subject_number") or 0) == _n for c in _catalog) and _n not in _chosen:
                                     _chosen.append(_n)
@@ -18012,9 +18268,43 @@ class PipelineWorker(QThread):
                         _beat = _beat_core
                         if _context_bits:
                             _beat = (_beat_core.rstrip(" .") + ". " + " ".join(_context_bits)).strip()
-                        # Reference matching must use the real story event, not the generic prompt wrapper.
-                        _ref_nums = _mm_refs_for_text(_beat_core + "\n" + _beat)
-                        _subjects = [x for x in (_mm_cat(n) for n in _ref_nums) if isinstance(x, dict)]
+                        # Own Prompts can bind refs directly with <picture N>.  Parse those
+                        # BEFORE semantic matching and convert them to H3 <Subject N> tokens.
+                        # Example: `Use <picture 1> as Marcel ...` => physical ref #1,
+                        # subject name Marcel, and <Subject 1> in the compiled H3 prompt.
+                        _forced_ref_nums, _picture_aliases = _mm_picture_bindings(_beat_core + "\n" + _beat)
+                        _ref_nums = _mm_refs_for_text(_beat_core + "\n" + _beat, _forced_ref_nums)
+                        _subjects = []
+                        for _n in _ref_nums:
+                            _base_sub = _mm_cat(_n)
+                            if not isinstance(_base_sub, dict):
+                                continue
+                            _sub = dict(_base_sub)
+                            if _n in _picture_aliases:
+                                _sub["name"] = str(_picture_aliases[_n])
+                            _subjects.append(_sub)
+
+                        def _mm_picture_to_subject(_text):
+                            _out = str(_text or "")
+                            for _n in _forced_ref_nums:
+                                _out = re.sub(
+                                    rf"<\s*picture\s+{int(_n)}\s*>",
+                                    f"<Subject {int(_n)}>",
+                                    _out,
+                                    flags=re.I,
+                                )
+                                _alias = str(_picture_aliases.get(_n) or "").strip()
+                                if _alias:
+                                    _out = re.sub(
+                                        rf"(<Subject\s+{int(_n)}>)\s+as\s+{re.escape(_alias)}\b",
+                                        rf"\1 ({_alias})",
+                                        _out,
+                                        flags=re.I,
+                                    )
+                            return _out
+
+                        _beat_core = _mm_picture_to_subject(_beat_core)
+                        _beat = _mm_picture_to_subject(_beat)
 
                         _ratio_label = str((enc0 or {}).get("format") or (enc0 or {}).get("aspect_ratio") or "16:9")
                         _quality_label = str((enc0 or {}).get("gen_quality_preset") or "default")
@@ -18243,8 +18533,33 @@ class PipelineWorker(QThread):
                 shot_map=manifest.get("shots") if isinstance(manifest.get("shots"),dict) else {}; clips_out=[]
                 cli=(_root()/"helpers"/"planner_minimax_h3_cli.py").resolve()
                 if not cli.is_file(): raise RuntimeError(f"Missing MiniMax H3 planner CLI: {cli}")
-                try: refs=list((((manifest.get("project") or {}).get("references") or {}).get("copied_files") or []))[:9]
-                except Exception: refs=[]
+                # Resolve the physical MiniMax reference list defensively.  The project-copied
+                # files are preferred, but Own Prompts/resumed jobs can still have valid refs only
+                # in the original job attachments or encoding.  Never silently drop those refs.
+                refs=[]
+                try:
+                    refs=list((((manifest.get("project") or {}).get("references") or {}).get("copied_files") or []))[:9]
+                except Exception:
+                    refs=[]
+                refs=[str(x) for x in refs if x and os.path.isfile(str(x))]
+                if not refs:
+                    try:
+                        _mm_att = self.job.attachments or {}
+                        refs=[str(x) for x in list(_mm_att.get("minimax_video_refs") or [])[:9] if x and os.path.isfile(str(x))]
+                    except Exception:
+                        refs=[]
+                if not refs:
+                    try:
+                        refs=[str(x) for x in list((self.job.encoding or {}).get("minimax_video_refs") or [])[:9] if x and os.path.isfile(str(x))]
+                    except Exception:
+                        refs=[]
+                try:
+                    if refs:
+                        self.signals.log.emit("[minimax-h3] physical reference pool: " + ", ".join(Path(x).name for x in refs))
+                    else:
+                        self.signals.log.emit("[minimax-h3] physical reference pool: EMPTY")
+                except Exception:
+                    pass
                 chain_on=bool(_planner_last_frame_chain_enabled(self.job.encoding))
                 chain_dir=os.path.join(self.out_dir,"minimax_chain_frames")
                 try: os.makedirs(chain_dir,exist_ok=True)
@@ -18262,6 +18577,7 @@ class PipelineWorker(QThread):
                     frames=_planner_native_h3_frames(int(round(dsec*fps)),max_frames); seed=_planner_direct_video_seed(sid,rec)
                     out_file=os.path.join(clips_dir,f"{self.job.job_id}_{sid}.mp4")
                     args=[sys.executable,str(cli),"--prompt",prompt,"--output",out_file,"--width",str(w),"--height",str(h),"--frames",str(frames),"--seed",str(seed)]
+                    _mm_extra_loras = _planner_minimax_h3_append_extra_lora_args(args, self.job.encoding if isinstance(getattr(self.job, "encoding", None), dict) else {})
 
                     # Map <Subject N> to the Nth loaded MiniMax reference. This keeps
                     # each Ref2VA shot at 1-2 refs in normal use and never above 3.
@@ -18275,6 +18591,25 @@ class PipelineWorker(QThread):
                             _shot_subject_text=str(_mm.group(1) or '')
                     except Exception:
                         pass
+                    # Own Prompts safety net: literal <picture N> is a hard physical ref binding.
+                    # Re-parse it here at the final generation boundary so metadata loss in an
+                    # earlier stage can never downgrade an explicitly referenced shot to FL2VA.
+                    _picture_indices=[]
+                    _picture_source_text="\n".join([
+                        str(prompt or ""),
+                        str((sh or {}).get("assigned_event") or ""),
+                        str((sh or {}).get("event") or ""),
+                        str((sh or {}).get("description") or ""),
+                        str((sh or {}).get("visual_description") or ""),
+                    ])
+                    try:
+                        for _pm in re.finditer(r"<\s*picture\s+(\d+)\s*>", _picture_source_text, re.I):
+                            _pn=int(_pm.group(1))
+                            if _pn > 0 and _pn not in _picture_indices:
+                                _picture_indices.append(_pn)
+                    except Exception:
+                        _picture_indices=[]
+
                     used_subjects=[]
                     for _m in _subject_re.findall(_shot_subject_text):
                         try:
@@ -18343,6 +18678,30 @@ class PipelineWorker(QThread):
                             # ref selection and hybrid continuation mode.
                             used_subjects = list(_explicit_subjects[:3])
 
+                    # Literal <picture N> wins over every heuristic.  If the user explicitly
+                    # requested a picture that cannot be resolved, stop instead of silently
+                    # producing a text-to-video character replacement.
+                    if _picture_indices:
+                        _hard_refs=[]
+                        _hard_subjects=[]
+                        _missing=[]
+                        for _pn in _picture_indices[:3]:
+                            _pi=_pn-1
+                            if 0 <= _pi < len(refs) and os.path.isfile(refs[_pi]):
+                                if refs[_pi] not in _hard_refs:
+                                    _hard_refs.append(refs[_pi]); _hard_subjects.append(_pn)
+                            else:
+                                _missing.append(_pn)
+                        if _missing:
+                            raise RuntimeError(
+                                f"MiniMax shot {sid} explicitly requests "
+                                + ", ".join(f"<picture {n}>" for n in _missing)
+                                + f" but only {len(refs)} physical MiniMax reference image(s) could be resolved. "
+                                  "Refusing to fall back to FL2VA."
+                            )
+                        shot_refs=list(_hard_refs[:3])
+                        used_subjects=list(_hard_subjects[:3])
+
                     # Never inject arbitrary references merely because this is the first
                     # MiniMax shot. An older fallback used refs[0:2] here, which could
                     # turn a text-only/failed-conversion shot into unrelated characters
@@ -18372,7 +18731,9 @@ class PipelineWorker(QThread):
 
                     self.signals.stage.emit(f"Clips (MiniMax H3) — {sid} ({i}/{len(shots)})")
                     _mode_note="FL2VA native continuation" if native_continue else ("Ref2VA + previous last frame" if continuity_frame else "Ref2VA")
-                    self.signals.log.emit(f"[minimax-h3] {sid}: {w}x{h}, {frames} frames @ 24fps, refs={len(shot_refs)}; {_mode_note}; hybrid preferred automatically")
+                    _ref_names=", ".join(Path(x).name for x in shot_refs) if shot_refs else "none"
+                    _lora_note = ", ".join(f"{Path(str(x.get('path') or '')).name}@{float(x.get('strength') or 0):.2f}" for x in (_mm_extra_loras or [])) or "none"
+                    self.signals.log.emit(f"[minimax-h3] {sid}: {w}x{h}, {frames} frames @ 24fps, refs={len(shot_refs)} [{_ref_names}]; {_mode_note}; extra_loras=[{_lora_note}]; hybrid preferred automatically")
                     subprocess.run(args,cwd=str(_root()),check=True)
                     if not os.path.isfile(out_file) or os.path.getsize(out_file)<1024: raise RuntimeError(f"MiniMax H3 output missing/too small: {out_file}")
                     seen_subjects.update(used_subjects)
@@ -27216,6 +27577,66 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         # never visible at the same time as MiniMax H3.
         grid.addWidget(self.lbl_minimax_h3_clip_length, 4, 0)
         grid.addWidget(self.minimax_h3_clip_length_row, 4, 1)
+
+
+        def _make_minimax_extra_lora_row(slot: int):
+            lbl = QLabel(f"MiniMax extra LoRA {slot}")
+            row = QWidget()
+            lay = QHBoxLayout(row)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(6)
+            chk = QCheckBox("On")
+            edit = QLineEdit()
+            edit.setPlaceholderText("No LoRA selected")
+            edit.setReadOnly(True)
+            btn = QPushButton("Browse")
+            strength = _PlannerNoWheelDoubleSpinBox()
+            strength.setRange(-10.0, 10.0)
+            strength.setDecimals(2)
+            strength.setSingleStep(0.05)
+            strength.setValue(1.0)
+            strength.setMinimumWidth(86)
+            strength.setToolTip("MiniMax H3 LoRA strength. 1.0 = trained strength; 0 disables this slot; negative values are allowed for compatible LoRAs.")
+            tip = (
+                "MiniMax H3 only. Optional diffusion-model LoRA. The automatic 4-step Turbo LoRA remains enabled separately, "
+                "so these two slots fill LoRA positions 2 and 3. Maximum backend total: 3 LoRAs."
+            )
+            for _w in (lbl, row, chk, edit, btn):
+                try: _w.setToolTip(tip)
+                except Exception: pass
+            lay.addWidget(chk, 0)
+            lay.addWidget(edit, 1)
+            lay.addWidget(btn, 0)
+            lay.addWidget(QLabel("Strength"), 0)
+            lay.addWidget(strength, 0)
+            try:
+                saved = _load_planner_settings() or {}
+            except Exception:
+                saved = {}
+            path = str(saved.get(f"minimax_h3_extra_lora{slot}_path", "") or "").strip()
+            chk.setChecked(bool(saved.get(f"minimax_h3_extra_lora{slot}_enabled", False)))
+            if path:
+                edit.setText(path)
+                edit.setToolTip(path)
+            try:
+                strength.setValue(float(saved.get(f"minimax_h3_extra_lora{slot}_strength", 1.0) or 1.0))
+            except Exception:
+                strength.setValue(1.0)
+            chk.toggled.connect(lambda checked, slot=slot: self._on_minimax_h3_extra_lora_changed(slot))
+            btn.clicked.connect(lambda _=False, slot=slot: self._browse_minimax_h3_extra_lora(slot))
+            strength.valueChanged.connect(lambda value, slot=slot: self._on_minimax_h3_extra_lora_changed(slot))
+            return lbl, row, chk, edit, btn, strength
+
+        (self.lbl_minimax_h3_extra_lora1, self.row_minimax_h3_extra_lora1, self.chk_minimax_h3_extra_lora1,
+         self.edit_minimax_h3_extra_lora1, self.btn_minimax_h3_extra_lora1, self.spin_minimax_h3_extra_lora1_strength) = _make_minimax_extra_lora_row(1)
+        (self.lbl_minimax_h3_extra_lora2, self.row_minimax_h3_extra_lora2, self.chk_minimax_h3_extra_lora2,
+         self.edit_minimax_h3_extra_lora2, self.btn_minimax_h3_extra_lora2, self.spin_minimax_h3_extra_lora2_strength) = _make_minimax_extra_lora_row(2)
+        # Rows 5/6 are shared with the LTX-only extra-LoRA controls; the visibility
+        # handlers guarantee that only the currently selected backend's rows are shown.
+        grid.addWidget(self.lbl_minimax_h3_extra_lora1, 5, 0)
+        grid.addWidget(self.row_minimax_h3_extra_lora1, 5, 1)
+        grid.addWidget(self.lbl_minimax_h3_extra_lora2, 6, 0)
+        grid.addWidget(self.row_minimax_h3_extra_lora2, 6, 1)
         try:
             self._refresh_minimax_h3_clip_length_slider()
             self._sync_minimax_h3_controls_visibility()
@@ -31756,7 +32177,11 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             visible = bool(self._is_minimax_h3_video_model_selected())
         except Exception:
             visible = False
-        for _name in ("lbl_minimax_h3_clip_length", "minimax_h3_clip_length_row"):
+        for _name in (
+            "lbl_minimax_h3_clip_length", "minimax_h3_clip_length_row",
+            "lbl_minimax_h3_extra_lora1", "row_minimax_h3_extra_lora1",
+            "lbl_minimax_h3_extra_lora2", "row_minimax_h3_extra_lora2",
+        ):
             try:
                 _w = getattr(self, _name, None)
                 if _w is not None:
@@ -32985,6 +33410,66 @@ These prompts override the normal reused Own Storymode prompts for the video sta
                 out[f"ltx23_extra_lora{slot}_multiplier"] = 1.0
         return out
 
+    def _minimax_h3_extra_lora_widgets(self, slot: int):
+        return (
+            getattr(self, f"chk_minimax_h3_extra_lora{slot}", None),
+            getattr(self, f"edit_minimax_h3_extra_lora{slot}", None),
+            getattr(self, f"spin_minimax_h3_extra_lora{slot}_strength", None),
+        )
+
+    def _save_minimax_h3_extra_lora_slot(self, slot: int) -> None:
+        try:
+            chk, edit, strength = self._minimax_h3_extra_lora_widgets(slot)
+            path = str(edit.text() if edit is not None else "").strip()
+            value = float(strength.value() if strength is not None else 1.0)
+            _save_planner_settings({
+                f"minimax_h3_extra_lora{slot}_enabled": bool(chk.isChecked()) if chk is not None else False,
+                f"minimax_h3_extra_lora{slot}_path": path,
+                f"minimax_h3_extra_lora{slot}_strength": max(-10.0, min(10.0, value)),
+            })
+        except Exception:
+            pass
+
+    def _on_minimax_h3_extra_lora_changed(self, slot: int) -> None:
+        self._save_minimax_h3_extra_lora_slot(slot)
+
+    def _browse_minimax_h3_extra_lora(self, slot: int) -> None:
+        try:
+            start = str((_root() / "models" / "minimax_h3" / "loras").resolve())
+            if not os.path.isdir(start):
+                start = ""
+            fn, _ = QFileDialog.getOpenFileName(self, f"Select MiniMax H3 Extra LoRA {slot}", start, "LoRA files (*.safetensors);;All files (*.*)")
+        except Exception:
+            fn = ""
+        if not fn:
+            return
+        try:
+            chk, edit, _strength = self._minimax_h3_extra_lora_widgets(slot)
+            if edit is not None:
+                edit.setText(str(fn))
+                edit.setToolTip(str(fn))
+            if chk is not None:
+                chk.setChecked(True)
+        except Exception:
+            pass
+        self._save_minimax_h3_extra_lora_slot(slot)
+
+    def _collect_minimax_h3_extra_lora_settings(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for slot in (1, 2):
+            try:
+                chk, edit, strength = self._minimax_h3_extra_lora_widgets(slot)
+                path = str(edit.text() if edit is not None else "").strip()
+                value = float(strength.value() if strength is not None else 1.0)
+                out[f"minimax_h3_extra_lora{slot}_enabled"] = bool(chk.isChecked()) if chk is not None else False
+                out[f"minimax_h3_extra_lora{slot}_path"] = path
+                out[f"minimax_h3_extra_lora{slot}_strength"] = max(-10.0, min(10.0, value))
+            except Exception:
+                out[f"minimax_h3_extra_lora{slot}_enabled"] = False
+                out[f"minimax_h3_extra_lora{slot}_path"] = ""
+                out[f"minimax_h3_extra_lora{slot}_strength"] = 1.0
+        return out
+
     def _collect_attachments(self) -> Dict[str, List[str]]:
         # Chunk 4: reference images are stored separately, but keep backward-compat with older "images" key.
         out = {"json": [], "ref_images": [], "minimax_video_refs": [], "images": [], "end_images": [], "videos": [], "music": [], "music_new": [], "text": [], "transcripts": []}
@@ -33282,6 +33767,17 @@ These prompts override the normal reused Own Storymode prompts for the video sta
                     enc[f"ltx23_extra_lora{_slot}_enabled"] = False
                     enc[f"ltx23_extra_lora{_slot}_path"] = ""
                     enc[f"ltx23_extra_lora{_slot}_multiplier"] = 1.0
+        except Exception:
+            pass
+
+        try:
+            if self._is_minimax_h3_video_model_selected():
+                enc.update(self._collect_minimax_h3_extra_lora_settings())
+            else:
+                for _slot in (1, 2):
+                    enc[f"minimax_h3_extra_lora{_slot}_enabled"] = False
+                    enc[f"minimax_h3_extra_lora{_slot}_path"] = ""
+                    enc[f"minimax_h3_extra_lora{_slot}_strength"] = 1.0
         except Exception:
             pass
 

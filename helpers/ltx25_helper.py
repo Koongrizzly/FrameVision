@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import traceback
@@ -16,14 +17,24 @@ APP_NAME = "LTX25Helper"
 HERE = Path(__file__).resolve().parent
 APP_ROOT = HERE.parent if HERE.name.lower() == "helpers" else HERE
 DEFAULT_ROOT = APP_ROOT
-DEFAULT_REPO = APP_ROOT / "presets" / "extra_env" / "LTX-2"
-DEFAULT_ENV = APP_ROOT / "environments" / "ltx25"
-DEFAULT_MODELS = APP_ROOT / "models" / "ltx-2.5"
+FP16_MODELS = APP_ROOT / "models" / "ltx-2.5"
+CONVROT_MODELS = APP_ROOT / "models" / "ltx_2_5_convrot"
+FP16_REPO = FP16_MODELS / "LTX-2"
+CONVROT_REPO = CONVROT_MODELS / "LTX-2"
+FP16_ENV = APP_ROOT / "environments" / "ltx25"
+CONVROT_ENV = APP_ROOT / "environments" / "ltx25_convrot"
+DEFAULT_REPO = FP16_REPO
+DEFAULT_ENV = FP16_ENV
+DEFAULT_MODELS = FP16_MODELS
 DEFAULT_CACHE = DEFAULT_MODELS / "cache"
 DEFAULT_OUTPUT = APP_ROOT / "output"
 DEFAULT_SETTINGS_PATH = APP_ROOT / "presets" / "setsave" / "ltx25.json"
 DEFAULT_LOGS_DIR = APP_ROOT / "logs"
-DEFAULT_INSTALLER = APP_ROOT / "presets" / "extra_env" / "install_ltx_2_5_distilled.bat"
+INSTALLER_DIR = APP_ROOT / "presets" / "extra_env"
+PY_INSTALLER = INSTALLER_DIR / "ltx2_5_install.py"
+FP16_INSTALLER_BAT = INSTALLER_DIR / "install_ltx_2_5_distilled.bat"
+CONVROT_WORKER = APP_ROOT / "helpers" / "ltx25_convrot_worker.py"
+CONVROT_CACHE = CONVROT_MODELS / "cache"
 DEFAULT_PROMPT = "A red sports car races along a coastal highway at sunset, cinematic tracking shot, realistic lighting, detailed reflections, fast natural motion."
 
 # ----------------------------- Worker mode ---------------------------------
@@ -477,6 +488,22 @@ def run_worker():
         )
         return generator, noiser, ctx_p.video_encoding, ctx_p.audio_encoding
 
+    def _resolve_image_conditioning_crf(pipeline, images):
+        """Resolve checkpoint-specific CRF values before custom image preprocessing.
+
+        ImageConditioningInput is immutable; ImageConditioner.resolve_crf() returns
+        replacement inputs rather than mutating the existing list in place.
+        """
+        if not images:
+            return images
+        resolved = pipeline.image_conditioner.resolve_crf(images)
+        unresolved = [img for img in resolved if getattr(img, "crf", None) is None]
+        if unresolved:
+            raise ValueError("LTX image-conditioning CRF resolution returned unresolved inputs.")
+        crfs = sorted({int(img.crf) for img in resolved})
+        print(f"[IMAGE] Resolved checkpoint image-conditioning CRF: {crfs}.", flush=True)
+        return resolved
+
     def _run_distilled_one_phase(pipeline, job, images):
         """Distilled one-pass route using the same native stage as DistilledPipeline.
 
@@ -490,6 +517,7 @@ def run_worker():
         if width % 32 or height % 32:
             raise ValueError("One-phase LTX requires width and height divisible by 32.")
         generator, noiser, vctx, actx = _prepare_common(pipeline, job, images)
+        images = _resolve_image_conditioning_crf(pipeline, images)
         scale_factors = tiling_scale_factors_for_vae(pipeline.video_decoder.checkpoint_path)
         tiling = ensure_tiling_config(
             AUTO_TILING,
@@ -530,6 +558,7 @@ def run_worker():
         if width % 64 or height % 64:
             raise ValueError("Two-phase LTX requires width and height divisible by 64.")
         generator, noiser, vctx, actx = _prepare_common(pipeline, job, images)
+        images = _resolve_image_conditioning_crf(pipeline, images)
         scale_factors = tiling_scale_factors_for_vae(pipeline.video_decoder.checkpoint_path)
         tiling = ensure_tiling_config(
             AUTO_TILING,
@@ -839,18 +868,7 @@ def run_gui(parent=None, embedded=False):
             self.open_last_btn = QPushButton("Open last result")
             self.open_last_btn.setMinimumHeight(42)
             self.open_last_btn.clicked.connect(self.open_last_result)
-            self.install_btn = QPushButton("Install LTX 2.5")
-            self.install_btn.setMinimumHeight(42)
-            self.install_btn.clicked.connect(self.install_ltx25)
-            self.install_progress = QProgressBar()
-            self.install_progress.setRange(0, 0)
-            self.install_progress.setTextVisible(False)
-            self.install_progress.setFixedWidth(130)
-            self.install_progress.setVisible(False)
-
             fl.addWidget(self.generate_btn, 2)
-            fl.addWidget(self.install_btn, 1)
-            fl.addWidget(self.install_progress, 0)
             fl.addWidget(self.open_output_btn, 1)
             fl.addWidget(self.open_last_btn, 1)
             outer.addWidget(footer, 0)
@@ -997,6 +1015,40 @@ def run_gui(parent=None, embedded=False):
             lay.setContentsMargins(12, 12, 12, 12)
             lay.setSpacing(12)
 
+            install_group = QGroupBox("LTX 2.5 installation")
+            install_layout = QHBoxLayout(install_group)
+            self.install_btn = QPushButton("Install / Remove LTX 2.5")
+            self.install_btn.setMinimumHeight(42)
+            self.install_btn.clicked.connect(self.install_ltx25)
+            self.install_progress = QProgressBar()
+            self.install_progress.setRange(0, 0)
+            self.install_progress.setTextVisible(False)
+            self.install_progress.setFixedWidth(130)
+            self.install_progress.setVisible(False)
+            install_layout.addWidget(self.install_btn, 1)
+            install_layout.addWidget(self.install_progress, 0)
+            lay.addWidget(install_group)
+
+            model_group = QGroupBox("LTX 2.5 model / quantization")
+            model_form = QFormLayout(model_group)
+            self.model_type_combo = SafeComboBox()
+            self.model_type_combo.addItems([
+                "Full FP16 / BF16",
+                "W4A8 ConvRot (recommended)",
+                "INT4 ConvRot",
+            ])
+            self.model_folder_value = QLabel()
+            self.model_folder_value.setWordWrap(True)
+            self.transformer_name_value = QLabel()
+            self.transformer_name_value.setWordWrap(True)
+            self.text_encoder_name_value = QLabel()
+            self.text_encoder_name_value.setWordWrap(True)
+            model_form.addRow("Model type", self.model_type_combo)
+            model_form.addRow("Model folder", self.model_folder_value)
+            model_form.addRow("Transformer", self.transformer_name_value)
+            model_form.addRow("Text encoder", self.text_encoder_name_value)
+            lay.addWidget(model_group)
+
             paths = QGroupBox("Folders and model files")
             form = QFormLayout(paths)
 
@@ -1056,10 +1108,7 @@ def run_gui(parent=None, embedded=False):
             self.offload_combo.addItems(["cpu", "none", "disk"])
             pf.addRow("Offload", self.offload_combo)
 
-            self.quant_combo = SafeComboBox()
-            self.quant_combo.addItems(["fp8-cast", "none"])
-            pf.addRow("Transformer quantization", self.quant_combo)
-
+            self.model_type_combo.currentIndexChanged.connect(self._model_type_changed)
             self.use_int8_transformer_cb.toggled.connect(self._update_int8_controls)
             self.use_int8_text_cb.toggled.connect(self._update_int8_controls)
 
@@ -1203,11 +1252,9 @@ def run_gui(parent=None, embedded=False):
             """)
 
         def _defaults(self):
-            root = DEFAULT_ROOT
-            runtime = DEFAULT_REPO
-            models = DEFAULT_MODELS
+            models = FP16_MODELS
             return {
-                "runtime": str(runtime),
+                "runtime": str(FP16_REPO),
                 "models": str(models),
                 "output": str(DEFAULT_OUTPUT),
                 "transformer": str(models / "diffusion_models" / "ltx-2.5-22b-distilled-transformer-bf16.safetensors"),
@@ -1217,7 +1264,58 @@ def run_gui(parent=None, embedded=False):
                 "upsampler": str(models / "latent_upscale_models" / "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"),
                 "int8_transformer": str(models / "diffusion_models" / "ltx-2.5-22b-distilled-transformer-int8-quanto"),
                 "int8_text": str(models / "text_encoders" / "gemma4-12b-with-proj-ltx-2.5-int8-quanto"),
+                "model_type": "Full FP16 / BF16",
             }
+
+        def _model_paths_for_type(self, model_type: str):
+            if model_type.startswith("W4A8"):
+                models = CONVROT_MODELS
+                return {
+                    "runtime": CONVROT_REPO,
+                    "models": models,
+                    "transformer": models / "diffusion_models" / "ltx-2.5-22b-distilled-transformer-w4a8_convrot.safetensors",
+                    "text_encoder": models / "text_encoders" / "gemma4-12b-with-proj-ltx-2.5-w4a8_convrot.safetensors",
+                    "video_vae": models / "vae" / "ltx-2.5-video-vae-bf16.safetensors",
+                    "audio_vae": models / "vae" / "ltx-2.5-audio-vae-bf16.safetensors",
+                    "upsampler": models / "latent_upscale_models" / "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+                }
+            if model_type.startswith("INT4"):
+                models = CONVROT_MODELS
+                return {
+                    "runtime": CONVROT_REPO,
+                    "models": models,
+                    "transformer": models / "diffusion_models" / "ltx-2.5-22b-distilled-transformer-int4_convrot.safetensors",
+                    "text_encoder": models / "text_encoders" / "gemma4-12b-with-proj-ltx-2.5-int4_convrot.safetensors",
+                    "video_vae": models / "vae" / "ltx-2.5-video-vae-bf16.safetensors",
+                    "audio_vae": models / "vae" / "ltx-2.5-audio-vae-bf16.safetensors",
+                    "upsampler": models / "latent_upscale_models" / "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+                }
+            models = FP16_MODELS
+            return {
+                "runtime": FP16_REPO,
+                "models": models,
+                "transformer": models / "diffusion_models" / "ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+                "text_encoder": models / "text_encoders" / "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+                "video_vae": models / "vae" / "ltx-2.5-video-vae-bf16.safetensors",
+                "audio_vae": models / "vae" / "ltx-2.5-audio-vae-bf16.safetensors",
+                "upsampler": models / "latent_upscale_models" / "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+            }
+
+        def _model_type_changed(self, *args):
+            model_type = self.model_type_combo.currentText()
+            p = self._model_paths_for_type(model_type)
+            self.runtime_edit.setText(str(p["runtime"]))
+            self.models_edit.setText(str(p["models"]))
+            self.transformer_edit.setText(str(p["transformer"]))
+            self.text_encoder_edit.setText(str(p["text_encoder"]))
+            self.video_vae_edit.setText(str(p["video_vae"]))
+            self.audio_vae_edit.setText(str(p["audio_vae"]))
+            self.upsampler_edit.setText(str(p["upsampler"]))
+            self.model_folder_value.setText(str(p["models"]))
+            self.transformer_name_value.setText(Path(p["transformer"]).name)
+            self.text_encoder_name_value.setText(Path(p["text_encoder"]).name)
+            is_convrot = model_type.startswith("W4A8") or model_type.startswith("INT4")
+            self._schedule_settings_save()
 
         @staticmethod
         def _to_bool(v):
@@ -1227,6 +1325,9 @@ def run_gui(parent=None, embedded=False):
 
         def _load_settings(self):
             d = self._defaults()
+            saved_model_type = str(self.settings.value("model_type", d["model_type"]))
+            idx = self.model_type_combo.findText(saved_model_type)
+            self.model_type_combo.setCurrentIndex(idx if idx >= 0 else 0)
             self.runtime_edit.setText(str(self.settings.value("runtime", d["runtime"])))
             self.models_edit.setText(str(self.settings.value("models", d["models"])))
             self.output_edit.setText(str(self.settings.value("output", d["output"])))
@@ -1239,6 +1340,7 @@ def run_gui(parent=None, embedded=False):
             self.int8_text_edit.setText(str(self.settings.value("int8_text", d["int8_text"])))
             self.use_int8_transformer_cb.setChecked(False)
             self.use_int8_text_cb.setChecked(False)
+            self._model_type_changed()
 
             self.prompt_edit.setPlainText(str(self.settings.value("prompt", DEFAULT_PROMPT)))
             self.width_spin.setValue(int(self.settings.value("width", 832)))
@@ -1251,7 +1353,6 @@ def run_gui(parent=None, embedded=False):
             self.image_strength.setValue(float(self.settings.value("image_strength", 1.0)))
 
             self.offload_combo.setCurrentText(str(self.settings.value("offload", "cpu")))
-            self.quant_combo.setCurrentText(str(self.settings.value("quant", "fp8-cast")))
             self.batch_spin.setValue(int(self.settings.value("batch", 1)))
             self.sage_attention_cb.setChecked(self._to_bool(self.settings.value("use_sage_attention", False)))
             self.use_framevision_queue_cb.setChecked(self._to_bool(self.settings.value("use_framevision_queue", False)))
@@ -1265,6 +1366,7 @@ def run_gui(parent=None, embedded=False):
 
         def _save_settings(self):
             vals = {
+                "model_type": self.model_type_combo.currentText(),
                 "runtime": self.runtime_edit.text(),
                 "models": self.models_edit.text(),
                 "output": self.output_edit.text(),
@@ -1288,7 +1390,7 @@ def run_gui(parent=None, embedded=False):
                 "audio_path": self.audio_path,
                 "image_strength": self.image_strength.value(),
                 "offload": self.offload_combo.currentText(),
-                "quant": self.quant_combo.currentText(),
+                "quant": "fp8-cast",
                 "batch": self.batch_spin.value(),
                 "use_sage_attention": self.sage_attention_cb.isChecked(),
                 "use_framevision_queue": self.use_framevision_queue_cb.isChecked(),
@@ -1318,21 +1420,14 @@ def run_gui(parent=None, embedded=False):
             self.prompt_edit.textChanged.connect(self._schedule_settings_save)
             for w in [self.width_spin, self.height_spin, self.frames_spin, self.fps_spin, self.seed_spin, self.image_strength, self.batch_spin]:
                 w.valueChanged.connect(self._schedule_settings_save)
-            for w in [self.mode_combo, self.workflow_combo, self.offload_combo, self.quant_combo]:
+            for w in [self.mode_combo, self.workflow_combo, self.offload_combo, self.model_type_combo]:
                 w.currentIndexChanged.connect(self._schedule_settings_save)
             for w in [self.sage_attention_cb, self.use_framevision_queue_cb, self.keep_warm_cb, self.cache_prompt_cb, self.defer_trim_cb]:
                 w.toggled.connect(self._schedule_settings_save)
 
         def _update_int8_controls(self):
-            use_int8 = False
-            if use_int8:
-                self.quant_combo.setCurrentText("none")
-            self.quant_combo.setEnabled(not use_int8)
-            self.quant_combo.setToolTip(
-                "Runtime quantization for the BF16 transformer."
-                if not use_int8
-                else "Disabled because the transformer bundle is already INT8 Quanto."
-            )
+            model_type = self.model_type_combo.currentText() if hasattr(self, "model_type_combo") else "Full FP16 / BF16"
+            is_convrot = model_type.startswith("W4A8") or model_type.startswith("INT4")
 
         def _toggle_image_group(self):
             self.image_group.setVisible(self.mode_combo.currentText() == "Image to Video")
@@ -1484,8 +1579,12 @@ def run_gui(parent=None, embedded=False):
                     "strength": self.image_strength.value(),
                 })
 
+            model_type = self.model_type_combo.currentText()
+            quantization = "fp8-cast" if model_type.startswith("Full") else "none"
+
             return {
                 "cmd": "generate",
+                "model_type": model_type,
                 "prompt": self.prompt_edit.toPlainText().strip(),
                 "workflow": "one_phase" if self.workflow_combo.currentText() == "1 phase" else "two_phase",
                 "audio_path": self.audio_path,
@@ -1504,7 +1603,7 @@ def run_gui(parent=None, embedded=False):
                     "upsampler": self.upsampler_edit.text(),
                 },
                 "offload": self.offload_combo.currentText(),
-                "quantization": self.quant_combo.currentText(),
+                "quantization": quantization,
                 "max_batch_size": self.batch_spin.value(),
                 "use_sage_attention": self.sage_attention_cb.isChecked(),
                 "use_int8_transformer": False,
@@ -1535,14 +1634,15 @@ def run_gui(parent=None, embedded=False):
                     encoding="utf-8",
                 )
 
-                python_exe = str(self._python_exe())
-                helper_path = str(Path(__file__).resolve())
-                cmd = [
-                    python_exe,
-                    helper_path,
-                    "--queue-job",
-                    str(payload_path),
-                ]
+                is_convrot = str(job.get("model_type", "")).startswith(("W4A8", "INT4"))
+                if is_convrot:
+                    python_exe = str(self._convrot_python_exe())
+                    helper_path = str(CONVROT_WORKER)
+                    cmd = [python_exe, helper_path, "--job", str(payload_path)]
+                else:
+                    python_exe = str(self._python_exe())
+                    helper_path = str(Path(__file__).resolve())
+                    cmd = [python_exe, helper_path, "--queue-job", str(payload_path)]
 
                 # queue_adapter uses input mainly for display/metadata. Prefer a
                 # real image/audio source if one exists, otherwise use the helper.
@@ -1558,8 +1658,8 @@ def run_gui(parent=None, embedded=False):
                 args = {
                     "cmd": cmd,
                     "outfile": str(out_path),
-                    "cwd": str(self.runtime_edit.text()),
-                    "engine": "ltx25",
+                    "cwd": str(APP_ROOT if is_convrot else self.runtime_edit.text()),
+                    "engine": "ltx25_convrot" if is_convrot else "ltx25",
                     "scan_dir": str(out_path.parent),
                     "scan_ext": out_path.suffix or ".mp4",
                 }
@@ -1587,6 +1687,11 @@ def run_gui(parent=None, embedded=False):
 
             self._save_settings()
             job = self._build_job()
+            is_convrot = str(job.get("model_type", "")).startswith(("W4A8", "INT4"))
+
+            if is_convrot and not CONVROT_WORKER.is_file():
+                QMessageBox.warning(self, "ConvRot backend missing", f"ConvRot worker was not found:\n{CONVROT_WORKER}")
+                return
 
             if self.use_framevision_queue_cb.isChecked():
                 self._log("=" * 72)
@@ -1600,6 +1705,10 @@ def run_gui(parent=None, embedded=False):
                 if self._enqueue_framevision_job(job):
                     return
                 # Queueing failed: do not silently run locally.
+                return
+
+            if is_convrot:
+                self._generate_convrot(job)
                 return
 
             self.generate_btn.setEnabled(False)
@@ -1634,6 +1743,74 @@ def run_gui(parent=None, embedded=False):
                 self._one_shot_worker = False
                 self._generate_cli(job)
 
+
+        def _convrot_python_exe(self):
+            candidate = CONVROT_ENV / "Scripts" / "python.exe"
+            return str(candidate if candidate.exists() else Path(sys.executable))
+
+        def _apply_convrot_process_environment(self, process: QProcess):
+            env = QProcessEnvironment.systemEnvironment()
+            cache = CONVROT_CACHE
+            for sub in ("huggingface", "torch_extensions", "triton", "pip"):
+                (cache / sub).mkdir(parents=True, exist_ok=True)
+            env.insert("HF_HOME", str(cache / "huggingface"))
+            env.insert("HF_HUB_CACHE", str(cache / "huggingface" / "hub"))
+            env.insert("TORCH_EXTENSIONS_DIR", str(cache / "torch_extensions"))
+            env.insert("TRITON_CACHE_DIR", str(cache / "triton"))
+            env.insert("PIP_CACHE_DIR", str(cache / "pip"))
+            process.setProcessEnvironment(env)
+
+        def _generate_convrot(self, job: dict):
+            if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
+                self.unload_worker()
+            payload_dir = APP_ROOT / "temp" / "ltx25_convrot_jobs"
+            payload_dir.mkdir(parents=True, exist_ok=True)
+            payload_path = payload_dir / (f"ltx25_convrot_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_seed_{job['seed']}.json")
+            payload_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.generate_btn.setEnabled(False)
+            self._log("=" * 72)
+            self._log(f"[CONVROT] {job['model_type']} via embedded Comfy backend")
+            self._log(f"[JOB] {job['width']}x{job['height']} | {job['frames']} frames | {job['fps']} fps | seed {job['seed']}")
+            self._log(f"[JOB] Output: {job['output']}")
+            proc = QProcess(self)
+            self.process = proc
+            proc.setWorkingDirectory(str(APP_ROOT))
+            proc.setProgram(self._convrot_python_exe())
+            proc.setArguments([str(CONVROT_WORKER), "--job", str(payload_path)])
+            self._apply_convrot_process_environment(proc)
+            proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+            proc.readyReadStandardOutput.connect(self._read_convrot_output)
+            proc.finished.connect(self._convrot_finished)
+            proc.start()
+            if not proc.waitForStarted(10000):
+                self._log("[CONVROT ERROR] Could not start ConvRot worker.")
+                self.process = None
+                self.generate_btn.setEnabled(True)
+
+        def _read_convrot_output(self):
+            if not self.process:
+                return
+            text = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+            for line in text.replace("\r", "\n").splitlines():
+                if not line.strip():
+                    continue
+                self._log(line)
+                if line.startswith("@@RESULT@@"):
+                    try:
+                        obj = json.loads(line[len("@@RESULT@@"):])
+                    except Exception:
+                        obj = {}
+                    if obj.get("ok"):
+                        self.last_result = obj.get("output", "")
+                        self.settings.setValue("last_result", self.last_result)
+                        self._log(f"[DONE] Saved: {self.last_result}")
+                    else:
+                        self._log("[ERROR] " + obj.get("error", "ConvRot generation failed"))
+
+        def _convrot_finished(self, code, status):
+            self._log(f"[CONVROT] Worker exited with code {code}.")
+            self.process = None
+            self.generate_btn.setEnabled(True)
 
         def _python_exe(self):
             candidate = DEFAULT_ENV / "Scripts" / "python.exe"
@@ -1796,51 +1973,154 @@ def run_gui(parent=None, embedded=False):
                     continue
                 self._log(line)
 
-        def _install_complete(self):
-            env_ok = (DEFAULT_ENV / "Scripts" / "python.exe").is_file()
-            required = [
-                DEFAULT_MODELS / "diffusion_models" / "ltx-2.5-22b-distilled-transformer-bf16.safetensors",
-                DEFAULT_MODELS / "text_encoders" / "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
-                DEFAULT_MODELS / "vae" / "ltx-2.5-video-vae-bf16.safetensors",
-                DEFAULT_MODELS / "vae" / "ltx-2.5-audio-vae-bf16.safetensors",
-                DEFAULT_MODELS / "latent_upscale_models" / "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
-            ]
-            models_ok = DEFAULT_MODELS.is_dir() and all(p.is_file() for p in required)
-            return env_ok and models_ok
-
         def _refresh_install_button(self):
-            complete = self._install_complete()
-            self.install_btn.setVisible(not complete)
-            self.install_btn.setEnabled(not complete and self.install_process is None)
-            if complete:
+            # The install manager is intentionally always visible.
+            self.install_btn.setVisible(True)
+            self.install_btn.setEnabled(self.install_process is None)
+            if self.install_process is None:
                 self.install_progress.setVisible(False)
 
         def install_ltx25(self):
             if self.install_process is not None:
                 return
-            if not DEFAULT_INSTALLER.is_file():
-                QMessageBox.warning(self, "Install LTX 2.5", f"Installer was not found:\n{DEFAULT_INSTALLER}")
+
+            box = QMessageBox(self)
+            box.setWindowTitle("LTX 2.5 installation")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText("Choose which LTX 2.5 installation action to run.")
+            w4a8_btn = box.addButton("W4A8 (recommended)", QMessageBox.ButtonRole.AcceptRole)
+            int4_btn = box.addButton("INT4", QMessageBox.ButtonRole.AcceptRole)
+            fp16_btn = box.addButton("Full FP16", QMessageBox.ButtonRole.AcceptRole)
+            remove_btn = box.addButton("Remove an install", QMessageBox.ButtonRole.DestructiveRole)
+            cancel_btn = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(w4a8_btn)
+            box.exec()
+
+            clicked = box.clickedButton()
+            if clicked is None or clicked is cancel_btn:
                 return
-            self.tabs.setCurrentIndex(1)
+            if clicked is remove_btn:
+                self._remove_ltx25_install()
+                return
+            if clicked is w4a8_btn:
+                action = "install-w4a8"
+                label = "W4A8 ConvRot"
+            elif clicked is int4_btn:
+                action = "install-int4"
+                label = "INT4 ConvRot"
+            else:
+                action = "install-fp16"
+                label = "Full FP16"
+
+            self._start_ltx25_installer(action, label)
+
+        def _start_ltx25_installer(self, action: str, label: str):
+            is_fp16 = action == "install-fp16"
+            installer = FP16_INSTALLER_BAT if is_fp16 else PY_INSTALLER
+
+            if not installer.is_file():
+                kind = "BAT" if is_fp16 else "Python"
+                QMessageBox.warning(
+                    self,
+                    "Install LTX 2.5",
+                    f"{kind} installer was not found:\n{installer}"
+                )
+                return
+
             self._log("=" * 72)
-            self._log(f"[INSTALL] Starting LTX 2.5 installer: {DEFAULT_INSTALLER}")
+            self._log(f"[INSTALL] Starting {label}: {installer}")
+            if not is_fp16:
+                self._log(f"[INSTALL] Action: {action}")
             self.install_btn.setEnabled(False)
             self.install_progress.setVisible(True)
+
             proc = QProcess(self)
             self.install_process = proc
-            proc.setWorkingDirectory(str(DEFAULT_INSTALLER.parent))
-            proc.setProgram("cmd.exe")
-            proc.setArguments(["/d", "/c", str(DEFAULT_INSTALLER), "--no-pause"])
+            proc.setWorkingDirectory(str(APP_ROOT))
+
+            if is_fp16:
+                proc.setProgram("cmd.exe")
+                proc.setArguments(["/d", "/c", str(installer), "--no-pause"])
+            else:
+                proc.setProgram(sys.executable)
+                proc.setArguments([str(installer), "--action", action])
+
             self._apply_ltx_process_environment(proc)
             proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
             proc.readyReadStandardOutput.connect(self._read_installer_output)
             proc.finished.connect(self._installer_finished)
             proc.start()
             if not proc.waitForStarted(10000):
-                self._log("[INSTALL] ERROR: installer process could not be started.")
+                self._log("[INSTALL] ERROR: Installer process could not be started.")
                 self.install_process = None
                 self.install_progress.setVisible(False)
                 self._refresh_install_button()
+
+
+        def _remove_ltx25_install(self):
+            box = QMessageBox(self)
+            box.setWindowTitle("Remove LTX 2.5 installation")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText("Which installation do you want to remove?")
+            fp16_btn = box.addButton("Full FP16", QMessageBox.ButtonRole.DestructiveRole)
+            convrot_btn = box.addButton("ConvRot (W4A8 / INT4)", QMessageBox.ButtonRole.DestructiveRole)
+            cancel_btn = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+
+            clicked = box.clickedButton()
+            if clicked is None or clicked is cancel_btn:
+                return
+            if clicked is fp16_btn:
+                label = "Full FP16"
+                targets = [
+                    APP_ROOT / "models" / "ltx-2.5",
+                    APP_ROOT / "environments" / "ltx25",
+                ]
+            else:
+                label = "ConvRot (W4A8 / INT4)"
+                targets = [
+                    APP_ROOT / "models" / "ltx_2_5_convrot",
+                    APP_ROOT / "environments" / "ltx25_convrot",
+                ]
+
+            existing = [p for p in targets if p.exists()]
+            if not existing:
+                QMessageBox.information(
+                    self, "Remove LTX 2.5",
+                    f"No {label} installation created by the clean installer was found."
+                )
+                return
+
+            details = "\n".join(str(p) for p in existing)
+            answer = QMessageBox.question(
+                self,
+                "Confirm removal",
+                f"Remove {label}?\n\nOnly these locations will be deleted:\n{details}\n\n"
+                "The shared vendor folder and helper files will NOT be touched.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+            errors = []
+            for p in existing:
+                try:
+                    shutil.rmtree(p)
+                    self._log(f"[REMOVE] Removed: {p}")
+                except Exception as exc:
+                    errors.append(f"{p}: {exc}")
+                    self._log(f"[REMOVE ERROR] {p}: {exc}")
+
+            if errors:
+                QMessageBox.warning(
+                    self, "Remove LTX 2.5",
+                    "Some files could not be removed:\n\n" + "\n".join(errors)
+                )
+            else:
+                QMessageBox.information(self, "Remove LTX 2.5", f"{label} was removed.")
+
+            self._refresh_install_button()
 
         def _read_installer_output(self):
             if not self.install_process:
@@ -1853,18 +2133,17 @@ def run_gui(parent=None, embedded=False):
             self.install_process = None
             self.install_progress.setVisible(False)
             if code == 0:
-                # Re-apply canonical root-relative paths in case this is a fresh install.
-                d = self._defaults()
-                self.runtime_edit.setText(d["runtime"])
-                self.models_edit.setText(d["models"])
-                self.output_edit.setText(d["output"])
-                self.transformer_edit.setText(d["transformer"])
-                self.text_encoder_edit.setText(d["text_encoder"])
-                self.video_vae_edit.setText(d["video_vae"])
-                self.audio_vae_edit.setText(d["audio_vae"])
-                self.upsampler_edit.setText(d["upsampler"])
-                self._save_settings()
+                self._log("[INSTALL] Finished successfully.")
+                QMessageBox.information(self, "LTX 2.5 installation", "Installer finished successfully.")
+            else:
+                self._log(f"[INSTALL] Installer failed with code {code}.")
+                QMessageBox.warning(
+                    self,
+                    "LTX 2.5 installation",
+                    f"Installer exited with code {code}. Check the LTX install log for details."
+                )
             self._refresh_install_button()
+
 
         def open_output_folder(self):
             path = Path(self.output_edit.text())

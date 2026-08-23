@@ -342,6 +342,41 @@ def _parse_fps(src: Path) -> Optional[str]:
         return None
 
 
+def _parse_video_bitrate_kbps(src: Path) -> Optional[int]:
+    """Return the source video stream bitrate in kbps, best effort.
+
+    Prefer the video stream's own bit_rate so audio/container overhead is not
+    accidentally counted. Fall back to format bit_rate only when the stream
+    does not expose one.
+    """
+    try:
+        out = subprocess.check_output(
+            [FFPROBE, "-v", "error",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=bit_rate",
+             "-show_entries", "format=bit_rate",
+             "-of", "json", str(src)],
+            cwd=str(ROOT),
+            universal_newlines=True
+        )
+        j = json.loads(out or "{}")
+        streams = j.get("streams") or []
+        s0 = streams[0] if streams else {}
+        raw = s0.get("bit_rate")
+        if raw not in (None, "", "N/A"):
+            bps = int(float(raw))
+            if bps > 0:
+                return max(1, int(round(bps / 1000.0)))
+        raw = (j.get("format") or {}).get("bit_rate")
+        if raw not in (None, "", "N/A"):
+            bps = int(float(raw))
+            if bps > 0:
+                return max(1, int(round(bps / 1000.0)))
+    except Exception:
+        pass
+    return None
+
+
 class _RunThread(QtCore.QThread):
     progress = Signal(str)
     done = Signal(int, str)
@@ -796,23 +831,40 @@ class UpscPane(QtWidgets.QWidget):
         lay_enc.addWidget(self.rad_crf, 1, 0); lay_enc.addWidget(self.spin_crf, 1, 1)
         self.rad_bitrate = QtWidgets.QRadioButton("Bitrate (kbps)", self)
         self.spin_bitrate = QtWidgets.QSpinBox(self); self.spin_bitrate.setRange(100, 200000); self.spin_bitrate.setValue(8000)
-        lay_enc.addWidget(self.rad_bitrate, 2, 0); lay_enc.addWidget(self.spin_bitrate, 2, 1)
+        self.chk_keep_source_bitrate = QtWidgets.QCheckBox("Keep source bitrate", self)
+        self.chk_keep_source_bitrate.setChecked(False)
+        self.chk_keep_source_bitrate.setToolTip("Use the input video's own video bitrate for the final encode. Overrides CRF/Bitrate rate control while enabled.")
+        _rate_row = QtWidgets.QWidget(self)
+        _rate_row_lay = QtWidgets.QHBoxLayout(_rate_row)
+        _rate_row_lay.setContentsMargins(0, 0, 0, 0)
+        _rate_row_lay.setSpacing(10)
+        _rate_row_lay.addWidget(self.spin_bitrate)
+        _rate_row_lay.addWidget(self.chk_keep_source_bitrate)
+        _rate_row_lay.addStretch(1)
+        lay_enc.addWidget(self.rad_bitrate, 2, 0); lay_enc.addWidget(_rate_row, 2, 1)
 
         # Grey out the non-selected rate control
         try:
             def _update_rate_controls():
-                use_crf = bool(self.rad_crf.isChecked())
+                keep_source = bool(self.chk_keep_source_bitrate.isChecked())
+                use_crf = bool(self.rad_crf.isChecked()) and not keep_source
+                try:
+                    self.rad_crf.setEnabled(not keep_source)
+                    self.rad_bitrate.setEnabled(not keep_source)
+                except Exception:
+                    pass
                 try:
                     self.spin_crf.setEnabled(use_crf)
                 except Exception:
                     pass
                 try:
-                    self.spin_bitrate.setEnabled(bool(self.rad_bitrate.isChecked()))
+                    self.spin_bitrate.setEnabled(bool(self.rad_bitrate.isChecked()) and not keep_source)
                 except Exception:
                     pass
             try:
                 self.rad_crf.toggled.connect(_update_rate_controls)
                 self.rad_bitrate.toggled.connect(_update_rate_controls)
+                self.chk_keep_source_bitrate.toggled.connect(_update_rate_controls)
             except Exception:
                 pass
             _update_rate_controls()
@@ -1194,6 +1246,7 @@ class UpscPane(QtWidgets.QWidget):
             ("spin_crf", "valueChanged"),
             ("rad_bitrate", "toggled"),
             ("spin_bitrate", "valueChanged"),
+            ("chk_keep_source_bitrate", "toggled"),
             ("combo_preset", "currentTextChanged"),
             ("spin_keyint", "valueChanged"),
             ("radio_a_copy", "toggled"),
@@ -1285,6 +1338,7 @@ class UpscPane(QtWidgets.QWidget):
             d["crf"] = int(self.spin_crf.value())
             d["use_bitrate"] = bool(self.rad_bitrate.isChecked())
             d["bitrate"] = int(self.spin_bitrate.value())
+            d["keep_source_bitrate"] = bool(self.chk_keep_source_bitrate.isChecked())
         except Exception: pass
         try: d["preset"] = self.combo_preset.currentText()
         except Exception: pass
@@ -1511,6 +1565,7 @@ class UpscPane(QtWidgets.QWidget):
                 self.rad_bitrate.setChecked(True)
             self.spin_crf.setValue(int(d.get("crf", 18)))
             self.spin_bitrate.setValue(int(d.get("bitrate", 8000)))
+            self.chk_keep_source_bitrate.setChecked(bool(d.get("keep_source_bitrate", False)))
         except Exception:
             pass
         try:
@@ -2485,7 +2540,18 @@ class UpscPane(QtWidgets.QWidget):
                 vcodec = self.combo_vcodec.currentText()
                 cmd_encode += ["-c:v", vcodec, "-pix_fmt", "yuv420p"]
                 cmd_encode += ["-vsync", "cfr"]
-                if self.rad_crf.isChecked():
+                if getattr(self, "chk_keep_source_bitrate", None) is not None and self.chk_keep_source_bitrate.isChecked():
+                    source_kbps = _parse_video_bitrate_kbps(src)
+                    if source_kbps:
+                        cmd_encode += ["-b:v", f"{source_kbps}k"]
+                        self._append_log(f"Video bitrate: keep source ({source_kbps} kbps)")
+                    elif self.rad_crf.isChecked():
+                        cmd_encode += ["-crf", str(self.spin_crf.value())]
+                        self._append_log("Video bitrate: source bitrate unavailable; falling back to CRF")
+                    else:
+                        cmd_encode += ["-b:v", f"{self.spin_bitrate.value()}k"]
+                        self._append_log("Video bitrate: source bitrate unavailable; falling back to configured bitrate")
+                elif self.rad_crf.isChecked():
                     cmd_encode += ["-crf", str(self.spin_crf.value())]
                 else:
                     cmd_encode += ["-b:v", f"{self.spin_bitrate.value()}k"]
@@ -3713,6 +3779,8 @@ try:
                 "Bitrate mode targets an average video bitrate (kbps). Use when you need a fixed size/bitrate. Disables CRF.")
             tip(getattr(self, "spin_bitrate", None),
                 "Target video bitrate in kbps (e.g., 8000 = 8 Mbps). Rough guide: 1080p 6–12 Mbps; 4K 12–35 Mbps (content dependent).")
+            tip(getattr(self, "chk_keep_source_bitrate", None),
+                "Use the source video's own video bitrate for the final encode. This overrides CRF and the manual bitrate value while enabled.")
             tip(getattr(self, "combo_preset", None),
                 "Encoder speed/quality trade‑off. Slower presets compress better (smaller files for same quality).")
             tip(getattr(self, "spin_keyint", None),
@@ -4098,7 +4166,7 @@ except Exception:
 # so its Torch/Diffusers stack never imports into the main FrameVision process.
 try:
     HYPIR_ENV_PY = ROOT / "environments" / ".hypir" / ("python.exe" if os.name == "nt" else "bin/python")
-    HYPIR_REPO_DIR = ROOT / "presets" / "extra_env" / "hypir_src" / "HYPIR"
+    HYPIR_REPO_DIR = ROOT / "models" / "hypir" / "HYPIR"
     HYPIR_MODEL_DIR = ROOT / "models" / "hypir"
     HYPIR_WEIGHT = HYPIR_MODEL_DIR / "HYPIR_sd2.pth"
     HYPIR_RUNNER = ROOT / "helpers" / "hypir_runner.py"
@@ -4106,7 +4174,7 @@ try:
 except Exception:
     _fv_hypir_root = Path(__file__).resolve().parents[1]
     HYPIR_ENV_PY = _fv_hypir_root / "environments" / ".hypir" / ("python.exe" if os.name == "nt" else "bin/python")
-    HYPIR_REPO_DIR = _fv_hypir_root / "presets" / "extra_env" / "hypir_src" / "HYPIR"
+    HYPIR_REPO_DIR = _fv_hypir_root / "models" / "hypir" / "HYPIR"
     HYPIR_MODEL_DIR = _fv_hypir_root / "models" / "hypir"
     HYPIR_WEIGHT = HYPIR_MODEL_DIR / "HYPIR_sd2.pth"
     HYPIR_RUNNER = _fv_hypir_root / "helpers" / "hypir_runner.py"
@@ -4191,6 +4259,35 @@ def _fv_hypir_integration_missing():
 def _fv_hypir_runtime_ready():
     missing, _base = _fv_hypir_missing_components()
     return not missing
+
+
+def _fv_hypir_clean_prompt(value, *forbidden_paths):
+    """Keep FrameVision path widgets from ever becoming HYPIR text conditioning.
+
+    A previous HYPIR integration build could persist the output directory in the
+    prompt field.  Treat exact matches to known input/output/work paths as an
+    empty prompt while leaving normal user text untouched.
+    """
+    try:
+        raw = str(value or "").strip()
+    except Exception:
+        return ""
+    if not raw:
+        return ""
+
+    def _norm(v):
+        try:
+            return os.path.normcase(os.path.normpath(os.path.abspath(str(v or "").strip())))
+        except Exception:
+            return ""
+
+    raw_norm = _norm(raw)
+    for item in forbidden_paths:
+        if item is None:
+            continue
+        if raw_norm and raw_norm == _norm(item):
+            return ""
+    return raw
 
 # Keep HYPIR visible in the engine selector even before its optional runtime is
 # installed. The HYPIR run path gives a precise missing-component message.
@@ -4321,8 +4418,19 @@ try:
             seed = -1
             patch_size = 512
             overlap = 256
-            try: prompt = self.edit_hypir_prompt.text().strip()
-            except Exception: pass
+            try:
+                raw_prompt = self.edit_hypir_prompt.text().strip()
+                prompt = _fv_hypir_clean_prompt(raw_prompt, outd, outfile, src)
+                if raw_prompt and not prompt:
+                    self._append_log(f"HYPIR prompt guard: ignored path-like stale prompt: {raw_prompt}")
+                    try:
+                        self.edit_hypir_prompt.blockSignals(True)
+                        self.edit_hypir_prompt.clear()
+                        self.edit_hypir_prompt.blockSignals(False)
+                    except Exception:
+                        pass
+            except Exception:
+                prompt = ""
             try: seed = int(self.spin_hypir_seed.value())
             except Exception: pass
             try: patch_size = int(self.spin_hypir_patch.value())
@@ -4380,7 +4488,18 @@ try:
                 vcodec = self.combo_vcodec.currentText()
                 cmd_encode += ["-c:v", vcodec, "-pix_fmt", "yuv420p"]
                 cmd_encode += ["-vsync", "cfr"]
-                if self.rad_crf.isChecked():
+                if getattr(self, "chk_keep_source_bitrate", None) is not None and self.chk_keep_source_bitrate.isChecked():
+                    source_kbps = _parse_video_bitrate_kbps(src)
+                    if source_kbps:
+                        cmd_encode += ["-b:v", f"{source_kbps}k"]
+                        self._append_log(f"Video bitrate: keep source ({source_kbps} kbps)")
+                    elif self.rad_crf.isChecked():
+                        cmd_encode += ["-crf", str(self.spin_crf.value())]
+                        self._append_log("Video bitrate: source bitrate unavailable; falling back to CRF")
+                    else:
+                        cmd_encode += ["-b:v", f"{self.spin_bitrate.value()}k"]
+                        self._append_log("Video bitrate: source bitrate unavailable; falling back to configured bitrate")
+                elif self.rad_crf.isChecked():
                     cmd_encode += ["-crf", str(self.spin_crf.value())]
                 else:
                     cmd_encode += ["-b:v", f"{self.spin_bitrate.value()}k"]
@@ -4408,6 +4527,7 @@ try:
                 self._append_log(f"Seed: {seed}")
                 self._append_log(f"Tile: {patch_size}, overlap: {overlap}, stride: {stride}")
                 self._append_log(f"Prompt: {prompt if prompt else '(empty)'}")
+                self._append_log("Prompt source: HYPIR prompt field (path guard active)")
                 self._append_log(f"FPS: {fps}")
                 self._append_log(f"Work dir: {work}")
                 self._append_log(f"Input: {src}")
@@ -4438,6 +4558,7 @@ try:
                 self._append_log(f"Seed: {seed}")
                 self._append_log(f"Tile: {patch_size}, overlap: {overlap}, stride: {stride}")
                 self._append_log(f"Prompt: {prompt if prompt else '(empty)'}")
+                self._append_log("Prompt source: HYPIR prompt field (path guard active)")
                 self._append_log(f"Input: {src}")
                 self._append_log(f"Output: {outfile}")
                 self._run_cmd([cmd], open_on_success=True, cwd=HYPIR_REPO_DIR, env=env)
@@ -4555,7 +4676,11 @@ try:
                     return
                 try:
                     flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-                    subprocess.Popen(["cmd.exe", "/c", str(HYPIR_INSTALLER)], cwd=str(HYPIR_INSTALLER.parent), creationflags=flags)
+                    self._hypir_install_process = subprocess.Popen(
+                        ["cmd.exe", "/c", str(HYPIR_INSTALLER)],
+                        cwd=str(HYPIR_INSTALLER.parent),
+                        creationflags=flags,
+                    )
                     self._append_log(f"Started HYPIR installer: {HYPIR_INSTALLER}")
                     self.btn_hypir_install.setEnabled(False)
                     self.btn_hypir_install.setText("Installing HYPIR...")
@@ -4563,11 +4688,31 @@ try:
                         self._hypir_install_timer = QtCore.QTimer(self)
                         self._hypir_install_timer.setInterval(2500)
                         def _poll_hypir_install():
+                            # First allow the normal runtime check to complete the UI
+                            # as soon as every required component is present.
                             if _hypir_refresh_runtime_ui():
                                 self._hypir_install_timer.stop()
                                 self.btn_hypir_install.setEnabled(True)
                                 self.btn_hypir_install.setText("Install HYPIR")
                                 self._append_log("HYPIR runtime detected: installation is complete.")
+                                return
+
+                            # Also watch the actual installer process.  Previously the
+                            # button could remain stuck on 'Installing HYPIR...' forever
+                            # when the process had already exited but a runtime check
+                            # still failed (for example because the repo path changed).
+                            proc = getattr(self, "_hypir_install_process", None)
+                            if proc is not None:
+                                code = proc.poll()
+                                if code is not None:
+                                    self._hypir_install_timer.stop()
+                                    self.btn_hypir_install.setEnabled(True)
+                                    self.btn_hypir_install.setText("Install HYPIR")
+                                    _hypir_refresh_runtime_ui()
+                                    if code == 0:
+                                        self._append_log("HYPIR installer finished; runtime is still incomplete. See the HYPIR status above.")
+                                    else:
+                                        self._append_log(f"HYPIR installer exited with code {code}. See installer console/status for details.")
                         self._hypir_install_timer.timeout.connect(_poll_hypir_install)
                     self._hypir_install_timer.start()
                 except Exception:
@@ -4710,8 +4855,16 @@ try:
                     with open(sp, "r", encoding="utf-8") as fh:
                         saved = json.load(fh)
                     self._hypir_last_scale = max(1, min(8, int(saved.get("hypir_scale", 4))))
-                    try: self.edit_hypir_prompt.setText(str(saved.get("hypir_prompt", "") or ""))
-                    except Exception: pass
+                    try:
+                        saved_prompt = str(saved.get("hypir_prompt", "") or "").strip()
+                        saved_outdir = str(saved.get("outdir", "") or "").strip()
+                        current_outdir = self.edit_outdir.text().strip() if hasattr(self, "edit_outdir") else ""
+                        clean_saved_prompt = _fv_hypir_clean_prompt(saved_prompt, saved_outdir, current_outdir)
+                        self.edit_hypir_prompt.setText(clean_saved_prompt)
+                        if saved_prompt and not clean_saved_prompt:
+                            self._append_log(f"HYPIR settings guard: cleared stale output-path prompt: {saved_prompt}")
+                    except Exception:
+                        pass
                     try: self.spin_hypir_seed.setValue(int(saved.get("hypir_seed", -1)))
                     except Exception: pass
                     try: self.spin_hypir_patch.setValue(int(saved.get("hypir_patch_size", 512)))

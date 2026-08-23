@@ -635,55 +635,14 @@ class InterpPane(QWidget):
         lay.addSpacing(8)
 
 
-                # ---- Recent results gallery (NEW) ----
-        self.recent = Collapsible("Recent results", start_open=False)
-        root.addWidget(self.recent)
-        rlay = self.recent.body_layout()
-
-        # Recent sort row
-        sort_row = QHBoxLayout()
-        try:
-            lbl_recent_sort = QLabel("Sort:", self)
-        except Exception:
-            lbl_recent_sort = None
-        try:
-            self.combo_recent_sort = QComboBox(self)
-            self.combo_recent_sort.addItem("Newest first", "newest")
-            self.combo_recent_sort.addItem("Oldest first", "oldest")
-            self.combo_recent_sort.addItem("Alphabetical (A-Z)", "az")
-            self.combo_recent_sort.addItem("Alphabetical (Z-A)", "za")
-            self.combo_recent_sort.addItem("Size (smallest first)", "size_small")
-            self.combo_recent_sort.addItem("Size (largest first)", "size_large")
-        except Exception:
-            self.combo_recent_sort = None
-
-        try:
-            if lbl_recent_sort is not None:
-                sort_row.addWidget(lbl_recent_sort)
-        except Exception:
-            pass
-        try:
-            if self.combo_recent_sort is not None:
-                sort_row.addWidget(self.combo_recent_sort)
-        except Exception:
-            pass
-        sort_row.addStretch(1)
-        rlay.addLayout(sort_row)
-
-        self.recent_area = QScrollArea()
-        self.recent_area.setWidgetResizable(True)
-        self.recent_area.setFrameShape(QFrame.NoFrame)
-        self.recent_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.recent_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.recent_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-
-        self.recent_container = QWidget()
-        self.recent_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.recent_flow = FlowLayout(self.recent_container, hSpacing=8, vSpacing=8)
-        self.recent_container.setLayout(self.recent_flow)
-
-        self.recent_area.setWidget(self.recent_container)
-        rlay.addWidget(self.recent_area)
+        # ---- Recent results gallery disabled ----
+        # The old "Recent results" / "Last results" gallery is intentionally
+        # not constructed anymore.  Keep the compatibility attributes so older
+        # saved settings and harmless refresh calls can safely no-op.
+        self.recent = None
+        self.combo_recent_sort = None
+        self.recent_area = None
+        self.recent_container = None
 
 
 

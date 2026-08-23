@@ -54,7 +54,26 @@ def main()->int:
     ap.add_argument("--frames",type=int,required=True); ap.add_argument("--seed",type=int,default=-1)
     ap.add_argument("--ref-image",action="append",default=[])
     ap.add_argument("--continue-video",default="")
+    ap.add_argument("--lora",action="append",default=[])
+    ap.add_argument("--lora-strength",action="append",type=float,default=[])
     ns=ap.parse_args()
+    if len(ns.lora) != len(ns.lora_strength):
+        raise SystemExit("Each --lora needs one matching --lora-strength")
+    if len(ns.lora) > 2:
+        raise SystemExit("Planner supports maximum 2 user LoRAs; the automatic Turbo LoRA occupies the third backend slot")
+    _user_loras=[]
+    _seen_loras=set()
+    for _lp, _ls in zip(ns.lora, ns.lora_strength):
+        _p=Path(_lp).resolve()
+        if not _p.is_file():
+            raise SystemExit(f"MiniMax H3 extra LoRA not found: {_p}")
+        if float(_ls) == 0.0:
+            continue
+        _k=os.path.normcase(str(_p))
+        if _k in _seen_loras:
+            continue
+        _seen_loras.add(_k)
+        _user_loras.append((str(_p), max(-10.0,min(10.0,float(_ls)))))
     if not PYTHON.is_file(): raise SystemExit(f"MiniMax H3 environment not found: {PYTHON}")
     refs=[str(Path(p).resolve()) for p in ns.ref_image if p and Path(p).is_file()][:9]
     continue_video=str(Path(ns.continue_video).resolve()) if ns.continue_video and Path(ns.continue_video).is_file() else ""
@@ -73,12 +92,26 @@ def main()->int:
          "--vram-manager-auto","--video-vae-tile-size","256","--video-vae-tile-overlap","128"]
     if _native_frames > 719:
         cmd += ["--experimental-long-duration"]
+    _active_lora_paths=set()
     if turbo_lora:
         cmd += ["--lora",turbo_lora,"--lora-strength","1.0"]
+        _active_lora_paths.add(os.path.normcase(str(Path(turbo_lora).resolve())))
         print(f"[minimax-planner] 4-step Turbo LoRA default: {turbo_lora}",flush=True)
         print("[minimax-planner] sampling steps: 4",flush=True)
     else:
         print(f"[minimax-planner] no Turbo LoRA found under {MODEL_ROOT / 'loras'}; sampling steps: 15",flush=True)
+    _added_extra=0
+    for _lp, _ls in _user_loras:
+        _key=os.path.normcase(str(Path(_lp).resolve()))
+        if _key in _active_lora_paths:
+            print(f"[minimax-planner] extra LoRA skipped because it is already active: {_lp}",flush=True)
+            continue
+        if len(_active_lora_paths) >= 3:
+            break
+        cmd += ["--lora",_lp,"--lora-strength",str(_ls)]
+        _active_lora_paths.add(_key)
+        _added_extra += 1
+        print(f"[minimax-planner] extra LoRA {_added_extra}: {_lp} | strength={_ls:g}",flush=True)
     if continue_video:
         cmd += ["--continue-video",continue_video,"--continue-context-frames","39"]
         print(f"[minimax-planner] native continuation source: {continue_video}",flush=True)
