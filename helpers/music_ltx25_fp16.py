@@ -19,4 +19,3 @@ def is_available() -> bool:
 def ltx25_install_status(root_dir=None):
     return install_status("fp16")
 
-print(f"[LTX25] Music Clip FP16 bridge loaded: {BRIDGE_PATCH_VERSION}", flush=True)

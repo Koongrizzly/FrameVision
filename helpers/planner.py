@@ -18577,8 +18577,39 @@ class PipelineWorker(QThread):
                 chain_dir=os.path.join(self.out_dir,"minimax_chain_frames")
                 try: os.makedirs(chain_dir,exist_ok=True)
                 except Exception: pass
+
+                # MiniMax resume support: unlike the other video backends, the old H3
+                # loop always started rendering at S01 again.  Build a live per-shot
+                # clip index from the project manifest so Resume can keep completed
+                # clips (including a manually recreated take whose filename changed).
+                _mm_resume_run = bool((self.job.encoding or {}).get("planner_resume_run"))
+                _mm_existing_by_id = {}
+                try:
+                    _mm_manifest_clips = ((manifest.get("paths") or {}).get("clips") or [])
+                    if isinstance(_mm_manifest_clips, list):
+                        for _it in _mm_manifest_clips:
+                            if not isinstance(_it, dict):
+                                continue
+                            _sid0 = str(_it.get("id") or "").strip()
+                            _fp0 = str(_it.get("file") or "").strip()
+                            if _sid0 and _fp0 and os.path.isfile(_fp0) and os.path.getsize(_fp0) >= 1024:
+                                _mm_existing_by_id[_sid0] = dict(_it)
+                except Exception:
+                    pass
+                try:
+                    if isinstance(shot_map, dict):
+                        for _sid0, _rec0 in shot_map.items():
+                            if not isinstance(_rec0, dict):
+                                continue
+                            _fp0 = str(_rec0.get("clip_file") or "").strip()
+                            if _sid0 and _fp0 and os.path.isfile(_fp0) and os.path.getsize(_fp0) >= 1024:
+                                _mm_existing_by_id.setdefault(str(_sid0), {"id": str(_sid0), "file": _fp0})
+                except Exception:
+                    pass
+
                 prev_clip=""
                 seen_subjects=set()
+                _mm_resume_chain_broken = False
                 _subject_re=re.compile(r"<\s*Subject\s+(\d+)\s*>",re.I)
                 for i,sh in enumerate(shots,start=1):
                     sid=str((sh or {}).get("id") or f"S{i:02d}"); rec=shot_map.get(sid) if isinstance(shot_map.get(sid),dict) else {}
@@ -18719,6 +18750,59 @@ class PipelineWorker(QThread):
                     # MiniMax shot. An older fallback used refs[0:2] here, which could
                     # turn a text-only/failed-conversion shot into unrelated characters
                     # (for example a Merovingian glass leaking into a Neo scene).
+
+                    # Resume: keep already completed MiniMax clips instead of rendering
+                    # again from clip 1.  In last-frame-chain mode reuse is only safe
+                    # until the first missing clip; after a gap, every later clip must be
+                    # rebuilt from the new chain.  A manual Recreate updates manifest
+                    # clip_file, so that replacement is treated as the completed take.
+                    _mm_existing = _mm_existing_by_id.get(sid) if _mm_resume_run else None
+                    _mm_existing_file = str((_mm_existing or {}).get("file") or "").strip() if isinstance(_mm_existing, dict) else ""
+                    _mm_can_reuse = bool(
+                        _mm_resume_run
+                        and _mm_existing_file
+                        and os.path.isfile(_mm_existing_file)
+                        and os.path.getsize(_mm_existing_file) >= 1024
+                        and (not chain_on or not _mm_resume_chain_broken)
+                    )
+                    if _mm_can_reuse:
+                        _reuse_item = dict(_mm_existing) if isinstance(_mm_existing, dict) else {}
+                        _reuse_item.update({
+                            "id": sid,
+                            "file": _mm_existing_file,
+                            "frames": int(_reuse_item.get("frames") or frames),
+                            "fps": int(_reuse_item.get("fps") or 24),
+                            "duration_sec": float(_reuse_item.get("duration_sec") or round(frames/24.0,2)),
+                            "seed": _reuse_item.get("seed", seed),
+                            "resolution": str(_reuse_item.get("resolution") or f"{w}x{h}"),
+                            "model_key": "minimax_h3",
+                            "video_model": "minimax_h3",
+                            "reference_images": list(_reuse_item.get("reference_images") or shot_refs),
+                        })
+                        clips_out.append(_reuse_item)
+                        rec.update({
+                            "clip_file": _mm_existing_file,
+                            "clip_seed": _reuse_item.get("seed", seed),
+                            "video_model": "minimax_h3",
+                            "model_key": "minimax_h3",
+                            "reference_images": list(_reuse_item.get("reference_images") or shot_refs),
+                        })
+                        shot_map[sid] = rec
+                        manifest.setdefault("paths", {})["clips"] = clips_out
+                        manifest["paths"]["clips_dir"] = clips_dir
+                        manifest["shots"] = shot_map
+                        _safe_write_json(manifest_path, manifest)
+                        seen_subjects.update(used_subjects)
+                        prev_clip = _mm_existing_file
+                        self.signals.stage.emit(f"Clips (MiniMax H3) — {sid} (skip {i}/{len(shots)})")
+                        self.signals.log.emit(f"[minimax-h3] {sid}: resume found valid completed clip; skipping regeneration")
+                        self.signals.progress.emit(min(99, 72 + int((i - 1) * (25 / max(1, len(shots))))))
+                        continue
+                    elif _mm_resume_run and chain_on:
+                        # The first missing chained clip is the resume boundary.  Do not
+                        # trust any later old clips because their continuation source may
+                        # no longer match after cancel/recreate.
+                        _mm_resume_chain_broken = True
 
                     # In chain mode the hybrid checkpoint can switch per shot:
                     # - no newly introduced subjects => native FL2VA continue-video
