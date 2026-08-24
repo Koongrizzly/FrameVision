@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-BRIDGE_PATCH_VERSION = "2026-08-24-backend-route-v3"
+BRIDGE_PATCH_VERSION = "2026-08-24-msr-detect-v4"
 
 HERE = Path(__file__).resolve().parent
 APP_ROOT = HERE.parent if HERE.name.lower() == "helpers" else HERE
@@ -412,7 +412,16 @@ def install_generation_patch(base, mode: str):
 
     def build(*args, **kwargs):
         old_cmd = [str(x) for x in list(original(*args, **kwargs) or [])]
-        is_msr = "--video-conditioning" in old_cmd or any("msr" in str(x).lower() and "pipeline" in str(x).lower() for x in old_cmd)
+        # The known-working LTX 2.3 Music Clip route marks MSR at this layer with
+        # msr_enabled/--msr-enabled.  --video-conditioning only appears deeper in
+        # the old IC-LoRA workflow, so using it as the primary detector causes a
+        # valid MSR shot to be mistaken for ordinary I2V before that deeper route.
+        is_msr = bool(
+            kwargs.get("msr_enabled", False)
+            or "--msr-enabled" in old_cmd
+            or "--video-conditioning" in old_cmd
+            or any("msr" in str(x).lower() and "pipeline" in str(x).lower() for x in old_cmd)
+        )
         if is_msr:
             if mode != "fp16":
                 raise RuntimeError(

@@ -426,12 +426,17 @@ def _save(images, audio, sr, out_path, fps, soundtrack_path=None):
             '-c:v','libx264','-pix_fmt','yuv420p','-crf','18',
             '-c:a','aac','-b:a','256k','-shortest',str(out)
         ]
-        proc=subprocess.Popen(cmd,stdin=subprocess.PIPE)
-        try:
-            proc.stdin.write(arr.tobytes()); proc.stdin.close(); code=proc.wait()
-        finally:
-            if proc.stdin and not proc.stdin.closed: proc.stdin.close()
-        if code: raise RuntimeError(f'ffmpeg exited with code {code}')
+        # Use communicate()/subprocess.run semantics instead of manually writing
+        # to stdin. With -shortest, ffmpeg can intentionally finish as soon as
+        # the soundtrack ends and close the raw-video pipe before every generated
+        # frame has been written. A manual stdin.write then raises BrokenPipeError
+        # even though ffmpeg successfully created a valid output file.
+        proc = subprocess.run(cmd, input=arr.tobytes())
+        code = int(proc.returncode)
+        if code:
+            raise RuntimeError(f'ffmpeg exited with code {code}')
+        if not out.is_file() or out.stat().st_size <= 0:
+            raise RuntimeError('ffmpeg returned success but no output video was created')
     return out
 
 

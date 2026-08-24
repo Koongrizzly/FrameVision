@@ -39,9 +39,9 @@ from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDO
 from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
 from ltx_core.model.video_vae import AUTO_TILING, TilingConfig, VideoEncoder, get_video_chunks_number
 from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoLatentShape, VideoPixelShape
-from ltx_pipelines.utils.args import default_2_stage_arg_parser, resolve_cli_params
-from ltx_pipelines.utils.constants import STAGE_2_DISTILLED_SIGMAS
-from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
+from ltx_pipelines.utils.args import default_2_stage_distilled_arg_parser, resolve_cli_params
+from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, STAGE_2_DISTILLED_SIGMAS
+from ltx_pipelines.utils.denoisers import SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
     combined_image_conditionings,
@@ -49,6 +49,7 @@ from ltx_pipelines.utils.helpers import (
     get_device,
     tiling_scale_factors_for_vae,
 )
+from ltx_pipelines.utils.blocks import AudioConditioner
 from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video
 from ltx_pipelines.utils.types import ModalitySpec
 
@@ -58,10 +59,10 @@ except ImportError:  # older package layout
     from ltx_core.conditioning.types.attention_strength_wrapper import ConditioningItemAttentionStrengthWrapper
 
 try:
-    from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage
+    from ltx_pipelines.distilled import DistilledPipeline
 except ImportError as exc:  # explicit error is much easier to diagnose in FrameVision log
     raise RuntimeError(
-        "LTX 2.5 MSR requires an LTX package containing ltx_pipelines.a2vid_two_stage. "
+        "LTX 2.5 MSR requires the native ltx_pipelines.distilled pipeline. "
         "Install/update the normal FrameVision LTX 2.5 runtime first."
     ) from exc
 
@@ -321,7 +322,17 @@ def _make_reference_tiling(video_encoder: VideoEncoder, width: int, height: int,
         from ltx_core.tiling import DimensionSizeConfig
 
         long_side = DimensionSizeConfig(tile_size=int(tile_size), overlap=int(tile_overlap))
-        frames = DimensionSizeConfig(tile_size=int(reference_frames), overlap=min(8, max(0, reference_frames - 1)))
+
+        # LTX 2.5's video VAE requires the temporal TILE SIZE itself to be
+        # divisible by the temporal compression factor (8). MSR reference
+        # sequence lengths remain 25 or 33 frames; only the internal temporal
+        # tile window is rounded down to the largest valid multiple of 8.
+        temporal_tile = max(8, (int(reference_frames) // 8) * 8)
+        temporal_overlap = min(16, max(0, temporal_tile - 8))
+        frames = DimensionSizeConfig(
+            tile_size=temporal_tile,
+            overlap=temporal_overlap,
+        )
         return TileSizeConfig.from_long_side(
             long_side=long_side,
             height=height,
@@ -457,8 +468,13 @@ def collect_reference_paths(
     return result
 
 
-class LTX25MSRAudioPipeline(A2VidPipelineTwoStage):
-    """LTX 2.5 two-stage A2V pipeline with Licon MSR applied in both stages."""
+class LTX25MSRAudioPipeline(DistilledPipeline):
+    """Native distilled LTX 2.5 two-stage pipeline with Licon MSR and frozen supplied audio.
+
+    The installed FrameVision LTX 2.5 checkpoint is already distilled.  Do not use
+    A2VidPipelineTwoStage here: that class is for the full/dev checkpoint plus a
+    separate distilled LoRA, and therefore incorrectly requires --distilled-lora.
+    """
 
     def __init__(
         self,
@@ -484,7 +500,30 @@ class LTX25MSRAudioPipeline(A2VidPipelineTwoStage):
             )
         )
         kwargs["loras"] = tuple(loras)
+
+        # DistilledPipeline is the same native base used by FrameVision's working
+        # standalone LTX 2.5 helper.  Capture its model paths before construction
+        # so we can add the supplied-audio encoder used by Music Clip Creator.
+        model_paths = kwargs.get("model_paths")
+        registry = kwargs.get("registry")
+        alloc_trim_strategy = kwargs.get("alloc_trim_strategy")
         super().__init__(*args, **kwargs)
+        if model_paths is None:
+            raise ValueError("LTX 2.5 MSR requires split model_paths.")
+        conditioner_kwargs = {"registry": registry}
+        if alloc_trim_strategy is not None:
+            conditioner_kwargs["alloc_trim_strategy"] = alloc_trim_strategy
+        try:
+            self.audio_conditioner = AudioConditioner(
+                model_paths.audio_vae(), self.dtype, self.device, **conditioner_kwargs
+            )
+        except TypeError:
+            # Compatibility with LTX package revisions that do not expose
+            # alloc_trim_strategy on AudioConditioner.
+            conditioner_kwargs.pop("alloc_trim_strategy", None)
+            self.audio_conditioner = AudioConditioner(
+                model_paths.audio_vae(), self.dtype, self.device, **conditioner_kwargs
+            )
         LOG.info(
             "[LTX25-MSR] Loaded %s | model_strength=%g | downscale=%d | slot_dim=%d",
             self.msr_lora_path,
@@ -542,14 +581,12 @@ class LTX25MSRAudioPipeline(A2VidPipelineTwoStage):
         self,
         *,
         prompt: str,
-        negative_prompt: str,
+        negative_prompt: str = "",
         seed: int,
         height: int,
         width: int,
         num_frames: int,
         frame_rate: float,
-        num_inference_steps: int,
-        video_guider_params: MultiModalGuiderParams,
         images,
         audio_path: str,
         msr_references: Sequence[tuple[str, str, bool]],
@@ -565,9 +602,10 @@ class LTX25MSRAudioPipeline(A2VidPipelineTwoStage):
         enhance_prompt: bool = False,
         enhance_static_cache: bool = False,
         max_batch_size: int = 1,
-        stage_1_sigmas: torch.Tensor | None = None,
+        stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
         color_space=None,
+        **_ignored,
     ):
         if max_batch_size != 1:
             raise ValueError("Licon LTX 2.5 MSR currently requires max_batch_size=1.")
@@ -577,14 +615,16 @@ class LTX25MSRAudioPipeline(A2VidPipelineTwoStage):
         noiser = GaussianNoiser(generator=generator)
         vae_dtype = vae_dtype or self.dtype
 
-        ctx_p, ctx_n = self.prompt_encoder(
-            [prompt, negative_prompt],
+        # Distilled LTX 2.5 uses SimpleDenoiser and its fixed distilled sigma
+        # schedules.  A negative CFG context / distilled LoRA is intentionally not
+        # used here because the transformer checkpoint itself is distilled.
+        (ctx_p,) = self.prompt_encoder(
+            [prompt],
             enhance_first_prompt=enhance_prompt,
             enhance_static_cache=enhance_static_cache,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
-        v_context_n, _ = ctx_n.video_encoding, ctx_n.audio_encoding
 
         scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
         tiling_config = ensure_tiling_config(
@@ -610,108 +650,69 @@ class LTX25MSRAudioPipeline(A2VidPipelineTwoStage):
             lambda enc: vae_encode_audio(decoded_audio, enc, None)
         )
         audio_shape = AudioLatentShape.from_duration(
-            batch=1,
-            duration=num_frames / frame_rate,
-            channels=8,
-            mel_bins=16,
+            batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16
         )
         encoded_audio_latent = encoded_audio_latent[:, :, : audio_shape.frames]
-
-        stage_1_shape = VideoPixelShape(
-            batch=1,
-            frames=num_frames,
-            width=width // 2,
-            height=height // 2,
-            fps=frame_rate,
+        LOG.info(
+            "[LTX25-MSR] Supplied audio encoded and frozen for both stages; latent_frames=%d",
+            int(encoded_audio_latent.shape[2]),
         )
-        LOG.info("[LTX25-MSR] Encoding Stage 1 MSR references at %dx%d", stage_1_shape.width, stage_1_shape.height)
+
+        stage_1_w, stage_1_h = width // 2, height // 2
+        LOG.info("[LTX25-MSR] Encoding Stage 1 references at %dx%d", stage_1_w, stage_1_h)
         stage_1_conditionings = self._stage_conditionings(
-            images=images,
-            references=msr_references,
-            width=stage_1_shape.width,
-            height=stage_1_shape.height,
-            reference_frames=msr_reference_frames,
-            reference_strength=msr_reference_strength,
-            use_tiled_encode=msr_use_tiled_encode,
-            tile_size=msr_tile_size,
-            tile_overlap=msr_tile_overlap,
-            color_space=color_space,
+            images=images, references=msr_references, width=stage_1_w, height=stage_1_h,
+            reference_frames=msr_reference_frames, reference_strength=msr_reference_strength,
+            use_tiled_encode=msr_use_tiled_encode, tile_size=msr_tile_size,
+            tile_overlap=msr_tile_overlap, color_space=color_space,
         )
-        sigmas = (
-            stage_1_sigmas
-            if stage_1_sigmas is not None
-            else self._scheduler.execute(steps=num_inference_steps)
-        ).to(dtype=torch.float32, device=self.device)
-
-        video_state, _ = self.stage_1(
-            denoiser=GuidedDenoiser(
-                v_context=v_context_p,
-                a_context=a_context_p,
-                video_guider=MultiModalGuider(
-                    params=video_guider_params,
-                    negative_context=v_context_n,
-                ),
-                audio_guider=MultiModalGuider(params=MultiModalGuiderParams()),
-            ),
-            sigmas=sigmas,
+        stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
+        stage1_extra = {}
+        sampler_kwargs = getattr(self, "_stage_1_sampler_kwargs", None)
+        if callable(sampler_kwargs):
+            stage1_extra.update(sampler_kwargs(seed))
+        video_state, _ = self.stage(
+            denoiser=SimpleDenoiser(v_context_p, a_context_p),
+            sigmas=stage_1_sigmas,
             noiser=noiser,
-            width=stage_1_shape.width,
-            height=stage_1_shape.height,
-            frames=num_frames,
-            fps=frame_rate,
+            width=stage_1_w, height=stage_1_h, frames=num_frames, fps=frame_rate,
             video=ModalitySpec(context=v_context_p, conditionings=stage_1_conditionings),
             audio=ModalitySpec(
-                context=a_context_p,
-                frozen=True,
-                noise_scale=0.0,
+                context=a_context_p, frozen=True, noise_scale=0.0,
                 initial_latent=encoded_audio_latent,
             ),
-            max_batch_size=1,
+            **stage1_extra,
         )
 
-        # DiffusionStage returns the target video latent; conditioning tokens do not
-        # become decoded frames. This is the native equivalent of Comfy's CropGuides.
+        # Rebuild reference conditions at the Stage-2 resolution, matching Licon's
+        # LTX 2.5 workflow rather than carrying low-resolution ref latents forward.
         upscaled_video_latent = self.upsampler(video_state.latent[:1])
         stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
-
-        # Critical Licon 2.5 behavior: rebuild the references after upscaling instead
-        # of carrying Stage-1 reference latents into Stage 2.
-        LOG.info("[LTX25-MSR] Re-encoding Stage 2 MSR references at %dx%d", width, height)
+        LOG.info("[LTX25-MSR] Re-encoding Stage 2 references at %dx%d", width, height)
         stage_2_conditionings = self._stage_conditionings(
-            images=images,
-            references=msr_references,
-            width=width,
-            height=height,
-            reference_frames=msr_reference_frames,
-            reference_strength=msr_reference_strength,
-            use_tiled_encode=msr_use_tiled_encode,
-            tile_size=msr_tile_size,
-            tile_overlap=msr_tile_overlap,
-            color_space=color_space,
+            images=images, references=msr_references, width=width, height=height,
+            reference_frames=msr_reference_frames, reference_strength=msr_reference_strength,
+            use_tiled_encode=msr_use_tiled_encode, tile_size=msr_tile_size,
+            tile_overlap=msr_tile_overlap, color_space=color_space,
         )
-        video_state, _ = self.stage_2(
+        video_state, _ = self.stage(
             denoiser=SimpleDenoiser(v_context_p, a_context_p),
             sigmas=stage_2_sigmas,
             noiser=noiser,
-            width=width,
-            height=height,
-            frames=num_frames,
-            fps=frame_rate,
+            width=width, height=height, frames=num_frames, fps=frame_rate,
             video=ModalitySpec(
-                context=v_context_p,
-                conditionings=stage_2_conditionings,
-                noise_scale=stage_2_sigmas[0].item(),
-                initial_latent=upscaled_video_latent,
+                context=v_context_p, conditionings=stage_2_conditionings,
+                noise_scale=stage_2_sigmas[0].item(), initial_latent=upscaled_video_latent,
             ),
             audio=ModalitySpec(
-                context=a_context_p,
-                frozen=True,
-                noise_scale=0.0,
+                context=a_context_p, frozen=True, noise_scale=0.0,
                 initial_latent=encoded_audio_latent,
             ),
         )
 
-        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
+        decoded_video = self.video_decoder(
+            video_state.latent, tiling_config, generator, dtype=vae_dtype
+        )
         original_audio = Audio(
             waveform=decoded_audio.waveform.squeeze(0),
             sampling_rate=decoded_audio.sampling_rate,
@@ -744,10 +745,15 @@ def _add_msr_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    # The FrameVision LTX 2.5 transformer is already distilled.  Using the full
+    # two-stage parser would incorrectly require --distilled-lora.
     try:
-        parser = default_2_stage_arg_parser(params=resolve_cli_params())
+        parser = default_2_stage_distilled_arg_parser(params=resolve_cli_params(distilled=True))
     except TypeError:
-        parser = default_2_stage_arg_parser()
+        try:
+            parser = default_2_stage_distilled_arg_parser(params=resolve_cli_params())
+        except TypeError:
+            parser = default_2_stage_distilled_arg_parser()
     return _add_msr_args(parser)
 
 
@@ -766,7 +772,6 @@ def main() -> None:
     )
     pipeline = LTX25MSRAudioPipeline(
         model_paths=args.model_paths,
-        distilled_lora=args.distilled_lora,
         spatial_upsampler_path=args.spatial_upsampler_path,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
@@ -784,21 +789,12 @@ def main() -> None:
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
     video, audio, tiling_config = pipeline(
         prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
+        negative_prompt=getattr(args, "negative_prompt", ""),
         seed=args.seed,
         height=args.height,
         width=args.width,
         num_frames=args.num_frames,
         frame_rate=args.frame_rate,
-        num_inference_steps=args.num_inference_steps,
-        video_guider_params=MultiModalGuiderParams(
-            cfg_scale=args.video_cfg_guidance_scale,
-            stg_scale=args.video_stg_guidance_scale,
-            rescale_scale=args.video_rescale_scale,
-            modality_scale=args.a2v_guidance_scale,
-            skip_step=args.video_skip_step,
-            stg_blocks=args.video_stg_blocks,
-        ),
         images=args.images,
         audio_path=args.audio_path,
         audio_start_time=args.audio_start_time,

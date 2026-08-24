@@ -18,4 +18,3 @@ def is_available() -> bool:
 
 def ltx25_install_status(root_dir=None):
     return install_status("fp16")
-

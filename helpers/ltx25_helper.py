@@ -462,20 +462,77 @@ def run_worker():
 
 
     def _encode_frozen_audio(pipeline, audio_path: str, num_frames: int, fps: float):
-        decoded = decode_audio_from_file(audio_path, pipeline.device, 0.0, num_frames / fps)
+        """Encode supplied audio and make video/audio stop at the shortest input.
+
+        LTX requires the frozen audio latent to match the temporal target shape
+        exactly.  If the source WAV ends before the requested video duration,
+        reduce the VIDEO frame count to the largest legal LTX count (8n+1)
+        supported by the available audio instead of padding silence or crashing.
+        """
+        requested_frames = int(num_frames)
+        decoded = decode_audio_from_file(
+            audio_path, pipeline.device, 0.0, requested_frames / fps
+        )
         if decoded is None:
             raise ValueError(f"Failed to decode supplied audio: {audio_path}")
+
         latent = pipeline.audio_conditioner(lambda enc: vae_encode_audio(decoded, enc, None))
-        shape = AudioLatentShape.from_duration(
-            batch=1, duration=num_frames / fps, channels=8, mel_bins=16
-        )
-        latent = latent[:, :, : shape.frames]
+        available_audio_frames = int(latent.shape[2])
+
+        def _audio_target_frames(video_frames: int) -> int:
+            return int(AudioLatentShape.from_duration(
+                batch=1,
+                duration=float(video_frames) / float(fps),
+                channels=8,
+                mel_bins=16,
+            ).frames)
+
+        effective_frames = requested_frames
+        required_audio_frames = _audio_target_frames(effective_frames)
+
+        if available_audio_frames < required_audio_frames:
+            # FrameVision/LTX valid video counts are 8n+1. Walk downward only;
+            # the supplied soundtrack is the hard stop, matching the old 2.3
+            # "whichever ends first" behaviour.
+            effective_frames = requested_frames
+            while effective_frames > 1 and _audio_target_frames(effective_frames) > available_audio_frames:
+                effective_frames -= 8
+            effective_frames = max(1, effective_frames)
+            required_audio_frames = _audio_target_frames(effective_frames)
+
+            if required_audio_frames > available_audio_frames:
+                raise ValueError(
+                    "Supplied soundtrack is too short for even the minimum valid LTX duration: "
+                    f"available audio latent={available_audio_frames}, "
+                    f"required={required_audio_frames}."
+                )
+
+            print(
+                "[AUDIO] Supplied soundtrack ends before requested video; "
+                f"shortening generation {requested_frames} -> {effective_frames} video frames "
+                "(shortest-input rule).",
+                flush=True,
+            )
+
+        latent = latent[:, :, :required_audio_frames]
+
+        # Keep the returned original waveform aligned with the effective video
+        # duration too; do not leave a longer audio tail in the encoded MP4.
+        waveform = decoded.waveform
+        sampling_rate = int(decoded.sampling_rate)
+        max_samples = max(1, int(round((effective_frames / float(fps)) * sampling_rate)))
+        waveform = waveform[..., :max_samples]
         original = Audio(
-            waveform=decoded.waveform.squeeze(0),
-            sampling_rate=decoded.sampling_rate,
+            waveform=waveform.squeeze(0),
+            sampling_rate=sampling_rate,
         )
-        print(f"[AUDIO] Supplied soundtrack encoded and frozen ({latent.shape[2]} latent frames).", flush=True)
-        return latent, original
+
+        print(
+            f"[AUDIO] Supplied soundtrack encoded/frozen: "
+            f"{latent.shape[2]} latent frames for {effective_frames} video frames.",
+            flush=True,
+        )
+        return latent, original, effective_frames
 
     def _prepare_common(pipeline, job, images):
         seed = int(job["seed"])
@@ -534,7 +591,21 @@ def run_worker():
         audio_path = str(job.get("audio_path") or "").strip()
         frozen_latent = original_audio = None
         if audio_path:
-            frozen_latent, original_audio = _encode_frozen_audio(pipeline, audio_path, frames, fps)
+            frozen_latent, original_audio, frames = _encode_frozen_audio(
+                pipeline, audio_path, frames, fps
+            )
+            # Audio may have shortened the generation. Rebuild tiling for the
+            # effective frame count before any stage starts.
+            tiling = ensure_tiling_config(
+                AUTO_TILING,
+                scale_factors=scale_factors,
+                vae_checkpoint_path=pipeline.video_decoder.checkpoint_path,
+                video_shape=VideoPixelShape(
+                    batch=1, frames=frames, height=height, width=width, fps=fps
+                ),
+                diffvae_optimization=pipeline.video_decoder.diffvae_optimization,
+                device=pipeline.device,
+            )
         audio_spec = ModalitySpec(context=actx)
         if frozen_latent is not None:
             audio_spec = ModalitySpec(context=actx, frozen=True, noise_scale=0.0, initial_latent=frozen_latent)
@@ -568,8 +639,20 @@ def run_worker():
             diffvae_optimization=pipeline.video_decoder.diffvae_optimization,
             device=pipeline.device,
         )
-        frozen_audio, original_audio = _encode_frozen_audio(
+        frozen_audio, original_audio, frames = _encode_frozen_audio(
             pipeline, str(job["audio_path"]), frames, fps
+        )
+        # The soundtrack may be the shorter input. Rebuild tiling against the
+        # effective frame count so video/audio target shapes stay identical.
+        tiling = ensure_tiling_config(
+            AUTO_TILING,
+            scale_factors=scale_factors,
+            vae_checkpoint_path=pipeline.video_decoder.checkpoint_path,
+            video_shape=VideoPixelShape(
+                batch=1, frames=frames, height=height, width=width, fps=fps
+            ),
+            diffvae_optimization=pipeline.video_decoder.diffvae_optimization,
+            device=pipeline.device,
         )
         s1w, s1h = width // 2, height // 2
         cond1 = pipeline.image_conditioner(lambda enc: combined_image_conditionings(
