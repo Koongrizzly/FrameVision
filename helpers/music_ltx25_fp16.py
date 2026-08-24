@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 try:
-    from .ltx25_music_bridge_common import _load_base, export_base_api, install_generation_patch, install_settings_patch, install_status
+    from .ltx25_music_bridge_common import BRIDGE_PATCH_VERSION, _load_base, export_base_api, install_generation_patch, install_settings_patch, install_status
 except Exception:
-    from ltx25_music_bridge_common import _load_base, export_base_api, install_generation_patch, install_settings_patch, install_status
+    from ltx25_music_bridge_common import BRIDGE_PATCH_VERSION, _load_base, export_base_api, install_generation_patch, install_settings_patch, install_status
 
 _BASE = _load_base("fp16")
 install_settings_patch(_BASE, "fp16")
@@ -18,3 +18,5 @@ def is_available() -> bool:
 
 def ltx25_install_status(root_dir=None):
     return install_status("fp16")
+
+print(f"[LTX25] Music Clip FP16 bridge loaded: {BRIDGE_PATCH_VERSION}", flush=True)

@@ -18,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+BRIDGE_PATCH_VERSION = "2026-08-24-backend-route-v3"
+
 HERE = Path(__file__).resolve().parent
 APP_ROOT = HERE.parent if HERE.name.lower() == "helpers" else HERE
 BASE_PATH = HERE / "clip2ltx_cli.py"
@@ -383,6 +385,7 @@ def _msr_command(old_cmd: list[str], call_args: tuple[Any, ...], call_kwargs: di
         "--num-frames", str(frames), "--frame-rate", str(fps),
         "--seed", str(seed), "--prompt", prompt,
         "--output-path", output,
+        "--msr-enabled",
         "--msr-lora-path", str(MSR_MODEL),
         "--msr-reference-strength", str(strength),
         "--msr-reference-frames", str(ref_frames),
@@ -416,7 +419,19 @@ def install_generation_patch(base, mode: str):
                     "LTX 2.5 ConvRot MSR is not available in this backend yet. "
                     "Select LTX 2.5 FP16 for Licon MSR, or turn MSR off for ConvRot."
                 )
-            return _msr_command(old_cmd, args, kwargs)
+            msr_cmd = _msr_command(old_cmd, args, kwargs)
+            # clip2ltx_cli.py intentionally refuses an MSR job unless the final
+            # backend command carries this marker. Keep the invariant here even
+            # if _msr_command is edited later.
+            if "--msr-enabled" not in msr_cmd:
+                insert_at = 2 if len(msr_cmd) >= 2 else len(msr_cmd)
+                msr_cmd.insert(insert_at, "--msr-enabled")
+            print(
+                f"[LTX25-MSR] bridge={BRIDGE_PATCH_VERSION} final_route=MSR "
+                f"marker={'yes' if '--msr-enabled' in msr_cmd else 'NO'} refs={sum(1 for x in msr_cmd if str(x).startswith('--msr-ref-'))}",
+                flush=True,
+            )
+            return msr_cmd
 
         payload_path, job = _write_job(mode, old_cmd, args, kwargs)
         if mode == "convrot":
@@ -457,7 +472,42 @@ def install_settings_patch(base, mode: str):
     setattr(base, "_ltx23_vramlab_ui_settings", settings)
 
 
+def _force_inherited_runner_backend(payload: Any) -> Any:
+    """Route LTX 2.5 through the inherited runner's replaceable VRAMLab builder.
+
+    clip2ltx_cli.py only invokes _ltx23_build_vramlab_direct_args when its internal
+    backend value normalizes to ``vramlab``.  The public/director-plan backend is
+    still ltx25_fp16/ltx25_convrot; this copy changes only the compatibility value
+    passed into the borrowed LTX 2.3 runner.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    routed = dict(payload)
+    routed["ltx_backend"] = "vramlab"
+    routed["ltx_generation_backend"] = "vramlab"
+    return routed
+
+
+def _install_runner_route_patch(base) -> None:
+    original_single = getattr(base, "run_single_ltx_shot_test", None)
+    if callable(original_single) and not getattr(original_single, "_ltx25_route_wrapper", False):
+        def single(payload: dict) -> dict:
+            routed = _force_inherited_runner_backend(payload)
+            print(f"[LTX25] bridge={BRIDGE_PATCH_VERSION} inherited_runner_backend=vramlab", flush=True)
+            return original_single(routed)
+        single._ltx25_route_wrapper = True
+        setattr(base, "run_single_ltx_shot_test", single)
+
+    original_all = getattr(base, "run_all_ltx_director_shots", None)
+    if callable(original_all) and not getattr(original_all, "_ltx25_route_wrapper", False):
+        def all_shots(payload: dict) -> dict:
+            return original_all(_force_inherited_runner_backend(payload))
+        all_shots._ltx25_route_wrapper = True
+        setattr(base, "run_all_ltx_director_shots", all_shots)
+
+
 def export_base_api(namespace: dict[str, Any], base) -> None:
+    _install_runner_route_patch(base)
     for name in (
         "export_musicclip_scene_plan", "create_prompt_plan", "create_ltx_shot_plan",
         "create_ltx_director_plan", "apply_ltx_start_end_duration_safety_to_plan",

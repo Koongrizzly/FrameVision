@@ -720,6 +720,11 @@ class LTX25MSRAudioPipeline(A2VidPipelineTwoStage):
 
 
 def _add_msr_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    # Compatibility/routing marker used by FrameVision's Music Clip Creator.
+    # This pipeline is MSR-only, so the flag does not change inference behavior;
+    # it lets the caller verify that an MSR job was not accidentally routed to
+    # ordinary I2V before launching the expensive backend.
+    parser.add_argument("--msr-enabled", action="store_true", default=False)
     parser.add_argument("--msr-lora-path", required=True)
     parser.add_argument("--msr-strength-model", type=float, default=1.0)
     parser.add_argument("--msr-ref-1", required=True)
