@@ -1106,7 +1106,7 @@ def _musicclip_ltx_hard_cap_seconds_from_payload(payload: dict) -> float:
     if not isinstance(settings, dict):
         settings = {}
     backend = str(settings.get("ltx_backend") or payload.get("ltx_backend") or payload.get("generation_backend") or "").strip().lower()
-    has_vramlab_limit = backend in {"int4", "vramlab"} or settings.get("ltx_max_generation_frames") or settings.get("hard_max_ltx_shot_seconds") or settings.get("ltx_max_generation_seconds")
+    has_vramlab_limit = backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} or settings.get("ltx_max_generation_frames") or settings.get("hard_max_ltx_shot_seconds") or settings.get("ltx_max_generation_seconds")
     if not has_vramlab_limit:
         return 0.0
     msr_v2 = bool(settings.get("msr_enabled") or payload.get("msr_enabled") or settings.get("use_msr") or payload.get("use_msr"))
@@ -4289,6 +4289,19 @@ def _load_music_ltx_int4_bridge():
     return _musicclip_patch_msr_location_override_bridge(_musicclip_patch_own_images_bridge(_musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(bridge)))))
 
 
+def _load_music_ltx25_fp16_bridge():
+    # LTX 2.5 keeps the mature clip2ltx planning/review/assembly contract and
+    # replaces only the final renderer with helpers/ltx25_helper.py.
+    bridge = _load_musicclip_bridge_file("music_ltx25_fp16.py", "_framevision_music_ltx25_fp16_bridge")
+    return _musicclip_patch_msr_location_override_bridge(_musicclip_patch_own_images_bridge(_musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(bridge)))))
+
+
+def _load_music_ltx25_convrot_bridge():
+    # Same planner/assembly path, rendered by the isolated LTX 2.5 ConvRot worker.
+    bridge = _load_musicclip_bridge_file("music_ltx25_convrot.py", "_framevision_music_ltx25_convrot_bridge")
+    return _musicclip_patch_own_images_bridge(_musicclip_patch_own_prompts_bridge(_musicclip_patch_qwen2511_bridge(_musicclip_patch_krea2_bridge(bridge))))
+
+
 def _musicclip_default_llama_runner() -> str:
     """Best-effort portable llama-server lookup for Music Clip Creator LTX.
 
@@ -6667,15 +6680,19 @@ def _musicclip_load_ltx_bridge_module_for_queue(root_dir: str, backend: str = ""
 
     root = Path(str(root_dir or _musicclip_project_root())).resolve()
     selected = str(backend or "").strip().lower().replace("_", "-")
-    if selected in {"int4", "ltx-int4", "ltx23-int4", "sdnq-int4"}:
+    if selected in {"ltx25-fp16", "ltx25_fp16", "2.5-fp16", "25-fp16"}:
+        filenames = ["music_ltx25_fp16.py"]
+    elif selected in {"ltx25-convrot", "ltx25_convrot", "2.5-convrot", "25-convrot"}:
+        filenames = ["music_ltx25_convrot.py"]
+    elif selected in {"int4", "ltx-int4", "ltx23-int4", "sdnq-int4"}:
         filenames = ["music_ltx_int4.py"]
     elif selected in {"vramlab", "vram-lab", "ltx-vramlab"}:
         filenames = ["clip2ltx_cli.py"]
     elif selected in {"wan2gp", "wangp", "wan-gp", "wgp"}:
         filenames = ["musicclip_planner_bridge.py"]
     else:
-        # Old queue payloads did not store the selected backend. Keep them
-        # working while preferring INT4 when that complete installation exists.
+        # Old queue payloads did not store the selected backend. Preserve their
+        # old preference order; new 2.5 payloads always store an explicit backend.
         filenames = ["music_ltx_int4.py", "clip2ltx_cli.py", "musicclip_planner_bridge.py"]
 
     errors = []
@@ -13688,9 +13705,12 @@ class AutoMusicSyncWidget(QWidget):
         self._visual_thumbs = VisualThumbManager(self, ffmpeg=self._ffmpeg)
 
         # Optional/private LTX bridge files. Missing/broken helpers must not affect public builds.
-        # music_ltx_int4.py = isolated INT4 adapter (preferred when fully installed).
-        # clip2ltx_cli.py = own LTX-VRAMLab FP16/FP8 bridge.
+        # music_ltx25_fp16.py / music_ltx25_convrot.py = LTX 2.5 render adapters.
+        # music_ltx_int4.py = isolated LTX 2.3 INT4 adapter.
+        # clip2ltx_cli.py = LTX 2.3 VRAM-Lab FP16/FP8 bridge.
         # musicclip_planner_bridge.py = original/Wan2GP bridge.
+        self._ltx25_fp16_bridge = _load_music_ltx25_fp16_bridge()
+        self._ltx25_convrot_bridge = _load_music_ltx25_convrot_bridge()
         self._ltx_int4_bridge = _load_music_ltx_int4_bridge()
         self._ltx_vramlab_bridge = _load_clip2ltx_bridge()
         self._planner_bridge = _load_musicclip_planner_bridge()
@@ -14741,6 +14761,7 @@ class AutoMusicSyncWidget(QWidget):
                 self.combo_ltx_generation_backend.currentIndexChanged.connect(lambda _i: self._apply_ltx_backend_duration_limits())
                 self.combo_ltx_generation_backend.currentIndexChanged.connect(lambda _i: self._save_settings())
                 self.combo_ltx_generation_backend.currentIndexChanged.connect(lambda _i: self._update_ltx_int8_text_encoder_ui())
+                self.combo_ltx_generation_backend.currentIndexChanged.connect(lambda _i: self._update_ltx_msr_ui())
             except Exception:
                 pass
             try:
@@ -18741,7 +18762,7 @@ class AutoMusicSyncWidget(QWidget):
 
         backend = self._current_ltx_generation_backend() if hasattr(self, "_current_ltx_generation_backend") else ""
         msr_v2_enabled = bool(msr.get("msr_enabled"))
-        if backend in {"int4", "vramlab"}:
+        if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"}:
             # Normal LTX keeps the proven 9.9s plan cap. MSR V2 is the explicit
             # exception and may plan up to 15.0s / 361 frames at 24 fps.
             planned_ltx_cap = 15.0 if msr_v2_enabled else 9.9
@@ -18826,13 +18847,13 @@ class AutoMusicSyncWidget(QWidget):
             "ltx_aspect_mode": "portrait" if ltx_portrait else "landscape",
             # MSR V2 is allowed 15s / 361 frames. Its raw render gets up to
             # 16s / 385 frames for the same trim/lipsync breathing room.
-            "ltx_max_generation_seconds": (15.0 if msr_v2_enabled else 10.0) if backend in {"int4", "vramlab"} else None,
-            "ltx_max_generation_frames": (361 if msr_v2_enabled else 241) if backend in {"int4", "vramlab"} else None,
-            "hard_max_ltx_shot_seconds": (15.0 if msr_v2_enabled else 9.9) if backend in {"int4", "vramlab"} else None,
-            "ltx_raw_generation_seconds": (16.0 if msr_v2_enabled else 11.0) if backend in {"int4", "vramlab"} else None,
-            "ltx_raw_generation_frames": (385 if msr_v2_enabled else 265) if backend in {"int4", "vramlab"} else None,
-            "ltx_generation_tail_padding_seconds": 0.5 if backend in {"int4", "vramlab"} else None,
-            "ltx_trim_to_planned_shot_seconds": True if backend in {"int4", "vramlab"} else None,
+            "ltx_max_generation_seconds": (15.0 if (msr_v2_enabled and backend != "ltx25_convrot") else 10.0) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
+            "ltx_max_generation_frames": (361 if (msr_v2_enabled and backend != "ltx25_convrot") else 241) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
+            "hard_max_ltx_shot_seconds": (15.0 if (msr_v2_enabled and backend != "ltx25_convrot") else 9.9) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
+            "ltx_raw_generation_seconds": (16.0 if (msr_v2_enabled and backend != "ltx25_convrot") else 11.0) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
+            "ltx_raw_generation_frames": (385 if (msr_v2_enabled and backend != "ltx25_convrot") else 265) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
+            "ltx_generation_tail_padding_seconds": 0.5 if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
+            "ltx_trim_to_planned_shot_seconds": True if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
             "timestamped_microclips_enabled": bool(getattr(self, "check_bridge_timestamped_microclips", None) and self.check_bridge_timestamped_microclips.isChecked()),
             "collage_effect_enabled": bool(getattr(self, "check_bridge_collage_effect", None) and self.check_bridge_collage_effect.isChecked()),
             "avoid_effects_in_first_clip": bool((getattr(self, "check_bridge_avoid_effects_first_clip", None) is None) or self.check_bridge_avoid_effects_first_clip.isChecked()),
@@ -19050,7 +19071,56 @@ class AutoMusicSyncWidget(QWidget):
         self._queue_settings_save()
 
     def _update_ltx_msr_ui(self) -> None:
+        backend = self._current_ltx_generation_backend() if hasattr(self, "_current_ltx_generation_backend") else ""
+        # Licon LTX 2.5 MSR is implemented by the native FP16 backend. ConvRot
+        # keeps the rest of the 2.5 Music Clip workflow but does not yet have the
+        # learned-slot MSR conditioning implementation. Never silently route a
+        # stale checked box through the old 2.3 pseudo-video MSR path.
+        if backend == "ltx25_convrot":
+            try:
+                if getattr(self, "check_ltx_use_msr", None) is not None:
+                    self.check_ltx_use_msr.blockSignals(True)
+                    self.check_ltx_use_msr.setChecked(False)
+                    self.check_ltx_use_msr.blockSignals(False)
+                    self.check_ltx_use_msr.setEnabled(False)
+                    self.check_ltx_use_msr.setText("Use MSR reference workflow (FP16 or LTX 2.3 only)")
+                    self.check_ltx_use_msr.setToolTip("LTX 2.5 ConvRot generation is available, but Licon's learned-slot MSR conditioning is currently wired to the native LTX 2.5 FP16 backend only.")
+            except Exception:
+                pass
+        else:
+            try:
+                if getattr(self, "check_ltx_use_msr", None) is not None:
+                    self.check_ltx_use_msr.setEnabled(True)
+                    if backend == "ltx25_fp16":
+                        self.check_ltx_use_msr.setText("Use LTX 2.5 MSR reference workflow")
+                        self.check_ltx_use_msr.setToolTip("Use LiconStudio LTX 2.5 Multiple Subject Reference with independent learned reference slots. The existing Music Clip Creator reference/background lists are reused.")
+                    else:
+                        self.check_ltx_use_msr.setText("Use MSR V2 reference workflow")
+                        self.check_ltx_use_msr.setToolTip("Use the LTX 2.3 MSR V2 reference workflow with the selected LTX 2.3/Wan2GP backend.")
+            except Exception:
+                pass
         enabled = self._ltx_msr_enabled()
+        try:
+            spin = getattr(self, "spin_ltx_msr_reference_frames", None)
+            if spin is not None:
+                if backend == "ltx25_fp16":
+                    # Licon 2.5 supports exactly 25 or 33 reference frames. Keep
+                    # the old spinbox but snap legacy 41/65 settings to 33.
+                    spin.blockSignals(True)
+                    spin.setRange(25, 33)
+                    spin.setSingleStep(8)
+                    if int(spin.value()) not in (25, 33):
+                        spin.setValue(33)
+                    spin.blockSignals(False)
+                    spin.setToolTip("LTX 2.5 MSR reference length. Supported values are 25 or 33 frames; 33 is recommended.")
+                else:
+                    spin.blockSignals(True)
+                    spin.setRange(17, 129)
+                    spin.setSingleStep(8)
+                    spin.blockSignals(False)
+                    spin.setToolTip("LTX 2.3/Wan2GP MSR reference-video length. 41 is the model default; 65 is a useful longer setting.")
+        except Exception:
+            pass
         try:
             self.ltx_section_msr.setVisible(enabled)
             if enabled:
@@ -19175,7 +19245,7 @@ class AutoMusicSyncWidget(QWidget):
         mode = "random" if self.combo_ltx_msr_background_mode and self.combo_ltx_msr_background_mode.currentIndex() == 1 else "sequence"
         return {
             "msr_enabled": bool(enabled),
-            "msr_version": 2,
+            "msr_version": (25 if (hasattr(self, "_current_ltx_generation_backend") and self._current_ltx_generation_backend() == "ltx25_fp16") else 2),
             "msr_automate_backgrounds": bool(automate),
             "msr_enhance_prompts": bool(getattr(self, "check_ltx_msr_enhance_prompts", None) and self.check_ltx_msr_enhance_prompts.isChecked()),
             "msr_automation_image_model": automation_model,
@@ -22936,24 +23006,32 @@ class AutoMusicSyncWidget(QWidget):
 
     def _has_any_ltx_bridge(self) -> bool:
         return bool(
-            getattr(self, "_ltx_int4_bridge", None) is not None
+            getattr(self, "_ltx25_fp16_bridge", None) is not None
+            or getattr(self, "_ltx25_convrot_bridge", None) is not None
+            or getattr(self, "_ltx_int4_bridge", None) is not None
             or getattr(self, "_ltx_vramlab_bridge", None) is not None
             or getattr(self, "_planner_bridge", None) is not None
         )
 
     def _current_ltx_bridge(self):
         backend = self._current_ltx_generation_backend() if hasattr(self, "_current_ltx_generation_backend") else ""
+        if backend == "ltx25_fp16":
+            return getattr(self, "_ltx25_fp16_bridge", None)
+        if backend == "ltx25_convrot":
+            return getattr(self, "_ltx25_convrot_bridge", None)
         if backend == "int4":
             return getattr(self, "_ltx_int4_bridge", None)
         if backend == "vramlab":
             return getattr(self, "_ltx_vramlab_bridge", None)
         if backend == "wan2gp":
             return getattr(self, "_planner_bridge", None)
-        # Safe fallback for startup/old saved settings. Prefer INT4 only when its
-        # adapter has already validated the model, environment and runner.
+        # Startup/legacy fallback keeps the proven old order unless a 2.5 choice
+        # has actually been selected/saved.
         return (
             getattr(self, "_ltx_int4_bridge", None)
             or getattr(self, "_ltx_vramlab_bridge", None)
+            or getattr(self, "_ltx25_fp16_bridge", None)
+            or getattr(self, "_ltx25_convrot_bridge", None)
             or getattr(self, "_planner_bridge", None)
         )
 
@@ -23157,17 +23235,25 @@ class AutoMusicSyncWidget(QWidget):
             combo.blockSignals(True)
             combo.clear()
 
+            ltx25_fp16_bridge = getattr(self, "_ltx25_fp16_bridge", None)
+            if ltx25_fp16_bridge is not None and (helpers / "music_ltx25_fp16.py").is_file() and (helpers / "ltx25_helper.py").is_file():
+                combo.addItem("LTX 2.5 FP16", "ltx25_fp16")
+
+            ltx25_convrot_bridge = getattr(self, "_ltx25_convrot_bridge", None)
+            if ltx25_convrot_bridge is not None and (helpers / "music_ltx25_convrot.py").is_file() and (helpers / "ltx25_convrot_worker.py").is_file():
+                combo.addItem("LTX 2.5 ConvRot (W4A8)", "ltx25_convrot")
+
             int4_bridge = getattr(self, "_ltx_int4_bridge", None)
             int4_adapter_file = helpers / "music_ltx_int4.py"
             int4_cli_file = helpers / "ltx_int4_cli.py"
             if int4_bridge is not None and int4_adapter_file.is_file() and int4_cli_file.is_file():
-                combo.addItem("LTX INT4 (preferred)", "int4")
+                combo.addItem("LTX 2.3 INT4", "int4")
 
             vram_bridge = getattr(self, "_ltx_vramlab_bridge", None)
             vram_bridge_file = helpers / "clip2ltx_cli.py"
             raw_vram_cli = helpers / "ltx23_vram_lab_cli.py"
             if vram_bridge is not None and vram_bridge_file.is_file() and raw_vram_cli.is_file():
-                combo.addItem("LTX-VRAMLab (FP16/FP8)", "vramlab")
+                combo.addItem("LTX 2.3 VRAM-Lab (FP16/FP8)", "vramlab")
 
             wan_bridge = getattr(self, "_planner_bridge", None)
             wan_bridge_file = helpers / "musicclip_planner_bridge.py"
@@ -23189,12 +23275,12 @@ class AutoMusicSyncWidget(QWidget):
                     saved = ""
                     migrated = False
                 available = {str(combo.itemData(i) or "") for i in range(combo.count())}
-                if "int4" in available and not migrated:
-                    wanted = "int4"
-                elif old in available:
+                if old in available:
                     wanted = old
                 elif saved in available:
                     wanted = saved
+                elif "int4" in available and not migrated:
+                    wanted = "int4"
                 elif "int4" in available:
                     wanted = "int4"
                 elif "vramlab" in available:
@@ -23224,7 +23310,8 @@ class AutoMusicSyncWidget(QWidget):
             spin = getattr(self, "spin_smart_max_scene_len", None)
             if spin is not None:
                 msr_v2 = bool(getattr(self, "check_ltx_use_msr", None) and self.check_ltx_use_msr.isChecked())
-                max_allowed = 30.0 if backend == "wan2gp" else (15.0 if msr_v2 else 9.9)
+                msr_long = bool(msr_v2 and backend in {"int4", "vramlab", "ltx25_fp16"})
+                max_allowed = 30.0 if backend == "wan2gp" else (15.0 if msr_long else 9.9)
                 try:
                     spin.setRange(0.5, float(max_allowed))
                 except Exception:
@@ -23239,17 +23326,21 @@ class AutoMusicSyncWidget(QWidget):
                         spin.setToolTip("Manual maximum smart scene length. Auto mode ignores this value and uses source clip stats.")
                     elif msr_v2:
                         spin.setToolTip("MSR V2 exception: shots may be planned up to 15.0s / 361 frames at 24 fps, with a small extra raw-render tail.")
+                    elif backend == "ltx25_fp16":
+                        spin.setToolTip("Manual maximum smart scene length for LTX 2.5 FP16. It stops at 9.9s normally; LTX 2.5 MSR may use the 15s MSR exception.")
+                    elif backend == "ltx25_convrot":
+                        spin.setToolTip("Manual maximum smart scene length for LTX 2.5 ConvRot. It stops at 9.9s so the raw render has trim/lipsync breathing room.")
                     elif backend == "int4":
-                        spin.setToolTip("Manual maximum smart scene length for LTX INT4. It stops at 9.9s so the raw render has trim/lipsync breathing room.")
+                        spin.setToolTip("Manual maximum smart scene length for LTX 2.3 INT4. It stops at 9.9s so the raw render has trim/lipsync breathing room.")
                     else:
-                        spin.setToolTip("Manual maximum smart scene length for LTX-VRAMLab FP16/FP8. It stops at 9.9s so the raw render has trim/lipsync breathing room.")
+                        spin.setToolTip("Manual maximum smart scene length for LTX 2.3 VRAM-Lab FP16/FP8. It stops at 9.9s so the raw render has trim/lipsync breathing room.")
                 except Exception:
                     pass
         except Exception:
             pass
 
     def _current_ltx_generation_backend(self) -> str:
-        valid = {"int4", "vramlab", "wan2gp"}
+        valid = {"ltx25_fp16", "ltx25_convrot", "int4", "vramlab", "wan2gp"}
         combo = getattr(self, "combo_ltx_generation_backend", None)
         if combo is not None:
             value = str(combo.currentData() or "").strip().lower()
@@ -23266,6 +23357,10 @@ class AutoMusicSyncWidget(QWidget):
             return "int4"
         if getattr(self, "_ltx_vramlab_bridge", None) is not None:
             return "vramlab"
+        if getattr(self, "_ltx25_fp16_bridge", None) is not None:
+            return "ltx25_fp16"
+        if getattr(self, "_ltx25_convrot_bridge", None) is not None:
+            return "ltx25_convrot"
         if getattr(self, "_planner_bridge", None) is not None:
             return "wan2gp"
         return ""
@@ -26569,7 +26664,7 @@ class AutoMusicSyncWidget(QWidget):
                     int4_migrated = bool(int(s.get("ltx/int4_preference_initialized", 0)))
                     if int4_ready and not int4_migrated:
                         self._ltx_combo_set_data(self.combo_ltx_generation_backend, "int4")
-                    elif backend in ("int4", "vramlab", "wan2gp"):
+                    elif backend in ("ltx25_fp16", "ltx25_convrot", "int4", "vramlab", "wan2gp"):
                         self._ltx_combo_set_data(self.combo_ltx_generation_backend, backend)
                 finally:
                     self.combo_ltx_generation_backend.blockSignals(False)
@@ -26579,6 +26674,10 @@ class AutoMusicSyncWidget(QWidget):
                     pass
                 try:
                     self._update_ltx_int8_text_encoder_ui()
+                except Exception:
+                    pass
+                try:
+                    self._update_ltx_msr_ui()
                 except Exception:
                     pass
             if getattr(self, "check_ltx_use_framevision_queue", None) is not None:
@@ -27132,7 +27231,7 @@ class AutoMusicSyncWidget(QWidget):
         _set("planner_bridge_ltx_export_audio_chunks", _checked("check_bridge_ltx_export_audio_chunks", 1))
         _set("planner_bridge_ltx_fps", int(_spin_value("spin_bridge_ltx_fps", 24)))
         _ltx_backend_value = self._current_ltx_generation_backend() if hasattr(self, "_current_ltx_generation_backend") else ""
-        if _ltx_backend_value in {"int4", "vramlab", "wan2gp"}:
+        if _ltx_backend_value in {"ltx25_fp16", "ltx25_convrot", "int4", "vramlab", "wan2gp"}:
             _set("ltx/generation_backend", _ltx_backend_value)
             _set("musicclip_ltx_generation_backend", _ltx_backend_value)
             if getattr(self, "_ltx_int4_bridge", None) is not None:

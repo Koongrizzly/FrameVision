@@ -12886,29 +12886,9 @@ class PipelineWorker(QThread):
             # Run / skip reference guidance step
             try:
                 _refs_prev = (manifest.get("steps") or {}).get("Refs (Qwen3-VL Describe)") or {}
-                _own_minimax_verbatim = bool(
-                    _own_storyline_enabled
-                    and _video_model_key((self.job.encoding or {}).get("video_model") or "") == "minimax_h3"
-                )
-                _need_refs_step = bool(
-                    (not _own_minimax_verbatim)
-                    and _ref_strategy in ("qwen3vl_describe", "minimax_video_refs")
-                    and bool(_copied_refs)
-                )
+                _need_refs_step = (_ref_strategy in ("qwen3vl_describe", "minimax_video_refs") and bool(_copied_refs))
                 if not _need_refs_step:
-                    if _own_minimax_verbatim and bool(_copied_refs):
-                        _skip(
-                            "Refs (Qwen3-VL Describe)",
-                            "MiniMax + Own Storymode: reference LLM describe bypassed; refs pass directly to MiniMax and user prompts remain authoritative.",
-                        )
-                        try:
-                            self.signals.log.emit(
-                                "[planner] MiniMax + Own Storymode: ALL planner LLM/reference-description passes bypassed; pasted prompts are sent unchanged."
-                            )
-                        except Exception:
-                            pass
-                    else:
-                        _skip("Refs (Qwen3-VL Describe)", "No reference strategy A selected (or no refs).")
+                    _skip("Refs (Qwen3-VL Describe)", "No reference strategy A selected (or no refs).")
                 else:
                     up_to_date = (
                         _file_ok(refs_guidance_path, 50)
