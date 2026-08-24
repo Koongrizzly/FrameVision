@@ -12886,9 +12886,29 @@ class PipelineWorker(QThread):
             # Run / skip reference guidance step
             try:
                 _refs_prev = (manifest.get("steps") or {}).get("Refs (Qwen3-VL Describe)") or {}
-                _need_refs_step = (_ref_strategy in ("qwen3vl_describe", "minimax_video_refs") and bool(_copied_refs))
+                _own_minimax_verbatim = bool(
+                    _own_storyline_enabled
+                    and _video_model_key((self.job.encoding or {}).get("video_model") or "") == "minimax_h3"
+                )
+                _need_refs_step = bool(
+                    (not _own_minimax_verbatim)
+                    and _ref_strategy in ("qwen3vl_describe", "minimax_video_refs")
+                    and bool(_copied_refs)
+                )
                 if not _need_refs_step:
-                    _skip("Refs (Qwen3-VL Describe)", "No reference strategy A selected (or no refs).")
+                    if _own_minimax_verbatim and bool(_copied_refs):
+                        _skip(
+                            "Refs (Qwen3-VL Describe)",
+                            "MiniMax + Own Storymode: reference LLM describe bypassed; refs pass directly to MiniMax and user prompts remain authoritative.",
+                        )
+                        try:
+                            self.signals.log.emit(
+                                "[planner] MiniMax + Own Storymode: ALL planner LLM/reference-description passes bypassed; pasted prompts are sent unchanged."
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        _skip("Refs (Qwen3-VL Describe)", "No reference strategy A selected (or no refs).")
                 else:
                     up_to_date = (
                         _file_ok(refs_guidance_path, 50)
@@ -18072,7 +18092,20 @@ class PipelineWorker(QThread):
                 # HOW the already-created beat is filmed: one project-wide visual preset, duration-aware
                 # internal shot timing, shot-flow/camera preset, native sound formatting and Ref2VA subjects.
                 _is_minimax_i2v = _video_model_key(str((enc0 or {}).get("video_model") or "")) == "minimax_h3"
-                if _is_minimax_i2v and out_list:
+                # Own Storymode is explicitly user-authored. For MiniMax H3, keep those
+                # pasted prompts exactly as the Own Storymode pipeline produced them and
+                # bypass the deterministic H3 prompt builder entirely. Normal Planner
+                # stories still use the MiniMax prompt builder below.
+                _minimax_own_story_verbatim = bool(_is_minimax_i2v and own_storyline_enabled0)
+                if _minimax_own_story_verbatim:
+                    manifest.setdefault("settings", {})["minimax_prompt_conversion"] = "own_storyline_verbatim_bypass"
+                    try:
+                        self.signals.log.emit(
+                            f"[minimax-h3] Own Storymode: keeping {len(out_list)} pasted prompt(s) unchanged; H3 Prompt Builder bypassed"
+                        )
+                    except Exception:
+                        pass
+                if _is_minimax_i2v and out_list and not _minimax_own_story_verbatim:
                     try:
                         from planner_minimax_prompt_builder import (
                             build_prompt as _mm_build_prompt,
