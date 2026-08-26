@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-BRIDGE_PATCH_VERSION = "2026-08-24-msr-detect-v4"
+BRIDGE_PATCH_VERSION = "2026-08-25-convrot-i2v-route-v5"
 
 HERE = Path(__file__).resolve().parent
 APP_ROOT = HERE.parent if HERE.name.lower() == "helpers" else HERE
@@ -100,7 +100,32 @@ def _option(cmd: list[str], *names: str, default: str = "") -> str:
 
 
 def _images_from_command(cmd: list[str]) -> list[dict[str, Any]]:
+    """Recover ordinary first-frame I2V conditioning from the inherited LTX command.
+
+    The current FrameVision LTX 2.3 VRAMLab builder emits separate
+    ``--i2v-image`` / ``--i2v-image-frame`` / ``--i2v-image-strength`` flags.
+    Older routes used ``--image PATH FRAME STRENGTH [CRF]``.  Accept both so
+    the LTX 2.5 adapter does not silently turn an I2V Music Clip job into T2V.
+    """
     images: list[dict[str, Any]] = []
+
+    # Current VRAMLab command format.
+    i2v_path = _option(cmd, "--i2v-image", default="").strip()
+    if i2v_path:
+        frame_idx = _safe_int(_option(cmd, "--i2v-image-frame", default="0"), 0)
+        strength = _safe_float(_option(cmd, "--i2v-image-strength", default="1.0"), 1.0)
+        try:
+            p = Path(i2v_path).expanduser()
+            if p.is_file():
+                images.append({
+                    "path": str(p.resolve()),
+                    "frame_idx": int(frame_idx),
+                    "strength": float(strength),
+                })
+        except Exception:
+            pass
+
+    # Older ImageConditioningAction format.
     i = 0
     while i < len(cmd):
         if cmd[i] != "--image":
@@ -117,8 +142,18 @@ def _images_from_command(cmd: list[str]) -> list[dict[str, Any]]:
             strength = float(cmd[i + 3])
         except Exception:
             strength = 1.0
-        if path and Path(path).expanduser().is_file():
-            images.append({"path": str(Path(path).expanduser().resolve()), "frame_idx": frame_idx, "strength": strength})
+        try:
+            p = Path(path).expanduser()
+            if p.is_file():
+                resolved = str(p.resolve())
+                if not any(os.path.normcase(str(x.get("path", ""))) == os.path.normcase(resolved) for x in images):
+                    images.append({
+                        "path": resolved,
+                        "frame_idx": frame_idx,
+                        "strength": strength,
+                    })
+        except Exception:
+            pass
         # Old LTX 2.3 ImageConditioningAction sometimes has a fourth CRF value.
         i += 4
         if i < len(cmd) and not str(cmd[i]).startswith("--"):
@@ -312,6 +347,26 @@ def _write_job(mode: str, old_cmd: list[str], call_args: tuple[Any, ...], call_k
     # The existing 2.3 planner has already resolved 480p/720p + landscape/portrait
     # into exact width/height values. Reusing those values is what makes every
     # Music Clip Creator resolution/aspect setting carry across to 2.5.
+    images = _images_from_command(old_cmd)
+
+    # Safety fallback: the inherited builder is normally called with
+    # start_image_path as a keyword argument.  If command parsing ever changes
+    # again, preserve that already-resolved per-shot start image instead of
+    # silently creating a text-to-video job.
+    if not images:
+        roots: list[Any] = list(call_args) + [call_kwargs]
+        start_value = _find_named_value(
+            roots,
+            ("start_image_path", "current_start_image_path", "image_path"),
+        )
+        start_paths = _image_paths(start_value)
+        if start_paths:
+            images = [{
+                "path": start_paths[0],
+                "frame_idx": 0,
+                "strength": 1.0,
+            }]
+
     job = {
         "cmd": "generate",
         "model_type": "W4A8 ConvRot (recommended)" if mode == "convrot" else "Full FP16 / BF16",
@@ -324,7 +379,7 @@ def _write_job(mode: str, old_cmd: list[str], call_args: tuple[Any, ...], call_k
         "frames": frames,
         "fps": fps,
         "output": str(Path(output).expanduser()),
-        "images": _images_from_command(old_cmd),
+        "images": images,
         "paths": {k: str(v) for k, v in paths.items()},
         "offload": "cpu",
         "quantization": "none" if mode == "convrot" else "fp8-cast",
@@ -343,6 +398,58 @@ def _write_job(mode: str, old_cmd: list[str], call_args: tuple[Any, ...], call_k
     payload_path = payload_dir / f"musicclip_ltx25_{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{seed}.json"
     payload_path.write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
     return payload_path, job
+
+
+def _convrot_msr_command(old_cmd: list[str], call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> list[str]:
+    if not CONVROT_ENV.is_file():
+        raise RuntimeError(f"LTX 2.5 ConvRot environment Python is missing: {CONVROT_ENV}")
+    if not LTX25_CONVROT_WORKER.is_file():
+        raise RuntimeError(f"LTX 2.5 ConvRot worker is missing: {LTX25_CONVROT_WORKER}")
+    if not MSR_MODEL.is_file():
+        raise RuntimeError(
+            f"LTX 2.5 MSR model is missing: {MSR_MODEL}. "
+            "Run the LTX 2.5 MSR installer first."
+        )
+
+    refs, background = _msr_sources(old_cmd, call_args, call_kwargs)
+    if not refs:
+        raise RuntimeError(
+            "LTX 2.5 ConvRot MSR was selected, but the adapter could not recover "
+            "the individual reference images from this shot."
+        )
+
+    payload_path, job = _write_job("convrot", old_cmd, call_args, call_kwargs)
+    roots: list[Any] = list(call_args) + [call_kwargs]
+    requested_ref_frames = _safe_int(
+        str(_find_named_value(roots, ("msr_reference_frames",)) or 33), 33
+    )
+    ref_frames = 25 if requested_ref_frames <= 28 else 33
+    strength = _safe_float(
+        str(_find_named_value(roots, ("msr_strength", "msr_reference_strength")) or 1.0),
+        1.0,
+    )
+
+    job.update({
+        "msr_enabled": True,
+        "msr_lora_path": str(MSR_MODEL),
+        "msr_strength_model": 1.0,
+        "msr_reference_strength": strength,
+        "msr_reference_frames": ref_frames,
+        "msr_tile_size": 256,
+        "msr_tile_overlap": 64,
+        "msr_refs": refs[:4],
+        "msr_background": background,
+    })
+    payload_path.write_text(
+        json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return [
+        str(CONVROT_ENV),
+        str(LTX25_CONVROT_WORKER),
+        "--msr-enabled",
+        "--job",
+        str(payload_path),
+    ]
 
 
 def _msr_command(old_cmd: list[str], call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> list[str]:
@@ -423,23 +530,16 @@ def install_generation_patch(base, mode: str):
             or any("msr" in str(x).lower() and "pipeline" in str(x).lower() for x in old_cmd)
         )
         if is_msr:
-            if mode != "fp16":
-                raise RuntimeError(
-                    "LTX 2.5 ConvRot MSR is not available in this backend yet. "
-                    "Select LTX 2.5 FP16 for Licon MSR, or turn MSR off for ConvRot."
-                )
-            msr_cmd = _msr_command(old_cmd, args, kwargs)
+            if mode == "convrot":
+                msr_cmd = _convrot_msr_command(old_cmd, args, kwargs)
+            else:
+                msr_cmd = _msr_command(old_cmd, args, kwargs)
             # clip2ltx_cli.py intentionally refuses an MSR job unless the final
             # backend command carries this marker. Keep the invariant here even
             # if _msr_command is edited later.
             if "--msr-enabled" not in msr_cmd:
                 insert_at = 2 if len(msr_cmd) >= 2 else len(msr_cmd)
                 msr_cmd.insert(insert_at, "--msr-enabled")
-            print(
-                f"[LTX25-MSR] bridge={BRIDGE_PATCH_VERSION} final_route=MSR "
-                f"marker={'yes' if '--msr-enabled' in msr_cmd else 'NO'} refs={sum(1 for x in msr_cmd if str(x).startswith('--msr-ref-'))}",
-                flush=True,
-            )
             return msr_cmd
 
         payload_path, job = _write_job(mode, old_cmd, args, kwargs)
@@ -502,7 +602,6 @@ def _install_runner_route_patch(base) -> None:
     if callable(original_single) and not getattr(original_single, "_ltx25_route_wrapper", False):
         def single(payload: dict) -> dict:
             routed = _force_inherited_runner_backend(payload)
-            print(f"[LTX25] bridge={BRIDGE_PATCH_VERSION} inherited_runner_backend=vramlab", flush=True)
             return original_single(routed)
         single._ltx25_route_wrapper = True
         setattr(base, "run_single_ltx_shot_test", single)

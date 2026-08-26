@@ -64,6 +64,7 @@ import comfy.sample
 import comfy.samplers
 import comfy.nested_tensor
 import folder_paths
+import comfy_extras.nodes_lt as nodes_lt
 from comfy_extras.nodes_lt import LTXVDualCFGGuider
 from comfy_extras.nodes_custom_sampler import RandomNoise, SamplerCustomAdvanced
 from comfy_extras.nodes_audio import load as load_audio_file, VAEEncodeAudio
@@ -81,7 +82,7 @@ VIDEO_VAE_TILE_T = 8
 VIDEO_VAE_TILE_X = 32
 VIDEO_VAE_TILE_Y = 32
 VIDEO_VAE_OVERLAP = 8
-VIDEO_VAE_OVERLAP_T = 1
+VIDEO_VAE_OVERLAP_T = 4
 
 
 def _flush():
@@ -255,6 +256,345 @@ def _encode_soundtrack(audio_path, audio_vae, frames, fps):
     return latent
 
 
+
+_SLOT_PREFIXES = (
+    "diffusion_model.reference_slot_embedding.",
+    "reference_slot_embedding.",
+)
+
+
+def _clone_conditioning(conditioning):
+    return [[item[0], dict(item[1])] for item in conditioning]
+
+
+def _load_msr_checkpoint(path):
+    """Load Licon MSR LoRA + learned slot embedding using Comfy's native loader."""
+    lora, metadata = comfy.utils.load_torch_file(
+        str(path), safe_load=True, return_metadata=True
+    )
+    metadata = metadata or {}
+    slot_state = {}
+    normal_lora = {}
+    for key, value in lora.items():
+        matched = False
+        for prefix in _SLOT_PREFIXES:
+            if key.startswith(prefix):
+                slot_state[key[len(prefix):]] = value.detach().cpu()
+                matched = True
+                break
+        if not matched:
+            normal_lora[key] = value
+
+    required = {
+        "frequencies",
+        "net.0.weight",
+        "net.0.bias",
+        "net.2.weight",
+        "net.2.bias",
+    }
+    missing = sorted(required.difference(slot_state))
+    if missing:
+        raise ValueError(
+            "MSR checkpoint is missing reference slot tensors: " + ", ".join(missing)
+        )
+    if metadata.get("reference_token_order", "prepend") != "prepend":
+        raise ValueError("Unsupported MSR reference_token_order; expected prepend.")
+    if metadata.get(
+        "reference_slot_time_offsets", "pic1_based_negative_time"
+    ) != "pic1_based_negative_time":
+        raise ValueError(
+            "Unsupported MSR reference_slot_time_offsets; "
+            "expected pic1_based_negative_time."
+        )
+
+    downscale = max(1, round(float(metadata.get("reference_downscale_factor", 1))))
+    print(
+        f"[CONVROT-MSR] Loaded MSR checkpoint | "
+        f"adapter_tensors={len(normal_lora)} slot_tensors={len(slot_state)} "
+        f"downscale={downscale}",
+        flush=True,
+    )
+    return normal_lora, slot_state, metadata, downscale
+
+
+def _apply_msr_lora(model, normal_lora, metadata, strength_model):
+    """Apply the MSR adapter to the already-loaded quantized ConvRot model."""
+    if float(strength_model) == 0.0:
+        return model
+    loaded_model, _ = comfy.sd.load_lora_for_models(
+        model,
+        None,
+        normal_lora,
+        float(strength_model),
+        0.0,
+        lora_metadata=metadata,
+    )
+    return loaded_model
+
+
+def _slot_embedding(slot_id, state, device, dtype):
+    frequencies = state["frequencies"].to(device=device, dtype=torch.float32)
+    slot_value = torch.tensor(float(slot_id), device=device, dtype=torch.float32)
+    scaled = slot_value / 16.0
+    phases = scaled * frequencies
+    features = torch.cat((scaled.reshape(1), torch.sin(phases), torch.cos(phases)))
+    weight0 = state["net.0.weight"].to(device=device, dtype=torch.float32)
+    bias0 = state["net.0.bias"].to(device=device, dtype=torch.float32)
+    hidden = torch.nn.functional.silu(
+        torch.nn.functional.linear(features, weight0, bias0)
+    )
+    weight2 = state["net.2.weight"].to(device=device, dtype=torch.float32)
+    bias2 = state["net.2.bias"].to(device=device, dtype=torch.float32)
+    embedding = torch.nn.functional.linear(hidden, weight2, bias2)
+    return embedding.to(dtype=dtype)
+
+
+def _conditioning_get(conditioning, key, default=None):
+    for _, values in conditioning:
+        if key in values:
+            return values[key]
+    return default
+
+
+def _append_attention_entry(conditioning, pre_filter_count, latent_shape, strength):
+    existing = _conditioning_get(conditioning, "guide_attention_entries", [])
+    entry = {
+        "pre_filter_count": int(pre_filter_count),
+        "strength": float(strength),
+        "pixel_mask": None,
+        "latent_shape": list(latent_shape),
+    }
+    return node_helpers.conditioning_set_values(
+        conditioning, {"guide_attention_entries": [*existing, entry]}
+    )
+
+
+def _resize_msr_reference(images, target_width, target_height, is_background):
+    """Mirror Licon's official ComfyUI-LTX2.5-MSR resize policy."""
+    if is_background:
+        return comfy.utils.common_upscale(
+            images.movedim(-1, 1),
+            int(target_width),
+            int(target_height),
+            "bilinear",
+            crop="center",
+        ).movedim(1, -1)
+
+    source_height, source_width = images.shape[1:3]
+    if source_width == target_width and source_height == target_height:
+        return images
+
+    def aspect_family(width, height):
+        ratio = float(width) / float(height)
+        if ratio >= 1.25:
+            return "landscape"
+        if ratio <= 0.8:
+            return "portrait"
+        return "square"
+
+    same_family = (
+        aspect_family(source_width, source_height)
+        == aspect_family(target_width, target_height)
+    )
+    source_is_smaller = (
+        source_width <= target_width and source_height <= target_height
+    )
+    if same_family and not source_is_smaller:
+        return comfy.utils.common_upscale(
+            images.movedim(-1, 1),
+            int(target_width),
+            int(target_height),
+            "bilinear",
+            crop="center",
+        ).movedim(1, -1)
+
+    scale = min(
+        float(target_width) / float(source_width),
+        float(target_height) / float(source_height),
+    )
+    resized_width = max(1, min(int(target_width), round(source_width * scale)))
+    resized_height = max(1, min(int(target_height), round(source_height * scale)))
+    resized = comfy.utils.common_upscale(
+        images.movedim(-1, 1),
+        resized_width,
+        resized_height,
+        "bilinear",
+        crop="disabled",
+    ).movedim(1, -1)
+    canvas = torch.ones(
+        (images.shape[0], int(target_height), int(target_width), images.shape[-1]),
+        dtype=images.dtype,
+        device=images.device,
+    )
+    left = (int(target_width) - resized_width) // 2
+    top = (int(target_height) - resized_height) // 2
+    canvas[:, top:top + resized_height, left:left + resized_width] = resized
+    return canvas
+
+
+def _encode_msr_reference(
+    vae,
+    latent_width,
+    latent_height,
+    image_path,
+    reference_frames,
+    downscale,
+    is_background,
+    tile_size,
+    tile_overlap,
+):
+    image = _load_image(image_path)
+    repeated = image.repeat(int(reference_frames), 1, 1, 1)
+    time_scale, width_scale, height_scale = vae.downscale_index_formula
+    keep = ((repeated.shape[0] - 1) // int(time_scale)) * int(time_scale) + 1
+    repeated = repeated[:keep]
+    target_width = int(latent_width * width_scale / downscale)
+    target_height = int(latent_height * height_scale / downscale)
+    pixels = _resize_msr_reference(
+        repeated, target_width, target_height, bool(is_background)
+    )[..., :3]
+    with torch.inference_mode():
+        guide_latent = vae.encode_tiled(
+            pixels,
+            tile_x=int(tile_size),
+            tile_y=int(tile_size),
+            overlap=int(tile_overlap),
+        )
+    return guide_latent
+
+
+def _apply_msr_guides(
+    positive,
+    negative,
+    video_latent,
+    vae,
+    references,
+    slot_state,
+    downscale,
+    strength,
+    reference_frames,
+    tile_size,
+    tile_overlap,
+):
+    """
+    Native Comfy/Licon 2.5 MSR path:
+      independent VAE encode -> learned slot embedding -> negative time offset
+      -> append_keyframe -> guide attention metadata.
+    """
+    positive = _clone_conditioning(positive)
+    negative = _clone_conditioning(negative)
+    latent_image = video_latent["samples"]
+    noise_mask = nodes_lt.get_noise_mask(video_latent)
+
+    if latent_image.ndim != 5 or latent_image.shape[1] != 128:
+        raise ValueError(
+            "ConvRot MSR needs video latent [B,128,F,H,W], "
+            f"got {tuple(latent_image.shape)}"
+        )
+    if latent_image.shape[0] != 1:
+        raise ValueError("ConvRot MSR currently requires batch_size=1.")
+
+    _, _, _, latent_height, latent_width = latent_image.shape
+    if latent_height % int(downscale) or latent_width % int(downscale):
+        raise ValueError(
+            f"Target latent grid {latent_width}x{latent_height} is not divisible "
+            f"by MSR reference_downscale_factor={downscale}."
+        )
+
+    num_slots = len(references)
+    if not 1 <= num_slots <= 5:
+        raise ValueError(f"MSR requires 1-5 references, got {num_slots}.")
+
+    scale_factors = vae.downscale_index_formula
+    print(
+        f"[CONVROT-MSR] Applying {num_slots} references | "
+        f"frames_each={reference_frames} | target_latent={tuple(latent_image.shape)}",
+        flush=True,
+    )
+
+    for slot_index, ref in enumerate(references):
+        label = ref["label"]
+        path = ref["path"]
+        is_background = bool(ref.get("background", False))
+        slot_id = slot_index + 1
+
+        guide_latent = _encode_msr_reference(
+            vae,
+            latent_width,
+            latent_height,
+            path,
+            reference_frames,
+            downscale,
+            is_background,
+            tile_size,
+            tile_overlap,
+        )
+
+        embedding = _slot_embedding(
+            slot_id, slot_state, guide_latent.device, guide_latent.dtype
+        )
+        if embedding.numel() != guide_latent.shape[1]:
+            raise ValueError(
+                f"MSR slot embedding dimension {embedding.numel()} does not "
+                f"match LTX latent channels {guide_latent.shape[1]}."
+            )
+        guide_latent = guide_latent + embedding.view(1, -1, 1, 1, 1)
+
+        original_shape = list(guide_latent.shape[2:])
+        guide_mask = None
+        if int(downscale) > 1:
+            guide_latent, guide_mask = nodes_lt.LTXVAddGuide.dilate_latent(
+                guide_latent, int(downscale)
+            )
+
+        frame_offset = -(num_slots - slot_index)
+        positive, negative, latent_image, noise_mask = (
+            nodes_lt.LTXVAddGuide.append_keyframe(
+                positive,
+                negative,
+                frame_offset,
+                latent_image,
+                noise_mask,
+                guide_latent,
+                float(strength),
+                scale_factors,
+                guide_mask=guide_mask,
+                latent_downscale_factor=int(downscale),
+                causal_fix=True,
+            )
+        )
+
+        token_count = (
+            guide_latent.shape[2] * guide_latent.shape[3] * guide_latent.shape[4]
+        )
+        positive = _append_attention_entry(
+            positive, token_count, original_shape, strength
+        )
+        negative = _append_attention_entry(
+            negative, token_count, original_shape, strength
+        )
+        print(
+            f"[CONVROT-MSR] {label} slot={slot_id} offset={frame_offset} "
+            f"latent={tuple(guide_latent.shape)}",
+            flush=True,
+        )
+
+    out = dict(video_latent)
+    out["samples"] = latent_image
+    if noise_mask is not None:
+        out["noise_mask"] = noise_mask
+    return positive, negative, out
+
+
+def _crop_msr_guides(positive, negative, video_samples):
+    """Remove prepended MSR guide slots exactly through native LTXVCropGuides."""
+    result = nodes_lt.LTXVCropGuides.execute(
+        positive, negative, {"samples": video_samples}
+    )
+    cropped = _node_value(result, 2)
+    return cropped["samples"]
+
+
 def _load_latent_upsampler(path):
     """Load FrameVision's selected LTX latent x2 upscaler through current Comfy."""
     p = Path(path)
@@ -370,6 +710,13 @@ def _decode_video(latent, vae):
     # explicit 3D tiling under inference mode instead of trying a full-frame
     # decode first. The tile values are in latent space, matching Comfy's VAE
     # decode_tiled(...) interface for 3D/video latents.
+    temporal = int(latent.shape[2]) if getattr(latent, "ndim", 0) >= 3 else -1
+    print(
+        f"[CONVROT] VAE decode tiling | temporal={temporal} "
+        f"tile_t={VIDEO_VAE_TILE_T} overlap_t={VIDEO_VAE_OVERLAP_T} "
+        f"tile_xy={VIDEO_VAE_TILE_X} overlap_xy={VIDEO_VAE_OVERLAP}",
+        flush=True,
+    )
     with torch.inference_mode():
         images = vae.decode_tiled(
             latent,
@@ -449,14 +796,45 @@ def generate(job):
     seed=int(job['seed'])
     two_phase = job.get('workflow') == 'two_phase'
     soundtrack = str(job.get('audio_path') or '').strip()
+    msr_enabled = bool(job.get("msr_enabled", False))
 
     if two_phase and (width % 64 or height % 64):
         raise ValueError("Two-phase ConvRot requires width and height divisible by 64.")
 
+    msr_refs = []
+    msr_normal_lora = msr_slot_state = msr_metadata = None
+    msr_downscale = 1
+    msr_strength = float(job.get("msr_reference_strength", 1.0))
+    msr_model_strength = float(job.get("msr_strength_model", 1.0))
+    msr_reference_frames = int(job.get("msr_reference_frames", 33))
+    msr_tile_size = int(job.get("msr_tile_size", 256))
+    msr_tile_overlap = int(job.get("msr_tile_overlap", 64))
+
+    if msr_enabled:
+        if msr_reference_frames not in (25, 33):
+            raise ValueError(
+                f"ConvRot MSR reference_frames must be 25 or 33, got {msr_reference_frames}."
+            )
+        raw_refs = [str(x).strip() for x in (job.get("msr_refs") or []) if str(x).strip()]
+        background = str(job.get("msr_background") or "").strip()
+        for idx, path in enumerate(raw_refs[:4], 1):
+            msr_refs.append({"label": f"pic{idx}", "path": path, "background": False})
+        if background:
+            msr_refs.append({"label": "background", "path": background, "background": True})
+        if not msr_refs:
+            raise ValueError("ConvRot MSR was requested but no references were supplied.")
+        msr_path = str(job.get("msr_lora_path") or "").strip()
+        if not msr_path or not Path(msr_path).is_file():
+            raise FileNotFoundError(f"LTX 2.5 MSR checkpoint not found: {msr_path}")
+        msr_normal_lora, msr_slot_state, msr_metadata, msr_downscale = (
+            _load_msr_checkpoint(msr_path)
+        )
+
     print(
         f'[CONVROT] Embedded Comfy backend | {job.get("model_type")} | '
         f'{"2 phase" if two_phase else "1 phase"} | '
-        f'{width}x{height} | {frames} frames | seed {seed}',
+        f'{width}x{height} | {frames} frames | seed {seed}'
+        + (f' | MSR refs={len(msr_refs)}' if msr_enabled else ''),
         flush=True
     )
 
@@ -465,11 +843,9 @@ def generate(job):
         [str(paths['text_encoder'])],
         clip_type=None,
     )
-    positive,negative=_encode_conditioning(clip,job['prompt'],fps)
+    base_positive,base_negative=_encode_conditioning(clip,job['prompt'],fps)
     del clip; _flush()
 
-    # Audio latent: supplied soundtrack is encoded and frozen; otherwise use an
-    # empty latent and let LTX generate its own audio.
     print('[CONVROT] Loading audio VAE...',flush=True)
     av=_load_vae(paths['audio_vae'],audio=True)
     if soundtrack:
@@ -482,22 +858,77 @@ def generate(job):
     stage_h = height // 2 if two_phase else height
     video_latent=_empty_video(stage_w,stage_h,frames)
 
+    # Accept both the worker-native ``images`` list and the music-clip
+    # bridge's singular ``image`` field.  The bridge payloads currently pass
+    # a single start-image path, so without this compatibility normalization
+    # the I2V branch below was silently skipped and the run became text/audio
+    # to video even though the payload contained a valid image path.
     images=job.get('images') or []
+    if not images:
+        single_image = job.get('image')
+        if isinstance(single_image, str) and single_image.strip():
+            images=[{'path': single_image.strip(), 'strength': float(job.get('image_strength', 1.0))}]
+        elif isinstance(single_image, dict):
+            image_path = str(single_image.get('path') or single_image.get('image') or '').strip()
+            if image_path:
+                images=[{
+                    'path': image_path,
+                    'strength': float(single_image.get('strength', job.get('image_strength', 1.0))),
+                }]
+    if images:
+        print(
+            f"[CONVROT] Start-image route active | {images[0].get('path')} | "
+            f"strength={float(images[0].get('strength', 1.0)):.3f}",
+            flush=True,
+        )
+    else:
+        print('[CONVROT] Start-image route inactive | no image supplied', flush=True)
+
+    vv = None
+    if images or msr_enabled:
+        vv=_load_vae(paths['video_vae'])
+
+    # Preserve ordinary first/last-frame conditioning if the existing planner
+    # supplied it. MSR references are added separately through native guides.
     if images:
         print(
             f'[CONVROT] Encoding first-frame image conditioning at '
             f'{stage_w}x{stage_h}...',
             flush=True
         )
-        vv=_load_vae(paths['video_vae'])
         image=images[0]
         video_latent=_apply_i2v(video_latent,vv,image['path'],image.get('strength',1.0))
-        del vv; _flush()
+
+    if msr_enabled:
+        print('[CONVROT-MSR] Encoding Stage 1 multi-reference guides...', flush=True)
+        positive, negative, video_latent = _apply_msr_guides(
+            base_positive,
+            base_negative,
+            video_latent,
+            vv,
+            msr_refs,
+            msr_slot_state,
+            msr_downscale,
+            msr_strength,
+            msr_reference_frames,
+            msr_tile_size,
+            msr_tile_overlap,
+        )
+    else:
+        positive, negative = base_positive, base_negative
+
+    if vv is not None:
+        del vv
+        _flush()
 
     latent=_concat_av(video_latent,audio_latent)
 
     print('[CONVROT] Loading quantized LTX 2.5 diffusion model through comfy.sd...',flush=True)
     model=_load_quantized_diffusion_model(str(paths['transformer']))
+    if msr_enabled:
+        print('[CONVROT-MSR] Applying MSR LoRA to quantized ConvRot transformer...', flush=True)
+        model=_apply_msr_lora(model, msr_normal_lora, msr_metadata, msr_model_strength)
+
     print(
         f'[CONVROT] Stage 1 sampling | {stage_w}x{stage_h} | '
         f'{len(SIGMAS_DISTILLED)-1} steps...',
@@ -506,22 +937,21 @@ def generate(job):
     sampled=_sample(model,positive,negative,latent,seed,SIGMAS_DISTILLED)
     streams=sampled.unbind()
     video_z,audio_z=streams[0],streams[1]
+    if msr_enabled:
+        video_z = _crop_msr_guides(positive, negative, video_z)
+        print(
+            f'[CONVROT-MSR] Stage 1 guide slots cropped | video_latent={tuple(video_z.shape)}',
+            flush=True,
+        )
 
     del model,latent,sampled,video_latent
     _flush()
 
     if two_phase:
-        # Upscale only the video latent. The user's soundtrack stays frozen and
-        # is re-attached unchanged for the refine stage.
         print('[CONVROT] Stage 1 complete; preparing x2 latent spatial upscale...', flush=True)
         vv=_load_vae(paths['video_vae'])
         video_z=_upscale_video_latent(video_z,vv,paths['upsampler'])
 
-        # IMPORTANT: latent upscaling does not preserve the Stage-1 I2V
-        # noise/freeze mask. Re-apply the original first-frame conditioning at
-        # full target resolution before Stage 2, otherwise the refine pass is
-        # free to reinvent the supplied image (faces, clothes, instruments,
-        # etc.) even when Stage 1 started correctly.
         stage2_video = {'samples': video_z, 'downscale_ratio_spacial': 32}
         if images:
             image=images[0]
@@ -538,27 +968,59 @@ def generate(job):
             )
             video_z=stage2_video['samples']
 
+        if msr_enabled:
+            print('[CONVROT-MSR] Re-encoding Stage 2 multi-reference guides...', flush=True)
+            positive2, negative2, stage2_video = _apply_msr_guides(
+                base_positive,
+                base_negative,
+                stage2_video,
+                vv,
+                msr_refs,
+                msr_slot_state,
+                msr_downscale,
+                msr_strength,
+                msr_reference_frames,
+                msr_tile_size,
+                msr_tile_overlap,
+            )
+        else:
+            positive2, negative2 = base_positive, base_negative
+
         del vv
         _flush()
 
-        # Rebuild the AV latent for stage 2. Always use the original frozen
-        # soundtrack latent when one was supplied.
         stage2_audio = audio_latent
         stage2_latent = _concat_av(stage2_video, stage2_audio)
 
         print('[CONVROT] Reloading quantized LTX model for Stage 2 refine...', flush=True)
         model=_load_quantized_diffusion_model(str(paths['transformer']))
+        if msr_enabled:
+            print('[CONVROT-MSR] Re-applying MSR LoRA for Stage 2 refine...', flush=True)
+            model=_apply_msr_lora(model, msr_normal_lora, msr_metadata, msr_model_strength)
+
         print(
             f'[CONVROT] Stage 2 refine | {width}x{height} | '
             f'{len(SIGMAS_STAGE2)-1} steps...',
             flush=True
         )
-        sampled2=_sample(model,positive,negative,stage2_latent,seed,SIGMAS_STAGE2)
+        sampled2=_sample(model,positive2,negative2,stage2_latent,seed,SIGMAS_STAGE2)
         streams2=sampled2.unbind()
         video_z,audio_z=streams2[0],streams2[1]
-        del model,stage2_latent,sampled2
+        if msr_enabled:
+            video_z = _crop_msr_guides(positive2, negative2, video_z)
+            print(
+                f'[CONVROT-MSR] Stage 2 guide slots cropped | video_latent={tuple(video_z.shape)}',
+                flush=True,
+            )
+
+        del model,stage2_latent,sampled2,stage2_video
         _flush()
         print('[CONVROT] Two-phase latent-upscale workflow complete.', flush=True)
+
+    # The MSR adapter/checkpoint is no longer needed once diffusion finishes.
+    if msr_enabled:
+        del msr_normal_lora, msr_slot_state, msr_metadata
+        _flush()
 
     print('[CONVROT] Decoding video...',flush=True)
     vv=_load_vae(paths['video_vae'])
@@ -567,8 +1029,6 @@ def generate(job):
     _flush()
 
     if soundtrack:
-        # We already used the encoded soundtrack to condition/freeze the AV
-        # latent. Keep the original source audio in the final mux.
         print('[CONVROT] Preserving original supplied soundtrack in output...',flush=True)
         audio = torch.zeros((1,2,1), dtype=torch.float32)
         sr = 48000
@@ -588,9 +1048,8 @@ def generate(job):
     )
     return {'ok':True,'output':str(out),'seed':seed}
 
-
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('--job',required=True); ns=ap.parse_args()
+    ap=argparse.ArgumentParser(); ap.add_argument('--job',required=True); ap.add_argument('--msr-enabled', action='store_true'); ns=ap.parse_args()
     p=Path(ns.job)
     try:
         job=json.loads(p.read_text(encoding='utf-8'))
