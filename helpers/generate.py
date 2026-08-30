@@ -214,9 +214,16 @@ def main():
                 seg_a = f"[{2 + extra_inputs}:a]"; extra_inputs += 1
             else:
                 seg_a = "[1:a]"
+            # Smooth the exact audio boundary without changing timeline length.
+            # The continuation has already had one video-frame worth of audio removed
+            # to stay aligned with the dropped duplicate video frame.  A hard PCM join
+            # can still click if the two waveforms meet at different amplitudes, so fade
+            # the last/first 10 ms to silence before concatenating.
+            seam_fade = min(0.010, src_d / 4.0, seg_d / 4.0)
+            src_fade_start = max(0.0, src_d - seam_fade)
             af = ";".join([
-                f"{src_a}aresample=32000,apad,atrim=duration={src_d:.9f},asetpts=PTS-STARTPTS[a0]",
-                f"{seg_a}aresample=32000,apad,atrim=duration={seg_d:.9f},asetpts=PTS-STARTPTS[a1]",
+                f"{src_a}aresample=32000,apad,atrim=duration={src_d:.9f},asetpts=PTS-STARTPTS,afade=t=out:st={src_fade_start:.9f}:d={seam_fade:.9f}[a0]",
+                f"{seg_a}aresample=32000,apad,atrim=duration={seg_d:.9f},asetpts=PTS-STARTPTS,afade=t=in:st=0:d={seam_fade:.9f}[a1]",
                 "[a0][a1]concat=n=2:v=0:a=1[a]",
             ])
             return cmd, af
@@ -383,7 +390,8 @@ def main():
             audio_head_trim = seam_drop_frames / 24.0
             if seam_drop_frames:
                 print(
-                    f"Glue seam trim: dropping duplicated first continuation frame + {audio_head_trim:.6f}s audio head",
+                    f"Glue seam trim: dropping duplicated first continuation frame + {audio_head_trim:.6f}s audio head; "
+                    "final audio seam will be smoothed over 10 ms",
                     flush=True,
                 )
             print(f"Muxing video and audio on exact frame duration: {mux_frame_count} frames / {exact_duration:.6f}s", flush=True)

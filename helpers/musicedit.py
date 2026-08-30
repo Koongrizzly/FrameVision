@@ -898,6 +898,31 @@ class MusicEditWidget(QWidget):
         playback_row2.addStretch(1)
         main_layout.addLayout(playback_row2)
 
+        # Row 3: volume adjustment for the active waveform selection (or full track).
+        volume_row = QHBoxLayout()
+        self.lbl_volume = QLabel("Volume:", self)
+        self.spin_volume_db = QDoubleSpinBox(self)
+        self.spin_volume_db.setRange(-60.0, 24.0)
+        self.spin_volume_db.setDecimals(1)
+        self.spin_volume_db.setSingleStep(1.0)
+        self.spin_volume_db.setValue(0.0)
+        self.spin_volume_db.setSuffix(" dB")
+        self.spin_volume_db.setToolTip(
+            "Volume change to apply to the selected waveform region. "
+            "Use a positive value to make it louder and a negative value to make it quieter."
+        )
+        self.btn_apply_volume = QPushButton("Apply volume", self)
+        self.btn_apply_volume.setToolTip(
+            "Apply this volume change to the current selection. "
+            "If the full waveform is selected, the whole track is changed."
+        )
+        self.btn_apply_volume.clicked.connect(self._on_apply_volume)
+        volume_row.addWidget(self.lbl_volume)
+        volume_row.addWidget(self.spin_volume_db)
+        volume_row.addWidget(self.btn_apply_volume)
+        volume_row.addStretch(1)
+        main_layout.addLayout(volume_row)
+
         # Export options
         export_group = QGroupBox("Export / Save As", self)
         export_layout = QFormLayout(export_group)
@@ -1535,6 +1560,127 @@ class MusicEditWidget(QWidget):
             )
             return
 
+        self.load_file(out_path)
+
+
+    def _on_apply_volume(self):
+        """Apply a dB volume change to the current selection or the full track."""
+        if not self._current_file or self._duration_ms <= 0:
+            return
+
+        ff = self._get_ffmpeg_for_edit()
+        if not ff:
+            return
+
+        gain_db = float(self.spin_volume_db.value())
+        if abs(gain_db) < 0.0001:
+            QMessageBox.information(
+                self,
+                "Volume unchanged",
+                "The volume change is 0 dB, so there is nothing to apply.",
+            )
+            return
+
+        start_ms, end_ms = self.waveform_view.get_selection_ms()
+        if end_ms <= start_ms:
+            start_ms, end_ms = 0, self._duration_ms
+
+        # Treat a selection touching both ends as a full-track adjustment.
+        full_track = start_ms <= 1 and end_ms >= (self._duration_ms - 1)
+        start_sec = max(0.0, start_ms / 1000.0)
+        end_sec = min(self._duration_ms / 1000.0, end_ms / 1000.0)
+
+        out_path = self._make_edit_temp_path()
+        ext = os.path.splitext(self._current_file)[1].lower()
+        gain_expr = f"{gain_db:+.3f}dB"
+
+        if full_track:
+            cmd = [
+                ff,
+                "-y",
+                "-i",
+                self._current_file,
+                "-filter:a",
+                f"volume={gain_expr}",
+                "-vn",
+            ]
+        else:
+            # Rebuild the audio from unchanged before/after pieces plus the
+            # gain-adjusted selection.  Special-case selections that touch an
+            # edge so FFmpeg never has to concatenate a zero-length segment.
+            duration_sec = self._duration_ms / 1000.0
+            if start_sec <= 0.001:
+                filter_complex = (
+                    f"[0:a]atrim=start=0:end={end_sec:.6f},asetpts=N/SR/TB,"
+                    f"volume={gain_expr}[sel];"
+                    f"[0:a]atrim=start={end_sec:.6f}:end={duration_sec:.6f},"
+                    f"asetpts=N/SR/TB[after];"
+                    f"[sel][after]concat=n=2:v=0:a=1[aout]"
+                )
+            elif end_sec >= duration_sec - 0.001:
+                filter_complex = (
+                    f"[0:a]atrim=start=0:end={start_sec:.6f},asetpts=N/SR/TB[before];"
+                    f"[0:a]atrim=start={start_sec:.6f}:end={duration_sec:.6f},"
+                    f"asetpts=N/SR/TB,volume={gain_expr}[sel];"
+                    f"[before][sel]concat=n=2:v=0:a=1[aout]"
+                )
+            else:
+                filter_complex = (
+                    f"[0:a]atrim=start=0:end={start_sec:.6f},asetpts=N/SR/TB[before];"
+                    f"[0:a]atrim=start={start_sec:.6f}:end={end_sec:.6f},"
+                    f"asetpts=N/SR/TB,volume={gain_expr}[sel];"
+                    f"[0:a]atrim=start={end_sec:.6f}:end={duration_sec:.6f},"
+                    f"asetpts=N/SR/TB[after];"
+                    f"[before][sel][after]concat=n=3:v=0:a=1[aout]"
+                )
+            cmd = [
+                ff,
+                "-y",
+                "-i",
+                self._current_file,
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                "[aout]",
+            ]
+
+        if ext == ".mp3":
+            cmd += ["-c:a", "libmp3lame", "-b:a", "320k"]
+        else:
+            cmd += ["-c:a", "pcm_s16le"]
+        cmd.append(out_path)
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception as e:
+            try:
+                if os.path.isfile(out_path):
+                    os.remove(out_path)
+            except Exception:
+                pass
+            QMessageBox.critical(self, "Volume change failed", f"Failed to run ffmpeg:\n{e}")
+            return
+
+        if proc.returncode != 0:
+            try:
+                if os.path.isfile(out_path):
+                    os.remove(out_path)
+            except Exception:
+                pass
+            QMessageBox.critical(
+                self,
+                "Volume change failed",
+                "ffmpeg reported an error while changing the volume.\n\n"
+                f"Command:\n{' '.join(cmd)}\n\nError:\n{proc.stderr}",
+            )
+            return
+
+        self._push_undo_point("volume")
         self.load_file(out_path)
 
 

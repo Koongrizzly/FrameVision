@@ -914,8 +914,37 @@ class MainWindow(QMainWindow):
         rs = QFormLayout(); rs.addRow("Reference image size", self.ref_size); rfl.addLayout(rs)
         self.ref_images = RefList("Reference images (max 9)", "Images (*.png *.jpg *.jpeg *.webp *.bmp)", 9)
         self.ref_videos = RefList("Reference videos (max 3; soundtrack extracted when present)", "Video (*.mp4 *.mov *.mkv *.webm *.avi)", 3)
-        self.ref_audios = RefList("Standalone reference audio (max 3)", "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg)", 3)
-        rfl.addWidget(self.ref_images); rfl.addWidget(self.ref_videos); rfl.addWidget(self.ref_audios); v.addWidget(self.ref_group)
+        self.ref_audios = RefList("Voice / standalone reference audio (max 3)", "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg)", 3)
+        rfl.addWidget(self.ref_images); rfl.addWidget(self.ref_videos); rfl.addWidget(self.ref_audios)
+
+        # Standalone audio can be ordinary sound/music reference, or it can be tied
+        # to a specific H3 subject as a persistent voice-timbre reference.  Keep
+        # the mapping separate from the file list so existing saved ref_audios
+        # settings remain backward compatible.  The runtime resolves the *actual*
+        # <Audio n> index after any audio tracks embedded in reference videos.
+        voice_map_box = QGroupBox("Voice identity mapping")
+        voice_map_form = QFormLayout(voice_map_box)
+        self.ref_audio_subjects = []
+        for i in range(3):
+            combo = QComboBox()
+            combo.addItem("Generic audio / no character", 0)
+            for subject_n in range(1, 10):
+                combo.addItem(f"Subject {subject_n}", subject_n)
+            combo.setToolTip(
+                "Assign the standalone audio file in this slot to an H3 <Subject n>. "
+                "FrameVision will automatically add the correct '<Audio n> is the voice timbre reference' declaration. "
+                "Choose Generic audio for music, ambience, effects, or when you want to write the mapping yourself."
+            )
+            self.ref_audio_subjects.append(combo)
+            voice_map_form.addRow(f"Audio slot {i + 1}", combo)
+        voice_note = QLabel(
+            "Voice mapping uses the standalone-audio slot order above. The backend calculates the real <Audio n> tag at runtime, "
+            "including audio tracks carried by reference videos, so voice tags do not shift accidentally."
+        )
+        voice_note.setWordWrap(True)
+        voice_map_form.addRow(voice_note)
+        rfl.addWidget(voice_map_box)
+        v.addWidget(self.ref_group)
 
         loras = QGroupBox("LoRA adapters (up to 3)"); lf = QFormLayout(loras)
         lnote = QLabel(f"Optional MiniMax H3 diffusion-model LoRAs. Browse starts in {DEFAULT_LORA_DIR}. Files from any other folder can also be selected. Strength 1.0 = normal; 0 disables that slot.")
@@ -2562,7 +2591,7 @@ class MainWindow(QMainWindow):
         )
         self.ref_images.setToolTip("Ref2VA reference images. MiniMax H3 supports up to 9 images.")
         self.ref_videos.setToolTip("Ref2VA reference videos. MiniMax H3 supports up to 3 videos.")
-        self.ref_audios.setToolTip("Ref2VA standalone audio references. MiniMax H3 supports up to 3 audio files.")
+        self.ref_audios.setToolTip("Ref2VA standalone audio references. MiniMax H3 supports up to 3 audio files. Use Voice identity mapping below to bind a slot to an H3 Subject for consistent character voices.")
         self.cfg.setToolTip("Classifier-free guidance strength used by the sampler. Default: 1.0.")
         self.shift.setToolTip("Video timestep/sigma shift. Validated starting value for this install: 12.")
         self.audio_shift.setToolTip("Audio timestep/sigma shift. Validated starting value for this install: 3.")
@@ -2789,6 +2818,7 @@ class MainWindow(QMainWindow):
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
             "continue_audio_memory": self.continue_audio_memory.isChecked(),
             "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(),
+            "ref_audio_subjects": [int(combo.currentData() or 0) for combo in self.ref_audio_subjects],
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
             "system_hud": False if self._embedded else self.system_hud_toggle.isChecked(),
@@ -2829,6 +2859,11 @@ class MainWindow(QMainWindow):
             ctx=int(d.get("continue_context_frames",39)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 1)
             self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_last_result.setChecked(bool(d.get("continue_last_result", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self._sync_continue_video_options()
             self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", []))
+            saved_voice_subjects = d.get("ref_audio_subjects", []) or []
+            for i, combo in enumerate(self.ref_audio_subjects):
+                subject_n = int(saved_voice_subjects[i]) if i < len(saved_voice_subjects) else 0
+                idx = combo.findData(subject_n)
+                combo.setCurrentIndex(idx if idx >= 0 else 0)
             self.cfg.setValue(float(d.get("cfg", 1.0))); self.shift.setValue(float(d.get("shift", 12))); self.audio_shift.setValue(float(d.get("audio_shift", 3))); self.sampler.setCurrentText(d.get("sampler", "euler")); self.scheduler.setCurrentText(d.get("scheduler", "simple"))
             # Backward compatibility with the first GUI patch's single output field.
             old_output = d.get("output", "")
@@ -3581,7 +3616,10 @@ print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
             args += ["--ref-image-size",self.ref_size.currentText()]
             for pth in self.ref_images.paths(): args += ["--ref-image",pth]
             for pth in self.ref_videos.paths(): args += ["--ref-video",pth]
-            for pth in self.ref_audios.paths(): args += ["--ref-audio",pth]
+            for i, pth in enumerate(self.ref_audios.paths()):
+                args += ["--ref-audio", pth]
+                subject_n = int(self.ref_audio_subjects[i].currentData() or 0) if i < len(self.ref_audio_subjects) else 0
+                args += ["--ref-audio-subject", str(subject_n)]
         args += self.model_override_args()
         args += self.lora_args()
         if self.vram_manager_enabled.isChecked():
