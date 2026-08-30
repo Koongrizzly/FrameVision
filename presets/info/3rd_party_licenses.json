@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "generated_at_utc": "2026-07-19T11:32:34Z",
+  "generated_at_utc": "2026-08-30T08:55:42Z",
   "generated_from": [
     "ace_setup.bat",
     "background_download.py",
@@ -25,7 +25,8 @@
     "manual-edit: add Bernini source code and Bernini-R 1.3B Diffusers license entries",
     "manual-edit: add dots.tts source code and dots.tts-mf Turbo/MeanFlow model license entries",
     "manual-edit: add Qwen-Image-Edit-2511 base assets, LAXMAYDAY Nunchaku INT4 model credit, and Nunchaku runtime license entries",
-    "manual-edit: add OzzyGT LTX-2.3 Distilled 1.1 SDNQ INT4 credit, SDNQ GPL-3.0 runtime, and explicit PyTorch/Hugging Face runtime credits; correct Nunchaku license URL"
+    "manual-edit: add OzzyGT LTX-2.3 Distilled 1.1 SDNQ INT4 credit, SDNQ GPL-3.0 runtime, and explicit PyTorch/Hugging Face runtime credits; correct Nunchaku license URL",
+    "manual_update_2026-08-30_ltx25_minimaxh3_hypir_licon_msr"
   ],
   "items": [
     {
@@ -775,6 +776,90 @@
       "license_url": "https://huggingface.co/rednote-hilab/dots.tts-mf",
       "notes": "MeanFlow-distilled dots.tts checkpoint used for low-latency few-step TTS and voice cloning. The model card lists Apache-2.0 and recommends NFE/num_steps=4 as the quality/latency trade-off; guidance_scale is ignored because CFG is fused into the distilled student.",
       "source_url": "https://huggingface.co/rednote-hilab/dots.tts-mf"
+    },
+    {
+      "id": "ltx_2_5_model_weights",
+      "name": "LTX 2.5 full / distilled video-audio model weights",
+      "category": "model",
+      "installed_by": "optional_installs",
+      "source": "Lightricks/LTX-2.5 (Hugging Face)",
+      "download_url": "https://huggingface.co/Lightricks/LTX-2.5",
+      "license": "LTX-2.x Community License Agreement",
+      "license_url": "https://github.com/Lightricks/LTX-2/blob/main/LICENSE",
+      "notes": "LTX 2.5 model family used by FrameVision, including the BF16 full/dev and distilled components, text encoder, VAEs, audio components, latent upscaler and related official files. The Hugging Face repository is gated and use/redistribution is subject to the LTX-2.x Community License Agreement and model-card terms.",
+      "source_url": "https://huggingface.co/Lightricks/LTX-2.5"
+    },
+    {
+      "id": "ltx_2_5_comfy_int8_convrot",
+      "name": "LTX 2.5 Comfy INT8 ConvRot model weights",
+      "category": "model",
+      "installed_by": "optional_installs",
+      "source": "Lightricks/LTX-2.5 (Hugging Face)",
+      "download_url": "https://huggingface.co/Lightricks/LTX-2.5",
+      "license": "LTX-2.x Community License Agreement",
+      "license_url": "https://github.com/Lightricks/LTX-2/blob/main/LICENSE",
+      "notes": "Official ComfyUI-format INT8 ConvRot LTX 2.5 transformer/text-encoder weights. The upstream model card identifies these ConvRot checkpoints as ComfyUI-only and licenses them under the same LTX-2.x Community License Agreement as the rest of LTX 2.5.",
+      "source_url": "https://huggingface.co/Lightricks/LTX-2.5"
+    },
+    {
+      "id": "comfyui_mini_backend",
+      "name": "ComfyUI core (mini/headless backend used by FrameVision)",
+      "category": "backend",
+      "installed_by": "optional_installs",
+      "source": "Comfy-Org/ComfyUI (GitHub)",
+      "download_url": "https://github.com/Comfy-Org/ComfyUI",
+      "license": "GPL-3.0",
+      "license_url": "https://github.com/Comfy-Org/ComfyUI/blob/master/LICENSE",
+      "notes": "FrameVision uses a reduced/headless ComfyUI backend for selected LTX 2.5 ConvRot and MiniMax H3 workflows rather than exposing the full ComfyUI application. Any bundled or modified ComfyUI core code remains subject to GPL-3.0 requirements.",
+      "source_url": "https://github.com/Comfy-Org/ComfyUI"
+    },
+    {
+      "id": "comfy_kitchen",
+      "name": "Comfy Kitchen accelerated diffusion kernels",
+      "category": "library",
+      "installed_by": "optional_installs",
+      "source": "Comfy-Org/comfy-kitchen (GitHub)",
+      "download_url": "https://github.com/Comfy-Org/comfy-kitchen",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/Comfy-Org/comfy-kitchen/blob/main/LICENSE",
+      "notes": "Kernel library used by recent ComfyUI quantized inference paths, including INT8 ConvRot support used by MiniMax H3/LTX 2.5 configurations. Preserve the Apache-2.0 license and upstream NOTICE information when redistributing applicable binaries or source.",
+      "source_url": "https://github.com/Comfy-Org/comfy-kitchen"
+    },
+    {
+      "id": "minimax_h3_model_weights",
+      "name": "MiniMax H3 video/audio generation model weights",
+      "category": "model",
+      "installed_by": "optional_installs",
+      "source": "MiniMaxAI/MiniMax-H3 (Hugging Face)",
+      "download_url": "https://huggingface.co/MiniMaxAI/MiniMax-H3",
+      "license": "MiniMax H3 Community License Agreement",
+      "license_url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE",
+      "notes": "MiniMax H3 model family used by FrameVision's mini-ComfyUI backend, including video/audio generation components and official derivatives where applicable. IMPORTANT: the August 2, 2026 MiniMax H3 Community License defines the Applicable Territory as worldwide excluding the European Union, United Kingdom, Republic of Korea and United States; use in an excluded territory requires separate authorization from MiniMax. The upstream license also contains redistribution, NOTICE, use-restriction and commercial terms. The Qwen3-VL-32B encoder used by H3 is separately licensed under Apache-2.0.",
+      "source_url": "https://huggingface.co/MiniMaxAI/MiniMax-H3"
+    },
+    {
+      "id": "hypir_image_restoration",
+      "name": "HYPIR AI image restoration / super-resolution",
+      "category": "model_and_code",
+      "installed_by": "optional_installs",
+      "source": "XPixelGroup/HYPIR (GitHub)",
+      "download_url": "https://github.com/XPixelGroup/HYPIR",
+      "license": "Non-commercial use only (upstream HYPIR terms)",
+      "license_url": "https://github.com/XPixelGroup/HYPIR",
+      "notes": "Official HYPIR implementation used for AI image restoration/upscaling. Upstream explicitly restricts the software to non-commercial use unless prior written permission is obtained from the HYPIR authors. This entry refers to the official XPixelGroup project; third-party ComfyUI wrappers can have separate additional license terms.",
+      "source_url": "https://github.com/XPixelGroup/HYPIR"
+    },
+    {
+      "id": "liconstudio_comfyui_licon_msr",
+      "name": "Licon MSR ComfyUI custom node",
+      "category": "plugin",
+      "installed_by": "optional_installs",
+      "source": "liconstudio/ComfyUI-Licon-MSR (GitHub)",
+      "download_url": "https://github.com/liconstudio/ComfyUI-Licon-MSR",
+      "license": "MIT",
+      "license_url": "https://github.com/liconstudio/ComfyUI-Licon-MSR/blob/main/LICENSE",
+      "notes": "ComfyUI custom node used to create fixed-frame reference videos for LTX MSR (Multiple-Subject-Reference) workflows. Keep the MIT copyright/license notice when redistributing the node or substantial portions of its code.",
+      "source_url": "https://github.com/liconstudio/ComfyUI-Licon-MSR"
     }
   ]
 }
