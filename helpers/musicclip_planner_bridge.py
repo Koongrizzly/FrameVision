@@ -860,7 +860,6 @@ def _normalize_bridge_generation_settings(*sources: Any) -> Dict[str, Any]:
         "scene_cut_style": scene_cut_style,
         "smart_max_scene_mode": max_mode,
         "beat_style": beat_style,
-        "dance_video": _safe_bool(merged.get("dance_video"), False),
         "timestamped_microclips_enabled": _safe_bool(merged.get("timestamped_microclips_enabled"), False),
         "collage_effect_enabled": _safe_bool(merged.get("collage_effect_enabled"), False),
         "avoid_effects_in_first_clip": _safe_bool(merged.get("avoid_effects_in_first_clip"), True),
@@ -6745,107 +6744,9 @@ def _prefix_msr_characters_subjects(prompt: Any, brief: Dict[str, str]) -> str:
     return f"{identity_sentence} {text}".strip()
 
 
-def _dance_video_enabled(*sources: Any) -> bool:
-    """Return the explicit Dance video mode from payload/plan/shot settings."""
-    for src in sources:
-        if not isinstance(src, dict):
-            continue
-        if "dance_video" in src:
-            return _safe_bool(src.get("dance_video"), False)
-        settings = src.get("bridge_generation_settings")
-        if isinstance(settings, dict) and "dance_video" in settings:
-            return _safe_bool(settings.get("dance_video"), False)
-    return False
-
-
-def _dance_video_motion_instruction(shot: Optional[Dict[str, Any]] = None) -> str:
-    """Create a stable but varied full-body choreography requirement per shot."""
-    shot = shot if isinstance(shot, dict) else {}
-    sid = _safe_str(shot.get("id") or shot.get("shot_id") or shot.get("index") or "dance")
-    match = re.search(r"(\d+)", sid)
-    index = _safe_int(match.group(1), 1) if match else 1
-    variants = (
-        "clear side steps, quick turns, broad arm sweeps, shoulder hits, and rhythmic weight shifts",
-        "fast footwork, cross-steps, body rolls, sharp arm accents, and energetic direction changes",
-        "bouncing groove steps, half-turns, coordinated arm patterns, torso hits, and continuous foot movement",
-        "traveling steps, pivots, low-to-high body levels, strong arm extensions, and beat-matched rebounds",
-        "syncopated footwork, hip and shoulder accents, spins, hand gestures, and continuous full-body groove",
-        "forward-and-back steps, lateral shuffles, turns, upper-body isolations, and strong beat-driven arm motion",
-    )
-    moves = variants[(max(1, index) - 1) % len(variants)]
-    vocal = _safe_bool(shot.get("needs_lipsync"), False) or _safe_bool(shot.get("active_vocal_window"), False)
-    vocal_clause = " Keep lip-sync readable during vocal moments while the body continues dancing." if vocal else ""
-    return (
-        "DANCE ACTION LOCK: From the first visible frame, the visible characters are already actively dancing and "
-        "perform continuous full-body choreography in rhythm with the music throughout the entire shot, "
-        f"using {moves}. Their feet, arms, torso, shoulders, and body position keep changing clearly on the beat. "
-        "They never settle into idle standing, posing, only smiling, looking around, subtle swaying, or waiting while "
-        "the camera supplies the motion." + vocal_clause
-    )
-
-
-def _dance_video_continuity_instruction(shot: Optional[Dict[str, Any]] = None) -> str:
-    """Final chronological override so rich Qwen prose cannot stop the dance later in the shot."""
-    shot = shot if isinstance(shot, dict) else {}
-    vocal = _safe_bool(shot.get("needs_lipsync"), False) or _safe_bool(shot.get("active_vocal_window"), False)
-    vocal_clause = " During lip-sync moments, keep the mouth performance readable without stopping the full-body choreography." if vocal else ""
-    return (
-        "DANCE CONTINUITY OVERRIDE: Keep the dance active through the middle and all the way to the final frame. "
-        "Any earlier wording about standing, pausing, gazing, smiling, walking into place, gathering together, or looking at the scenery "
-        "is staging only and must happen while the characters continue clear rhythmic full-body choreography. "
-        "Do not let the characters become static after the opening. End with them still visibly dancing on the beat, not standing or posing." + vocal_clause
-    )
-
-
-def _strip_dance_video_motion_lock(prompt: Any) -> str:
-    text = _safe_str(prompt)
-    if not text:
-        return text
-    # Strip both old and current Dance-video guards before regenerating a clean
-    # per-shot lock.  The broad marker-to-marker patterns intentionally avoid
-    # depending on the exact move wording used by older patches.
-    text = re.sub(
-        r"DANCE ACTION LOCK:\s*.*?(?=(?:#!PROMPT!|DANCE CONTINUITY OVERRIDE:|$))",
-        " ",
-        text,
-        count=1,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    text = re.sub(
-        r"DANCE CONTINUITY OVERRIDE:\s*.*$",
-        " ",
-        text,
-        count=1,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    return re.sub(r"\s{2,}", " ", text).strip(" ,.;")
-
-
-def _inject_dance_video_motion(prompt: Any, shot: Optional[Dict[str, Any]] = None) -> str:
-    text = _safe_str(prompt).strip()
-    if not text:
-        return text
-    # Always regenerate both guards so an older saved/review prompt cannot keep
-    # the weaker start-only lock from an earlier build.
-    text = _strip_dance_video_motion_lock(text)
-    instruction = _dance_video_motion_instruction(shot)
-    continuity = _dance_video_continuity_instruction(shot)
-    # Timestamped prompts must keep their first 0:00 marker at the beginning.
-    match = re.match(r"^(\s*0:00\s*-\s*)(.*)$", text, flags=re.IGNORECASE | re.DOTALL)
-    if match:
-        return f"{match.group(1)}{instruction} {match.group(2).lstrip()} {continuity}".strip()
-    return f"{instruction} {text} {continuity}".strip()
-
-
 def _sanitize_final_ltx_prompt_for_model(raw_prompt: Any, *, brief: Dict[str, str], shot: Dict[str, Any], prompt_is_timestamped: bool = False) -> tuple[str, List[str]]:
     removed_all: List[str] = []
     raw_text = _safe_str(raw_prompt)
-    dance_video_active = bool(_dance_video_enabled(shot) and not _safe_bool((shot or {}).get("own_prompts_enabled"), False))
-    if dance_video_active:
-        # Remove an already-saved lock before generic/timestamp cleanup, then add
-        # one pristine lock after cleanup. This prevents timestamp normalization
-        # from chopping the choreography sentence into malformed fragments.
-        raw_text = _strip_dance_video_motion_lock(raw_text)
     # The Qwen MSR two-pass enhancer deliberately prefixes its rich prompt with
     # ``#!PROMPT!:`` for Review/display.  That prompt can be several paragraphs
     # long.  The old generic director compiler reduced every non-timestamped
@@ -6894,15 +6795,6 @@ def _sanitize_final_ltx_prompt_for_model(raw_prompt: Any, *, brief: Dict[str, st
     text = re.sub(r"\b(?:in|on|at|inside|through)\s+([,.;])", r"\1", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+([,.;])", r"\1", text).strip(" ,.;")
     final_limit = 6200 if preserve_rich_msr_prompt else 2200
-    if dance_video_active:
-        # Reserve room for BOTH the opening action lock and the final continuity
-        # override.  Otherwise a long Qwen prompt can push the crucial ending
-        # instruction past the final character limit and LTX again stops dancing.
-        opening = _dance_video_motion_instruction(shot)
-        ending = _dance_video_continuity_instruction(shot)
-        reserve = len(opening) + len(ending) + 8
-        text = _clean_text(text, max(400, final_limit - reserve))
-        text = _inject_dance_video_motion(text, shot)
     return _sentence(_clean_text(text, final_limit)), _dedupe_texts(removed_all, max_items=40, max_len=2200)
 
 
@@ -8332,11 +8224,6 @@ def create_ltx_director_plan(payload: dict) -> dict:
             )
             out["director_image_prompt"] = _sanitize_prompt_no_visible_text(out.get("director_image_prompt") or _director_template_image_prompt(src, brief), src.get("lyrics"), image_prompt=True)
             out["director_video_prompt"] = _sanitize_prompt_no_visible_text(out.get("director_video_prompt") or _director_template_video_prompt(src, brief), src.get("lyrics"), image_prompt=False)
-            if _safe_bool(bridge_generation_settings.get("dance_video"), False):
-                out["dance_video"] = True
-                for _dance_key in ("template_video_prompt", "director_video_prompt"):
-                    if _safe_str(out.get(_dance_key)):
-                        out[_dance_key] = _inject_dance_video_motion(out.get(_dance_key), out)
             out["director_negative_prompt"] = _negative_prompt_with_no_visible_text(out.get("director_negative_prompt") or _director_template_negative_prompt(src), max_len=1200)
             if not _safe_str(out.get("director_notes")):
                 out["director_notes"] = "Template cleanup fallback."
@@ -10423,10 +10310,6 @@ def _stage_msr_end_frame_copy(source_path: str, output_dir: Path, shot_id: str) 
 def _msr_automated_background_prompt(shot: Dict[str, Any], director_plan: Dict[str, Any], index: int) -> str:
     """Build a location-only plate prompt.
 
-    Prefer the current shot/location pool from the active creative brief. The old
-    hard-coded venue bag remains only as a last-resort fallback when the run has
-    no usable location information at all.
-
     Do not pass the normal shot/image prompt through here. Those prompts describe
     performers, faces, outfits and actions; placing them before a later "no people"
     clause makes image models recreate the cast inside the supposed background.
@@ -10486,10 +10369,6 @@ def _msr_automated_background_prompt(shot: Dict[str, Any], director_plan: Dict[s
                 "brick", "concrete", "industrial", "lighting", "lights", "night", "dusk",
                 "dawn", "rain", "fog", "moody", "cinematic", "warm", "cold", "neon",
                 "background", "location", "environment", "landscape", "architecture",
-                "canyon", "ocean", "valley", "temple", "cathedral", "garden", "plaza",
-                "labyrinth", "corridor", "staircase", "sanctuary", "waterfall", "cavern",
-                "chamber", "plain", "portal", "pyramid", "monolith", "mountain", "island",
-                "sphere", "arches", "world", "horizon",
             )
             if any(term in low for term in place_terms):
                 kept.append(clean)
@@ -10497,38 +10376,21 @@ def _msr_automated_background_prompt(shot: Dict[str, Any], director_plan: Dict[s
                 break
         return ", ".join(kept)
 
-    brief = _normalize_creative_brief(director_plan.get("creative_brief"))
     location_parts: List[str] = []
-
-    # Prefer the actual location selected for this shot / run.
-    preferred_location = _safe_environment_text(
-        shot.get("dominant_location")
-        or shot.get("selected_location")
-        or shot.get("main_location")
-        or shot.get("location")
-        or shot.get("setting")
-        or shot.get("environment")
-        or shot.get("background")
-        or shot.get("director_location")
-        or _single_location_world_for_scene(brief, shot, index)
-        or _dominant_location_for_index(brief, index)
-    )
-    if preferred_location:
-        location_parts.append(preferred_location)
-
-    # Explicit location fields remain useful if they contain extra environment detail.
+    # Explicit location fields are safest and take priority.
     for key in ("location", "setting", "environment", "background", "director_location"):
         value = _safe_environment_text(shot.get(key))
-        if value and value not in location_parts:
+        if value:
             location_parts.append(value)
 
     # Scene descriptions may contain useful architecture/lighting clauses, but all
     # performer-related clauses are filtered out above.
     for key in ("director_scene_description", "scene_description"):
         value = _safe_environment_text(shot.get(key))
-        if value and value not in location_parts:
+        if value:
             location_parts.append(value)
 
+    brief = _normalize_creative_brief(director_plan.get("creative_brief"))
     style = _safe_environment_text(
         brief.get("visual_style") or brief.get("style") or brief.get("lighting") or ""
     )
@@ -10565,7 +10427,6 @@ def _msr_automated_background_prompt(shot: Dict[str, Any], director_plan: Dict[s
         "single coherent full-frame scene, no text, no logos, no collage, no split-screen, no grid",
         "realistic cinematic lighting, clean unobstructed environment",
     ])[:1200]
-
 
 
 def _find_framevision_ffmpeg(root: Path) -> str:
@@ -10832,10 +10693,6 @@ def _enhance_msr_prompts_with_qwen3vl(
         bg = _safe_str(pack.get("background"))
         references = [str(x) for x in _as_list(pack.get("references")) if x and os.path.isfile(str(x))][:4]
         original, image_prompt, video_prompt = _msr_shot_prompt_parts(shot, payload, director_plan, idx)
-        dance_video = _dance_video_enabled(payload, director_plan, shot)
-        if dance_video and not _safe_bool(payload.get("own_prompts_enabled"), False):
-            shot["dance_video"] = True
-            video_prompt = _inject_dance_video_motion(video_prompt, shot)
         vocals_active = bool(
             _safe_bool(shot.get("needs_lipsync"), False)
             or _safe_bool(shot.get("active_vocal_window"), False)
@@ -10848,8 +10705,6 @@ def _enhance_msr_prompts_with_qwen3vl(
             "image_prompt": image_prompt,
             "video_prompt": video_prompt,
             "vocals_active": vocals_active,
-            "dance_video": bool(dance_video),
-            "dance_motion_requirement": _dance_video_motion_instruction(shot) if dance_video else "",
             "image_paths": ([bg] if bg else []) + references,
         })
 
@@ -10896,10 +10751,6 @@ def _enhance_msr_prompts_with_qwen3vl(
         enhanced_script = _safe_str(row.get("enhanced_script"))
         if not combined:
             continue
-        if _dance_video_enabled(payload, director_plan, shot) and not _safe_bool(payload.get("own_prompts_enabled"), False):
-            shot["dance_video"] = True
-            combined = _inject_dance_video_motion(combined, shot)
-            enhanced_script = _inject_dance_video_motion(enhanced_script or combined, shot)
         # MSR command builders may select any one of these fields. Keep them in
         # sync so Wan2GP, INT4 and FP8/FP16 all receive the same enhanced prompt.
         for key in (
@@ -11937,8 +11788,6 @@ def run_single_ltx_shot_test(payload: dict) -> dict:
         else:
             return {"ok": False, "message": f"Unknown start image mode: {image_mode}"}
 
-        if _dance_video_enabled(payload, director_plan, shot) and not _safe_bool(payload.get("own_prompts_enabled"), False):
-            shot["dance_video"] = True
         raw_ltx_prompt, final_ltx_prompt_source, prompt_is_timestamped = _select_ltx_video_prompt_source(shot, payload)
         prompt, ltx_prompt_removed_phrases = _sanitize_final_ltx_prompt_for_model(
             raw_ltx_prompt,
