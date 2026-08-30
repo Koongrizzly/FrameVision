@@ -82,6 +82,8 @@ VIDEO_VAE_TILE_T = 8
 VIDEO_VAE_TILE_X = 32
 VIDEO_VAE_TILE_Y = 32
 VIDEO_VAE_OVERLAP = 8
+# Use a larger temporal overlap to hide visible VAE tile seams that can
+# appear in ConvRot outputs at regular intervals when overlap_t is too small.
 VIDEO_VAE_OVERLAP_T = 4
 
 
@@ -749,7 +751,7 @@ def _find_ffmpeg():
     raise FileNotFoundError('ffmpeg.exe was not found under FrameVision/presets/bin')
 
 
-def _save(images, audio, sr, out_path, fps, soundtrack_path=None):
+def _save(images, audio, sr, out_path, fps, soundtrack_path=None, keep_video_duration=False):
     out=Path(out_path); out.parent.mkdir(parents=True,exist_ok=True)
     ffmpeg=_find_ffmpeg()
     arr=(images.clamp(0,1).numpy()*255.0+0.5).astype(np.uint8)
@@ -771,8 +773,15 @@ def _save(images, audio, sr, out_path, fps, soundtrack_path=None):
             '-f','rawvideo','-pix_fmt','rgb24','-s',f'{w}x{h}','-r',str(float(fps)),'-i','pipe:0',
             '-i',audio_input,
             '-c:v','libx264','-pix_fmt','yuv420p','-crf','18',
-            '-c:a','aac','-b:a','256k','-shortest',str(out)
+            '-c:a','aac','-b:a','256k'
         ]
+        # Music Clip Creator intentionally generates extra raw video headroom and
+        # trims/syncs it afterward.  Do not let a slightly shorter guide WAV cut
+        # the raw ConvRot video short, otherwise the outer duration checker sees
+        # an under-delivered clip and needlessly regenerates the shot.
+        if not keep_video_duration:
+            cmd += ['-shortest']
+        cmd += [str(out)]
         # Use communicate()/subprocess.run semantics instead of manually writing
         # to stdin. With -shortest, ffmpeg can intentionally finish as soon as
         # the soundtrack ends and close the raw-video pipe before every generated
@@ -1045,6 +1054,7 @@ def generate(job):
     out=_save(
         decoded,audio,sr,job['output'],fps,
         soundtrack_path=soundtrack if soundtrack else None,
+        keep_video_duration=bool(job.get('defer_trim', False)),
     )
     return {'ok':True,'output':str(out),'seed':seed}
 

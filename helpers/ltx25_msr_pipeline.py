@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from PIL import Image
 from safetensors import safe_open
 
+from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.patchifiers import get_pixel_coords
@@ -710,8 +711,53 @@ class LTX25MSRAudioPipeline(DistilledPipeline):
             ),
         )
 
+        # Stage 2 is finished. Keep only the final latent required by DiffVAE and
+        # release MSR/reference/stage tensors before loading the decoder. Normal
+        # FP16 already sits near the 24 GB ceiling; the extra MSR adapter/context
+        # can otherwise push Windows into shared GPU memory at this exact handoff.
+        final_video_latent = video_state.latent
+        del video_state
+        del stage_1_conditionings
+        del stage_2_conditionings
+        del upscaled_video_latent
+        del stage_1_sigmas
+        del stage_2_sigmas
+        del encoded_audio_latent
+        del v_context_p
+        del a_context_p
+        del noiser
+        del images
+
+        import gc
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
+                free_before, total_mem = torch.cuda.mem_get_info()
+            except Exception:
+                free_before = total_mem = 0
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+            try:
+                free_after, _ = torch.cuda.mem_get_info()
+                LOG.info(
+                    "[LTX25-MSR] Pre-decode cleanup complete; GPU free %.2f -> %.2f GiB / %.2f GiB",
+                    free_before / (1024 ** 3),
+                    free_after / (1024 ** 3),
+                    total_mem / (1024 ** 3),
+                )
+            except Exception:
+                LOG.info("[LTX25-MSR] Pre-decode cleanup complete")
+
         decoded_video = self.video_decoder(
-            video_state.latent, tiling_config, generator, dtype=vae_dtype
+            final_video_latent, tiling_config, generator, dtype=vae_dtype
         )
         original_audio = Audio(
             waveform=decoded_audio.waveform.squeeze(0),
@@ -770,6 +816,9 @@ def main() -> None:
         args.msr_ref_4,
         args.msr_background,
     )
+    # Music Clip Creator MSR jobs are short-lived processes, so retaining CUDA
+    # allocator blocks between components only increases peak VRAM. Match the
+    # proven normal FP16 helper's non-spilling configuration: CPU offload + TRIM.
     pipeline = LTX25MSRAudioPipeline(
         model_paths=args.model_paths,
         spatial_upsampler_path=args.spatial_upsampler_path,
@@ -777,11 +826,13 @@ def main() -> None:
         quantization=args.quantization,
         compilation_config=args.compile,
         offload_mode=args.offload_mode,
+        alloc_trim_strategy=AllocatorTrimStrategy.TRIM,
         prompt_enhancer_gemma_root=getattr(args, "prompt_enhancer_gemma_root", None),
         diffvae_optimization=args.diffvae_optimization,
         msr_lora_path=args.msr_lora_path,
         msr_strength_model=args.msr_strength_model,
     )
+    LOG.info("[LTX25-MSR] CUDA allocator strategy: TRIM (hardcoded for Music Clip MSR)")
 
     from ltx_pipelines.utils.media_io import resolve_hdr_color_space, vae_dtype_for_hdr
 

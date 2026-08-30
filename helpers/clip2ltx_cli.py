@@ -13262,6 +13262,15 @@ def run_all_ltx_director_shots(payload: dict) -> dict:
                         if attempt_no > 1:
                             _emit(f"{sid}: retry succeeded on attempt {attempt_no}/{ltx_retry_attempts}")
                         break
+                    # run_single_ltx_shot_test() already performs its own longer-frame
+                    # regeneration loop for short raw clips.  If that loop reports
+                    # needs_regeneration, repeating the *entire* shot another 2 times
+                    # just renders the same expensive clip again and still never reaches
+                    # the normal trim/sync stage.  Reserve this outer retry loop for
+                    # actual backend/process failures.
+                    if _safe_str(result.get("status")).lower() == "needs_regeneration":
+                        _emit(f"{sid}: raw clip remained shorter than planned after the internal duration retries; not restarting the entire shot again.")
+                        break
                     if attempt_no < ltx_retry_attempts:
                         _emit(f"{sid}: attempt {attempt_no}/{ltx_retry_attempts} failed: {last_error}")
                 if not isinstance(result, dict) or not bool(result.get("ok")):

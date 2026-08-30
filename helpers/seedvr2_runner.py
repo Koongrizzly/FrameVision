@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import re
 import os
 import shlex
 import subprocess
@@ -88,17 +89,80 @@ def _run_cmd(cmd: List[str], cwd: Optional[Path], root: Path) -> int:
             universal_newlines=True,
         )
         out_lines: List[str] = []
+        # SeedVR2's inner phase bars repeatedly run 0->100.  Track the CLI's
+        # outer streaming chunks instead and expose cumulative frame progress.
+        total_frames = 0
+        done_frames = 0
+        current_chunk_new = 0
+        current_chunk = 0
+        total_chunks = 0
         assert p.stdout is not None
         for line in p.stdout:
             line = line.rstrip("\r\n")
             if not line:
                 continue
             out_lines.append(line)
+            # Exact total from SeedVR2's own VideoCapture probe.
+            try:
+                m = re.search(r"Video info:\s*(\d+)\s+frames", line, re.IGNORECASE)
+                if m:
+                    total_frames = int(m.group(1))
+                    # Honor skip/load limits from forwarded CLI args when present.
+                    def _arg_int(name, default=0):
+                        try:
+                            for ii, tok in enumerate(forward):
+                                st = str(tok)
+                                if st == name and ii + 1 < len(forward):
+                                    return int(forward[ii + 1])
+                                if st.startswith(name + "="):
+                                    return int(st.split("=", 1)[1])
+                        except Exception:
+                            pass
+                        return default
+                    skip = max(0, _arg_int("--skip_first_frames", 0))
+                    cap = max(0, _arg_int("--load_cap", 0))
+                    total_frames = max(0, total_frames - skip)
+                    if cap > 0:
+                        total_frames = min(total_frames, cap)
+                    _write_seedvr2_progress(progress_sidecar, done=done_frames, total=total_frames,
+                                            chunk=current_chunk, chunks=total_chunks, state="running")
+            except Exception:
+                pass
+            # A new Chunk line means the previous chunk has fully returned from
+            # encode->upscale->decode->postprocess and is therefore completed.
+            try:
+                m = re.search(r"Chunk\s+(\d+)\s*/\s*(\d+)\s*:\s*(\d+)\s+new", line, re.IGNORECASE)
+                if m:
+                    if current_chunk_new > 0:
+                        done_frames += current_chunk_new
+                    current_chunk = int(m.group(1))
+                    total_chunks = int(m.group(2))
+                    current_chunk_new = int(m.group(3))
+                    if total_frames <= 0 and total_chunks > 0:
+                        # Fallback when the Video info line is suppressed: this
+                        # is exact for all full chunks and close for the final one.
+                        total_frames = max(done_frames + current_chunk_new,
+                                           total_chunks * current_chunk_new)
+                    _write_seedvr2_progress(progress_sidecar, done=done_frames, total=total_frames,
+                                            chunk=current_chunk, chunks=total_chunks, state="running")
+            except Exception:
+                pass
             try:
                 print(line, flush=True)
             except Exception:
                 pass
         p.wait()
+        if int(p.returncode or 0) == 0:
+            if current_chunk_new > 0:
+                done_frames += current_chunk_new
+                current_chunk_new = 0
+            if total_frames > 0:
+                done_frames = min(done_frames, total_frames)
+            _write_seedvr2_progress(progress_sidecar, done=done_frames, total=total_frames,
+                                    chunk=current_chunk, chunks=total_chunks, state="done")
+        else:
+            _write_seedvr2_progress(progress_sidecar, done=done_frames, total=total_frames,
+                                    chunk=current_chunk, chunks=total_chunks, state="failed")
         if out_lines:
             _write_log(root, "STDOUT/ERR:\n" + "\n".join(out_lines))
         _write_log(root, f"EXIT: {p.returncode}")
@@ -595,6 +659,49 @@ def _normalize_forward_args(forward: List[str]) -> List[str]:
         i += 1
     return out
 
+def _seedvr2_progress_sidecar(forward: List[str], root: Path) -> Optional[Path]:
+    """Derive a deterministic live progress sidecar from SeedVR2 --output."""
+    try:
+        out = _parse_output_from_forward_args(forward)
+        if not out:
+            return None
+        p = Path(out)
+        if not p.is_absolute():
+            # FrameVision normally supplies an absolute output.  Resolve relative
+            # paths from the app root rather than the SeedVR2 repo cwd.
+            p = (root / p).resolve()
+        return Path(str(p) + ".seedvr2.progress.json")
+    except Exception:
+        return None
+
+
+def _write_seedvr2_progress(path: Optional[Path], *, done: int = 0, total: int = 0,
+                            chunk: int = 0, chunks: int = 0, state: str = "running") -> None:
+    if path is None:
+        return
+    try:
+        import time as _time
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "done_frames": max(0, int(done)),
+            "total_frames": max(0, int(total)),
+            "chunk": max(0, int(chunk)),
+            "chunks": max(0, int(chunks)),
+            "state": str(state),
+            "updated_at": _time.time(),
+        }
+        tmp = Path(str(path) + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        try:
+            tmp.replace(path)
+        except Exception:
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            try: tmp.unlink(missing_ok=True)
+            except Exception: pass
+    except Exception:
+        pass
+
+
 def _new_mode(args: argparse.Namespace) -> int:
     root = Path(args.work_root).resolve()
     _write_log(root, f"MODE: new; py={sys.executable}; cwd={os.getcwd()} [PATCH active newmode-postfix-v3-input-root-fix]")
@@ -626,6 +733,8 @@ def _new_mode(args: argparse.Namespace) -> int:
 
     # Remaining args after '--' are forwarded to inference_cli.py (except output which may be present there)
     forward = _normalize_forward_args(list(args.forward_args or []))
+    progress_sidecar = _seedvr2_progress_sidecar(forward, root)
+    _write_seedvr2_progress(progress_sidecar, state="preparing")
     try:
         _write_log(root, "Forward args (normalized): " + " ".join(forward))
     except Exception:
@@ -658,22 +767,82 @@ def _new_mode(args: argparse.Namespace) -> int:
             universal_newlines=True,
         )
         out_lines: List[str] = []
+        # Track SeedVR2's OUTER chunk progress.  The CLI's inner encode / DiT /
+        # decode bars each run 0->100 and must never be treated as whole-job progress.
+        done_frames = 0
+        total_frames = 0
+        current_chunk_new = 0
+        current_chunk = 0
+        total_chunks = 0
         assert p.stdout is not None
         for line in p.stdout:
             line = line.rstrip("\r\n")
             if not line:
                 continue
             out_lines.append(line)
+
+            # Some SeedVR2 builds print an exact source frame count.
+            try:
+                m = re.search(r"Video info:\s*(\d+)\s+frames", line, re.IGNORECASE)
+                if m:
+                    total_frames = int(m.group(1))
+                    _write_seedvr2_progress(
+                        progress_sidecar, done=done_frames, total=total_frames,
+                        chunk=current_chunk, chunks=total_chunks, state="running"
+                    )
+            except Exception:
+                pass
+
+            # A new Chunk line means the previous chunk fully completed
+            # encode -> DiT -> decode -> post-process and can be counted.
+            try:
+                m = re.search(r"Chunk\s+(\d+)\s*/\s*(\d+)\s*:\s*(\d+)\s+new", line, re.IGNORECASE)
+                if m:
+                    if current_chunk_new > 0:
+                        done_frames += current_chunk_new
+                    current_chunk = int(m.group(1))
+                    total_chunks = int(m.group(2))
+                    current_chunk_new = int(m.group(3))
+                    if total_frames <= 0 and total_chunks > 0:
+                        # Full chunks are normally equal-sized.  This is exact until
+                        # the final partial chunk; when that appears we correct it.
+                        total_frames = max(done_frames + current_chunk_new,
+                                           total_chunks * current_chunk_new)
+                    if current_chunk == total_chunks:
+                        # On the last chunk SeedVR2 tells us the exact remaining count.
+                        total_frames = done_frames + current_chunk_new
+                    _write_seedvr2_progress(
+                        progress_sidecar, done=done_frames, total=total_frames,
+                        chunk=current_chunk, chunks=total_chunks, state="running"
+                    )
+            except Exception:
+                pass
+
             try:
                 print(line, flush=True)
             except Exception:
                 pass
         p.wait()
+        rc = int(p.returncode or 0)
+        if rc == 0:
+            if current_chunk_new > 0:
+                done_frames += current_chunk_new
+                current_chunk_new = 0
+            if total_frames > 0:
+                done_frames = min(done_frames, total_frames)
+            _write_seedvr2_progress(
+                progress_sidecar, done=done_frames, total=total_frames,
+                chunk=current_chunk, chunks=total_chunks, state="done"
+            )
+        else:
+            _write_seedvr2_progress(
+                progress_sidecar, done=done_frames, total=total_frames,
+                chunk=current_chunk, chunks=total_chunks, state="failed"
+            )
         if out_lines:
             _write_log(root, "STDOUT/ERR:\n" + "\n".join(out_lines))
         _write_log(root, f"EXIT: {p.returncode}")
 
-        rc = int(p.returncode or 0)
         if rc == 0:
             try:
                 out_path_str = _parse_output_from_forward_args(forward)

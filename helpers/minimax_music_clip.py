@@ -88,7 +88,7 @@ def _detect_project_root() -> Path:
 
 ROOT = _detect_project_root()
 HELPERS_DIR = ROOT / "helpers"
-OUTPUT_ROOT = ROOT / "output" / "minimax_music_clips"
+OUTPUT_ROOT = ROOT / "output" / "videoclips" / "minimaxh3"
 SETTINGS_PATH = ROOT / "presets" / "minimax_music_clip_settings.json"
 AUTOSAVE_PATH = ROOT / "presets" / "setsave" / "minimax_music_clip.json"
 WHISPER_DIR = ROOT / "presets" / "bin" / "whisper"
@@ -164,6 +164,22 @@ def _cleanup_music_clip_temp_artifacts() -> None:
                 try:
                     if folder.is_dir() and now - folder.stat().st_mtime > 6 * 3600:
                         shutil.rmtree(folder, ignore_errors=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Final prune: scratch cleanup can leave empty directory shells behind.
+    # Walk deepest-first so empty children are removed before their parents.
+    # Keep OUTPUT_ROOT itself as the permanent default destination.
+    try:
+        if OUTPUT_ROOT.is_dir():
+            dirs = [p for p in OUTPUT_ROOT.rglob("*") if p.is_dir()]
+            dirs.sort(key=lambda p: len(p.parts), reverse=True)
+            for folder in dirs:
+                try:
+                    if not any(folder.iterdir()):
+                        folder.rmdir()
                 except Exception:
                     pass
     except Exception:
@@ -2042,6 +2058,14 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
                 with _ACTIVE_GENERATION_LOCK:
                     _ACTIVE_GENERATION_PROCESS = cp
                 tail: List[str] = []
+                # MiniMax/Comfy's sampler reports progress with tqdm lines such as
+                #   20%|##        | 1/5 [03:01<12:04, ...]
+                # Those lines do not contain the literal word "step", so the old
+                # filter silently discarded them and the GUI looked frozen during
+                # long 768p sampling runs. Track the completed count and display the
+                # step that is currently being worked on instead.
+                sampler_last_displayed = None
+                sampler_progress_re = re.compile(r"(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)")
                 assert cp.stdout is not None
                 for line in cp.stdout:
                     if _GENERATION_CANCEL.is_set() and cp.poll() is None:
@@ -2052,7 +2076,29 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
                     if text:
                         tail.append(text)
                         tail = tail[-40:]
-                        if "step" in text.lower() or "saved" in text.lower() or "error" in text.lower():
+                        low = text.lower()
+                        sampler_match = sampler_progress_re.search(text)
+                        is_sampler_line = sampler_match is not None and (
+                            "%|" in text or "it/s" in low or "s/it" in low
+                        )
+                        if is_sampler_line:
+                            completed = int(sampler_match.group(1))
+                            total = int(sampler_match.group(2))
+                            if total > 0:
+                                # tqdm prints 0/N before step 1 starts and N/N after
+                                # the final step finishes. While between updates, the
+                                # useful user-facing value is the next/current step.
+                                if completed >= total:
+                                    display_step = total
+                                    label = f"Shot {shot.index}: Sampling step {display_step}/{total} complete..."
+                                else:
+                                    display_step = completed + 1
+                                    label = f"Shot {shot.index}: Sampling step {display_step}/{total}..."
+                                state = (display_step, total, completed >= total)
+                                if state != sampler_last_displayed:
+                                    sampler_last_displayed = state
+                                    progress(label)
+                        elif "step" in low or "saved" in low or "error" in low:
                             progress(f"Shot {shot.index}: {text}")
                 rc = cp.wait()
                 last_rc = rc
@@ -2205,12 +2251,81 @@ class MiniMaxMusicClipWidget(QWidget):
         self._one_click_active = False
         _cleanup_music_clip_temp_artifacts()
         self._build_ui()
+        # Give every persistent control a stable identity. FrameVision also has a
+        # generic widget-state restorer; unnamed child widgets can otherwise be
+        # matched by construction/order after this helper gains or moves controls,
+        # which can put one field's saved value into another field on startup.
+        self._assign_persistence_object_names()
         # Restore the complete working session first. The older small settings file
         # remains only as a fallback for installs that do not have a session save yet.
         if not self._load_autosave():
             self._load_settings()
         self._sync_ui_from_project()
         self._start_autosave()
+        # The parent FrameVision window may run its generic restore only after this
+        # embedded widget has finished constructing. Re-assert our authoritative
+        # key-based project state after that pass, before the 1.5 s autosave can
+        # accidentally persist values injected into the wrong controls.
+        QTimer.singleShot(0, self._startup_reassert_project_state)
+        QTimer.singleShot(250, self._startup_reassert_project_state)
+
+    def _assign_persistence_object_names(self) -> None:
+        """Use stable names so host-level persistence never depends on widget order."""
+        persistent = {
+            "tabs": "minimax_music_tabs",
+            "edit_audio": "minimax_music_audio_path",
+            "edit_output": "minimax_music_output_dir",
+            "edit_title": "minimax_music_project_title",
+            "edit_idea": "minimax_music_main_idea",
+            "edit_style": "minimax_music_style_theme",
+            "edit_subjects": "minimax_music_reference_details",
+            "edit_world": "minimax_music_locations_world",
+            "edit_camera": "minimax_music_camera_choreography",
+            "check_randomize_ref_characters": "minimax_music_randomize_ref_characters",
+            "spin_sensitivity": "minimax_music_beat_sensitivity",
+            "check_whisper_timing": "minimax_music_whisper_timing",
+            "check_visible_lyric_subtitles": "minimax_music_visible_lyrics",
+            "combo_resolution": "minimax_music_resolution",
+            "combo_aspect": "minimax_music_aspect",
+            "slider_frames": "minimax_music_max_frames",
+            "spin_head": "minimax_music_head_padding",
+            "spin_tail": "minimax_music_tail_padding",
+            "spin_snap": "minimax_music_phrase_snap",
+            "spin_steps": "minimax_music_steps",
+            "spin_cfg": "minimax_music_cfg",
+            "spin_shift": "minimax_music_shift",
+            "spin_audio_shift": "minimax_music_audio_shift",
+            "combo_ref_size": "minimax_music_ref_image_size",
+            "edit_turbo_lora": "minimax_music_turbo_lora_path",
+            "spin_turbo_lora": "minimax_music_turbo_lora_strength",
+            "edit_extra_lora1": "minimax_music_extra_lora1_path",
+            "spin_extra_lora1": "minimax_music_extra_lora1_strength",
+            "edit_extra_lora2": "minimax_music_extra_lora2_path",
+            "spin_extra_lora2": "minimax_music_extra_lora2_strength",
+            "check_hybrid_model": "minimax_music_use_hybrid_model",
+            "edit_hybrid_model": "minimax_music_hybrid_model_path",
+            "check_vram_manager": "minimax_music_vram_manager",
+            "check_vram_auto_bypass": "minimax_music_vram_auto_bypass",
+            "check_sage": "minimax_music_sage_attention",
+            "check_spectrum": "minimax_music_spectrum",
+            "check_hypir_x1_upscale": "minimax_music_hypir_x1",
+            "check_lanczos_x2_upsampling": "minimax_music_lanczos_x2",
+            "check_framevision_queue": "minimax_music_framevision_queue",
+        }
+        for attr, name in persistent.items():
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                try:
+                    widget.setObjectName(name)
+                except Exception:
+                    pass
+
+    def _startup_reassert_project_state(self) -> None:
+        """Undo any late host-level positional restore before autosave reads UI."""
+        try:
+            self._sync_ui_from_project()
+        except Exception:
+            pass
 
     # ---- UI construction ----
     def _build_ui(self) -> None:

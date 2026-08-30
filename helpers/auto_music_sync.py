@@ -1286,17 +1286,17 @@ def _musicclip_msr_location_override_list(payload: dict | None = None, plan_data
 
 
 def _musicclip_msr_background_prompt_for_location(location: str, payload: dict | None = None, shot: dict | None = None) -> str:
+    """Build an MSR background prompt from CURRENT UI location/style only.
+
+    Do not append scene-role/title/description text from the director plan here.
+    Those fields may belong to a cached older job and were able to overpower a
+    newly entered Locations / world value, especially with Krea 2. The MSR
+    background stage is intentionally location-authoritative.
+    """
     loc = re.sub(r"\s+", " ", str(location or "").strip()) or "cinematic location"
     src_payload = dict(payload or {})
     brief = src_payload.get("creative_brief") if isinstance(src_payload.get("creative_brief"), dict) else {}
     style = re.sub(r"\s+", " ", str((brief or {}).get("style_theme") or src_payload.get("style_theme") or "").strip())
-    mood = ""
-    if isinstance(shot, dict):
-        for key in ("microclip_style", "scene_role_summary", "title", "description"):
-            candidate = re.sub(r"\s+", " ", str(shot.get(key) or "").strip())
-            if candidate:
-                mood = candidate
-                break
     bits = [
         loc,
         "empty location background plate for a music video",
@@ -1313,8 +1313,6 @@ def _musicclip_msr_background_prompt_for_location(location: str, payload: dict |
     ]
     if style:
         bits.append(style)
-    if mood:
-        bits.append(mood)
     return ", ".join(bit for bit in bits if bit)
 
 
@@ -1463,7 +1461,46 @@ def _musicclip_prepare_msr_location_override_backgrounds(mod: Any, payload: dict
     generated_paths: list[str] = []
     use_end_auto = _musicclip_bool_value(prepared.get("msr_use_end_frames")) and bool(list(prepared.get("msr_transparent_character_paths") or []))
 
+    cancel_check = prepared.get("cancel_check")
+
+    def _cancel_requested() -> bool:
+        if not callable(cancel_check):
+            return False
+        try:
+            return bool(cancel_check())
+        except Exception:
+            return False
+
+    def _cancel_result() -> dict:
+        # Persist every background that reached a safe completed boundary before
+        # returning. A later Continue/Generate run can reuse those images instead
+        # of starting the Krea background batch from the beginning.
+        if assignments:
+            try:
+                _musicclip_apply_msr_location_override_metadata(plan_path, assignments, locations)
+            except Exception:
+                pass
+        partial = dict(prepared)
+        partial["msr_background_paths"] = list(generated_paths)
+        partial["msr_background_mode"] = "sequence"
+        partial["msr_pre_generated_backgrounds"] = bool(generated_paths)
+        return {
+            "ok": False,
+            "cancelled": True,
+            "changed": bool(assignments),
+            "payload": partial,
+            "generated_paths": list(generated_paths),
+            "locations": list(locations),
+            "assignments": list(assignments),
+            "message": "LTX generation cancelled after the current MSR background finished.",
+        }
+
     for index, shot in enumerate(shots):
+        # Krea/sd-cli is allowed to finish the image currently in flight. The
+        # cancellation boundary is between images so Cancel never launches the
+        # next background in the batch.
+        if _cancel_requested():
+            return _cancel_result()
         if not isinstance(shot, dict):
             continue
         sid = str(shot.get("id") or shot.get("shot_id") or shot.get("ltx_id") or shot.get("name") or f"LTX{index + 1:02d}").strip() or f"LTX{index + 1:02d}"
@@ -1472,7 +1509,17 @@ def _musicclip_prepare_msr_location_override_backgrounds(mod: Any, payload: dict
         prompt = _musicclip_msr_background_prompt_for_location(location, prepared, shot)
         existing_path = str(shot.get("framevision_msr_background_path") or "").strip()
         existing_location = str(shot.get("framevision_msr_background_location") or "").strip()
-        if existing_path and os.path.isfile(existing_path) and existing_location.casefold() == location.casefold():
+        existing_prompt = re.sub(r"\s+", " ", str(shot.get("framevision_msr_background_prompt") or "").strip())
+        current_prompt = re.sub(r"\s+", " ", str(prompt or "").strip())
+        # Reuse only when BOTH the current location and the exact generated
+        # background prompt still match. This prevents an old background from
+        # surviving after the user changes Locations / world or the visual style.
+        if (
+            existing_path
+            and os.path.isfile(existing_path)
+            and existing_location.casefold() == location.casefold()
+            and existing_prompt.casefold() == current_prompt.casefold()
+        ):
             generated_paths.append(existing_path)
             assignments.append({"shot_id": sid, "location": location, "prompt": prompt, "path": existing_path})
             continue
@@ -1511,6 +1558,10 @@ def _musicclip_prepare_msr_location_override_backgrounds(mod: Any, payload: dict
             }
         generated_paths.append(image_path)
         assignments.append({"shot_id": sid, "location": location, "prompt": prompt, "path": image_path})
+        # If Cancel was pressed while Krea was rendering this image, stop here.
+        # The completed image is retained and recorded; no next image is started.
+        if _cancel_requested():
+            return _cancel_result()
 
     prepared["msr_background_paths"] = list(generated_paths)
     prepared["msr_background_mode"] = "sequence"
@@ -4164,6 +4215,13 @@ def _musicclip_patch_msr_location_override_bridge(mod):
                 prepared_payload = dict(payload or {})
                 prep = _musicclip_prepare_msr_location_override_backgrounds(mod, prepared_payload)
                 if isinstance(prep, dict) and not bool(prep.get("ok", True)):
+                    if bool(prep.get("cancelled")):
+                        return {
+                            "ok": False,
+                            "cancelled": True,
+                            "message": str(prep.get("message") or "LTX generation cancelled."),
+                            "generated_paths": list(prep.get("generated_paths") or []),
+                        }
                     return {"ok": False, "message": str(prep.get("message") or "MSR location override preparation failed.")}
                 if isinstance(prep, dict) and isinstance(prep.get("payload"), dict):
                     prepared_payload = dict(prep.get("payload") or {})
@@ -9570,7 +9628,7 @@ class LtxFullRunWorker(QThread):
             payload["cancel_check"] = _cancel_check
             self.progress_text.emit("Loading LTX director plan...")
             result = run_fn(payload)
-            if isinstance(result, dict) and bool(result.get("ok")):
+            if isinstance(result, dict) and (bool(result.get("ok")) or bool(result.get("cancelled"))):
                 self.finished_result.emit(result)
             else:
                 msg = "Full LTX director-shot generation failed."
@@ -14454,6 +14512,7 @@ class AutoMusicSyncWidget(QWidget):
         self._planner_bridge_character_reference_sheet_paths = {f"char_{i:02d}": "" for i in range(1, 6)}
         self._planner_bridge_character_reference_widgets = {}
         self.check_bridge_use_vocal_roles = None
+        self.check_bridge_dance_video = None
         self.combo_bridge_ltx_grouping_mode = None
         self.check_bridge_ltx_export_audio_chunks = None
         self.spin_bridge_ltx_fps = None
@@ -15121,6 +15180,18 @@ class AutoMusicSyncWidget(QWidget):
             ltx_msr_lay.addWidget(self.label_ltx_msr_status)
             self.ltx_section_msr.setVisible(False)
             bridge_lay.addWidget(self.ltx_section_msr)
+
+            row_dance_video = QHBoxLayout()
+            self.check_bridge_dance_video = QCheckBox("Dance video", self.box_planner_bridge)
+            self.check_bridge_dance_video.setChecked(False)
+            self.check_bridge_dance_video.setToolTip(
+                "Makes physical dancing a non-negotiable action in generated video prompts. "
+                "Characters keep doing clear full-body choreography instead of standing still while only the camera moves. "
+                "This can be combined with vocal/non-vocal scene roles so important vocal shots can lipsync while still dancing."
+            )
+            row_dance_video.addWidget(self.check_bridge_dance_video)
+            row_dance_video.addStretch(1)
+            ltx_lipsync_lay.addLayout(row_dance_video)
 
             row_bridge_roles = QHBoxLayout()
             self.check_bridge_use_vocal_roles = QCheckBox("Use vocal/non-vocal scene roles", self.box_planner_bridge)
@@ -17445,6 +17516,8 @@ class AutoMusicSyncWidget(QWidget):
             if getattr(self, "list_ltx_own_images", None) is not None:
                 self.list_ltx_own_images.itemDoubleClicked.connect(lambda item: self._on_open_ltx_own_image_item(item))
             self._update_ltx_own_images_ui()
+            if getattr(self, "check_bridge_dance_video", None) is not None:
+                self.check_bridge_dance_video.toggled.connect(self._save_settings)
             if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
                 self.check_bridge_use_vocal_roles.toggled.connect(self._save_settings)
                 self.check_bridge_use_vocal_roles.toggled.connect(lambda _v: self._update_ltx_lipsync_trim_lock())
@@ -18830,6 +18903,7 @@ class AutoMusicSyncWidget(QWidget):
             "target_clip_seconds": float(target_clip_seconds) if target_clip_seconds > 0.0 else None,
             "scene_cut_style": scene_cut_style,
             "beat_style": scene_cut_style,
+            "dance_video": bool(getattr(self, "check_bridge_dance_video", None) and self.check_bridge_dance_video.isChecked()),
             "locations_world": self._planner_bridge_text("edit_bridge_locations_world"),
             "smart_scene_duration_guard": bool(duration_guard),
             "smart_min_scene_len": float(manual_min),
@@ -18847,11 +18921,11 @@ class AutoMusicSyncWidget(QWidget):
             "ltx_aspect_mode": "portrait" if ltx_portrait else "landscape",
             # MSR V2 is allowed 15s / 361 frames. Its raw render gets up to
             # 16s / 385 frames for the same trim/lipsync breathing room.
-            "ltx_max_generation_seconds": (15.0 if (msr_v2_enabled and backend != "ltx25_convrot") else 10.0) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
-            "ltx_max_generation_frames": (361 if (msr_v2_enabled and backend != "ltx25_convrot") else 241) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
-            "hard_max_ltx_shot_seconds": (15.0 if (msr_v2_enabled and backend != "ltx25_convrot") else 9.9) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
-            "ltx_raw_generation_seconds": (16.0 if (msr_v2_enabled and backend != "ltx25_convrot") else 11.0) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
-            "ltx_raw_generation_frames": (385 if (msr_v2_enabled and backend != "ltx25_convrot") else 265) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
+            "ltx_max_generation_seconds": (15.0 if msr_v2_enabled else 10.0) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
+            "ltx_max_generation_frames": (361 if msr_v2_enabled else 241) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
+            "hard_max_ltx_shot_seconds": (15.0 if msr_v2_enabled else 9.9) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
+            "ltx_raw_generation_seconds": (16.0 if msr_v2_enabled else 11.0) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
+            "ltx_raw_generation_frames": (385 if msr_v2_enabled else 265) if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
             "ltx_generation_tail_padding_seconds": 0.5 if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
             "ltx_trim_to_planned_shot_seconds": True if backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"} else None,
             "timestamped_microclips_enabled": bool(getattr(self, "check_bridge_timestamped_microclips", None) and self.check_bridge_timestamped_microclips.isChecked()),
@@ -19072,38 +19146,33 @@ class AutoMusicSyncWidget(QWidget):
 
     def _update_ltx_msr_ui(self) -> None:
         backend = self._current_ltx_generation_backend() if hasattr(self, "_current_ltx_generation_backend") else ""
-        # Licon LTX 2.5 MSR is implemented by the native FP16 backend. ConvRot
-        # keeps the rest of the 2.5 Music Clip workflow but does not yet have the
-        # learned-slot MSR conditioning implementation. Never silently route a
-        # stale checked box through the old 2.3 pseudo-video MSR path.
-        if backend == "ltx25_convrot":
-            try:
-                if getattr(self, "check_ltx_use_msr", None) is not None:
-                    self.check_ltx_use_msr.blockSignals(True)
-                    self.check_ltx_use_msr.setChecked(False)
-                    self.check_ltx_use_msr.blockSignals(False)
-                    self.check_ltx_use_msr.setEnabled(False)
-                    self.check_ltx_use_msr.setText("Use MSR reference workflow (FP16 or LTX 2.3 only)")
-                    self.check_ltx_use_msr.setToolTip("LTX 2.5 ConvRot generation is available, but Licon's learned-slot MSR conditioning is currently wired to the native LTX 2.5 FP16 backend only.")
-            except Exception:
-                pass
-        else:
-            try:
-                if getattr(self, "check_ltx_use_msr", None) is not None:
-                    self.check_ltx_use_msr.setEnabled(True)
-                    if backend == "ltx25_fp16":
-                        self.check_ltx_use_msr.setText("Use LTX 2.5 MSR reference workflow")
-                        self.check_ltx_use_msr.setToolTip("Use LiconStudio LTX 2.5 Multiple Subject Reference with independent learned reference slots. The existing Music Clip Creator reference/background lists are reused.")
-                    else:
-                        self.check_ltx_use_msr.setText("Use MSR V2 reference workflow")
-                        self.check_ltx_use_msr.setToolTip("Use the LTX 2.3 MSR V2 reference workflow with the selected LTX 2.3/Wan2GP backend.")
-            except Exception:
-                pass
+        # LTX 2.5 FP16 and ConvRot both support the learned-slot Licon MSR path.
+        # Keep the same Music Clip Creator reference/background controls enabled
+        # for either 2.5 backend.
+        try:
+            if getattr(self, "check_ltx_use_msr", None) is not None:
+                self.check_ltx_use_msr.setEnabled(True)
+                if backend in {"ltx25_fp16", "ltx25_convrot"}:
+                    self.check_ltx_use_msr.setText("Use LTX 2.5 MSR reference workflow")
+                    self.check_ltx_use_msr.setToolTip(
+                        "Use LiconStudio LTX 2.5 Multiple Subject Reference with "
+                        "independent learned reference slots. Works with FP16 and "
+                        "W4A8 ConvRot; the existing Music Clip Creator "
+                        "reference/background lists are reused."
+                    )
+                else:
+                    self.check_ltx_use_msr.setText("Use MSR V2 reference workflow")
+                    self.check_ltx_use_msr.setToolTip(
+                        "Use the LTX 2.3 MSR V2 reference workflow with the "
+                        "selected LTX 2.3/Wan2GP backend."
+                    )
+        except Exception:
+            pass
         enabled = self._ltx_msr_enabled()
         try:
             spin = getattr(self, "spin_ltx_msr_reference_frames", None)
             if spin is not None:
-                if backend == "ltx25_fp16":
+                if backend in {"ltx25_fp16", "ltx25_convrot"}:
                     # Licon 2.5 supports exactly 25 or 33 reference frames. Keep
                     # the old spinbox but snap legacy 41/65 settings to 33.
                     spin.blockSignals(True)
@@ -20094,6 +20163,7 @@ class AutoMusicSyncWidget(QWidget):
                 "creative_brief": self._planner_bridge_creative_brief(),
                 "prompt_backend": "template_rule_based",
                 "use_vocal_scene_roles": bool(getattr(self, "check_bridge_use_vocal_roles", None) is None or self.check_bridge_use_vocal_roles.isChecked()),
+                "dance_video": bool(getattr(self, "check_bridge_dance_video", None) and self.check_bridge_dance_video.isChecked()),
                 "bridge_generation_settings": self._planner_bridge_generation_settings(),
                 "character_reference": self._planner_bridge_character_reference_payload(),
             }
@@ -20876,6 +20946,7 @@ class AutoMusicSyncWidget(QWidget):
             "creative_brief": self._planner_bridge_creative_brief(),
             "prompt_backend": "template_rule_based",
             "use_vocal_scene_roles": bool(getattr(self, "check_bridge_use_vocal_roles", None) is None or self.check_bridge_use_vocal_roles.isChecked()),
+            "dance_video": bool(getattr(self, "check_bridge_dance_video", None) and self.check_bridge_dance_video.isChecked()),
             "bridge_generation_settings": self._planner_bridge_generation_settings(),
             "character_reference": self._planner_bridge_character_reference_payload(),
             "grouping_mode": grouping_mode,
@@ -21679,7 +21750,18 @@ class AutoMusicSyncWidget(QWidget):
         try:
             path = str(getattr(self, "_planner_bridge_last_ltx_director_plan_path", "") or "").strip()
             if path and os.path.isfile(path):
-                return path
+                # Automated MSR backgrounds must never silently run against a
+                # director plan from an older creative brief. This was the stale
+                # background bug: the saved director-plan path survived restart
+                # and remained authoritative even after Locations / world changed.
+                msr_auto = bool(
+                    getattr(self, "check_ltx_msr_automate_backgrounds", None)
+                    and self.check_ltx_msr_automate_backgrounds.isChecked()
+                    and self._ltx_msr_enabled()
+                )
+                if not msr_auto or self._planner_bridge_plan_matches_current_brief(path):
+                    return path
+                return ""
         except Exception:
             pass
         for attr in ("_planner_bridge_last_ltx_shot_plan_path", "_planner_bridge_last_prompt_plan_path", "_planner_bridge_last_scene_plan_path"):
@@ -23310,7 +23392,7 @@ class AutoMusicSyncWidget(QWidget):
             spin = getattr(self, "spin_smart_max_scene_len", None)
             if spin is not None:
                 msr_v2 = bool(getattr(self, "check_ltx_use_msr", None) and self.check_ltx_use_msr.isChecked())
-                msr_long = bool(msr_v2 and backend in {"int4", "vramlab", "ltx25_fp16"})
+                msr_long = bool(msr_v2 and backend in {"int4", "vramlab", "ltx25_fp16", "ltx25_convrot"})
                 max_allowed = 30.0 if backend == "wan2gp" else (15.0 if msr_long else 9.9)
                 try:
                     spin.setRange(0.5, float(max_allowed))
@@ -23329,7 +23411,7 @@ class AutoMusicSyncWidget(QWidget):
                     elif backend == "ltx25_fp16":
                         spin.setToolTip("Manual maximum smart scene length for LTX 2.5 FP16. It stops at 9.9s normally; LTX 2.5 MSR may use the 15s MSR exception.")
                     elif backend == "ltx25_convrot":
-                        spin.setToolTip("Manual maximum smart scene length for LTX 2.5 ConvRot. It stops at 9.9s so the raw render has trim/lipsync breathing room.")
+                        spin.setToolTip("Manual maximum smart scene length for LTX 2.5 ConvRot. It stops at 9.9s normally; LTX 2.5 MSR may use the 15s MSR exception.")
                     elif backend == "int4":
                         spin.setToolTip("Manual maximum smart scene length for LTX 2.3 INT4. It stops at 9.9s so the raw render has trim/lipsync breathing room.")
                     else:
@@ -25517,6 +25599,8 @@ class AutoMusicSyncWidget(QWidget):
 
         # Planner Bridge / LTX testing defaults
         try:
+            if getattr(self, "check_bridge_dance_video", None) is not None:
+                self.check_bridge_dance_video.setChecked(False)
             if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
                 self.check_bridge_use_vocal_roles.setChecked(True)
             if getattr(self, "combo_bridge_ltx_grouping_mode", None) is not None:
@@ -26556,6 +26640,12 @@ class AutoMusicSyncWidget(QWidget):
                         _spins[_idx].setValue(float(s.get(f"ltx/krea2_lora_{_idx + 1}_strength", 1.0)))
             except Exception:
                 pass
+            if getattr(self, "check_bridge_dance_video", None) is not None:
+                try:
+                    self.check_bridge_dance_video.blockSignals(True)
+                    self.check_bridge_dance_video.setChecked(bool(int(s.get("planner_bridge_dance_video", 0))))
+                finally:
+                    self.check_bridge_dance_video.blockSignals(False)
             if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
                 try:
                     self.check_bridge_use_vocal_roles.blockSignals(True)
@@ -27212,6 +27302,7 @@ class AutoMusicSyncWidget(QWidget):
                     _set("ltx/krea2_lora_last_dir", os.path.dirname(_path))
         except Exception:
             pass
+        _set("planner_bridge_dance_video", _checked("check_bridge_dance_video", 0))
         _set("planner_bridge_use_vocal_roles", _checked("check_bridge_use_vocal_roles", 1))
         _set("planner_bridge_director_backend", _combo_text("combo_bridge_director_backend", "Template cleanup"))
         _llama_payload = self._bridge_own_llama_ui_payload() if hasattr(self, "_bridge_own_llama_ui_payload") else {}
@@ -27354,6 +27445,8 @@ class AutoMusicSyncWidget(QWidget):
                 s.set("ltx/use_own_images", int(self.check_ltx_use_own_images.isChecked()))
             if hasattr(self, "_ltx_own_image_paths"):
                 s.set("ltx/own_image_paths", json.dumps(self._ltx_own_image_paths(), ensure_ascii=False))
+            if getattr(self, "check_bridge_dance_video", None) is not None:
+                s.set("planner_bridge_dance_video", int(self.check_bridge_dance_video.isChecked()))
             if getattr(self, "check_bridge_use_vocal_roles", None) is not None:
                 s.set("planner_bridge_use_vocal_roles", int(self.check_bridge_use_vocal_roles.isChecked()))
             if getattr(self, "combo_bridge_director_backend", None) is not None:

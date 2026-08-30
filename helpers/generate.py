@@ -12,14 +12,14 @@ from runtime.paths import ROOT
 from runtime.validate_models import validate
 from runtime import vram_manager as _vram_manager_module
 
-_EXPECTED_VRAM_SIGNATURE = "V11_4_REF_VAE_ADMISSION_20260817A"
+_EXPECTED_VRAM_SIGNATURE = "V11_5_EXTREME_DIFFUSION_SAFE_20260826A"
 
 def _verify_vram_runtime():
     actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
     if actual != _EXPECTED_VRAM_SIGNATURE:
         path = getattr(_vram_manager_module, "__file__", "unknown")
         raise RuntimeError(
-            "VRAM Manager patch mismatch: the launcher is V11.4 but the loaded "
+            "VRAM Manager patch mismatch: the launcher is V11.5 but the loaded "
             f"runtime/vram_manager.py is not. Loaded: {path} | signature={actual!r}. "
             "Re-extract the patch into the MiniMax app root so both helpers/ and runtime/ are replaced."
         )
@@ -43,7 +43,7 @@ def main():
     ap.add_argument("--extended-logging", action="store_true")
     ap.add_argument("--tile-debugging", action="store_true")
     ap.add_argument("--video-vae-tile-size", type=int, default=256)
-    ap.add_argument("--video-vae-tile-overlap", type=int, default=128)
+    ap.add_argument("--video-vae-tile-overlap", type=int, default=64)
     ap.add_argument("--vram-manager", action="store_true")
     ap.add_argument("--vram-manager-auto", action="store_true", help="Automatically bypass VRAM Lab when native sampling is estimated to fit the detected GPU")
     ap.add_argument("--spectrum", action="store_true", help="Enable experimental bundled MiniMax H3 Spectrum feature forecasting")
@@ -82,7 +82,7 @@ def main():
             print(f"Comfy Kitchen W4A8 acceleration: requested but unavailable ({type(_exc).__name__}: {_exc})", flush=True)
     if ns.vram_manager:
         runtime_path = _verify_vram_runtime()
-        print(f"[VRAM-MGR] V11.4 runtime verified: {runtime_path}", flush=True)
+        print(f"[VRAM-MGR] V11.5 runtime verified: {runtime_path}", flush=True)
     if ns.video_vae_tile_size < 128: print("ERROR: video VAE tile size must be at least 128 px"); return 2
     if ns.video_vae_tile_overlap < 0 or ns.video_vae_tile_overlap >= ns.video_vae_tile_size: print("ERROR: video VAE tile overlap must be >= 0 and smaller than tile size"); return 2
     if len(ns.lora) != len(ns.lora_strength): print("ERROR: each --lora needs one matching --lora-strength"); return 2
@@ -294,9 +294,25 @@ def main():
                 comfy_args += ["--disable-dynamic-vram"]
             elif "diffusion" in managed_sample_stages:
                 comfy_args += ["--enable-dynamic-vram"]
-            if ns.vram_async_streams <= 0: comfy_args += ["--disable-async-offload"]
-            else: comfy_args += ["--async-offload", str(ns.vram_async_streams)]
-            print(f"VRAM Manager V11.4: sample stages={','.join(managed_sample_stages) if ns.vram_manager_auto else 'forced all'} | engine={ns.vram_residency_engine} | runtime free={ns.vram_runtime_free_gb:g} GB | text load headroom={ns.vram_text_headroom_gb:g} GB | diffusion load headroom={ns.vram_diffusion_headroom_gb:g} GB | chunk={ns.vram_offload_chunk_mb} MB | max weights={'auto' if ns.vram_max_resident_weights_gb <= 0 else f'{ns.vram_max_resident_weights_gb:g} GB'} | block check={ns.vram_block_interval if hasattr(ns, 'vram_block_interval') else ns.vram_block_check_interval} | async streams={ns.vram_async_streams}", flush=True)
+            effective_async_streams = ns.vram_async_streams
+            diffusion_plan = stage_plan["stages"]["diffusion"] if stage_plan else None
+            physical_total = stage_plan.get("total_gib") if stage_plan else None
+            extreme_diffusion = bool(
+                "diffusion" in managed_sample_stages
+                and diffusion_plan
+                and physical_total is not None
+                and float(diffusion_plan.get("required_gib", 0.0)) > float(physical_total)
+            )
+            if extreme_diffusion and effective_async_streams > 0:
+                effective_async_streams = 0
+                print(
+                    f"[VRAM-MGR] V11.5 extreme diffusion safety: estimate={diffusion_plan['required_gib']:.2f} GiB "
+                    f"> physical VRAM={physical_total:.2f} GiB; async weight offload automatically disabled for this sampling process",
+                    flush=True,
+                )
+            if effective_async_streams <= 0: comfy_args += ["--disable-async-offload"]
+            else: comfy_args += ["--async-offload", str(effective_async_streams)]
+            print(f"VRAM Manager V11.5: sample stages={','.join(managed_sample_stages) if ns.vram_manager_auto else 'forced all'} | engine={ns.vram_residency_engine} | runtime free={ns.vram_runtime_free_gb:g} GB | text load headroom={ns.vram_text_headroom_gb:g} GB | diffusion load headroom={ns.vram_diffusion_headroom_gb:g} GB | chunk={ns.vram_offload_chunk_mb} MB | max weights={'auto' if ns.vram_max_resident_weights_gb <= 0 else f'{ns.vram_max_resident_weights_gb:g} GB'} | block check={ns.vram_block_interval if hasattr(ns, 'vram_block_interval') else ns.vram_block_check_interval} | async streams={effective_async_streams}", flush=True)
         if comfy_args:
             sample_env["H3_COMFY_ARGS"] = " ".join(comfy_args)
         for lp, strength in zip(ns.lora, ns.lora_strength): sample_cmd += ["--lora", str(Path(lp).resolve()), "--lora-strength", str(strength)]
@@ -354,10 +370,28 @@ def main():
             frame_files = sorted(frames_dir.glob("frame_*.png"))
             if not frame_files:
                 raise RuntimeError("Video decode produced no frames for mux")
-            exact_duration = len(frame_files) / 24.0
-            print(f"Muxing video and audio on exact frame duration: {len(frame_files)} frames / {exact_duration:.6f}s", flush=True)
-            cmd = [ffmpeg, "-y", "-framerate", "24", "-i", str(frames_dir / "frame_%06d.png"), "-i", str(wav),
-                   "-filter:a", f"aresample=32000,apad,atrim=duration={exact_duration:.9f},asetpts=PTS-STARTPTS",
+
+            # A glued H3 continuation begins with the supplied boundary frame, so its
+            # first decoded frame duplicates the final frame of the source clip.  Drop
+            # that one frame before encoding the continuation segment.  Trim the same
+            # 1/24 second from the head of its audio so A/V stays frame-locked.
+            seam_drop_frames = 1 if ns.glue_source else 0
+            if seam_drop_frames and len(frame_files) <= seam_drop_frames:
+                raise RuntimeError("Continuation produced too few frames to drop the duplicated seam frame")
+            mux_frame_count = len(frame_files) - seam_drop_frames
+            exact_duration = mux_frame_count / 24.0
+            audio_head_trim = seam_drop_frames / 24.0
+            if seam_drop_frames:
+                print(
+                    f"Glue seam trim: dropping duplicated first continuation frame + {audio_head_trim:.6f}s audio head",
+                    flush=True,
+                )
+            print(f"Muxing video and audio on exact frame duration: {mux_frame_count} frames / {exact_duration:.6f}s", flush=True)
+            cmd = [ffmpeg, "-y", "-framerate", "24"]
+            if seam_drop_frames:
+                cmd += ["-start_number", str(seam_drop_frames)]
+            cmd += ["-i", str(frames_dir / "frame_%06d.png"), "-i", str(wav),
+                   "-filter:a", f"aresample=32000,atrim=start={audio_head_trim:.9f},asetpts=PTS-STARTPTS,apad,atrim=duration={exact_duration:.9f},asetpts=PTS-STARTPTS",
                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac", "-b:a", "256k",
                    "-t", f"{exact_duration:.9f}", str(mux_tmp)]
             subprocess.check_call(cmd)
@@ -367,7 +401,11 @@ def main():
             print(f"Audio/mux stage failed ({e}). Creating COMPLETE video-only fallback instead of leaving a partial MP4...", flush=True)
             if mux_tmp.exists(): mux_tmp.unlink()
             if segment_out.exists(): segment_out.unlink()
-            subprocess.check_call([ffmpeg, "-y", "-framerate", "24", "-i", str(frames_dir / "frame_%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", str(segment_out)])
+            fallback_cmd = [ffmpeg, "-y", "-framerate", "24"]
+            if ns.glue_source:
+                fallback_cmd += ["-start_number", "1"]
+            fallback_cmd += ["-i", str(frames_dir / "frame_%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", str(segment_out)]
+            subprocess.check_call(fallback_cmd)
         if ns.glue_source:
             try:
                 _concat_source_and_segment(ffmpeg, ffprobe, ns.glue_source, segment_out, out, width, height, td)

@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import random
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -318,6 +320,110 @@ def _safe_float(text: str, default: float) -> float:
         return float(default)
 
 
+
+def _install_ltx25_timing_compat(base) -> None:
+    """Install LTX 2.5-only frame-grid and video-stream timing fixes.
+
+    ``base`` is the private clip2ltx_cli module instance loaded by the LTX 2.5
+    bridge.  Nothing here modifies the normal LTX 2.3 module/import path.
+    """
+    if getattr(base, "_ltx25_timing_compat_installed", False):
+        return
+
+    original_timing = getattr(base, "_ltx_generation_timing_plan", None)
+    if callable(original_timing):
+        def timing_plan(shot, fps):
+            result = dict(original_timing(shot, fps) or {})
+            requested = max(1, _safe_int(str(result.get("requested_generation_frames", 1)), 1))
+            # LTX 2.5 temporal sizes are 8n+1. Round UP so a timeline slot such
+            # as 237/238 frames gets 241 real generated frames and can be trimmed.
+            legal = 1 if requested <= 1 else int(math.ceil((requested - 1) / 8.0)) * 8 + 1
+            result["requested_generation_frames"] = int(legal)
+            target_fps = max(1, _safe_int(str(result.get("target_fps", fps or 24)), int(fps or 24)))
+            result["requested_generation_duration"] = round(float(legal) / float(target_fps), 6)
+            result["ltx25_frame_grid_adjusted"] = bool(legal != requested)
+            result["ltx25_original_requested_frames"] = int(requested)
+            return result
+        setattr(base, "_ltx_generation_timing_plan", timing_plan)
+
+    def probe_video_frames(root: Path, media_path: Path) -> int:
+        src = Path(media_path)
+        if not src.is_file():
+            return 0
+        ffprobe = base._find_media_binary(root, "FV_FFPROBE", "ffprobe")
+        commands = [
+            [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=nb_frames", "-of", "default=noprint_wrappers=1:nokey=1", str(src)],
+            [ffprobe, "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "default=noprint_wrappers=1:nokey=1", str(src)],
+        ]
+        for cmd in commands:
+            try:
+                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", timeout=120)
+                if proc.returncode == 0:
+                    text = str(proc.stdout or "").strip()
+                    if text and text.upper() != "N/A":
+                        value = int(float(text.splitlines()[0].strip()))
+                        if value > 0:
+                            return value
+            except Exception:
+                pass
+        return 0
+
+    original_retime = getattr(base, "_retime_ltx_clip_to_duration", None)
+    if callable(original_retime):
+        def retime_ltx25(*, root, src, dst, fps, planned_duration, planned_frames, log_path):
+            actual_frames = probe_video_frames(root, src)
+            # If frame count is unavailable, preserve the mature inherited path.
+            if actual_frames <= 0:
+                return original_retime(root=root, src=src, dst=dst, fps=fps, planned_duration=planned_duration, planned_frames=planned_frames, log_path=log_path)
+            actual = float(actual_frames) / float(max(1, int(fps)))
+            planned = max(0.001, float(planned_duration))
+            speed = max(0.001, actual / planned)
+            if actual < planned - float(getattr(base, "DURATION_TOLERANCE_SECONDS", 0.05)):
+                return {
+                    "ok": False, "status": "needs_regeneration", "actual_duration": round(actual, 6),
+                    "actual_video_frames": int(actual_frames), "planned_duration": round(planned, 6),
+                    "speed_factor": round(speed, 8), "returncode": 0,
+                    "message": getattr(base, "LTX_SHORT_RAW_REGEN_MESSAGE", "Short LTX video stream; regenerate shot."),
+                    "raw_output_shorter_than_planned": True, "short_raw_padded_to_planned": False,
+                    "freeze_last_frame_padding_applied": False, "retime_skipped_to_avoid_slow_motion": True,
+                    "recommended_action": "regenerate shot", "assembly_should_stop_cleanly": True,
+                }
+            ffmpeg = base._find_media_binary(root, "FV_FFMPEG", "ffmpeg")
+            dst = Path(dst); src = Path(src); log_path = Path(log_path)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if dst.exists(): dst.unlink()
+            except Exception:
+                pass
+            vf = f"setpts=(PTS-STARTPTS)/{speed:.10f},fps={int(fps)},trim=duration={planned:.10f},setpts=PTS-STARTPTS,format=yuv420p"
+            cmd = [ffmpeg, "-y", "-hide_banner", "-i", str(src), "-map", "0:v:0", "-vf", vf,
+                   "-frames:v", str(max(1, int(planned_frames))), "-r", str(int(fps)), "-an",
+                   "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+                   "-movflags", "+faststart", str(dst)]
+            try:
+                with log_path.open("a", encoding="utf-8", errors="replace") as lf:
+                    lf.write("\n[retime] LTX 2.5 video-frame-locked retime\n")
+                    lf.write(f"Input: {src}\nOutput: {dst}\nactual_video_frames={actual_frames} actual_video={actual:.6f} planned={planned:.6f} fps={fps} frames={planned_frames} speed_factor={speed:.8f}\n")
+                    lf.write("Command:\n" + " ".join(str(x) for x in cmd) + "\n\n"); lf.flush()
+                    proc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", timeout=1800)
+                    lf.write(f"\n[retime] ffmpeg exit code: {proc.returncode}\n")
+            except Exception as exc:
+                return {"ok": False, "actual_duration": actual, "actual_video_frames": actual_frames, "speed_factor": speed, "message": str(exc)}
+            ok = bool(proc.returncode == 0 and dst.is_file() and dst.stat().st_size >= 1024)
+            got_frames = probe_video_frames(root, dst) if ok else 0
+            if ok and got_frames != max(1, int(planned_frames)):
+                ok = False
+            return {
+                "ok": ok, "actual_duration": actual, "actual_video_frames": int(actual_frames),
+                "speed_factor": speed, "retimed_duration": (float(got_frames) / float(max(1, int(fps)))) if got_frames else 0.0,
+                "retimed_video_frames": int(got_frames), "returncode": int(proc.returncode),
+                "message": "ok" if ok else f"LTX 2.5 exact-frame check failed: wanted {planned_frames}, got {got_frames}. Regenerate this shot.",
+            }
+        setattr(base, "_retime_ltx_clip_to_duration", retime_ltx25)
+
+    setattr(base, "_ltx25_timing_compat_installed", True)
+
+
 def _write_job(mode: str, old_cmd: list[str], call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
     paths = _paths(mode)
     prompt = _option(old_cmd, "--prompt", default="").strip()
@@ -513,6 +619,7 @@ def _msr_command(old_cmd: list[str], call_args: tuple[Any, ...], call_kwargs: di
 
 
 def install_generation_patch(base, mode: str):
+    _install_ltx25_timing_compat(base)
     original = getattr(base, "_ltx23_build_vramlab_direct_args", None)
     if not callable(original):
         raise RuntimeError("clip2ltx_cli.py does not expose _ltx23_build_vramlab_direct_args; cannot safely replace only the renderer.")

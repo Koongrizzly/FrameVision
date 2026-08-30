@@ -1925,8 +1925,16 @@ class UpscPane(QtWidgets.QWidget):
             pass
 
     def _sync_scale_from_spin(self, v: float):
+        # Scale is intentionally limited to half-step values only:
+        # 1.0, 1.5, 2.0, 2.5, ...
+        # QDoubleSpinBox.setSingleStep() does not stop typed values such as
+        # 1.25, so snap here as well as in the slider handler.
+        snapped = max(1.0, min(8.0, round(float(v) * 2.0) / 2.0))
+        self.spin_scale.blockSignals(True)
+        self.spin_scale.setValue(snapped)
+        self.spin_scale.blockSignals(False)
         self.slider_scale.blockSignals(True)
-        self.slider_scale.setValue(int(round(v * 10)))
+        self.slider_scale.setValue(int(round(snapped * 10)))
         self.slider_scale.blockSignals(False)
         try:
             self._update_batch_limit()
@@ -1934,8 +1942,14 @@ class UpscPane(QtWidgets.QWidget):
             pass
 
     def _sync_scale_from_slider(self, v: int):
+        # QSlider's singleStep controls keyboard/wheel movement, but dragging
+        # can still land between steps. Force the slider onto 0.5x increments.
+        snapped_slider = max(10, min(80, int(round(float(v) / 5.0) * 5)))
+        self.slider_scale.blockSignals(True)
+        self.slider_scale.setValue(snapped_slider)
+        self.slider_scale.blockSignals(False)
         self.spin_scale.blockSignals(True)
-        self.spin_scale.setValue(v / 10.0)
+        self.spin_scale.setValue(snapped_slider / 10.0)
         self.spin_scale.blockSignals(False)
         try:
             self._update_batch_limit()
@@ -3035,12 +3049,15 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success, **_kwargs):
                 if "seedvr2" in txt0 or "inference_cli.py" in txt0:
                     job = {
                         "name": "Upscale (seedVR2)",
+                        "label": "Upscale (seedVR2)",
                         "category": "upscale",
                         "engine": "seedvr2",
+                        "input": str(input_path or ""),
                         "cmd": c0,
                         "cwd": str((_kwargs.get("cwd") or globals().get("ROOT", "."))),
                         "open_on_success": bool(open_on_success),
                         "output": str(getattr(self, "_last_outfile", "")),
+                        "outfile": str(getattr(self, "_last_outfile", "")),
                     }
                     # pass env through if the queue/worker supports it
                     try:
@@ -4333,6 +4350,8 @@ try:
             except Exception: pass
             try: d["hypir_video_experimental"] = bool(self.chk_hypir_video.isChecked())
             except Exception: pass
+            try: d["hypir_video_batch_size"] = int(self.spin_hypir_batch.value())
+            except Exception: pass
             return d
         _PaneH._gather_settings = _fv_hypir_gather_settings
 
@@ -4418,6 +4437,7 @@ try:
             seed = -1
             patch_size = 512
             overlap = 256
+            video_batch_size = 1
             try:
                 raw_prompt = self.edit_hypir_prompt.text().strip()
                 prompt = _fv_hypir_clean_prompt(raw_prompt, outd, outfile, src)
@@ -4436,6 +4456,8 @@ try:
             try: patch_size = int(self.spin_hypir_patch.value())
             except Exception: pass
             try: overlap = int(self.spin_hypir_overlap.value())
+            except Exception: pass
+            try: video_batch_size = max(1, min(8, int(self.spin_hypir_batch.value())))
             except Exception: pass
             patch_size = max(512, min(1024, patch_size))
             overlap = max(0, min(patch_size - 128, overlap))
@@ -4476,6 +4498,7 @@ try:
                     "--seed", str(seed),
                     "--patch-size", str(patch_size),
                     "--stride", str(stride),
+                    "--batch-size", str(video_batch_size),
                     "--device", "cuda",
                 ]
 
@@ -4526,6 +4549,7 @@ try:
                 self._append_log(f"Scale: x{scale}")
                 self._append_log(f"Seed: {seed}")
                 self._append_log(f"Tile: {patch_size}, overlap: {overlap}, stride: {stride}")
+                self._append_log(f"Video batch size: {video_batch_size}")
                 self._append_log(f"Prompt: {prompt if prompt else '(empty)'}")
                 self._append_log("Prompt source: HYPIR prompt field (path guard active)")
                 self._append_log(f"FPS: {fps}")
@@ -4615,23 +4639,36 @@ try:
             self.lbl_hypir_stride.setStyleSheet("color:#9fb3c8;font-size:12px;")
             grid.addWidget(self.lbl_hypir_stride, 3, 2, 1, 2)
 
+            grid.addWidget(QtWidgets.QLabel("Video batch size:", self), 4, 0)
+            self.spin_hypir_batch = QtWidgets.QSpinBox(self)
+            self.spin_hypir_batch.setRange(1, 8)
+            self.spin_hypir_batch.setValue(1)
+            self.spin_hypir_batch.setToolTip(
+                "Number of video frames processed together in one HYPIR forward pass. "
+                "1 is the safest default. Try 2, 3 or 4 while watching peak VRAM."
+            )
+            grid.addWidget(self.spin_hypir_batch, 4, 1)
+            self.lbl_hypir_batch_note = QtWidgets.QLabel("Higher = more VRAM; may improve throughput", self)
+            self.lbl_hypir_batch_note.setStyleSheet("color:#9fb3c8;font-size:12px;")
+            grid.addWidget(self.lbl_hypir_batch_note, 4, 2, 1, 2)
+
             self.chk_hypir_video = QtWidgets.QCheckBox("Enable experimental HYPIR video upscale", self)
             self.chk_hypir_video.setChecked(False)
-            self.chk_hypir_video.setToolTip("When enabled, videos are processed frame-by-frame through HYPIR. This can cause temporal flicker or shimmer.")
-            grid.addWidget(self.chk_hypir_video, 4, 0, 1, 4)
+            self.chk_hypir_video.setToolTip("When enabled, videos are processed through HYPIR in configurable frame batches. This can cause temporal flicker or shimmer.")
+            grid.addWidget(self.chk_hypir_video, 5, 0, 1, 4)
 
-            self.lbl_hypir_video_note = QtWidgets.QLabel("Experimental: video is processed frame-by-frame and may flicker/shimmer between frames.", self)
+            self.lbl_hypir_video_note = QtWidgets.QLabel("Experimental: each frame is restored independently even when batched, so video may flicker/shimmer between frames.", self)
             self.lbl_hypir_video_note.setWordWrap(True)
             self.lbl_hypir_video_note.setStyleSheet("color:#ffcc66;font-size:12px;")
-            grid.addWidget(self.lbl_hypir_video_note, 5, 0, 1, 4)
+            grid.addWidget(self.lbl_hypir_video_note, 6, 0, 1, 4)
 
             self.lbl_hypir_runtime = QtWidgets.QLabel("", self)
             self.lbl_hypir_runtime.setWordWrap(True)
             self.lbl_hypir_runtime.setStyleSheet("color:#ffcc66;font-size:12px;")
-            grid.addWidget(self.lbl_hypir_runtime, 6, 0, 1, 3)
+            grid.addWidget(self.lbl_hypir_runtime, 7, 0, 1, 3)
             self.btn_hypir_install = QtWidgets.QPushButton("Install HYPIR", self)
             self.btn_hypir_install.setToolTip("Install HYPIR into FrameVision/environments/.hypir and download its local models.")
-            grid.addWidget(self.btn_hypir_install, 6, 3)
+            grid.addWidget(self.btn_hypir_install, 7, 3)
             grid.setColumnStretch(3, 1)
 
             self._hypir_page_index = self.stk_models.addWidget(pg)
@@ -4841,6 +4878,7 @@ try:
                 (self.spin_hypir_patch, "valueChanged"),
                 (self.spin_hypir_overlap, "valueChanged"),
                 (self.chk_hypir_video, "toggled"),
+                (self.spin_hypir_batch, "valueChanged"),
             ):
                 try:
                     getattr(obj, signal_name).connect(self._auto_save_if_enabled)
@@ -4872,6 +4910,8 @@ try:
                     try: self.spin_hypir_overlap.setValue(int(saved.get("hypir_overlap", 256)))
                     except Exception: pass
                     try: self.chk_hypir_video.setChecked(bool(saved.get("hypir_video_experimental", False)))
+                    except Exception: pass
+                    try: self.spin_hypir_batch.setValue(max(1, min(8, int(saved.get("hypir_video_batch_size", 1)))))
                     except Exception: pass
                     engine_name = str(saved.get("engine_name", "") or "").strip()
                     if engine_name:

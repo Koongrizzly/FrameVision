@@ -1239,21 +1239,38 @@ def add_job(input_path: str, out_dir: str, factor: int, model: str):
 def _infer_seedvr2_input_from_cmd(cmd):
     try:
         if isinstance(cmd, (list, tuple)):
-            parts=list(cmd)
+            parts = list(cmd)
         elif isinstance(cmd, str):
             import shlex
-            parts=shlex.split(cmd)
+            parts = shlex.split(cmd)
         else:
             return ''
-        # heuristic: input is first argument after inference_cli.py
+
+        # Current FrameVision launches SeedVR2 through seedvr2_runner.py and
+        # supplies the real media as an explicit --input argument.  Resolve
+        # that FIRST.  Looking immediately after inference_cli.py would return
+        # the literal token '--input' from the wrapper command.
+        for i, part in enumerate(parts):
+            if str(part) == '--input' and i + 1 < len(parts):
+                return str(parts[i + 1])
+            if isinstance(part, str) and part.startswith('--input='):
+                return str(part).split('=', 1)[1]
+
+        # Direct inference_cli.py invocation: first non-option positional token
+        # after the script is the input media.
         for i, part in enumerate(parts):
             if isinstance(part, str) and part.lower().endswith('inference_cli.py'):
-                if i+1 < len(parts):
-                    return str(parts[i+1])
-        # fallback: first existing file path in args
+                for nxt in parts[i + 1:]:
+                    s = str(nxt)
+                    if s and not s.startswith('-'):
+                        return s
+                break
+
+        # Last fallback: prefer an existing media file rather than python/script paths.
         import os
+        media_exts = ('.mp4','.mov','.mkv','.avi','.webm','.m4v','.mpg','.mpeg','.wmv','.png','.jpg','.jpeg','.webp')
         for part in parts:
-            if isinstance(part, str) and os.path.exists(part):
+            if isinstance(part, str) and part.lower().endswith(media_exts) and os.path.exists(part):
                 return part
     except Exception:
         pass

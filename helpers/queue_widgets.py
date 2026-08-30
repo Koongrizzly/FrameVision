@@ -1806,10 +1806,189 @@ class JobRowWidget(QWidget):
         color = self._status_color(status)
         self.status_strip.setStyleSheet(f"background: {color};")
 
+    def _hypir_video_frame_progress(self):
+        """Return (done_frames, total_frames) for a running queued HYPIR video.
+
+        HYPIR emits several nested tqdm bars (VAE encode / generator / VAE
+        decode).  The generic worker progress parser can interpret each inner
+        bar reaching 100% as the *whole queue job* reaching 100%, which makes
+        the Queue card bounce toward 99% every few seconds.
+
+        A queued HYPIR video already stores its temporary work directory in
+        args.cleanup_dir.  Once extraction has finished, work/in contains the
+        complete source frame sequence and work/out contains completed HYPIR
+        frames.  Counting those files gives the real video progress.
+        """
+        try:
+            d = self.data or {}
+            args = d.get("args") if isinstance(d.get("args"), dict) else {}
+            engine = str(args.get("engine") or d.get("engine") or "").strip().lower()
+            label = str(args.get("label") or d.get("label") or "").lower()
+            cleanup = str(args.get("cleanup_dir") or d.get("cleanup_dir") or "").strip()
+            if engine != "hypir" and "hypir" not in label:
+                return None
+            if not cleanup:
+                return None
+
+            work = Path(cleanup)
+            in_dir = work / "in"
+            out_dir = work / "out"
+            if not in_dir.is_dir() or not out_dir.is_dir():
+                return None
+
+            # Only trust frame-based progress after HYPIR has begun producing
+            # output frames.  While FFmpeg is still extracting the input, the
+            # input directory is growing and therefore is not yet a valid total.
+            done = 0
+            try:
+                with os.scandir(out_dir) as it:
+                    for ent in it:
+                        if ent.is_file() and ent.name.lower().endswith(".png") and ent.name.lower().startswith("f_"):
+                            done += 1
+            except Exception:
+                return None
+            if done <= 0:
+                return (0, 0)
+
+            total = 0
+            try:
+                with os.scandir(in_dir) as it:
+                    for ent in it:
+                        if ent.is_file() and ent.name.lower().endswith(".png") and ent.name.lower().startswith("f_"):
+                            total += 1
+            except Exception:
+                return None
+            if total <= 0:
+                return None
+            if done > total:
+                done = total
+            return (done, total)
+        except Exception:
+            return None
+
+    def _seedvr2_video_frame_progress(self):
+        """Return (done_frames, total_frames) from SeedVR2 runner sidecar.
+
+        SeedVR2's internal phases each emit their own 0..100 progress bars, so
+        the generic queue parser cannot treat those percentages as whole-video
+        progress.  FrameVision's SeedVR2 runner writes a small live sidecar next
+        to the requested output containing completed chunk/frame counts.
+        """
+        try:
+            d = self.data or {}
+            args = d.get("args") if isinstance(d.get("args"), dict) else {}
+            engine = str(args.get("engine") or d.get("engine") or d.get("type") or "").strip().lower()
+            label = str(args.get("label") or args.get("name") or d.get("label") or d.get("name") or "").lower()
+            if engine != "seedvr2" and "seedvr2" not in label:
+                return None
+            out = str(args.get("output") or args.get("outfile") or d.get("output") or d.get("outfile") or "").strip()
+            if not out:
+                return None
+            side = Path(out + ".seedvr2.progress.json")
+            if not side.is_file():
+                return (0, 0)
+            try:
+                import json
+                info = json.loads(side.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                return (0, 0)
+            done = int(info.get("done_frames") or 0)
+            total = int(info.get("total_frames") or 0)
+            if total <= 0:
+                return (0, 0)
+            done = max(0, min(done, total))
+            return (done, total)
+        except Exception:
+            return None
+
+    def _real_progress_eta(self, done: int, total: int) -> str:
+        """Estimate remaining time from recent *real frame* progress only.
+
+        Samples begin when completed frames are observable, so extraction,
+        model loading and warm-up do not get counted as per-frame processing.
+        A rolling window also lets the estimate adapt if throughput changes.
+        """
+        try:
+            if done <= 0 or total <= done:
+                if total > 0 and done >= total:
+                    return ""
+                return ""
+            now = time.time()
+            samples = getattr(self, "_real_progress_samples", None)
+            if not isinstance(samples, list):
+                samples = []
+            # Reset if this is a new/restarted job or progress moved backwards.
+            if samples and done < samples[-1][1]:
+                samples = []
+            if not samples or done != samples[-1][1]:
+                samples.append((now, int(done)))
+            # Keep up to ~2 minutes, but preserve enough frame delta for a stable ETA.
+            cutoff = now - 120.0
+            while len(samples) > 2 and samples[1][0] < cutoff:
+                samples.pop(0)
+            self._real_progress_samples = samples
+            if len(samples) < 2:
+                return ""
+            first_t, first_d = samples[0]
+            last_t, last_d = samples[-1]
+            dt = float(last_t - first_t)
+            dd = int(last_d - first_d)
+            # Avoid displaying wild estimates from only a moment of data.
+            if dt < 8.0 or dd <= 0:
+                return ""
+            rate = float(dd) / dt
+            if rate <= 0:
+                return ""
+            remain = max(0.0, float(total - done) / rate)
+            if remain <= 0:
+                return ""
+            return f" • ETA ~{self._fmt_dur(remain)}"
+        except Exception:
+            return ""
+
     def _update_progressbar(self) -> None:
         status = self._status_from_fs() or self.status
         d = self.data or {}
-        # Accept various keys for progress
+
+        # HYPIR video has nested per-tile progress bars. Never use those as the
+        # Queue card's overall percentage; use completed video frames instead.
+        hypir_frames = self._hypir_video_frame_progress() if status == "running" else None
+        if hypir_frames is not None:
+            done, total = hypir_frames
+            if total > 0:
+                pct = max(0.0, min(99.0, (float(done) * 100.0) / float(total)))
+                eta = self._real_progress_eta(done, total)
+                self.bar.setRange(0, 100)
+                self.bar.setValue(int(pct))
+                self.bar.setTextVisible(True)
+                self.bar.setFormat(f"{done}/{total}  ({pct:.1f}%){eta}")
+            else:
+                # FFmpeg is still extracting the source frame sequence.  An
+                # indeterminate bar is more truthful than the nested tqdm 99%.
+                self.bar.setRange(0, 0)
+                self.bar.setTextVisible(True)
+                self.bar.setFormat("Preparing frames...")
+            return
+
+        # SeedVR2 also has nested phase progress bars that repeatedly reach
+        # 100%.  The runner sidecar reports whole-video completed frames.
+        seed_frames = self._seedvr2_video_frame_progress() if status == "running" else None
+        if seed_frames is not None:
+            done, total = seed_frames
+            if total > 0:
+                pct = max(0.0, min(99.0, (float(done) * 100.0) / float(total)))
+                eta = self._real_progress_eta(done, total)
+                self.bar.setRange(0, 100)
+                self.bar.setValue(int(pct))
+                self.bar.setTextVisible(True)
+                self.bar.setFormat(f"{done}/{total}  ({pct:.1f}%){eta}")
+            else:
+                self.bar.setRange(0, 0)
+                self.bar.setTextVisible(True)
+                self.bar.setFormat("Preparing SeedVR2...")
+            return
+
+        # Generic progress for all non-HYPIR/SeedVR2 jobs.
         pct = d.get("pct") or d.get("progress") or d.get("percent") or (d.get("metrics") or {}).get("progress")
         try:
             if pct is not None:
