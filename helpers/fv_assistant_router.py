@@ -50,7 +50,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -227,8 +227,20 @@ class FrameVisionAssistantRouter:
         intent = str(state.get("pending_intent") or "")
         waiting = str(state.get("waiting_for") or "")
         if intent == "ltx_video":
+            if waiting == "video_engine_choice":
+                return "Which video model should I use? Choose `LTX 2.3`, `LTX 2.5`, or `MiniMax H3`."
             if waiting == "model_choice":
-                return "Which LTX model should I use? Use `normal LTX`, `distilled 1.1`, or mention the exact `.safetensors` filename."
+                return "Which LTX 2.3 checkpoint should I use? Use `normal LTX`, `distilled 1.1`, or mention the exact `.safetensors` filename."
+            if waiting == "ltx25_mode_choice":
+                return "LTX 2.5: text to video or image to video?"
+            if waiting == "minimax_mode_choice":
+                return "MiniMax H3: text to video, image to video, reference video, or continue video?"
+            if waiting in {"ltx25_input_media", "minimax_input_media"}:
+                mode = str(state.get("video_mode") or "")
+                if mode in {"image", "reference"}:
+                    return "Please upload the image/reference image(s)."
+                if mode == "continue":
+                    return "Please upload the video you want to continue."
             if waiting == "mode_choice":
                 return "Text to video, image to video, or continue a video?"
             if waiting == "input_media":
@@ -239,7 +251,8 @@ class FrameVisionAssistantRouter:
                     return "Please upload the video you want to continue."
                 return "Text to video, image to video, or continue a video?"
             if waiting == "prompt":
-                return self._ltx_prompt_question()
+                engine = str(state.get("video_engine") or "ltx23")
+                return self._video_common_prompt_question(engine) if engine in {"ltx25", "minimax_h3"} else self._ltx_prompt_question()
             if waiting == "resolution_aspect":
                 return "What size do you want? Example: `704p 16:9`, `480p portrait`, or `1088p square`."
             if waiting == "duration_fps":
@@ -249,7 +262,8 @@ class FrameVisionAssistantRouter:
             if waiting == "output_name":
                 return "Name for the output file? Optional. Type `default` for a timestamped name."
             if waiting == "confirm":
-                return self._ltx_summary_message(state)
+                engine = str(state.get("video_engine") or "ltx23")
+                return self._modern_video_summary_message(state, engine) if engine in {"ltx25", "minimax_h3"} else self._ltx_summary_message(state)
             return "Which LTX model should I use?"
         if intent == "image_edit":
             if waiting == "edit_instruction":
@@ -383,7 +397,7 @@ class FrameVisionAssistantRouter:
             return False
         if any(x in low for x in (" create a video ", " make a video ", " generate a video ", " text to video ", " image to video ", " continue a video ", " extend a video ", " animate this image ", " animate the image ")):
             return True
-        return bool(re.search(r"\b(?:ltx|ltx\s*2\.3|ltx23)\b.*\b(video|animate|continue|extend)\b", low))
+        return bool(re.search(r"\b(?:ltx|ltx\s*2\.3|ltx23|ltx\s*2\.5|ltx25|minimax(?:\s*h3)?)\b.*\b(video|clip|animate|continue|extend)\b", low))
 
     def _media_paths_from_attachments(self, attachments: list[dict], want: str) -> list[str]:
         out: list[str] = []
@@ -405,19 +419,51 @@ class FrameVisionAssistantRouter:
         return out
 
     def _start_ltx_video_flow(self, text: str, attachments: list[dict]) -> AssistantRouteResult:
-        state = {"pending_intent": "ltx_video", "waiting_for": "model_choice", "created_at": time.time(), "requested_text": text}
-        # If user already attached media, keep it for the guided flow.
+        state = {"pending_intent": "ltx_video", "waiting_for": "video_engine_choice", "created_at": time.time(), "requested_text": text}
         imgs = self._media_paths_from_attachments(attachments, "image")
         vids = self._media_paths_from_attachments(attachments, "video")
         if imgs:
             state["attached_image_paths"] = imgs
         if vids:
             state["attached_video_paths"] = vids
+        explicit = self._parse_video_engine(text)
+        if explicit:
+            state["video_engine"] = explicit
+            self._save_state(state)
+            return self._enter_video_engine(state)
         self._save_state(state)
         return AssistantRouteResult(
             True,
-            "Which LTX model should I use?\n\nUse `normal LTX`, `distilled 1.1`, or mention the exact `.safetensors` filename for a finetune inside `models/ltx23/distilled-1.1/`. FP16 is preferred; FP8 may not work.\n\nType `cancel` anytime to stop and return to normal chat.",
+            "Which video model should I use?\n\nChoose `LTX 2.3`, `LTX 2.5`, or `MiniMax H3`.\n\nType `cancel` anytime to stop and return to normal chat.",
         )
+
+    def _parse_video_engine(self, text: str) -> str:
+        low = re.sub(r"[^a-z0-9.]+", " ", str(text or "").lower())
+        if re.search(r"\bminimax(?:\s*h3)?\b", low):
+            return "minimax_h3"
+        if re.search(r"\bltx\s*2\.5\b|\bltx25\b", low):
+            return "ltx25"
+        if re.search(r"\bltx\s*2\.3\b|\bltx23\b", low):
+            return "ltx23"
+        return ""
+
+    def _enter_video_engine(self, state: Dict[str, Any]) -> AssistantRouteResult:
+        engine = str(state.get("video_engine") or "")
+        if engine == "ltx23":
+            state["waiting_for"] = "model_choice"
+            self._save_state(state)
+            return AssistantRouteResult(True, "LTX 2.3 selected. Which checkpoint should I use?\n\nUse `normal LTX`, `distilled 1.1`, or mention the exact `.safetensors` filename for a finetune inside `models/ltx23/distilled-1.1/`. FP16 is preferred; FP8 may not work.")
+        if engine == "ltx25":
+            state["waiting_for"] = "ltx25_mode_choice"
+            self._save_state(state)
+            return AssistantRouteResult(True, "LTX 2.5 selected. Text to video or image to video?")
+        if engine == "minimax_h3":
+            state["waiting_for"] = "minimax_mode_choice"
+            self._save_state(state)
+            return AssistantRouteResult(True, "MiniMax H3 selected. Use `text to video`, `image to video`, `reference video`, or `continue video`?")
+        state["waiting_for"] = "video_engine_choice"
+        self._save_state(state)
+        return AssistantRouteResult(True, "Choose `LTX 2.3`, `LTX 2.5`, or `MiniMax H3`.")
 
     def _handle_pending_ltx_video(self, text: str, state: Dict[str, Any], attachments: list[dict]) -> AssistantRouteResult:
         raw = str(text or "").strip()
@@ -434,7 +480,20 @@ class FrameVisionAssistantRouter:
             state["attached_image_paths"] = imgs
         if vids:
             state["attached_video_paths"] = vids
-        waiting = str(state.get("waiting_for") or "model_choice")
+        waiting = str(state.get("waiting_for") or "video_engine_choice")
+
+        if waiting == "video_engine_choice":
+            engine = self._parse_video_engine(raw)
+            if not engine:
+                return AssistantRouteResult(True, "Please choose `LTX 2.3`, `LTX 2.5`, or `MiniMax H3`.")
+            state["video_engine"] = engine
+            return self._enter_video_engine(state)
+
+        engine = str(state.get("video_engine") or "ltx23")
+        if engine == "ltx25":
+            return self._handle_pending_ltx25_video(raw, state, attachments)
+        if engine == "minimax_h3":
+            return self._handle_pending_minimax_video(raw, state, attachments)
 
         if waiting == "model_choice":
             checkpoint, label_or_msg, ok = self._resolve_ltx_checkpoint(raw)
@@ -543,9 +602,311 @@ class FrameVisionAssistantRouter:
                 return self._queue_ltx_video_from_state(state)
             return AssistantRouteResult(True, "Type `yes` or `queue it` to add it to the queue, or say what to change. Example: `change resolution to 480p`.")
 
-        state["waiting_for"] = "model_choice"
+        state["waiting_for"] = "video_engine_choice"
         self._save_state(state)
-        return AssistantRouteResult(True, "Which LTX model should I use?")
+        return AssistantRouteResult(True, "Which video model should I use? Choose `LTX 2.3`, `LTX 2.5`, or `MiniMax H3`.")
+
+    def _video_common_prompt_question(self, engine: str) -> str:
+        if engine == "minimax_h3":
+            return "What is the MiniMax H3 prompt?"
+        if engine == "ltx25":
+            return "What is the LTX 2.5 prompt?"
+        return self._ltx_prompt_question()
+
+    def _parse_minimax_mode(self, text: str) -> str:
+        low = str(text or "").lower()
+        if any(x in low for x in ("reference", "ref2va", "ref video", "refs")):
+            return "reference"
+        if any(x in low for x in ("continue", "extend", "resume")):
+            return "continue"
+        if any(x in low for x in ("image", "animate", "fl2va", "i2v")):
+            return "image"
+        if any(x in low for x in ("text", "t2v", "t2va", "prompt")):
+            return "text"
+        return ""
+
+    def _handle_pending_ltx25_video(self, raw: str, state: Dict[str, Any], attachments: list[dict]) -> AssistantRouteResult:
+        waiting = str(state.get("waiting_for") or "ltx25_mode_choice")
+        imgs = self._media_paths_from_attachments(attachments, "image")
+        if imgs:
+            state["attached_image_paths"] = imgs
+        if waiting == "ltx25_mode_choice":
+            mode = self._parse_ltx_mode(raw)
+            if mode not in {"text", "image"}:
+                return AssistantRouteResult(True, "Choose `text to video` or `image to video` for LTX 2.5.")
+            state["video_mode"] = mode
+            if mode == "image" and not list(state.get("attached_image_paths") or []):
+                state["waiting_for"] = "ltx25_input_media"
+                self._save_state(state)
+                return AssistantRouteResult(True, "Please upload the image you want to animate with LTX 2.5.")
+            if mode == "image":
+                state["input_image_path"] = list(state.get("attached_image_paths") or [""])[0]
+            state["waiting_for"] = "prompt"
+            self._save_state(state)
+            return AssistantRouteResult(True, self._video_common_prompt_question("ltx25"))
+        if waiting == "ltx25_input_media":
+            paths = list(state.get("attached_image_paths") or [])
+            if not paths:
+                return AssistantRouteResult(True, "I still need the image attachment first.")
+            state["input_image_path"] = paths[0]
+            state["waiting_for"] = "prompt"
+            self._save_state(state)
+            return AssistantRouteResult(True, self._video_common_prompt_question("ltx25"))
+        return self._handle_pending_modern_video_common(raw, state, "ltx25")
+
+    def _handle_pending_minimax_video(self, raw: str, state: Dict[str, Any], attachments: list[dict]) -> AssistantRouteResult:
+        waiting = str(state.get("waiting_for") or "minimax_mode_choice")
+        imgs = self._media_paths_from_attachments(attachments, "image")
+        vids = self._media_paths_from_attachments(attachments, "video")
+        if imgs:
+            state["attached_image_paths"] = imgs
+        if vids:
+            state["attached_video_paths"] = vids
+        if waiting == "minimax_mode_choice":
+            mode = self._parse_minimax_mode(raw)
+            if not mode:
+                return AssistantRouteResult(True, "Choose `text to video`, `image to video`, `reference video`, or `continue video`.")
+            state["video_mode"] = mode
+            if mode in {"image", "reference"} and not list(state.get("attached_image_paths") or []):
+                state["waiting_for"] = "minimax_input_media"
+                self._save_state(state)
+                return AssistantRouteResult(True, "Please upload the image" + ("s you want to use as MiniMax references." if mode == "reference" else " you want to animate."))
+            if mode == "continue" and not list(state.get("attached_video_paths") or []):
+                state["waiting_for"] = "minimax_input_media"
+                self._save_state(state)
+                return AssistantRouteResult(True, "Please upload the video you want MiniMax H3 to continue.")
+            self._accept_minimax_media_from_state(state)
+            state["waiting_for"] = "prompt"
+            self._save_state(state)
+            return AssistantRouteResult(True, self._video_common_prompt_question("minimax_h3"))
+        if waiting == "minimax_input_media":
+            mode = str(state.get("video_mode") or "")
+            if mode in {"image", "reference"} and not list(state.get("attached_image_paths") or []):
+                return AssistantRouteResult(True, "I still need the image attachment first.")
+            if mode == "continue" and not list(state.get("attached_video_paths") or []):
+                return AssistantRouteResult(True, "I still need the video attachment first.")
+            self._accept_minimax_media_from_state(state)
+            state["waiting_for"] = "prompt"
+            self._save_state(state)
+            return AssistantRouteResult(True, self._video_common_prompt_question("minimax_h3"))
+        return self._handle_pending_modern_video_common(raw, state, "minimax_h3")
+
+    def _accept_minimax_media_from_state(self, state: Dict[str, Any]) -> None:
+        mode = str(state.get("video_mode") or "")
+        if mode == "image":
+            paths = list(state.get("attached_image_paths") or [])
+            if paths:
+                state["input_image_path"] = paths[0]
+        elif mode == "reference":
+            state["reference_image_paths"] = list(state.get("attached_image_paths") or [])[:9]
+        elif mode == "continue":
+            paths = list(state.get("attached_video_paths") or [])
+            if paths:
+                state["source_video_path"] = paths[0]
+
+    def _handle_pending_modern_video_common(self, raw: str, state: Dict[str, Any], engine: str) -> AssistantRouteResult:
+        low = str(raw or "").lower().strip()
+        waiting = str(state.get("waiting_for") or "prompt")
+        if waiting == "prompt":
+            prompt = self._clean_prompt(raw)
+            if not prompt:
+                return AssistantRouteResult(True, self._video_common_prompt_question(engine))
+            state["prompt"] = prompt
+            state["waiting_for"] = "resolution_aspect"
+            self._save_state(state)
+            return AssistantRouteResult(True, "What size do you want? Use `480p`, `704p`, `768p`, or `1088p` plus `16:9`, `9:16`, or `1:1`. Examples: `704p landscape`, `480p portrait`.")
+        if waiting == "resolution_aspect":
+            parsed = self._parse_modern_video_resolution_aspect(raw, engine)
+            if not parsed:
+                return AssistantRouteResult(True, "Please choose a size like `704p landscape`, `480p portrait`, `768p 16:9`, or `1088p square`.")
+            res_key, aspect_key, width, height = parsed
+            state.update({"resolution_key": res_key, "aspect_key": aspect_key, "width": width, "height": height})
+            state["waiting_for"] = "duration_fps"
+            self._save_state(state)
+            if engine == "minimax_h3":
+                return AssistantRouteResult(True, "How long should the clip be? MiniMax uses 24fps. Example: `10 seconds`.")
+            return AssistantRouteResult(True, "How long and at what FPS? Example: `10 seconds at 24fps`.")
+        if waiting == "duration_fps":
+            parsed = self._parse_ltx_duration_fps(raw, state)
+            if not parsed:
+                return AssistantRouteResult(True, "Please say a duration such as `10 seconds` or `240 frames at 24fps`.")
+            frames, fps, duration = parsed
+            if engine == "minimax_h3":
+                fps = 24
+                # MiniMax native frame grid: 124 + 17*n. Snap requested duration to nearest valid grid.
+                wanted = max(124, int(round(float(duration) * 24.0)))
+                max_frames = 2385 if wanted > 719 else 719
+                candidates = list(range(124, max_frames + 1, 17))
+                frames = min(candidates, key=lambda x: abs(x - wanted))
+                duration = frames / 24.0
+            state.update({"frames": int(frames), "fps": int(fps), "duration_sec": float(duration)})
+            state["waiting_for"] = "output_name"
+            self._save_state(state)
+            return AssistantRouteResult(True, "Name for the output file? Optional. Type `default` for a timestamped name.")
+        if waiting == "output_name":
+            state["output_name"] = self._sanitize_ltx_filename(raw)
+            state["waiting_for"] = "confirm"
+            self._save_state(state)
+            return AssistantRouteResult(True, self._modern_video_summary_message(state, engine))
+        if waiting == "confirm":
+            if low in {"yes", "y", "ok", "okay", "correct", "queue", "queue it", "add to queue", "no", "no changes"}:
+                return self._queue_modern_video_from_state(state, engine)
+            changed = self._apply_ltx_confirm_change(raw, state)
+            if changed:
+                self._save_state(state)
+                return AssistantRouteResult(True, "Ok done. Any other changes? Type `yes` or `queue it` when it looks right.\n\n" + self._modern_video_summary_message(state, engine))
+            return AssistantRouteResult(True, "Type `yes` or `queue it` to add it to the queue, or say what to change.")
+        state["waiting_for"] = "prompt"
+        self._save_state(state)
+        return AssistantRouteResult(True, self._video_common_prompt_question(engine))
+
+    def _parse_modern_video_resolution_aspect(self, text: str, engine: str) -> Optional[tuple[str, str, int, int]]:
+        low = str(text or "").lower()
+        aspect = "9:16" if ("portrait" in low or "9:16" in low) else "1:1" if ("square" in low or "1:1" in low) else "16:9"
+        if engine == "minimax_h3":
+            presets = {
+                "480p": (832, 480), "704p": (1280, 704), "720p": (1280, 704),
+                "768p": (1344, 768), "1088p": (1920, 1088), "1080p": (1920, 1088),
+            }
+            key = next((k for k in ("1088p", "1080p", "768p", "704p", "720p", "480p") if k in low), "")
+            if not key:
+                return None
+            w, h = presets[key]
+            if aspect == "9:16": w, h = h, w
+            elif aspect == "1:1": w = h = min(w, h)
+            return ("704p" if key == "720p" else key, aspect, w, h)
+        # LTX 2.5 accepts arbitrary multiples; keep the wizard on known FrameVision buckets.
+        presets = {"480p": (832, 480), "704p": (1280, 704), "720p": (1280, 704), "768p": (1344, 768), "1088p": (1920, 1088), "1080p": (1920, 1088)}
+        key = next((k for k in ("1088p", "1080p", "768p", "704p", "720p", "480p") if k in low), "")
+        if not key:
+            return None
+        w, h = presets[key]
+        if aspect == "9:16": w, h = h, w
+        elif aspect == "1:1": w = h = min(w, h)
+        return ("704p" if key == "720p" else key, aspect, w, h)
+
+    def _modern_video_summary_message(self, state: Dict[str, Any], engine: str) -> str:
+        label = "MiniMax H3" if engine == "minimax_h3" else "LTX 2.5"
+        mode = str(state.get("video_mode") or "text")
+        mode_label = {"text":"text-to-video","image":"image-to-video","reference":"reference-to-video","continue":"continue-video"}.get(mode, mode)
+        name = str(state.get("output_name") or "default") or "default"
+        return (
+            f"OK, we have:\nModel: {label}\nMode: {mode_label}\n"
+            f"Resolution: {state.get('resolution_key','704p')} / {int(state.get('width') or 1280)}×{int(state.get('height') or 704)} / {state.get('aspect_key','16:9')}\n"
+            f"Duration: {float(state.get('duration_sec') or 0.0):.2f}s at {int(state.get('fps') or 24)}fps / {int(state.get('frames') or 0)} frames\n"
+            f"Output name: `{name}`\n\nPrompt:\n{state.get('prompt') or ''}\n\nIs this correct, or do you want to make changes?"
+        )
+
+    def _queue_modern_video_from_state(self, state: Dict[str, Any], engine: str) -> AssistantRouteResult:
+        if engine == "minimax_h3":
+            return self._queue_minimax_h3_from_state(state)
+        return self._queue_ltx25_from_state(state)
+
+    def _queue_ltx25_from_state(self, state: Dict[str, Any]) -> AssistantRouteResult:
+        settings = _load_json(self.root / "presets" / "setsave" / "ltx25.json", {})
+        model_type = str(settings.get("model_type") or "Full FP16 / BF16")
+        is_convrot = model_type.startswith(("W4A8", "INT4"))
+        models = self.root / ("models/ltx_2_5_convrot" if is_convrot else "models/ltx-2.5")
+        runtime = models / "LTX-2"
+        transformer_name = "ltx-2.5-22b-distilled-transformer-w4a8_convrot.safetensors" if model_type.startswith("W4A8") else "ltx-2.5-22b-distilled-transformer-int4_convrot.safetensors" if model_type.startswith("INT4") else "ltx-2.5-22b-distilled-transformer-bf16.safetensors"
+        text_name = "gemma4-12b-with-proj-ltx-2.5-w4a8_convrot.safetensors" if is_convrot else "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
+        paths = {
+            "transformer": str(settings.get("transformer") or models / "diffusion_models" / transformer_name),
+            "text_encoder": str(settings.get("text_encoder") or models / "text_encoders" / text_name),
+            "video_vae": str(settings.get("video_vae") or models / "vae" / "ltx-2.5-video-vae-bf16.safetensors"),
+            "audio_vae": str(settings.get("audio_vae") or models / "vae" / "ltx-2.5-audio-vae-bf16.safetensors"),
+            "upsampler": str(settings.get("upsampler") or models / "latent_upscale_models" / "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"),
+        }
+        prompt = str(state.get("prompt") or "").strip()
+        seed = random.randint(0, 2147483647)
+        out_dir = Path(str(settings.get("output") or self.root / "output")).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        name = str(state.get("output_name") or "").strip() or "ltx25_video"
+        outfile = out_dir / f"{name}_seed{seed}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+        images = []
+        inp = str(state.get("input_image_path") or "").strip()
+        if inp:
+            images.append({"path": inp, "frame_idx": 0, "strength": float(settings.get("image_strength", 1.0) or 1.0)})
+        job = {
+            "cmd": "generate", "model_type": model_type, "prompt": prompt,
+            "workflow": "one_phase" if int(settings.get("workflow", 0) or 0) == 1 else "two_phase",
+            "audio_path": "", "seed": seed, "width": int(state.get("width") or 1280), "height": int(state.get("height") or 704),
+            "frames": int(state.get("frames") or 241), "fps": float(state.get("fps") or 24), "output": str(outfile), "images": images,
+            "paths": paths, "offload": str(settings.get("offload") or "cpu"),
+            "quantization": "fp8-cast" if model_type.startswith("Full") else "none", "max_batch_size": int(settings.get("batch", 1) or 1),
+            "use_sage_attention": bool(settings.get("use_sage_attention", False)), "use_int8_transformer": False, "int8_transformer_bundle": str(settings.get("int8_transformer") or ""),
+            "use_int8_text_encoder": False, "int8_text_encoder_bundle": str(settings.get("int8_text") or ""), "enhance_prompt": False,
+            "defer_trim": bool(settings.get("defer_trim", True)), "cache_prompt_embeddings": bool(settings.get("cache_prompt_embeddings", True)),
+        }
+        payload_dir = self.root / "temp" / "ltx25_queue_payloads"; payload_dir.mkdir(parents=True, exist_ok=True)
+        payload = payload_dir / f"ltx25_chat_{int(time.time()*1000)}_{seed}.json"; payload.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+        helper = self.root / "helpers" / ("ltx25_convrot_worker.py" if is_convrot else "ltx25_helper.py")
+        py = self.root / "environments" / ("ltx25_convrot" if is_convrot else "ltx25") / ("python.exe" if os.name == "nt" else "bin/python")
+        if not py.exists() or not helper.exists():
+            return AssistantRouteResult(True, f"LTX 2.5 is not ready. Missing runtime/helper: `{py}` or `{helper}`")
+        cmd = [str(py), str(helper), "--job" if is_convrot else "--queue-job", str(payload)]
+        try:
+            try:
+                from helpers.queue_adapter import enqueue_tool_job
+            except Exception:
+                from queue_adapter import enqueue_tool_job
+            input_path = inp or str(helper)
+            jid = enqueue_tool_job("ltx25_generate", input_path, str(outfile.parent), {"cmd":cmd,"outfile":str(outfile),"cwd":str(self.root if is_convrot else runtime),"engine":"ltx25_convrot" if is_convrot else "ltx25","scan_dir":str(outfile.parent),"scan_ext":".mp4", **self._assistant_chat_result_flags()}, priority=600)
+        except Exception as exc:
+            return AssistantRouteResult(True, f"I could not add the LTX 2.5 job to the FrameVision queue.\n\nError: {exc}")
+        self._clear_state()
+        return AssistantRouteResult(True, f"Added LTX 2.5 to the queue: `{outfile.name}` ({job['width']}×{job['height']}, {job['frames']} frames at {job['fps']}fps).", True, "ltx25", "LTX 2.5", prompt, job["width"], job["height"], time.time(), "video", tuple([inp] if inp else []), str(outfile))
+
+    def _queue_minimax_h3_from_state(self, state: Dict[str, Any]) -> AssistantRouteResult:
+        saved = _load_json(self.root / "presets" / "setsave" / "minimax_h3_gui_last.json", {})
+        prompt = str(state.get("prompt") or "").strip()
+        mode_name = str(state.get("video_mode") or "text")
+        mode = 2 if mode_name == "reference" else 1 if mode_name in {"image", "continue"} else 0
+        width, height = int(state.get("width") or 832), int(state.get("height") or 480)
+        frames, fps = int(state.get("frames") or 243), 24
+        seed = int(saved.get("seed", -1) if saved.get("seed") is not None else -1)
+        script = "helpers/generate_ref.py" if mode == 2 else "helpers/generate.py"
+        args = [script, "--width", str(width), "--height", str(height), "--frames", str(frames), "--steps", str(int(saved.get("steps", 15) or 15)), "--cfg", str(float(saved.get("cfg", 1.0) or 1.0)), "--shift", str(float(saved.get("shift", 12) or 12)), "--audio-shift", str(float(saved.get("audio_shift", 3) or 3)), "--seed", str(seed), "--sampler", str(saved.get("sampler") or "euler"), "--scheduler", str(saved.get("scheduler") or "simple"), "--prompt", prompt]
+        if mode_name == "image":
+            inp = str(state.get("input_image_path") or "").strip(); args += ["--first-frame", inp]
+        elif mode_name == "continue":
+            src = str(state.get("source_video_path") or "").strip(); args += ["--continue-video", src, "--continue-context-frames", str(int(saved.get("continue_context_frames",39) or 39))]
+        elif mode_name == "reference":
+            args += ["--ref-image-size", str(saved.get("ref_size") or "match")]
+            for p in list(state.get("reference_image_paths") or [])[:9]: args += ["--ref-image", str(p)]
+        # Reuse the user's normal advanced MiniMax settings without inventing new ones.
+        if bool(saved.get("experimental_long_duration", False)) or frames > 719: args += ["--experimental-long-duration"]
+        if bool(saved.get("vram_manager_enabled", True)):
+            args += ["--vram-manager-auto" if bool(saved.get("vram_manager_auto_bypass", True)) else "--vram-manager"]
+        if bool(saved.get("spectrum_enabled", False)): args += ["--spectrum"]
+        if bool(saved.get("sage_attention_enabled", False)): args += ["--sage-attention"]
+        if not bool(saved.get("comfy_kitchen_enabled", True)): args += ["--disable-comfy-kitchen"]
+        args += ["--video-vae-tile-size", str(int(saved.get("vram_video_vae_tile_size",256) or 256)), "--video-vae-tile-overlap", str(int(saved.get("vram_video_vae_tile_overlap",64) or 64))]
+        # Model overrides and LoRAs saved by the GUI.
+        for key, flag in (("fl2va_model","--fl2va-checkpoint"),("ref2va_model","--ref2va-checkpoint"),("text_encoder_model","--text-encoder"),("video_vae_model","--video-vae"),("audio_vae_model","--audio-vae")):
+            val=str(saved.get(key) or "").strip()
+            if val: args += [flag,val]
+        for item in list(saved.get("loras") or []):
+            if isinstance(item,dict) and str(item.get("path") or "").strip() and float(item.get("strength",1.0) or 0.0)!=0.0:
+                args += ["--lora", str(item.get("path")), "--lora-strength", str(float(item.get("strength",1.0)))]
+        out_dir = Path(str(saved.get("output_folder") or self.root / "output" / "video" / "minimax_h3")).resolve(); out_dir.mkdir(parents=True, exist_ok=True)
+        name = str(state.get("output_name") or "").strip() or "minimax_h3_video"
+        outfile = out_dir / f"{name}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"; args += ["--output", str(outfile)]
+        job={"id":uuid.uuid4().hex,"state":"pending","created_at":time.time(),"mode":mode,"mode_name":{"text":"Text to video (T2VA)","image":"Image / Continue Video (FL2VA)","continue":"Image / Continue Video (FL2VA)","reference":"Reference to video (Ref2VA)"}.get(mode_name,mode_name),"model_label":"MiniMax H3","output":str(outfile),"seed":seed,"resolution":f"{width} × {height}","frames":frames,"steps":int(saved.get("steps",15) or 15),"prompt":prompt,"args":args,"settings":saved,"continue_last_result":False,"manual_continue_video":str(state.get("source_video_path") or "") if mode_name=="continue" else "","continue_context_frames":int(saved.get("continue_context_frames",39) or 39),"glue_results":False,"continue_audio_memory":False}
+        try:
+            try:
+                from helpers.queue_adapter import enqueue_minimax_h3_job
+            except Exception:
+                from queue_adapter import enqueue_minimax_h3_job
+            qid=enqueue_minimax_h3_job(job)
+            if not qid: raise RuntimeError("FrameVision queue did not accept the MiniMax job.")
+        except Exception as exc:
+            return AssistantRouteResult(True, f"I could not add the MiniMax H3 job to the FrameVision queue.\n\nError: {exc}")
+        self._clear_state()
+        inputs=[]
+        if state.get("input_image_path"): inputs.append(str(state.get("input_image_path")))
+        inputs += [str(x) for x in list(state.get("reference_image_paths") or [])]
+        return AssistantRouteResult(True, f"Added MiniMax H3 to the queue: `{outfile.name}` ({width}×{height}, {frames} frames at 24fps).", True, "minimax_h3", "MiniMax H3", prompt, width, height, time.time(), "video", tuple(inputs), str(outfile))
 
     def _ltx_prompt_question(self) -> str:
         return "What is the prompt?\n\nLTX can include sound/speech-style prompt details. If you want dialogue or sound effects, timestamps help. Example:\n`0s: a woman dances under the moonlight 3s: wind blows through the trees 6s: the woman sings \"what a beautiful night\"`\n\nLeave enough time between events so the model can follow them."
@@ -2613,3 +2974,530 @@ class FrameVisionAssistantRouter:
         if ratio > 1.0:
             return "16:9"
         return "9:16"
+
+# ------------------------- Agent Planner + model management bridge -------------------------
+_ACTIVE_WINDOWS: List[Any] = []
+
+_ENHANCE_WORKERS: List[Any] = []
+
+def enhance_planner_story_idea(idea: str, visual_style: str, on_finished: Any, on_failed: Any) -> Tuple[bool, str]:
+    """Run Planner's existing story-idea enhancer without modifying planner.py.
+
+    The caller owns the conversation state.  This only reuses Planner's existing
+    _StoryIdeaEnhanceWorker and reports the enhanced text through callbacks.
+    """
+    try:
+        try:
+            from helpers import planner as planner_mod  # type: ignore
+        except Exception:
+            import planner as planner_mod  # type: ignore
+        idea = str(idea or '').strip()
+        style = str(visual_style or '').strip()
+        if not idea:
+            return False, 'Planner idea is empty.'
+        logs_dir = Path(planner_mod._root()) / 'logs'
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        log_path = str((logs_dir / 'planner_story_idea_enhancer.log').resolve())
+        worker = planner_mod._StoryIdeaEnhanceWorker(
+            idea=idea,
+            extra_info=style,
+            style_hint=style,
+            log_path=log_path,
+            planner_llama_settings={'enabled': False},
+            parent=None,
+        )
+        _ENHANCE_WORKERS.append(worker)
+
+        def _done(text: str) -> None:
+            try:
+                on_finished(str(text or '').strip())
+            finally:
+                try:
+                    _ENHANCE_WORKERS.remove(worker)
+                except Exception:
+                    pass
+
+        def _fail(err: str) -> None:
+            try:
+                on_failed(str(err or 'Unknown error.'))
+            finally:
+                try:
+                    _ENHANCE_WORKERS.remove(worker)
+                except Exception:
+                    pass
+
+        worker.signals.finished.connect(_done)
+        worker.signals.failed.connect(_fail)
+        worker.start()
+        return True, 'Enhancing story idea...'
+    except Exception as exc:
+        return False, f'Could not start Planner story enhancer: {exc}'
+
+
+
+def _set_combo_contains(combo: Any, needles: List[str]) -> bool:
+    wanted = [str(x).strip().lower() for x in needles if str(x).strip()]
+    if not wanted:
+        return False
+    for i in range(int(combo.count())):
+        text = str(combo.itemText(i) or '').lower()
+        if all(n in text for n in wanted):
+            combo.setCurrentIndex(i)
+            return True
+    return False
+
+
+def _set_combo_best_text(combo: Any, query: str) -> bool:
+    q = str(query or '').strip().lower()
+    if not q:
+        return False
+    # Exact/substring first.
+    for i in range(int(combo.count())):
+        text = str(combo.itemText(i) or '').strip().lower()
+        data = str(combo.itemData(i) or '').strip().lower()
+        if q == text or q == data or q in text or q in data:
+            combo.setCurrentIndex(i)
+            return True
+    # Token overlap fallback, useful for preset labels such as "Liquid Drum & Bass".
+    qt = {x for x in q.replace('&', ' ').replace('-', ' ').split() if len(x) > 1}
+    best_i, best_score = -1, 0
+    for i in range(int(combo.count())):
+        text = (str(combo.itemText(i) or '') + ' ' + str(combo.itemData(i) or '')).lower()
+        tt = {x for x in text.replace('&', ' ').replace('-', ' ').split() if len(x) > 1}
+        score = len(qt & tt)
+        if score > best_score:
+            best_i, best_score = i, score
+    if best_i >= 0 and best_score > 0:
+        combo.setCurrentIndex(best_i)
+        return True
+    return False
+
+
+def _add_minimax_refs(pane: Any, paths: List[str]) -> int:
+    try:
+        from PySide6.QtWidgets import QListWidgetItem
+        from PySide6.QtCore import Qt
+    except Exception:
+        return 0
+    widget = getattr(pane, 'minimax_video_ref_list', None)
+    if widget is None:
+        return 0
+    added = 0
+    try:
+        widget.clear()
+    except Exception:
+        pass
+    for raw in list(paths or [])[:9]:
+        p = os.path.abspath(str(raw or '').strip())
+        if not p or not os.path.isfile(p):
+            continue
+        item = QListWidgetItem(os.path.basename(p))
+        item.setToolTip(p)
+        item.setData(Qt.UserRole, {'kind': 'minimax_video_refs', 'path': p})
+        widget.addItem(item)
+        added += 1
+    return added
+
+
+def launch_planner_job(spec: Dict[str, Any]) -> Tuple[bool, str]:
+    """Configure the existing Planner GUI object and submit through its normal queue path.
+
+    planner.py remains the single owner of PlannerJob construction, defaults, model profiles,
+    preset loading and queue serialization.  This bridge only fills the same GUI controls an
+    operator would fill, forces queue mode, disables Pause for review, then calls _start_pipeline().
+    """
+    try:
+        try:
+            from helpers import planner as planner_mod  # type: ignore
+        except Exception:
+            import planner as planner_mod  # type: ignore
+
+        win = planner_mod.PlannerWindow()
+        pane = win.centralWidget()
+        if pane is None:
+            return False, 'Planner window did not expose its Planner pane.'
+        _ACTIVE_WINDOWS.append(win)
+
+        idea = str(spec.get('idea') or '').strip()
+        if not idea:
+            return False, 'Planner idea is empty.'
+        pane.prompt_edit.setPlainText(idea)
+        visual_style = str(spec.get('visual_style') or '').strip()
+        if visual_style and hasattr(pane, 'extra_info'):
+            pane.extra_info.setPlainText(visual_style)
+
+        duration = max(5, int(spec.get('duration_sec') or 15))
+        if hasattr(pane, 'spin_duration'):
+            pane.spin_duration.setValue(duration)
+        elif hasattr(pane, 'sld_duration'):
+            pane.sld_duration.setValue(duration)
+
+        # Agent jobs must never wait for interactive review.
+        if hasattr(pane, 'chk_allow_edit_while_running'):
+            pane.chk_allow_edit_while_running.setChecked(False)
+        pane._use_framevision_queue = True
+        if hasattr(pane, 'chk_use_framevision_queue'):
+            pane.chk_use_framevision_queue.setChecked(True)
+
+        model = str(spec.get('video_model') or '').strip().lower()
+        if model:
+            if 'minimax' in model:
+                _set_combo_contains(pane.cmb_video_model, ['minimax', 'h3'])
+            elif '2.5' in model or 'ltx25' in model:
+                _set_combo_contains(pane.cmb_video_model, ['ltx', '2.5'])
+            elif '2.3' in model or 'ltx23' in model:
+                _set_combo_contains(pane.cmb_video_model, ['ltx', '2.3'])
+            elif 'hunyuan' in model:
+                _set_combo_contains(pane.cmb_video_model, ['hunyuan'])
+            elif 'wan' in model:
+                _set_combo_contains(pane.cmb_video_model, ['wan', '2.2'])
+
+        quality = str(spec.get('quality') or '').strip().lower()
+        if quality:
+            if '704' in quality or quality == 'medium':
+                _set_combo_contains(pane.cmb_gen_quality, ['704']) or _set_combo_contains(pane.cmb_gen_quality, ['medium'])
+            elif '480' in quality or quality == 'low':
+                _set_combo_contains(pane.cmb_gen_quality, ['480']) or _set_combo_contains(pane.cmb_gen_quality, ['low'])
+            elif '1088' in quality or '1080' in quality or quality == 'ultra':
+                _set_combo_contains(pane.cmb_gen_quality, ['1088']) or _set_combo_contains(pane.cmb_gen_quality, ['ultra']) or _set_combo_contains(pane.cmb_gen_quality, ['high'])
+            elif '768' in quality:
+                _set_combo_contains(pane.cmb_gen_quality, ['768']) or _set_combo_contains(pane.cmb_gen_quality, ['high'])
+
+        aspect = str(spec.get('aspect') or '').strip().lower()
+        if aspect:
+            if 'portrait' in aspect or '9:16' in aspect:
+                _set_combo_contains(pane.cmb_aspect, ['portrait'])
+            elif 'square' in aspect or '1:1' in aspect:
+                _set_combo_contains(pane.cmb_aspect, ['1:1'])
+            else:
+                _set_combo_contains(pane.cmb_aspect, ['landscape'])
+
+        image_model = str(spec.get('image_model') or '').strip().lower()
+        if image_model:
+            if 'krea' in image_model:
+                _set_combo_contains(pane.cmb_image_model, ['krea', '2'])
+            elif 'qwen' in image_model:
+                _set_combo_contains(pane.cmb_image_model, ['qwen'])
+            elif 'z-image' in image_model or 'zimage' in image_model:
+                _set_combo_contains(pane.cmb_image_model, ['z-image'])
+            elif 'hidream' in image_model:
+                _set_combo_contains(pane.cmb_image_model, ['hidream'])
+            elif 'lens' in image_model:
+                _set_combo_contains(pane.cmb_image_model, ['lens'])
+
+        if hasattr(pane, 'chk_use_last_frame_as_next_image'):
+            pane.chk_use_last_frame_as_next_image.setChecked(bool(spec.get('use_last_frame_as_start', False)))
+
+        music_mode = str(spec.get('music_mode') or 'none').strip().lower()
+        # Clear any inherited attached music file from Planner state.
+        try:
+            pane._music_file_path = ''
+        except Exception:
+            pass
+        if music_mode == 'ace15':
+            pane.rad_music_ace15.setChecked(True)
+            if hasattr(pane, 'chk_music'):
+                pane.chk_music.setChecked(True)
+            preset = str(spec.get('ace15_preset') or '').strip()
+            if preset:
+                _set_combo_best_text(pane.cmb_ace15_preset, preset)
+            lyrics = bool(spec.get('create_lyrics', False))
+            pane.chk_ace15_lyrics.setChecked(lyrics)
+            if hasattr(pane, 'txt_ace15_lyrics'):
+                pane.txt_ace15_lyrics.clear()
+        else:
+            try:
+                pane.rad_music_ace15.setChecked(False)
+                pane.rad_music_file.setChecked(True)
+            except Exception:
+                pass
+            if hasattr(pane, 'chk_music'):
+                pane.chk_music.setChecked(False)
+
+        refs = [str(x) for x in (spec.get('minimax_reference_images') or []) if str(x).strip()]
+        if refs:
+            _add_minimax_refs(pane, refs)
+
+        # Lyrics generation is intentionally delegated to Planner's own implementation.
+        # Queue only after its async lyric worker has populated the lyrics box.
+        if music_mode == 'ace15' and bool(spec.get('create_lyrics', False)):
+            pane._generate_ace15_ai_lyrics()
+            worker = getattr(pane, '_ace15_lyrics_worker', None)
+            if worker is None:
+                return False, 'Planner could not start its built-in AI lyrics generator.'
+
+            def _queue_after_lyrics(*_args: Any) -> None:
+                try:
+                    pane._start_pipeline()
+                finally:
+                    # Keep the window alive for a little while; the queued job already owns its payload.
+                    try:
+                        win.hide()
+                    except Exception:
+                        pass
+
+            worker.signals.finished.connect(_queue_after_lyrics)
+            win.hide()
+            return True, 'Planner started its built-in lyrics step; the Planner job will be queued automatically when the lyrics are ready.'
+
+        pane._start_pipeline()
+        win.hide()
+        return True, 'Planner job queued through the normal FrameVision Planner queue.'
+    except Exception as exc:
+        return False, f'Could not start Planner: {exc}'
+
+
+# -----------------------------------------------------------------------------
+# Agent model / optional-download management
+# -----------------------------------------------------------------------------
+
+_MODEL_MANAGER_WINDOWS: List[Any] = []
+
+
+def _fv_root_for_management() -> str:
+    try:
+        try:
+            from helpers import remove_hide as rh  # type: ignore
+        except Exception:
+            import remove_hide as rh  # type: ignore
+        return str(rh.guess_app_root())
+    except Exception:
+        try:
+            return str(Path(__file__).resolve().parent.parent)
+        except Exception:
+            return os.getcwd()
+
+
+def _norm_model_text(value: str) -> str:
+    import re
+    s = str(value or '').lower().replace('_', ' ').replace('-', ' ')
+    s = re.sub(r'[^a-z0-9.]+', ' ', s)
+    return ' '.join(s.split())
+
+
+def _meaningful_tokens(value: str) -> List[str]:
+    stop = {
+        'the','a','an','with','using','use','model','models','video','image','text','to','and','or',
+        'create','generate','make','please','can','you','check','install','installed','remove','delete',
+        'uninstall','hide','unhide','show','optional','download','downloads','full','default','for','series',
+        'rtx','only','env','environment','gguf','fp16','fp8','int4','int8','bf16','turbo','edit','step','steps'
+    }
+    return [t for t in _norm_model_text(value).split() if len(t) > 1 and t not in stop]
+
+
+def _score_name(query: str, key: str, title: str) -> int:
+    qn = _norm_model_text(query)
+    kn = _norm_model_text(key)
+    tn = _norm_model_text(title)
+    score = 0
+    if kn and kn in qn:
+        score += 30
+    # Useful canonical aliases that people actually type.
+    aliases = {
+        'zimage': ['z image', 'zimage'],
+        'zimage_turbo_gguf': ['z image', 'zimage'],
+        'zimage_turbo_fp16': ['z image', 'zimage'],
+        'hunyuan15': ['hunyuan', 'hunyuan 1.5'],
+        'ltx23': ['ltx 2.3', 'ltx23'],
+        'wan22': ['wan 2.2', 'wan22'],
+        'wan22_turbo': ['wan 2.2 turbo', 'wan22 turbo'],
+        'ace_step_15': ['ace step', 'ace step 1.5', 'ace15'],
+        'ace15': ['ace step', 'ace step 1.5', 'ace15'],
+        'seedvr2': ['seedvr2', 'seed vr2'],
+        'seedvr2_env': ['seedvr2', 'seed vr2'],
+        'chroma': ['chroma', 'spark chroma'],
+        'lens_turbo_u4': ['lens', 'lens turbo'],
+        'qwen_image_2512': ['qwen image', 'qwen 2512'],
+        'qwen2512': ['qwen image', 'qwen 2512'],
+        'qwen_edit_2511_gguf': ['qwen edit', 'qwen 2511'],
+        'qwen_edit_2511_int4': ['qwen edit', 'qwen 2511'],
+        'qwen2511': ['qwen edit', 'qwen 2511'],
+        'flux_klein_4b': ['klein 4b', 'flux klein 4b'],
+        'flux_klein_9b': ['klein 9b', 'flux klein 9b'],
+        'gfpgan': ['gfpgan'],
+        'whisper': ['whisper'],
+        'qwentts': ['qwen tts', 'qwen3 tts'],
+        'qwen3tts': ['qwen tts', 'qwen3 tts'],
+        'dotstts': ['dots tts', 'dots.tts'],
+    }
+    for alias in aliases.get(str(key), []):
+        if _norm_model_text(alias) in qn:
+            score += 40
+    qt = set(_meaningful_tokens(query))
+    nt = set(_meaningful_tokens(key + ' ' + title))
+    score += len(qt & nt) * 8
+    # Strong phrase overlap from title segments.
+    if tn and tn in qn:
+        score += 50
+    return score
+
+
+def _load_management_modules() -> Tuple[Any, Any]:
+    try:
+        from helpers import remove_hide as rh  # type: ignore
+    except Exception:
+        import remove_hide as rh  # type: ignore
+    try:
+        from helpers import opt_installs as oi  # type: ignore
+    except Exception:
+        import opt_installs as oi  # type: ignore
+    return rh, oi
+
+
+def _entry_total_size_bytes(rh: Any, app_root: str, entry: Any) -> int:
+    r = rh.entry_paths_resolved(app_root, entry)
+    envs = [p for p in r.get('envs', []) if os.path.exists(p)]
+    models = [p for p in r.get('models', []) if os.path.exists(p)]
+    repos = [p for p in r.get('repos', []) if os.path.exists(p)]
+    excludes = [p for p in r.get('excludes', []) if p]
+    env_b = sum(rh._path_size_bytes_excluding(p, models + repos + excludes) for p in envs)
+    model_b = sum(rh._path_size_bytes_excluding(p, envs + repos + excludes) for p in models)
+    repo_b = sum(rh._path_size_bytes_excluding(p, envs + models) for p in repos)
+    return int(env_b + model_b + repo_b)
+
+
+def find_model_capability(query: str) -> Dict[str, Any]:
+    """Resolve a user model name against the live remove/hide registry and Optional Installs list."""
+    rh, oi = _load_management_modules()
+    root = _fv_root_for_management()
+    registry = list(rh.build_registry())
+    installs = list(oi._default_installs())
+
+    entry_scores = sorted(
+        [(_score_name(query, e.id, e.title), e) for e in registry],
+        key=lambda x: x[0], reverse=True,
+    )
+    best_score, entry = entry_scores[0] if entry_scores else (0, None)
+    if best_score < 16:
+        entry = None
+
+    # Optional variants are matched independently. When a removable entry was found,
+    # also use its id/title as family hints so requests like "Hunyuan" show all Hunyuan options.
+    match_text = str(query or '')
+    if entry is not None:
+        match_text += ' ' + str(entry.id) + ' ' + str(entry.title)
+    install_scored = [(_score_name(match_text, x.key, x.title), x) for x in installs]
+    install_scored.sort(key=lambda x: x[0], reverse=True)
+    variants = [x for score, x in install_scored if score >= 16]
+    # Keep only reasonably close family matches to avoid huge unrelated lists.
+    if install_scored:
+        top = install_scored[0][0]
+        variants = [x for score, x in install_scored if score >= max(16, top - 24)]
+    # De-duplicate preserving order.
+    seen = set(); dedup = []
+    for x in variants:
+        if x.key in seen:
+            continue
+        seen.add(x.key); dedup.append(x)
+    variants = dedup[:12]
+
+    installed = False
+    hidden = False
+    total_bytes = 0
+    if entry is not None:
+        installed = bool(rh.is_installed(root, entry))
+        try:
+            state = rh.load_state(rh.get_state_path())
+            hidden = entry.id in set(state.get('hidden_ids', []))
+        except Exception:
+            hidden = False
+        if installed:
+            try:
+                total_bytes = _entry_total_size_bytes(rh, root, entry)
+            except Exception:
+                total_bytes = 0
+
+    return {
+        'root': root,
+        'entry_id': getattr(entry, 'id', '') if entry is not None else '',
+        'title': getattr(entry, 'title', '') if entry is not None else '',
+        'installed': installed,
+        'hidden': hidden,
+        'size_bytes': total_bytes,
+        'size_text': rh._format_bytes(total_bytes) if total_bytes else '0 B',
+        'optional_variants': [
+            {'key': x.key, 'title': x.title, 'description': x.description} for x in variants
+        ],
+    }
+
+
+def set_model_hidden(entry_id: str, hidden: bool) -> Tuple[bool, str]:
+    try:
+        rh, _oi = _load_management_modules()
+        registry = list(rh.build_registry())
+        entry = next((e for e in registry if e.id == entry_id), None)
+        if entry is None:
+            return False, f'Unknown FrameVision model entry: {entry_id}'
+        if not bool(getattr(entry, 'can_hide', True)):
+            return False, f'{entry.title} cannot be hidden from FrameVision.'
+        state_path = rh.get_state_path()
+        state = rh.load_state(state_path)
+        ids = set(state.get('hidden_ids', []))
+        if hidden:
+            ids.add(entry.id)
+        else:
+            ids.discard(entry.id)
+        state['hidden_ids'] = sorted(ids)
+        rh.save_state(state_path, state)
+        return True, f'{entry.title} is now {"hidden" if hidden else "visible"} in FrameVision.'
+    except Exception as exc:
+        return False, f'Could not change model visibility: {exc}'
+
+
+def delete_model_entry(entry_id: str) -> Tuple[bool, str]:
+    try:
+        rh, _oi = _load_management_modules()
+        root = _fv_root_for_management()
+        registry = list(rh.build_registry())
+        entry = next((e for e in registry if e.id == entry_id), None)
+        if entry is None:
+            return False, f'Unknown FrameVision model entry: {entry_id}'
+        results = rh.remove_entry(root, registry, entry)
+        failed = [msg for ok, msg in results if not ok]
+        if failed:
+            return False, f'{entry.title} removal had errors:\n' + '\n'.join(failed[:8])
+        return True, f'{entry.title} files were removed from FrameVision.'
+    except Exception as exc:
+        return False, f'Could not remove model: {exc}'
+
+
+def launch_optional_install(install_key: str, parent: Any = None) -> Tuple[bool, str]:
+    """Open FrameVision's existing Optional Installs UI, preselect one item and start it.
+
+    The existing installer dialog remains visible, providing its normal progress bar,
+    live log, Cancel button and any installer-specific safety questions.
+    """
+    try:
+        _rh, oi = _load_management_modules()
+        try:
+            from PySide6 import QtCore
+        except Exception:
+            QtCore = None  # type: ignore
+        root = Path(_fv_root_for_management()).resolve()
+        dlg = oi.OptionalInstallsDialog(parent=parent, root_dir=root)
+        row = getattr(dlg, '_row_by_key', {}).get(str(install_key))
+        if row is None:
+            try:
+                dlg.close()
+            except Exception:
+                pass
+            return False, f'Optional download key not found: {install_key}'
+        # Clear every selection, then select only the requested variant.
+        for r in getattr(dlg, 'rows', []):
+            try:
+                r.set_checked(False)
+            except Exception:
+                pass
+        row.set_checked(True)
+        _MODEL_MANAGER_WINDOWS.append(dlg)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        if QtCore is not None:
+            QtCore.QTimer.singleShot(120, dlg._on_start)
+        else:
+            dlg._on_start()
+        return True, f'Started Optional Installs for {getattr(row, "opt", None).title if getattr(row, "opt", None) else install_key}. The live installer log is open.'
+    except Exception as exc:
+        return False, f'Could not start Optional Installs: {exc}'
+

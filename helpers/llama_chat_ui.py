@@ -3697,6 +3697,13 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._piper_installer_process: Optional[QtCore.QProcess] = None
         self._pending_seedvr2_request: Optional[Dict[str, Any]] = None
         self._pending_ace15_music_request: Optional[Dict[str, Any]] = None
+        self._pending_planner_agent_request: Optional[Dict[str, Any]] = None
+        self._pending_model_manager_request: Optional[Dict[str, Any]] = None
+        self._planner_skill_thread: Optional[ChatCompletionThread] = None
+        self._planner_skill_waiting_for_server: bool = False
+        # Chat mode is the safe/default conversational mode. FrameVision workflow
+        # triggers are only active when Agent mode is explicitly enabled.
+        self._agent_mode_enabled: bool = False
         self._framevision_fullscreen_active = False
         try:
             from helpers.fv_assistant_router import FrameVisionAssistantRouter
@@ -3945,6 +3952,26 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.cmb_model_quick.setMinimumWidth(420)
         self.lbl_status = QtWidgets.QLabel("Idle")
         self.lbl_status.setObjectName("StatusIdle")
+
+        # Explicit Chat / Agent mode switch. Agent mode enables the existing
+        # FrameVision trigger/wizard layer; Chat mode always sends ordinary
+        # messages to the LLM without launching those workflows.
+        self.btn_mode_chat = QtWidgets.QPushButton("Chat")
+        self.btn_mode_agent = QtWidgets.QPushButton("Agent")
+        for _btn in (self.btn_mode_chat, self.btn_mode_agent):
+            _btn.setCheckable(True)
+            _btn.setMinimumWidth(68)
+            _btn.setObjectName("ModeToggleButton")
+        self.btn_mode_chat.setToolTip("Normal LLM chat. FrameVision workflow triggers are disabled.")
+        self.btn_mode_agent.setToolTip("Agent mode. FrameVision workflow triggers and guided actions are enabled.")
+        self._mode_button_group = QtWidgets.QButtonGroup(self)
+        self._mode_button_group.setExclusive(True)
+        self._mode_button_group.addButton(self.btn_mode_chat)
+        self._mode_button_group.addButton(self.btn_mode_agent)
+        self.btn_mode_chat.setChecked(True)
+        self.btn_mode_chat.clicked.connect(lambda checked=False: self._set_agent_mode(False, save=True))
+        self.btn_mode_agent.clicked.connect(lambda checked=False: self._set_agent_mode(True, save=True))
+
         self.btn_load = QtWidgets.QPushButton("Load")
         self.btn_unload = QtWidgets.QPushButton("Unload")
         self.btn_unload.setEnabled(False)
@@ -3953,6 +3980,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
 
         tb_lay.addWidget(self.lbl_title)
         tb_lay.addStretch(1)
+        tb_lay.addWidget(self.btn_mode_chat, 0)
+        tb_lay.addWidget(self.btn_mode_agent, 0)
+        tb_lay.addSpacing(4)
         tb_lay.addWidget(self.cmb_model_quick, 0)
         tb_lay.addWidget(self.lbl_status, 0)
         tb_lay.addWidget(self.btn_load)
@@ -4788,6 +4818,23 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         QPushButton:hover {{
             background: {theme['hover']};
         }}
+        QPushButton#ModeToggleButton {{
+            min-width: 68px;
+            padding: 9px 16px;
+            border: 1px solid {theme['border']};
+            background: {theme['button']};
+            color: {_text_color_for_bg(theme['button'])};
+            font-weight: 400;
+        }}
+        QPushButton#ModeToggleButton:hover {{
+            background: {theme['hover']};
+        }}
+        QPushButton#ModeToggleButton:checked {{
+            background: {theme['selected']};
+            color: {_text_color_for_bg(theme['selected'])};
+            border: 2px solid {theme['highlight']};
+            font-weight: 700;
+        }}
         QPushButton:disabled {{
             color: {disabled_fg};
             background: {disabled_bg};
@@ -4900,6 +4947,48 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         }}
         """)
 
+    def _set_agent_mode(self, enabled: bool, save: bool = True) -> None:
+        """Switch between normal chat and FrameVision Agent trigger routing."""
+        enabled = bool(enabled)
+        self._agent_mode_enabled = enabled
+        try:
+            self.btn_mode_chat.blockSignals(True)
+            self.btn_mode_agent.blockSignals(True)
+            self.btn_mode_chat.setChecked(not enabled)
+            self.btn_mode_agent.setChecked(enabled)
+        finally:
+            try:
+                self.btn_mode_chat.blockSignals(False)
+                self.btn_mode_agent.blockSignals(False)
+            except Exception:
+                pass
+        # Make the selected mode unmistakable even on themes where the
+        # checked-button background is subtle.
+        try:
+            self.btn_mode_chat.setText("✓ Chat" if not enabled else "Chat")
+            self.btn_mode_agent.setText("✓ Agent" if enabled else "Agent")
+        except Exception:
+            pass
+        try:
+            self.ed_prompt.setPlaceholderText(
+                "Tell the agent what you want FrameVision to do…" if enabled
+                else "Send a message to the model…"
+            )
+        except Exception:
+            pass
+        try:
+            if enabled:
+                self.btn_mode_agent.setToolTip("Agent mode active. FrameVision workflow triggers and guided actions are enabled.")
+            else:
+                self.btn_mode_agent.setToolTip("Agent mode. FrameVision workflow triggers and guided actions are enabled.")
+        except Exception:
+            pass
+        if save:
+            self._queue_save()
+
+    def _agent_triggers_enabled(self) -> bool:
+        return bool(getattr(self, "_agent_mode_enabled", False))
+
     # ---------- persistence ----------
     def _load_settings(self):
         data = _load_json(self.settings_path, {})
@@ -4998,6 +5087,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self.chk_answer_voice.setChecked(self.voice_answer_enabled)
         except Exception:
             pass
+        # Default older settings files to Chat mode so adding this feature cannot
+        # unexpectedly launch a FrameVision workflow from ordinary conversation.
+        self._set_agent_mode(bool(data.get("agent_mode_enabled", False)), save=False)
         self.current_session_id = data.get("last_session_id") if isinstance(data.get("last_session_id"), str) else None
         self._saved_model_path = data.get("model_path", "") if isinstance(data.get("model_path"), str) else ""
         self._saved_template = (data.get("template_kind", "auto"), data.get("template_value", ""))
@@ -5046,6 +5138,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "memory_enabled": bool(getattr(self.settings_dialog, "chk_memory_enabled", None).isChecked()) if getattr(self.settings_dialog, "chk_memory_enabled", None) is not None else True,
             "memory_show_sources": bool(getattr(self.settings_dialog, "chk_memory_sources", None).isChecked()) if getattr(self.settings_dialog, "chk_memory_sources", None) is not None else True,
             "answer_with_voice": bool(getattr(self, "chk_answer_voice", None).isChecked()) if getattr(self, "chk_answer_voice", None) is not None else bool(getattr(self, "voice_answer_enabled", False)),
+            "agent_mode_enabled": bool(getattr(self, "_agent_mode_enabled", False)),
             "last_session_id": self.current_session_id or "",
             "chat_composer_splitter_sizes": list(getattr(self, "main_vertical_splitter", None).sizes()) if getattr(self, "main_vertical_splitter", None) is not None else [760, 150],
             "save_selection_folder": str(old_settings.get("save_selection_folder", "") or ""),
@@ -6118,7 +6211,57 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                 return True
         return False
 
+    def _reset_transient_agent_workflows(self) -> None:
+        """Clear conversational wizard/agent state when starting a fresh chat.
+
+        These states are intentionally not persisted as part of a ChatSession. If
+        they survive a New Chat action, the next message in the new conversation
+        is incorrectly treated as an answer to the previous chat's wizard.
+        Running/queued FrameVision jobs are not touched here.
+        """
+        self._pending_planner_agent_request = None
+        self._pending_model_manager_request = None
+        self._set_pending_ace15_music_state(None)
+        self._set_pending_seedvr2_state(None)
+        self._planner_skill_waiting_for_server = False
+
+        # If a private Planner enhancement call is still finishing, let the
+        # worker finish naturally but discard its result: callbacks already
+        # require an active pending Planner state before writing anything.
+
+        # The older FrameVision assistant router keeps its own wizard state.
+        # Use a public reset/cancel hook when available; otherwise only remove
+        # the pending conversational intent instead of replacing the whole
+        # router object or touching its configuration.
+        router = getattr(self, "_fv_assistant_router", None)
+        if router is not None:
+            reset_done = False
+            for name in ("reset", "reset_state", "cancel_pending", "cancel"):
+                fn = getattr(router, name, None)
+                if callable(fn):
+                    try:
+                        fn()
+                        reset_done = True
+                        break
+                    except TypeError:
+                        pass
+                    except Exception:
+                        break
+            if not reset_done:
+                try:
+                    state = getattr(router, "state", None)
+                    if isinstance(state, dict):
+                        for key in list(state.keys()):
+                            if key == "pending_intent" or key.startswith("pending_"):
+                                state.pop(key, None)
+                except Exception:
+                    pass
+
     def _new_chat(self):
+        # A new conversation must also mean a new Agent/wizard conversation.
+        # Do this before selecting the new ChatSession so no old Planner, ACE,
+        # model-manager, SeedVR2 or assistant-router question can leak into it.
+        self._reset_transient_agent_workflows()
         s = ChatSession.create_default()
         s.model_path = self.current_model_path()
         tk, tv = self.current_template_choice()
@@ -6783,6 +6926,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.btn_stop.setEnabled(False)
         self._set_status("Ready", "ready")
         self._update_header()
+        if bool(getattr(self, "_planner_skill_waiting_for_server", False)):
+            self._planner_skill_waiting_for_server = False
+            QtCore.QTimer.singleShot(0, self._planner_agent_start_story_skill_generation)
+            return
         if self.pending_retry_generation:
             self.pending_retry_generation = False
             target_session_id = self.pending_generate_session_id or self._active_generation_session_id or self.current_session_id or ""
@@ -8351,6 +8498,11 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "upscale image",
             "upscale video",
             "create a video",
+            "create video",
+            "make a video",
+            "make video",
+            "generate a video",
+            "generate video",
             "create music",
         ])
 
@@ -9106,6 +9258,781 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _agent_model_manager_intent(self, text: str) -> bool:
+        if not self._agent_triggers_enabled():
+            return False
+        s = str(text or '').strip().lower()
+        if not s:
+            return False
+        explicit = (
+            'install ' in s or 'download ' in s or 'uninstall ' in s or 'delete ' in s or
+            'remove ' in s or 'hide ' in s or 'unhide ' in s or 'show ' in s or
+            'size on disk' in s or 'how big' in s or 'is installed' in s or 'is it installed' in s or
+            "don't need" in s or 'dont need' in s or 'do not need' in s
+        )
+        return bool(explicit)
+
+    def _agent_model_manager_action(self, text: str) -> str:
+        s = str(text or '').strip().lower()
+        if any(x in s for x in ('uninstall ', 'delete ', 'completely delete', 'remove completely')):
+            return 'delete'
+        if 'unhide ' in s or 'make visible' in s:
+            return 'unhide'
+        if 'hide ' in s:
+            return 'hide'
+        if 'install ' in s or 'download ' in s:
+            return 'install'
+        if any(x in s for x in ('how big', 'size on disk', 'is installed', 'is it installed')):
+            return 'inspect'
+        if any(x in s for x in ("don't need", 'dont need', 'do not need', 'can this be removed', 'can it be removed')):
+            return 'remove_offer'
+        if 'remove ' in s:
+            return 'remove_offer'
+        return 'inspect'
+
+    def _agent_model_manager_start(self, text: str, requested_by_generation: bool = False) -> bool:
+        try:
+            try:
+                from helpers.fv_assistant_router import find_model_capability  # type: ignore
+            except Exception:
+                from fv_assistant_router import find_model_capability  # type: ignore
+            report = dict(find_model_capability(text) or {})
+        except Exception as exc:
+            self._append_framevision_assistant_reply(f"I couldn't check FrameVision's model registry: {exc}")
+            return True
+        entry_id = str(report.get('entry_id') or '')
+        variants = list(report.get('optional_variants') or [])
+        if not entry_id and not variants:
+            if requested_by_generation:
+                return False
+            self._append_framevision_assistant_reply("I couldn't match that to a model in FrameVision's Remove/Hide list or Optional Downloads.")
+            return True
+
+        action = 'install' if requested_by_generation else self._agent_model_manager_action(text)
+        state = {'action': action, 'report': report, 'original_text': str(text or '')}
+        self._pending_model_manager_request = state
+        title = str(report.get('title') or '').strip()
+        installed = bool(report.get('installed', False))
+        hidden = bool(report.get('hidden', False))
+        size_text = str(report.get('size_text') or '0 B')
+
+        if action == 'inspect':
+            if title:
+                status = 'installed' if installed else 'not installed'
+                extra = f" It uses about {size_text} on disk." if installed else ''
+                vis = ' It is currently hidden in FrameVision.' if hidden else ''
+                self._append_framevision_assistant_reply(f"{title} is {status}.{extra}{vis}")
+            elif variants:
+                names = '\n'.join(f"• {v.get('title')}" for v in variants[:10])
+                self._append_framevision_assistant_reply("I found these matching Optional Downloads:\n" + names)
+            self._pending_model_manager_request = None
+            return True
+
+        if action in ('remove_offer', 'delete', 'hide', 'unhide'):
+            if not title:
+                self._append_framevision_assistant_reply("I found optional downloads for that name, but no installed-model entry that FrameVision can hide/delete safely.")
+                self._pending_model_manager_request = None
+                return True
+            if not installed and action in ('remove_offer', 'delete'):
+                self._append_framevision_assistant_reply(f"{title} does not appear to be installed, so there is nothing to remove.")
+                self._pending_model_manager_request = None
+                return True
+            if action == 'remove_offer':
+                self._append_framevision_assistant_reply(
+                    f"I found {title}. It uses about {size_text} on disk. "
+                    f"Do you want me to hide it from FrameVision or completely delete its model/environment files?"
+                )
+                return True
+            verb = 'completely delete' if action == 'delete' else ('hide' if action == 'hide' else 'unhide')
+            self._append_framevision_assistant_reply(f"I found {title} ({size_text} on disk). Do you want me to {verb} it? Say yes or cancel.")
+            return True
+
+        # install
+        if installed and title:
+            self._append_framevision_assistant_reply(f"{title} already appears to be installed.")
+            self._pending_model_manager_request = None
+            return True
+        if not variants:
+            self._append_framevision_assistant_reply("That model is not installed, but I couldn't find a matching entry in Optional Downloads.")
+            self._pending_model_manager_request = None
+            return True
+        if len(variants) == 1:
+            v = variants[0]
+            state['selected_install_key'] = str(v.get('key') or '')
+            self._append_framevision_assistant_reply(
+                f"That model doesn't appear to be installed. I found this in Optional Downloads:\n"
+                f"• {v.get('title')}\n\nDo you want me to install it?"
+            )
+            return True
+        names = '\n'.join(f"{i+1}. {v.get('title')}" for i, v in enumerate(variants[:10]))
+        self._append_framevision_assistant_reply(
+            "That model doesn't appear to be installed. I found these matching Optional Downloads:\n"
+            + names + "\n\nWhich one do you want? You can answer with the number or part of the name."
+        )
+        return True
+
+    def _agent_model_manager_handle_pending(self, text: str) -> bool:
+        state = getattr(self, '_pending_model_manager_request', None)
+        if not isinstance(state, dict):
+            return False
+        s = str(text or '').strip().lower()
+        if s in ('cancel', 'stop', 'never mind', 'nevermind', 'no'):
+            self._pending_model_manager_request = None
+            self._append_framevision_assistant_reply('Okay, cancelled.')
+            return True
+        report = dict(state.get('report') or {})
+        action = str(state.get('action') or '')
+        entry_id = str(report.get('entry_id') or '')
+        title = str(report.get('title') or entry_id)
+        try:
+            try:
+                from helpers.fv_assistant_router import set_model_hidden, delete_model_entry, launch_optional_install  # type: ignore
+            except Exception:
+                from fv_assistant_router import set_model_hidden, delete_model_entry, launch_optional_install  # type: ignore
+        except Exception as exc:
+            self._pending_model_manager_request = None
+            self._append_framevision_assistant_reply(f"Model-management skill could not load: {exc}")
+            return True
+
+        if action == 'remove_offer':
+            if 'hide' in s:
+                ok, msg = set_model_hidden(entry_id, True)
+                self._pending_model_manager_request = None
+                self._append_framevision_assistant_reply(msg)
+                return True
+            if any(x in s for x in ('delete', 'remove', 'uninstall')):
+                state['action'] = 'delete'
+                self._pending_model_manager_request = state
+                self._append_framevision_assistant_reply(f"Completely delete {title}? This removes its registered model/environment files. Say yes to confirm or cancel.")
+                return True
+            self._append_framevision_assistant_reply("Please choose `hide`, `delete`, or `cancel`.")
+            return True
+
+        if action in ('delete', 'hide', 'unhide'):
+            if s not in ('yes', 'y', 'yes please', 'confirm', 'do it', 'go ahead'):
+                self._append_framevision_assistant_reply('Say yes to confirm, or cancel.')
+                return True
+            if action == 'delete':
+                ok, msg = delete_model_entry(entry_id)
+            else:
+                ok, msg = set_model_hidden(entry_id, action == 'hide')
+            self._pending_model_manager_request = None
+            self._append_framevision_assistant_reply(msg)
+            return True
+
+        if action == 'install':
+            variants = list(report.get('optional_variants') or [])
+            key = str(state.get('selected_install_key') or '')
+            if not key:
+                chosen = None
+                # numeric selection
+                try:
+                    idx = int(s) - 1
+                    if 0 <= idx < len(variants):
+                        chosen = variants[idx]
+                except Exception:
+                    pass
+                if chosen is None:
+                    for v in variants:
+                        if s and s in str(v.get('title') or '').lower():
+                            chosen = v; break
+                if chosen is None:
+                    self._append_framevision_assistant_reply('Tell me which Optional Download you want by number or part of its name, or say cancel.')
+                    return True
+                state['selected_install_key'] = str(chosen.get('key') or '')
+                self._pending_model_manager_request = state
+                self._append_framevision_assistant_reply(f"Install {chosen.get('title')}? Say yes to start or cancel.")
+                return True
+            if s not in ('yes', 'y', 'yes please', 'confirm', 'install it', 'do it', 'go ahead'):
+                self._append_framevision_assistant_reply('Say yes to start the install, or cancel.')
+                return True
+            ok, msg = launch_optional_install(key, parent=self)
+            self._pending_model_manager_request = None
+            self._append_framevision_assistant_reply(msg)
+            return True
+        return False
+
+    def _agent_maybe_offer_missing_model_for_generation(self, text: str) -> bool:
+        """Catch an explicitly named but missing FrameVision model before a workflow starts."""
+        if not self._agent_triggers_enabled():
+            return False
+        s = str(text or '').strip().lower()
+        if not s or not any(w in s for w in ('create ', 'generate ', 'make ', 'use ')):
+            return False
+        # Avoid intercepting Planner itself; Planner can select its own backend and the
+        # dedicated Planner flow owns that conversation.
+        if 'planner' in s:
+            return False
+        try:
+            try:
+                from helpers.fv_assistant_router import find_model_capability  # type: ignore
+            except Exception:
+                from fv_assistant_router import find_model_capability  # type: ignore
+            report = dict(find_model_capability(text) or {})
+        except Exception:
+            return False
+        # Require a concrete live-registry family match plus install alternatives.
+        if not str(report.get('entry_id') or ''):
+            return False
+        if bool(report.get('installed', False)):
+            return False
+        if not list(report.get('optional_variants') or []):
+            return False
+        return self._agent_model_manager_start(text, requested_by_generation=True)
+
+    def _planner_agent_is_start_command(self, text: str) -> bool:
+        if not self._agent_triggers_enabled():
+            return False
+        first = next((ln.strip().lower() for ln in str(text or '').splitlines() if ln.strip()), '')
+        # Accept both command-style wording ("start planner") and the natural
+        # agent wording the UI encourages ("use the planner to create ...").
+        # Keep this anchored to the beginning of the first non-empty line so a
+        # normal discussion ABOUT the Planner does not accidentally launch it.
+        return bool(
+            re.match(r'^(?:create|start|make|run|open)\s+(?:the\s+)?(?:framevision\s+)?planner\b', first)
+            or re.match(r'^(?:create|make)\s+(?:a\s+)?(?:video\s+plan|storyline)\b', first)
+            # Natural agent language: "use the planner" may be the whole
+            # command; the wizard can then ask for the missing idea/details.
+            or re.match(r'^use\s+(?:the\s+)?(?:framevision\s+)?planner\b', first)
+            or re.match(r'^(?:with|using)\s+(?:the\s+)?(?:framevision\s+)?planner\s*[,,:-]?\s*(?:create|make|plan|build|generate)\b', first)
+            or re.match(r'^(?:the\s+)?(?:framevision\s+)?planner\s*[:,-]\s*(?:create|make|plan|build|generate)\b', first)
+            # Also support the way a person is likely to phrase the request:
+            # "create a video with the planner ..." / "make a music video
+            # using FrameVision Planner ...".  Keep an action verb at the
+            # beginning so questions ABOUT the planner do not fire it.
+            or re.match(r'^(?:create|make|generate|build|plan)\s+(?:a\s+)?(?:music\s+)?video\b.*\b(?:with|using)\s+(?:the\s+)?(?:framevision\s+)?planner\b', first)
+        )
+
+    def _planner_agent_duration(self, text: str) -> int:
+        low = str(text or '').lower()
+        m = re.search(r'\b(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|min)\b', low)
+        if m:
+            return max(5, int(round(float(m.group(1)) * 60.0)))
+        m = re.search(r'\b(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|sec|s)\b', low)
+        if m:
+            return max(5, int(round(float(m.group(1)))))
+        m = re.search(r'\b(\d{1,2}):(\d{2})\b', low)
+        if m:
+            return max(5, int(m.group(1)) * 60 + int(m.group(2)))
+        return 0
+
+    def _planner_agent_visual_style(self, text: str) -> str:
+        raw = str(text or '').strip()
+        low = raw.lower()
+        # Explicit labels win and allow any free-form style, not only the common examples.
+        m = re.search(r'\b(?:visual\s+)?(?:genre|style)\s*:\s*([^\n,;]+)', raw, re.I)
+        if m:
+            return m.group(1).strip()
+        common = (
+            ('photorealistic', 'photorealistic'), ('photo realistic', 'photorealistic'),
+            ('realistic', 'realistic cinematic'), ('pixar', 'Pixar-style 3D animation'),
+            ('manga', 'manga'), ('anime', 'anime'), ('cartoon', 'cartoon'),
+            ('comic book', 'comic-book'), ('watercolor', 'watercolor'), ('watercolour', 'watercolor'),
+            ('oil painting', 'oil painting'), ('claymation', 'claymation'),
+            ('stop motion', 'stop-motion'), ('cyberpunk', 'cyberpunk'),
+            ('surreal', 'surreal'), ('abstract', 'abstract'),
+        )
+        for token, value in common:
+            if re.search(r'\b' + re.escape(token) + r'\b', low):
+                return value
+        return ''
+
+    def _planner_agent_extract_spec(self, text: str, attachments: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        raw = str(text or '').strip()
+        low = raw.lower()
+        spec: Dict[str, Any] = {'raw_request': raw}
+        d = self._planner_agent_duration(raw)
+        if d:
+            spec['duration_sec'] = d
+        visual_style = self._planner_agent_visual_style(raw)
+        if visual_style:
+            spec['visual_style'] = visual_style
+        if 'minimax' in low:
+            spec['video_model'] = 'minimax_h3'
+        elif ('ltx 2.5' in low) or ('ltx2.5' in low) or ('ltx25' in low):
+            spec['video_model'] = 'ltx25'
+        elif ('ltx 2.3' in low) or ('ltx2.3' in low) or ('ltx23' in low):
+            spec['video_model'] = 'ltx23'
+        elif 'hunyuan' in low:
+            spec['video_model'] = 'hunyuan'
+        elif 'wan 2.2' in low or 'wan2.2' in low:
+            spec['video_model'] = 'wan22'
+        if '704' in low:
+            spec['quality'] = '704p'
+        elif '480' in low:
+            spec['quality'] = '480p'
+        elif '1088' in low or '1080' in low:
+            spec['quality'] = '1088p'
+        elif '1344' in low or '768' in low:
+            spec['quality'] = '768p'
+        if 'portrait' in low or '9:16' in low:
+            spec['aspect'] = 'portrait'
+        elif 'square' in low or '1:1' in low:
+            spec['aspect'] = 'square'
+        elif 'landscape' in low or '16:9' in low:
+            spec['aspect'] = 'landscape'
+        if 'krea 2' in low or 'krea2' in low:
+            spec['image_model'] = 'krea2'
+        if re.search(r'\b(?:use\s+)?last\s+frame\s+as\s+(?:the\s+)?(?:next\s+)?start(?:ing)?\s+frame\b', low) or 'last frame chain' in low:
+            spec['use_last_frame_as_start'] = True
+        if re.search(r'\b(?:no|without)\s+music\b', low):
+            spec['music_mode'] = 'none'
+        elif 'ace step' in low or 'ace-step' in low or 'ace15' in low:
+            spec['music_mode'] = 'ace15'
+            if 'lyrics' in low and not re.search(r'\bno\s+lyrics\b|\binstrumental\b', low):
+                spec['create_lyrics'] = True
+        if str(spec.get('music_mode') or '') == 'ace15':
+            try:
+                _g, _sub = self._ace15_find_subgenre(raw)
+                if _sub:
+                    spec['ace15_preset'] = str(_sub)
+                elif _g:
+                    spec['ace15_preset'] = str(_g)
+                else:
+                    _g2 = self._ace15_find_genre(raw)
+                    if _g2:
+                        spec['ace15_preset'] = str(_g2)
+            except Exception:
+                pass
+        # Anything after "idea:" is unambiguously the project idea.
+        mi = re.search(r'\bidea\s*:\s*(.+)', raw, re.I | re.S)
+        if mi:
+            spec['idea'] = mi.group(1).strip()
+        imgs = []
+        for att in list(attachments or []):
+            try:
+                if str(att.get('kind') or '').lower() == 'image':
+                    path = str(att.get('path') or '').strip()
+                    if path and os.path.isfile(path):
+                        imgs.append(path)
+            except Exception:
+                pass
+        if imgs:
+            spec['minimax_reference_images'] = imgs[:9]
+        return spec
+
+    def _planner_agent_merge_reply(self, state: Dict[str, Any], text: str, attachments: Optional[List[Dict[str, Any]]] = None) -> None:
+        parsed = self._planner_agent_extract_spec(text, attachments)
+        for k, v in parsed.items():
+            if k != 'raw_request' and v not in (None, '', [], 0):
+                state[k] = v
+
+    def _planner_agent_apply_defaults(self, state: Dict[str, Any]) -> None:
+        # These mirror the normal Planner path the user expects when no extra
+        # generation settings were requested.  Explicit user settings always
+        # win because setdefault() never overwrites them.
+        state.setdefault('video_model', 'ltx23')
+        state.setdefault('quality', '704p')
+        state.setdefault('aspect', 'landscape')
+        state.setdefault('image_model', 'krea2')
+        state.setdefault('use_last_frame_as_start', False)
+
+    def _planner_agent_next_question(self, state: Dict[str, Any]) -> str:
+        if not str(state.get('idea') or '').strip():
+            return 'What is the idea/story for the Planner video?'
+        if not str(state.get('visual_style') or '').strip():
+            return ('What visual genre/style should the whole video use? For example: realistic, Pixar, manga, anime, cartoon, etc. '
+                    'I will pass this to the Planner as the project style so the images stay visually consistent.')
+        if 'story_prompt_decision' not in state:
+            return ('Is the idea you gave me the final story prompt, or shall I enhance the story idea first? '
+                    'Answer "use it" or "enhance it".')
+        if state.get('story_prompt_decision') == 'enhance' and bool(state.get('story_enhancing')):
+            return ''
+        if state.get('story_prompt_decision') == 'enhance' and not bool(state.get('story_enhanced_reviewed')):
+            return ''
+        if int(state.get('duration_sec') or 0) <= 0:
+            return 'How long should the video be? You can answer for example: 90 seconds, 2 minutes, or 2:30.'
+        if 'music_mode' not in state:
+            return 'Music: no music, or create music with Ace Step 1.5?'
+        if str(state.get('music_mode') or '') == 'ace15':
+            if not str(state.get('ace15_preset') or '').strip():
+                return 'Which ACE-Step genre/preset should the Planner use? I will select the existing FrameVision preset rather than inventing a genre prompt.'
+            if 'create_lyrics' not in state:
+                return 'Should the Planner create lyrics too? (yes/no)'
+
+        # Before a Planner job starts, explicitly offer the known default path.
+        # This prevents a short request from silently launching with settings the
+        # user did not get a chance to review.
+        if 'planner_defaults_decision' not in state:
+            return ('Shall I use the Planner defaults? '
+                    'Krea 2 + LTX 2.3 + landscape + 704p + no last-frame-as-start-frame. '
+                    'Answer yes to start with those defaults, or no and tell me what you want to change.')
+        if state.get('planner_defaults_decision') == 'custom' and not state.get('planner_custom_settings_received'):
+            return ('What would you like to change? You can specify only what matters, for example '
+                    '"use MiniMax", "LTX 2.5, portrait", "704p + Krea 2", or '
+                    '"use last frame as start frame". Anything you do not mention stays at the default.')
+
+        if str(state.get('video_model') or '').lower() == 'minimax_h3' and 'use_minimax_refs' not in state:
+            return 'Do you want to use reference images with MiniMax? (yes/no)'
+        if bool(state.get('use_minimax_refs')) and not list(state.get('minimax_reference_images') or []):
+            return 'Upload the MiniMax reference image(s) here, then send a message such as "use these". You can attach up to 9 images.'
+        return ''
+
+    def _planner_agent_start_flow(self, text: str, attachments: Optional[List[Dict[str, Any]]] = None) -> None:
+        state = self._planner_agent_extract_spec(text, attachments)
+        # A concise command may put the concept after the Planner keyword. Do not guess if it is only settings.
+        low = str(text or '').lower()
+        if 'idea' not in state:
+            tail = str(text or '').strip()
+            # Strip whichever supported Planner command prefix was used, leaving
+            # only the user's actual idea/settings for the normal spec parser.
+            prefixes = (
+                r'^(?:create|start|make|run|open)\s+(?:the\s+)?(?:framevision\s+)?planner\b\s*[:,-]?\s*',
+                # "use the planner" and "use the planner to create"
+                # both enter the same guided workflow.
+                r'^use\s+(?:the\s+)?(?:framevision\s+)?planner\b(?:\s+to\s+(?:create|make|plan|build|generate))?\s*[:,-]?\s*',
+                r'^(?:with|using)\s+(?:the\s+)?(?:framevision\s+)?planner\s*[,,:-]?\s*(?:create|make|plan|build|generate)\b\s*[:,-]?\s*',
+                r'^(?:the\s+)?(?:framevision\s+)?planner\s*[:,-]\s*(?:create|make|plan|build|generate)\b\s*[:,-]?\s*',
+                # For "create a video with the planner ...", strip both the
+                # action and the planner routing phrase; what remains can be
+                # treated as the idea/settings.
+                r'^(?:create|make|generate|build|plan)\s+(?:a\s+)?(?:music\s+)?video\s+(?:with|using)\s+(?:the\s+)?(?:framevision\s+)?planner\b\s*[:,-]?\s*',
+            )
+            for _prefix in prefixes:
+                _stripped = re.sub(_prefix, '', tail, flags=re.I)
+                if _stripped != tail:
+                    tail = _stripped
+                    break
+            if tail and len(tail.split()) >= 4 and not re.fullmatch(r'(?:minimax|ltx\s*2\.5|ltx25|\d+p?|portrait|landscape|krea\s*2|ace\s*step|lyrics|music|no\s+music|[,/+\s-])+', tail, re.I):
+                state['idea'] = tail
+        self._pending_planner_agent_request = state
+        q = self._planner_agent_next_question(state)
+        if q:
+            self._append_framevision_assistant_reply(q)
+            return
+        self._planner_agent_launch_pending()
+
+    def _planner_agent_story_skill_template(self) -> Tuple[str, str]:
+        """Return (name, template) for the configured Planner story-enhancement skill.
+
+        For now this intentionally resolves one pinned chat by name.  It does not
+        switch the visible chat or import that pinned chat's old conversation.
+        """
+        wanted = 'advanced prompt writer for FrameVision'
+        try:
+            self._load_pinned_chats()
+        except Exception:
+            pass
+        wanted_low = wanted.strip().lower()
+        for pinned in list(getattr(self, 'pinned_chats', []) or []):
+            name = str(pinned.get('name') or '').strip()
+            if name.lower() == wanted_low:
+                template = str(pinned.get('template') or '').strip()
+                if template:
+                    return name, template
+        # A conservative fallback keeps the workflow usable if the pinned chat
+        # was renamed/deleted.  It deliberately avoids the old Planner enhancer.
+        fallback = (
+            'You enhance short story ideas for the FrameVision video Planner. '
+            'Preserve the user\'s concept and facts. Add useful visual actions, locations, '
+            'progression and concrete scene details, but do not add emotional interpretation, '
+            'character psychology, moral themes, symbolism, or unrelated cinematic filler. '
+            'Do not turn the result into a shot list unless the user asks. Return only the improved story idea.'
+        )
+        return 'built-in FrameVision story enhancer', fallback
+
+    def _planner_agent_begin_story_enhancement(self, state: Dict[str, Any]) -> None:
+        state['story_prompt_decision'] = 'enhance'
+        state['story_enhancing'] = True
+        state['story_enhanced_reviewed'] = False
+        state.setdefault('story_original_idea', str(state.get('idea') or '').strip())
+        self._pending_planner_agent_request = state
+
+        skill_name, _template = self._planner_agent_story_skill_template()
+        if skill_name == 'advanced prompt writer for FrameVision':
+            self._append_framevision_assistant_reply(
+                'Enhancing the story idea with the pinned skill "advanced prompt writer for FrameVision"...'
+            )
+        else:
+            self._append_framevision_assistant_reply(
+                'Pinned skill "advanced prompt writer for FrameVision" was not found, so I am using the built-in LLM story-enhancement instruction instead.'
+            )
+
+        # Agent commands themselves do not require the LLM to be loaded.  Only
+        # wake it here when the user explicitly asks for enhancement.
+        try:
+            self._validate_runner_and_model()
+        except Exception as exc:
+            self._planner_agent_story_skill_failed(str(exc))
+            return
+        if not self._same_loaded_config() or not self.server_ready:
+            self._planner_skill_waiting_for_server = True
+            self._set_status('Loading LLM for story-enhancement skill...', 'loading')
+            self._load_selected_model()
+            return
+        self._planner_agent_start_story_skill_generation()
+
+    def _planner_agent_start_story_skill_generation(self) -> None:
+        state = getattr(self, '_pending_planner_agent_request', None)
+        if not isinstance(state, dict) or not bool(state.get('story_enhancing')):
+            return
+        if not self.server_ready:
+            self._planner_skill_waiting_for_server = True
+            return
+        if self._planner_skill_thread is not None and self._planner_skill_thread.isRunning():
+            return
+
+        skill_name, template = self._planner_agent_story_skill_template()
+        idea = str(state.get('story_original_idea') or state.get('idea') or '').strip()
+        style = str(state.get('visual_style') or '').strip()
+        user_request = (
+            'Enhance this story idea for use as the main idea/story prompt in FrameVision Planner.\n'
+            f'Visual style/genre: {style or "not specified"}\n\n'
+            f'Original story idea:\n{idea}\n\n'
+            'Return the enhanced story idea only. Keep it as one coherent project-level story/concept, '
+            'not a numbered shot list. Preserve the requested subject, events, style and intent.'
+        )
+        # This is an internal Agent skill call, not a normal visible chat turn.
+        # Thinking-capable Qwen models can otherwise place their scratch reasoning
+        # (for example "The user wants me to...") in the normal content stream.
+        # Preserve the user's pinned skill, but add a strict output contract and
+        # Qwen's /no_think control for this one-shot specialist call.
+        skill_output_contract = (
+            '\n\nAGENT SKILL OUTPUT CONTRACT:\n'
+            '- Return ONLY the finished enhanced story prompt.\n'
+            '- Do not describe the task, the user, your reasoning, analysis, plan, or decisions.\n'
+            '- Do not write preambles such as "The user wants...", "I need to...", or "Here is...".\n'
+            '- Start immediately with the actual enhanced story text.\n'
+            '- Do not include <think>, Thinking:, Reasoning:, Analysis:, or Final Answer: labels.\n'
+            '/no_think'
+        )
+        messages = [
+            {'role': 'system', 'content': template + skill_output_contract},
+            {'role': 'user', 'content': user_request + '\n\n/no_think'},
+        ]
+        self._set_status(f'Using Agent skill: {skill_name}', 'loading')
+        thread = ChatCompletionThread(
+            self.server_url,
+            messages,
+            self.settings_dialog.sp_max_tokens.value(),
+            self.settings_dialog.sp_temp.value(),
+            self.settings_dialog.sp_top_p.value(),
+            self.settings_dialog.sp_top_k.value(),
+            self.settings_dialog.sp_repeat_penalty.value(),
+            self.settings_dialog.sp_generation_timeout.value(),
+            self,
+        )
+        self._planner_skill_thread = thread
+        thread.succeeded.connect(self._planner_agent_story_skill_succeeded)
+        thread.failed.connect(self._planner_agent_story_skill_failed)
+        thread.finished.connect(self._planner_agent_story_skill_finished)
+        thread.start()
+
+    @staticmethod
+    def _planner_agent_clean_story_skill_output(text: str) -> str:
+        """Remove only obvious model meta-output from an internal story skill result.
+
+        The primary protection is /no_think above.  This is deliberately
+        conservative so legitimate story prose is not accidentally deleted.
+        """
+        raw = str(text or '').strip()
+        if not raw:
+            return ''
+        answer, _reasoning = _split_inline_reasoning(raw)
+        raw = str(answer or raw).strip()
+        raw = re.sub(r'<(?:think|thinking|reasoning)>.*?</(?:think|thinking|reasoning)>', '', raw, flags=re.I | re.S).strip()
+
+        # Remove common one-line preambles only when they occur at the start.
+        # Do not broadly search for these phrases inside the story itself.
+        preamble_patterns = (
+            r'^\s*(?:the user wants(?: me)? to|the user is asking(?: me)? to|i need to|i should|we need to|my task is to)\b[^\n]*\n+',
+            r'^\s*(?:analysis|reasoning|thinking|thought process)\s*:\s*[^\n]*(?:\n+|$)',
+            r'^\s*(?:here(?:\'s| is) (?:the )?(?:enhanced|improved|rewritten) (?:story|prompt|idea)[^:]*:)\s*',
+        )
+        changed = True
+        while changed and raw:
+            changed = False
+            for pattern in preamble_patterns:
+                cleaned = re.sub(pattern, '', raw, count=1, flags=re.I)
+                if cleaned != raw:
+                    raw = cleaned.strip()
+                    changed = True
+                    break
+        return raw.strip()
+
+    def _planner_agent_story_skill_succeeded(self, payload: object) -> None:
+        current = getattr(self, '_pending_planner_agent_request', None)
+        if not isinstance(current, dict):
+            return
+        enhanced = ''
+        if isinstance(payload, dict):
+            enhanced = str(payload.get('content') or '').strip()
+        else:
+            enhanced = str(payload or '').strip()
+        enhanced = self._planner_agent_clean_story_skill_output(enhanced)
+        current['story_enhancing'] = False
+        if not enhanced or enhanced == '[Model returned an empty response]':
+            self._planner_agent_story_skill_failed('The LLM returned an empty enhancement.')
+            return
+        current['idea'] = enhanced
+        current['story_enhanced_reviewed'] = False
+        self._pending_planner_agent_request = current
+        self._append_framevision_assistant_reply(
+            'Enhanced story idea:\n\n' + enhanced +
+            '\n\nReview it before I continue. Reply "use it" to accept it, or send your edited version and I will use that instead.'
+        )
+        self._set_status('Enhanced story ready for review', 'ready')
+
+    def _planner_agent_story_skill_failed(self, error: str) -> None:
+        current = getattr(self, '_pending_planner_agent_request', None)
+        if not isinstance(current, dict):
+            return
+        original = str(current.get('story_original_idea') or current.get('idea') or '').strip()
+        if original:
+            current['idea'] = original
+        current['story_enhancing'] = False
+        current['story_prompt_decision'] = 'use'
+        current['story_enhanced_reviewed'] = True
+        self._pending_planner_agent_request = current
+        self._append_framevision_assistant_reply(
+            'Story enhancement failed, so I kept your original idea. ' + str(error or '')
+        )
+        self._set_status('Story enhancement failed', 'error')
+        q = self._planner_agent_next_question(current)
+        if q:
+            self._append_framevision_assistant_reply(q)
+        else:
+            self._planner_agent_launch_pending()
+
+    def _planner_agent_story_skill_finished(self) -> None:
+        self._planner_skill_thread = None
+
+    def _planner_agent_handle_pending(self, text: str, attachments: Optional[List[Dict[str, Any]]] = None) -> bool:
+        state = getattr(self, '_pending_planner_agent_request', None)
+        if not isinstance(state, dict):
+            return False
+        low = str(text or '').strip().lower()
+        if low in {'cancel', 'cancel planner', 'stop', 'never mind', 'nevermind'}:
+            self._pending_planner_agent_request = None
+            self._append_framevision_assistant_reply('Planner setup cancelled.')
+            return True
+        if not str(state.get('idea') or '').strip():
+            state['idea'] = str(text or '').strip()
+            # If the same answer explicitly includes a visual style, keep it too.
+            style = self._planner_agent_visual_style(text)
+            if style:
+                state['visual_style'] = style
+        elif not str(state.get('visual_style') or '').strip():
+            style = self._planner_agent_visual_style(text) or str(text or '').strip()
+            if not style:
+                self._append_framevision_assistant_reply('Please give me a visual genre/style, for example realistic, Pixar, manga or anime.')
+                return True
+            state['visual_style'] = style
+        elif 'story_prompt_decision' not in state:
+            if re.search(r'\b(enhance|expand|improve|rewrite)\b', low):
+                self._planner_agent_begin_story_enhancement(state)
+                return True
+            if re.search(r'\b(use it|use this|keep it|as is|final|yes|okay|ok)\b', low):
+                state['story_prompt_decision'] = 'use'
+                state['story_enhanced_reviewed'] = True
+            else:
+                self._append_framevision_assistant_reply('Please answer "use it" if this is the final prompt, or "enhance it" if you want me to improve the story idea first.')
+                return True
+        elif state.get('story_prompt_decision') == 'enhance' and not bool(state.get('story_enhanced_reviewed')):
+            if bool(state.get('story_enhancing')):
+                self._append_framevision_assistant_reply('The story enhancer is still working. I will show you the result as soon as it is ready.')
+                return True
+            if re.search(r'^\s*(use it|use this|accept|looks good|good|yes|ok|okay)\b', low):
+                state['story_enhanced_reviewed'] = True
+            else:
+                edited = str(text or '').strip()
+                if not edited:
+                    self._append_framevision_assistant_reply('Reply "use it" to accept the enhanced prompt, or send your edited story prompt.')
+                    return True
+                state['idea'] = edited
+                state['story_enhanced_reviewed'] = True
+        elif int(state.get('duration_sec') or 0) <= 0:
+            d = self._planner_agent_duration(text)
+            if d:
+                state['duration_sec'] = d
+            else:
+                self._append_framevision_assistant_reply('I could not read that duration. Try for example: 90 seconds, 2 minutes, or 2:30.')
+                return True
+        elif 'music_mode' not in state:
+            if re.search(r'\b(no|none|without)\b', low):
+                state['music_mode'] = 'none'
+            elif 'ace' in low or re.search(r'\b(create|generate|yes)\b', low):
+                state['music_mode'] = 'ace15'
+                if 'lyrics' in low and 'no lyrics' not in low and 'instrumental' not in low:
+                    state['create_lyrics'] = True
+            else:
+                self._append_framevision_assistant_reply('Please answer either "no music" or "create with Ace Step 1.5".')
+                return True
+        elif str(state.get('music_mode') or '') == 'ace15' and not str(state.get('ace15_preset') or '').strip():
+            state['ace15_preset'] = str(text or '').strip()
+        elif str(state.get('music_mode') or '') == 'ace15' and 'create_lyrics' not in state:
+            state['create_lyrics'] = bool(re.search(r'\b(yes|yeah|yep|create|lyrics)\b', low) and not re.search(r'\b(no|instrumental)\b', low))
+        elif 'planner_defaults_decision' not in state:
+            # Resolve the review question.  A plain yes uses the full default
+            # path.  A no may include overrides in the same sentence; parse
+            # those immediately and keep every unspecified setting at default.
+            if re.match(r'^\s*(yes|yeah|yep|sure|ok|okay)\b', low):
+                state['planner_defaults_decision'] = 'default'
+                self._planner_agent_apply_defaults(state)
+            elif re.match(r'^\s*(no|nope)\b', low):
+                state['planner_defaults_decision'] = 'custom'
+                self._planner_agent_apply_defaults(state)
+                remainder = re.sub(r'^\s*(?:no|nope)\b[\s,;:.-]*', '', str(text or ''), flags=re.I).strip()
+                if remainder:
+                    self._planner_agent_merge_reply(state, remainder, attachments)
+                    state['planner_custom_settings_received'] = True
+            else:
+                # Be forgiving: if the user answers the defaults question
+                # directly with settings ("use MiniMax"), treat that as a no +
+                # overrides rather than forcing them to type the word no.
+                parsed = self._planner_agent_extract_spec(text, attachments)
+                meaningful = any(k in parsed for k in ('video_model', 'quality', 'aspect', 'image_model', 'use_last_frame_as_start'))
+                if meaningful:
+                    state['planner_defaults_decision'] = 'custom'
+                    self._planner_agent_apply_defaults(state)
+                    self._planner_agent_merge_reply(state, text, attachments)
+                    state['planner_custom_settings_received'] = True
+                else:
+                    self._append_framevision_assistant_reply('Please answer yes to use the defaults, or no and tell me what you want to change.')
+                    return True
+        elif state.get('planner_defaults_decision') == 'custom' and not state.get('planner_custom_settings_received'):
+            self._planner_agent_apply_defaults(state)
+            self._planner_agent_merge_reply(state, text, attachments)
+            state['planner_custom_settings_received'] = True
+        elif str(state.get('video_model') or '').lower() == 'minimax_h3' and 'use_minimax_refs' not in state:
+            state['use_minimax_refs'] = bool(re.search(r'\b(yes|yeah|yep|use|reference)\b', low) and not re.search(r'\b(no|none|without)\b', low))
+            self._planner_agent_merge_reply(state, text, attachments)
+        elif bool(state.get('use_minimax_refs')) and not list(state.get('minimax_reference_images') or []):
+            self._planner_agent_merge_reply(state, text, attachments)
+            if not list(state.get('minimax_reference_images') or []):
+                self._append_framevision_assistant_reply('I still need at least one uploaded image for the MiniMax references.')
+                return True
+        else:
+            self._planner_agent_merge_reply(state, text, attachments)
+        self._pending_planner_agent_request = state
+        q = self._planner_agent_next_question(state)
+        if q:
+            self._append_framevision_assistant_reply(q)
+        else:
+            self._planner_agent_launch_pending()
+        return True
+
+    def _planner_agent_launch_pending(self) -> None:
+        state = dict(getattr(self, '_pending_planner_agent_request', None) or {})
+        if not state:
+            return
+        self._pending_planner_agent_request = None
+        try:
+            try:
+                from helpers.fv_assistant_router import launch_planner_job  # type: ignore
+            except Exception:
+                from fv_assistant_router import launch_planner_job  # type: ignore
+            ok, msg = launch_planner_job(state)
+        except Exception as e:
+            ok, msg = False, f'Could not start Planner: {e}'
+        self._append_framevision_assistant_reply(msg)
+        self._set_status('Planner queued' if ok else 'Planner start failed', 'ready' if ok else 'error')
+        if ok:
+            try:
+                self._unload_llm_for_queue_job()
+            except Exception:
+                pass
+
     def _send_message(self):
         try:
             self._show_chat_view()
@@ -9142,28 +10069,53 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self._ask_memory_source_choice(s.id, text)
             return
 
-        if getattr(self, "_pending_ace15_music_request", None) is not None and text:
+        if self._agent_triggers_enabled() and getattr(self, "_pending_model_manager_request", None) is not None and text:
+            if self._agent_model_manager_handle_pending(text):
+                return
+
+        if self._agent_triggers_enabled() and text and self._agent_model_manager_intent(text):
+            if self._agent_model_manager_start(text):
+                return
+
+        if self._agent_triggers_enabled() and text and self._agent_maybe_offer_missing_model_for_generation(text):
+            return
+
+        if self._agent_triggers_enabled() and getattr(self, "_pending_planner_agent_request", None) is not None and (text or attachments):
+            s = self._append_user_message_to_current_session(text, attachments)
+            if not s:
+                return
+            if self._planner_agent_handle_pending(text, attachments):
+                return
+
+        if self._agent_triggers_enabled() and self._planner_agent_is_start_command(text):
+            s = self._append_user_message_to_current_session(text, attachments)
+            if not s:
+                return
+            self._planner_agent_start_flow(text, attachments)
+            return
+
+        if self._agent_triggers_enabled() and getattr(self, "_pending_ace15_music_request", None) is not None and text:
             s = self._append_user_message_to_current_session(text, attachments)
             if not s:
                 return
             if self._handle_pending_ace15_music_message(text):
                 return
 
-        if self._is_ace15_music_start_command(text) and self._ace15_music_intent(text):
+        if self._agent_triggers_enabled() and self._is_ace15_music_start_command(text) and self._ace15_music_intent(text):
             s = self._append_user_message_to_current_session(text, attachments)
             if not s:
                 return
             self._start_ace15_music_flow(requested_text=text)
             return
 
-        if getattr(self, "_pending_seedvr2_request", None) is not None and text:
+        if self._agent_triggers_enabled() and getattr(self, "_pending_seedvr2_request", None) is not None and text:
             s = self._append_user_message_to_current_session(text, attachments)
             if not s:
                 return
             if self._handle_pending_seedvr2_message(text):
                 return
 
-        if self._looks_like_seedvr2_upscale_request(text, attachments):
+        if self._agent_triggers_enabled() and self._looks_like_seedvr2_upscale_request(text, attachments):
             s = self._append_user_message_to_current_session(text, attachments)
             if not s:
                 return
@@ -9177,7 +10129,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         # Image-create commands are handled before requiring a loaded local LLM,
         # so users can queue FrameVision image jobs instead of getting a text-only
         # "I cannot create images" response. Normal chat still goes to the LLM.
-        if (text or attachments) and getattr(self, "_fv_assistant_router", None) is not None and self._is_framevision_wizard_start_command(text):
+        if self._agent_triggers_enabled() and (text or attachments) and getattr(self, "_fv_assistant_router", None) is not None and self._is_framevision_wizard_start_command(text):
             try:
                 self._ensure_assistant_output_dirs()
                 self._sync_assistant_router_output_dirs(self._assistant_router_intent_hint(text))

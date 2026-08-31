@@ -2796,12 +2796,23 @@ class MainWindow(QMainWindow):
             "Sampling stage complete", "Ref2VA sampling stage complete", "Sampling process",
             "Starting VAE", "Decoding video", "Video decode stage complete",
             "Decoding audio", "Audio decode stage complete", "Muxing ",
-            "Saved ", "Glue results", "video-only fallback", "LoRA ", "VRAM Manager", "[VRAM-MGR]", "ERROR", "FAILED", "WARNING",
+            "Saved ", "Glue results", "video-only fallback", "LoRA ", "ERROR", "FAILED", "WARNING",
             "Traceback", "Exception", "VALIDATION",
+        )
+        # Extended logging OFF should be a clean user-facing generation log.
+        # These prefixes are diagnostics only and must never leak into normal mode,
+        # even when a diagnostic line also contains a whitelisted word such as
+        # "Loading" or "Sampling".
+        diagnostic_prefixes = (
+            "[VRAM-MGR]", "[VRAM-AUTO]", "VRAM Manager ",
+            "[MEM]", "[WDDM", "[PEAK]", "[TRACE]",
+            "[SPECTRUM]", "[MODEL]",
         )
         for raw in text.replace("\r", "\n").splitlines():
             line = raw.strip()
             if not line:
+                continue
+            if line.startswith(diagnostic_prefixes):
                 continue
             low = line.lower()
             # tqdm/Comfy sampler progress, e.g. 40%|...| 6/15 [..]
