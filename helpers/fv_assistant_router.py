@@ -3501,3 +3501,149 @@ def launch_optional_install(install_key: str, parent: Any = None) -> Tuple[bool,
     except Exception as exc:
         return False, f'Could not start Optional Installs: {exc}'
 
+
+
+# -----------------------------------------------------------------------------
+# Agent Music Clip Creator bridge
+# -----------------------------------------------------------------------------
+_MUSIC_CLIP_WINDOWS: List[Any] = []
+
+
+def _set_combo_data_family(combo: Any, family: str) -> bool:
+    family = str(family or '').lower()
+    preferred = []
+    if family == 'ltx25':
+        preferred = ['ltx25_fp16', 'ltx25_convrot']
+    elif family == 'ltx23':
+        preferred = ['vramlab', 'int4']
+    # Preserve the user's current backend when it already belongs to that family.
+    try:
+        cur = str(combo.currentData() or '').lower()
+        if cur in preferred:
+            return True
+    except Exception:
+        pass
+    for wanted in preferred:
+        try:
+            for i in range(int(combo.count())):
+                if str(combo.itemData(i) or '').lower() == wanted:
+                    combo.setCurrentIndex(i)
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _fill_qt_path_list(widget: Any, paths: List[str], limit: int = 0) -> int:
+    try:
+        from PySide6.QtWidgets import QListWidgetItem
+        from PySide6.QtCore import Qt
+    except Exception:
+        return 0
+    if widget is None:
+        return 0
+    try:
+        widget.clear()
+    except Exception:
+        pass
+    count = 0
+    for raw in list(paths or []):
+        if limit and count >= limit:
+            break
+        p = os.path.abspath(str(raw or '').strip())
+        if not p or not os.path.isfile(p):
+            continue
+        item = QListWidgetItem(os.path.basename(p))
+        item.setToolTip(p)
+        item.setData(Qt.UserRole, p)
+        widget.addItem(item)
+        count += 1
+    return count
+
+
+def launch_music_clip_job(spec: Dict[str, Any]) -> Tuple[bool, str]:
+    """Configure and start the existing Music Clip Creator GUI workflow.
+
+    The actual LTX 2.3/LTX 2.5/MiniMax implementation remains owned by
+    auto_music_sync.py and minimax_music_clip.py. This bridge only fills their
+    existing controls and calls their normal one-click entry points.
+    """
+    engine = str(spec.get('clip_engine') or '').strip().lower()
+    audio = os.path.abspath(str(spec.get('audio_path') or '').strip()) if spec.get('audio_path') else ''
+    idea = str(spec.get('idea') or '').strip()
+    if engine not in {'ltx23', 'ltx25', 'minimax'}:
+        return False, 'Choose LTX 2.3, LTX 2.5, or MiniMax H3 for the Music Clip Creator.'
+    if not audio or not os.path.isfile(audio):
+        return False, 'The Music Clip Creator needs a valid music/audio file.'
+    if not idea:
+        return False, 'The Music Clip Creator needs a main idea / visual concept.'
+    try:
+        if engine == 'minimax':
+            try:
+                from helpers import minimax_music_clip as mm  # type: ignore
+            except Exception:
+                import minimax_music_clip as mm  # type: ignore
+            win = mm.MiniMaxMusicClipWidget()
+            _MUSIC_CLIP_WINDOWS.append(win)
+            win.edit_audio.setText(audio)
+            if hasattr(win, 'edit_title') and not str(win.edit_title.text() or '').strip():
+                win.edit_title.setText(Path(audio).stem)
+            # MiniMax's project-wide concept lives in characters_subjects; keep the
+            # existing prompt builder in charge of turning it into shot prompts.
+            try:
+                if hasattr(win, 'edit_idea'):
+                    win.edit_idea.setPlainText(idea) if hasattr(win.edit_idea, 'setPlainText') else win.edit_idea.setText(idea)
+            except Exception:
+                pass
+            refs = [str(x) for x in (spec.get('minimax_references') or []) if str(x).strip()][:9]
+            if refs:
+                try:
+                    win.project.references = [mm.ReferenceAsset(name=Path(x).stem, kind='Character', path=os.path.abspath(x), description='', enabled=True) for x in refs if os.path.isfile(x)]
+                    win._populate_refs()
+                except Exception as exc:
+                    return False, f'Could not load MiniMax reference images: {exc}'
+            win.hide()
+            win.create_video_clip()
+            return True, f'Started the MiniMax Music Clip Creator for `{Path(audio).name}`' + (f' with {len(refs)} reference image(s).' if refs else '.')
+
+        try:
+            from helpers import auto_music_sync as ams  # type: ignore
+        except Exception:
+            import auto_music_sync as ams  # type: ignore
+        win = ams.AutoMusicSyncWidget()
+        _MUSIC_CLIP_WINDOWS.append(win)
+        win.edit_audio.setText(audio)
+        if getattr(win, 'edit_ltx_audio', None) is not None:
+            win.edit_ltx_audio.setText(audio)
+        if getattr(win, 'edit_bridge_main_idea', None) is not None:
+            win.edit_bridge_main_idea.setText(idea)
+        if getattr(win, 'check_ltx_use_framevision_queue', None) is not None:
+            win.check_ltx_use_framevision_queue.setChecked(True)
+        combo = getattr(win, 'combo_ltx_generation_backend', None)
+        if combo is None or not _set_combo_data_family(combo, engine):
+            return False, f'No installed {"LTX 2.5" if engine == "ltx25" else "LTX 2.3"} Music Clip backend was found in the existing GUI.'
+
+        use_msr = bool(spec.get('use_msr', False))
+        if getattr(win, 'check_ltx_use_msr', None) is not None:
+            win.check_ltx_use_msr.setChecked(use_msr)
+        if use_msr:
+            bgs = [str(x) for x in (spec.get('msr_backgrounds') or []) if str(x).strip()]
+            refs = [str(x) for x in (spec.get('msr_references') or []) if str(x).strip()][:4]
+            if not any(os.path.isfile(x) for x in bgs):
+                return False, 'MSR needs at least one readable background image.'
+            if not any(os.path.isfile(x) for x in refs):
+                return False, 'MSR needs at least one readable subject/object reference image.'
+            _fill_qt_path_list(getattr(win, 'list_ltx_msr_backgrounds', None), bgs)
+            _fill_qt_path_list(getattr(win, 'list_ltx_msr_references', None), refs, 4)
+            try:
+                if getattr(win, 'check_ltx_msr_automate_backgrounds', None) is not None:
+                    win.check_ltx_msr_automate_backgrounds.setChecked(False)
+                win._update_ltx_msr_ui()
+            except Exception:
+                pass
+        win.hide()
+        win._on_queue_ltx_videoclip_clicked()
+        label = 'LTX 2.5' if engine == 'ltx25' else 'LTX 2.3'
+        return True, f'Started the {label} Music Clip Creator for `{Path(audio).name}`' + (' using Licon MSR.' if use_msr else ' using the normal workflow.')
+    except Exception as exc:
+        return False, f'Could not start Music Clip Creator: {exc}'

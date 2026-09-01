@@ -3446,55 +3446,60 @@ class SettingsDialog(QtWidgets.QDialog):
                 ul { margin-top: 4px; }
             </style>
 
-            <h3>Chat Memory</h3>
-            <p>User can save to memory or save to projects (both with right mouse click or directly typing in the chat (save to memory, save to project </p>
-            <p>User can put files in assets/memories/user_files for specific memory tasks.</p>
-            <p>Chat also has access to the framevision knowledge base to be able to answer questions about the app.</p>
-            
-            <h3>Chat Wizards</h3>
-            <p>Start a new line in a chat with one of these triggers.</p>
-            <p>You can also use 'shortcuts' example : Create an image with z-image, 1280 x 720, wizard will ask for the remaining details.</p>
-            <ul>
+            <h3>Chat and Agent mode</h3>
+            <p><b>Chat</b> is normal conversation mode. FrameVision workflow triggers are disabled so you can freely discuss images, video, music, prompts, settings and the app itself without accidentally starting a job.</p>
+            <p><b>Agent</b> enables the FrameVision wizards and workflow skills. Use normal language such as <i>create a video</i>, <i>use the planner</i>, or <i>create a music video with MiniMax</i>.</p>
+
+            <h3>Memory and FrameVision knowledge</h3>
+            <p>You can save useful information to memory or projects from the chat, and files placed in <b>assets/memories/user_files</b> can be used for memory tasks.</p>
+            <p>The chat also has access to the FrameVision knowledge base, so it can answer questions about the app without starting a workflow.</p>
+            <p>Pinned chats are reusable specialist prompts. Agent workflows can also use selected pinned chats as skills, for example the advanced FrameVision prompt writer.</p>
+
+            <h3>Agent wizards and skills</h3>
+            <p>You can include known details directly in your first request. The wizard only asks for what is still missing.</p>
 
             <h3>Create image</h3>
-            <p>The chat checks for available image models and lets you select a model to create an image.
-            Supported models include Z-Image GGUF, Lens, Chroma, Krea 2, Flux Klein and HiDream. Supported aspect presets include 1:1, 9:16 and 16:9, up to 2048 x 2048.</p>
+            <p>Checks the available image models and lets you select one to create an image. Supported models include Z-Image GGUF, Lens, Chroma, Krea 2, Flux Klein and HiDream. Common aspect presets include 1:1, 9:16 and 16:9, with larger custom resolutions also supported where the selected model allows them.</p>
 
             <h3>Edit image</h3>
-            <p>Currently supports Flux Klein for smaller edits and HiDream for bigger edits or reference-image based edits.</p>
+            <p>Uses the available FrameVision image-edit workflows, including Flux Klein for lighter edits and HiDream for larger or reference-image based edits.</p>
 
-            <h3>Upscale image/ upscale video</h3>
-            <p>Uses SeedVR2. Available output for images : 1920, 1440 and 2160p. For video it is 720, 1920 and 1440p (will be very slow)</p>
+            <h3>Upscale image / upscale video</h3>
+            <p>Starts the FrameVision upscaling wizard and collects the source file and desired output settings before queueing the job.</p>
 
             <h3>Create video</h3>
-            <p>This triggers the wizard for text-to-video, image-to-video, or video-to-video.
-            You can select resolution, frames, FPS, prompt and other needed details, including a finetuned safetensors file.
-            For image/video-to-video requests, matching aspect ratio and/or FPS (frames per second) is recommended to avoid bad or failed results.</p>
+            <p>The video wizard now supports <b>LTX 2.3</b>, <b>LTX 2.5</b> and <b>MiniMax H3</b>. You can specify the model in the first message, for example <i>create a video with MiniMax</i>.</p>
+            <p>LTX workflows can collect the normal video settings and input media. MiniMax supports text/image/reference/continue-video paths and can accept reference images where applicable. Existing model-specific FrameVision settings are reused instead of inventing a second configuration.</p>
 
             <h3>Create music</h3>
-            <p>Uses Ace Step Music 1.5. The chat checks the genre preset list for available genres and subgenres when present.
-            It can also ask for a custom genre description when no preset is found, then collect duration, title, lyrics or instrumental choice, and other needed details.</p>
+            <p>Uses ACE-Step Music 1.5. The wizard checks the FrameVision genre/subgenre presets first and uses the matching preset instead of inventing its own genre prompt. It can collect duration, title, lyrics or instrumental choice and other required details. Custom style prompting is only used when no suitable preset is selected.</p>
 
-            <p>cancel</b>: Stops the current wizard and returns to normal chat.</p>
-            <p>undo</b>: Goes back one step in the current wizard</p>
+            <h3>Planner</h3>
+            <p>Use natural requests such as <i>use the planner</i> or <i>create a video with the planner</i>. The Agent can collect the idea, visual style, duration, music choice and optional model/settings, then start the existing Planner workflow.</p>
+            <p>It can optionally enhance the story idea first using the configured pinned-chat skill, show the enhanced version for editing/approval, and then continue. Agent-started Planner jobs disable <b>Pause for review</b> so unattended jobs do not stop halfway.</p>
 
+            <h3>Music Clip Creator</h3>
+            <p>Supports the existing <b>LTX 2.3</b>, <b>LTX 2.5</b> and <b>MiniMax H3</b> music-clip creators.</p>
+            <p>For LTX 2.3/2.5 you can choose the normal workflow or <b>Licon MSR</b>. MSR requires at least one background image and at least one reference image. MiniMax can optionally use one or more reference images.</p>
 
-            </ul>
+            <h3>Model management</h3>
+            <p>In Agent mode the chat can check whether a FrameVision model is installed, hidden, or available through Optional Downloads. If a requested model is missing it can offer the matching installer instead of simply failing.</p>
+            <p>It can also inspect removable models, report their approximate disk usage, and offer to <b>hide</b> them from FrameVision or <b>delete</b> them completely. Installation and destructive removal require your confirmation.</p>
 
-            <h3>Wizard behavior and other info</h3>
+            <h3>Wizard controls</h3>
+            <p><b>cancel</b>: stop the current unfinished wizard and return to normal Agent conversation.</p>
+            <p><b>undo</b>: go back one step in the current wizard where supported.</p>
+            <p><b>New Chat</b>: starts clean and clears unfinished Agent/wizard state. Already queued or running FrameVision jobs are not cancelled.</p>
+
+            <h3>Behavior and useful notes</h3>
             <ul>
-                <li>Models need to be installed before the chat can use them.(find them in the 'optional downloads' menu</li>
-                <li>Usage is easy : use the trigger words above to start a wizard for a job</li>
-                <li>keep answers short and to the point to avoid llm getting confused</li>
-                <li>The Framevision extra chat options work with any loaded GGUF LLM model.</li>
-                <li>When the queue is busy creating a heavy FrameVision job, the LLM is unloaded from VRAM into cache.</li>
-                <li>A settings toggle lets generated results open in the original FrameVision player or stay only in the chat. Images can show in both.</li>
-                <li>Drag the splitter completely to the left to hide the internal mediaplayer and get a full sized llm chat program.</li>
-                <li>You can keep typing while a job is running, but sending is blocked until the job is finished to avoid overloading VRAM.</li>
-                <li>Right click on a response from the chat to use 'retry' for a new answer</li>
-                <li>Edit sent message and save them to have the chat try again with the updated request</li>
-                <li>Pinned chats allow you to save special prompts that can be re-used later (for example a prompt enhance script</li>
-                
+                <li>You can provide several settings in one sentence; only missing details should be requested.</li>
+                <li>The extra FrameVision chat/Agent features work with the loaded GGUF LLM model.</li>
+                <li>Heavy generation jobs and the LLM share VRAM safely: FrameVision can unload the LLM from VRAM when the queue needs the GPU.</li>
+                <li>Generated results can open in the normal FrameVision player or remain in chat depending on your settings.</li>
+                <li>Drag the splitter completely left to hide the internal media player and give the LLM chat more space.</li>
+                <li>Right-click an assistant response to retry it, and edit a sent message to rerun the request with changes.</li>
+                <li>For unattended jobs, review the Agent's choices before starting when the workflow contains important model, install, delete or reference-image decisions.</li>
             </ul>
             """
         )
@@ -3698,6 +3703,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._pending_seedvr2_request: Optional[Dict[str, Any]] = None
         self._pending_ace15_music_request: Optional[Dict[str, Any]] = None
         self._pending_planner_agent_request: Optional[Dict[str, Any]] = None
+        self._pending_music_clip_agent_request: Optional[Dict[str, Any]] = None
         self._pending_model_manager_request: Optional[Dict[str, Any]] = None
         self._planner_skill_thread: Optional[ChatCompletionThread] = None
         self._planner_skill_waiting_for_server: bool = False
@@ -6220,6 +6226,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         Running/queued FrameVision jobs are not touched here.
         """
         self._pending_planner_agent_request = None
+        self._pending_music_clip_agent_request = None
         self._pending_model_manager_request = None
         self._set_pending_ace15_music_state(None)
         self._set_pending_seedvr2_state(None)
@@ -9480,6 +9487,165 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             return False
         return self._agent_model_manager_start(text, requested_by_generation=True)
 
+    # ------------------------- Agent Music Clip Creator -------------------------
+    def _music_clip_agent_is_start_command(self, text: str) -> bool:
+        first = str(text or '').strip().splitlines()[0].strip().lower() if str(text or '').strip() else ''
+        if not first:
+            return False
+        # Natural language, but still explicit enough not to hijack normal discussion.
+        return bool(
+            re.match(r'^(?:use|start|open|run)\s+(?:the\s+)?(?:framevision\s+)?music\s+clip\s+creator\b', first)
+            or re.match(r'^(?:create|make|generate|build)\s+(?:me\s+)?(?:a\s+)?music\s+(?:video|videoclip|clip)\b.*\b(?:with|using)\s+(?:the\s+)?(?:framevision\s+)?music\s+clip\s+creator\b', first)
+            or re.match(r'^(?:create|make|generate|build)\s+(?:me\s+)?(?:a\s+)?music\s+(?:video|videoclip|clip)\s+(?:with|using)\s+(?:ltx\s*2\.[35]|minimax)', first)
+        )
+
+    def _music_clip_agent_extract_spec(self, text: str, attachments: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        raw = str(text or '').strip()
+        low = raw.lower()
+        spec: Dict[str, Any] = {'raw_request': raw}
+        if 'minimax' in low:
+            spec['clip_engine'] = 'minimax'
+        elif 'ltx 2.5' in low or 'ltx2.5' in low or 'ltx25' in low:
+            spec['clip_engine'] = 'ltx25'
+        elif 'ltx 2.3' in low or 'ltx2.3' in low or 'ltx23' in low:
+            spec['clip_engine'] = 'ltx23'
+        # MSR is an LTX-only choice. Explicit negative wording wins.
+        if re.search(r'\b(?:no|without|disable|don.t use)\s+msr\b', low):
+            spec['use_msr'] = False
+        elif re.search(r'\b(?:use\s+)?msr\b|\blicon\s+msr\b', low):
+            spec['use_msr'] = True
+        mi = re.search(r'\b(?:idea|concept|story)\s*:\s*(.+)', raw, re.I | re.S)
+        if mi:
+            spec['idea'] = mi.group(1).strip()
+        audio_paths, image_paths = [], []
+        for att in list(attachments or []):
+            try:
+                kind = str(att.get('kind') or '').lower()
+                path = str(att.get('path') or '').strip()
+                if not path or not os.path.isfile(path):
+                    continue
+                if kind == 'audio':
+                    audio_paths.append(path)
+                elif kind == 'image':
+                    image_paths.append(path)
+            except Exception:
+                pass
+        if audio_paths:
+            spec['audio_path'] = audio_paths[0]
+        if image_paths:
+            spec['attached_images'] = image_paths
+        return spec
+
+    def _music_clip_agent_merge_reply(self, state: Dict[str, Any], text: str, attachments: Optional[List[Dict[str, Any]]] = None) -> None:
+        parsed = self._music_clip_agent_extract_spec(text, attachments)
+        for k, v in parsed.items():
+            if k != 'raw_request' and v not in (None, '', []):
+                state[k] = v
+
+    def _music_clip_agent_next_question(self, state: Dict[str, Any]) -> str:
+        if not state.get('clip_engine'):
+            return 'Which Music Clip Creator should I use: **LTX 2.3, LTX 2.5, or MiniMax H3**?'
+        if not state.get('audio_path'):
+            return 'Please attach the **music/audio track** that the videoclip should be built around.'
+        if not state.get('idea'):
+            return 'What is the main **idea / visual concept** for the music video?'
+        engine = str(state.get('clip_engine') or '')
+        if engine in {'ltx23', 'ltx25'} and 'use_msr' not in state:
+            return 'Do you want to use the **Licon MSR reference workflow** for this LTX music video? (yes/no)'
+        if engine in {'ltx23', 'ltx25'} and bool(state.get('use_msr')):
+            if not state.get('msr_backgrounds'):
+                return 'MSR needs at least **1 background image**. Attach one or more background images, then send `backgrounds`.'
+            if not state.get('msr_references'):
+                return 'MSR also needs at least **1 reference image** for the subject/object. Attach one or more reference images, then send `references`.'
+        if engine == 'minimax' and 'minimax_refs_decision' not in state:
+            return 'Do you want to use **reference image(s)** with MiniMax? (yes/no)'
+        if engine == 'minimax' and state.get('minimax_refs_decision') == 'yes' and not state.get('minimax_references'):
+            return 'Attach the MiniMax reference image(s) now (up to 9), then send `use these`.'
+        return ''
+
+    def _music_clip_agent_start_flow(self, text: str, attachments: Optional[List[Dict[str, Any]]] = None) -> None:
+        state = self._music_clip_agent_extract_spec(text, attachments)
+        raw = str(text or '').strip()
+        # Pull a natural trailing idea from common command forms when possible.
+        cleaned = raw
+        patterns = [
+            r'^(?:use|start|open|run)\s+(?:the\s+)?(?:framevision\s+)?music\s+clip\s+creator\b\s*(?:to\s+)?(?:create|make|generate|build)?\s*(?:a\s+)?(?:music\s+)?(?:video|videoclip|clip)?\s*[:,-]?\s*',
+            r'^(?:create|make|generate|build)\s+(?:me\s+)?(?:a\s+)?music\s+(?:video|videoclip|clip)\b.*?\b(?:with|using)\s+(?:the\s+)?(?:framevision\s+)?music\s+clip\s+creator\b\s*[:,-]?\s*',
+        ]
+        for pat in patterns:
+            new = re.sub(pat, '', cleaned, flags=re.I)
+            if new != cleaned:
+                cleaned = new.strip()
+                break
+        if cleaned and cleaned != raw and not state.get('idea') and len(cleaned.split()) >= 3:
+            # Remove obvious routing tokens; whatever remains is a useful first-pass idea.
+            cleaned = re.sub(r'\b(?:with|using)?\s*(?:ltx\s*2\.[35]|ltx2\.[35]|ltx2[35]|minimax(?:\s+h3)?|msr|licon)\b', ' ', cleaned, flags=re.I)
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip(' ,:-')
+            if cleaned:
+                state['idea'] = cleaned
+        self._pending_music_clip_agent_request = state
+        q = self._music_clip_agent_next_question(state)
+        if q:
+            self._append_framevision_assistant_reply(q)
+            return
+        self._music_clip_agent_launch_pending()
+
+    def _music_clip_agent_handle_pending(self, text: str, attachments: Optional[List[Dict[str, Any]]] = None) -> bool:
+        state = getattr(self, '_pending_music_clip_agent_request', None)
+        if state is None:
+            return False
+        low = str(text or '').strip().lower()
+        if low in {'cancel', 'cancel music clip', 'stop', 'never mind', 'nevermind'}:
+            self._pending_music_clip_agent_request = None
+            self._append_framevision_assistant_reply('Cancelled the Music Clip Creator setup.')
+            return True
+        self._music_clip_agent_merge_reply(state, text, attachments)
+        engine = str(state.get('clip_engine') or '')
+        # If the user answered the MSR question, capture it even when the reply is just yes/no.
+        if engine in {'ltx23', 'ltx25'} and 'use_msr' not in state:
+            if low in {'yes', 'y', 'yeah', 'yep', 'use msr', 'msr'}:
+                state['use_msr'] = True
+            elif low in {'no', 'n', 'nope', 'without msr', 'normal', 'normal workflow'}:
+                state['use_msr'] = False
+        # Image attachments are context-sensitive during the MSR/ref questions.
+        imgs = [str(a.get('path') or '') for a in list(attachments or []) if str(a.get('kind') or '').lower() == 'image' and os.path.isfile(str(a.get('path') or ''))]
+        if engine in {'ltx23', 'ltx25'} and bool(state.get('use_msr')) and imgs:
+            if not state.get('msr_backgrounds') and ('background' in low or not state.get('msr_backgrounds')):
+                state['msr_backgrounds'] = imgs
+            elif not state.get('msr_references'):
+                state['msr_references'] = imgs[:4]
+        if engine == 'minimax':
+            if 'minimax_refs_decision' not in state:
+                if low in {'yes', 'y', 'yeah', 'yep'}:
+                    state['minimax_refs_decision'] = 'yes'
+                    if state.get('attached_images') and not state.get('minimax_references'):
+                        state['minimax_references'] = list(state.get('attached_images') or [])[:9]
+                elif low in {'no', 'n', 'nope'}:
+                    state['minimax_refs_decision'] = 'no'
+            if imgs and state.get('minimax_refs_decision') == 'yes':
+                state['minimax_references'] = imgs[:9]
+        self._pending_music_clip_agent_request = state
+        q = self._music_clip_agent_next_question(state)
+        if q:
+            self._append_framevision_assistant_reply(q)
+        else:
+            self._music_clip_agent_launch_pending()
+        return True
+
+    def _music_clip_agent_launch_pending(self) -> None:
+        state = dict(getattr(self, '_pending_music_clip_agent_request', None) or {})
+        self._pending_music_clip_agent_request = None
+        try:
+            try:
+                from helpers.fv_assistant_router import launch_music_clip_job  # type: ignore
+            except Exception:
+                from fv_assistant_router import launch_music_clip_job  # type: ignore
+            ok, msg = launch_music_clip_job(state)
+        except Exception as exc:
+            ok, msg = False, f'Could not start Music Clip Creator: {exc}'
+        self._append_framevision_assistant_reply(msg)
+        self._set_status('Music Clip Creator started' if ok else 'Music Clip Creator failed', 'success' if ok else 'error')
+
     def _planner_agent_is_start_command(self, text: str) -> bool:
         if not self._agent_triggers_enabled():
             return False
@@ -10078,6 +10244,20 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                 return
 
         if self._agent_triggers_enabled() and text and self._agent_maybe_offer_missing_model_for_generation(text):
+            return
+
+        if self._agent_triggers_enabled() and getattr(self, "_pending_music_clip_agent_request", None) is not None and (text or attachments):
+            s = self._append_user_message_to_current_session(text, attachments)
+            if not s:
+                return
+            if self._music_clip_agent_handle_pending(text, attachments):
+                return
+
+        if self._agent_triggers_enabled() and self._music_clip_agent_is_start_command(text):
+            s = self._append_user_message_to_current_session(text, attachments)
+            if not s:
+                return
+            self._music_clip_agent_start_flow(text, attachments)
             return
 
         if self._agent_triggers_enabled() and getattr(self, "_pending_planner_agent_request", None) is not None and (text or attachments):
