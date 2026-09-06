@@ -719,6 +719,78 @@ class StorylineGenerator:
             return False
         return False
 
+    _FACE_MARK_TERMS = {
+        "freckles": ("freckle", "freckles", "freckled"),
+        "moles": ("mole", "moles"),
+        "beauty marks": ("beauty mark", "beauty marks"),
+        "scars": ("scar", "scars", "scarred"),
+        "tattoos": ("tattoo", "tattoos", "tattooed"),
+        "birthmarks": ("birthmark", "birthmarks"),
+        "piercings": ("piercing", "piercings", "pierced"),
+        "face paint": ("face paint", "face-paint", "facepaint"),
+        "clown makeup": ("clown makeup", "clown make-up"),
+        "blemishes": ("blemish", "blemishes"),
+    }
+
+    @classmethod
+    def _allowed_face_mark_keys(cls, source_text: str) -> set[str]:
+        low = str(source_text or "").lower()
+        allowed: set[str] = set()
+        for key, variants in cls._FACE_MARK_TERMS.items():
+            if any(re.search(r"\b" + re.escape(v) + r"\b", low) for v in variants):
+                allowed.add(key)
+        return allowed
+
+    @classmethod
+    def _strip_unrequested_face_marks_from_text(cls, text: str, source_text: str) -> str:
+        """Remove invented facial/body mark phrases unless the user/predefined bible requested them.
+
+        This is deterministic provenance enforcement after LLM generation.  The LLM may
+        suggest freckles/scars/etc. despite prompt instructions; those phrases must not
+        become identity anchors unless they existed in user-authored source material.
+        """
+        raw = str(text or "").strip()
+        if not raw:
+            return raw
+        allowed = cls._allowed_face_mark_keys(source_text)
+        forbidden_variants = []
+        for key, variants in cls._FACE_MARK_TERMS.items():
+            if key not in allowed:
+                forbidden_variants.extend(variants)
+        if not forbidden_variants:
+            return raw
+
+        # Character bible / prompt prose is mostly comma/semicolon delimited. Remove the
+        # smallest phrase containing an unrequested mark rather than damaging the rest.
+        chunks = re.split(r"([,;])", raw)
+        kept = []
+        i = 0
+        while i < len(chunks):
+            chunk = chunks[i]
+            if chunk in {",", ";"}:
+                i += 1
+                continue
+            low = chunk.lower()
+            bad = any(re.search(r"\b" + re.escape(v) + r"\b", low) for v in forbidden_variants)
+            if not bad and chunk.strip():
+                kept.append(chunk.strip())
+            i += 1
+        out = ", ".join(kept)
+        out = re.sub(r"\s{2,}", " ", out).strip(" ,;.-")
+        return out
+
+    @classmethod
+    def _filter_character_bibles_by_user_marks(cls, entries: List[str], source_text: str) -> List[str]:
+        out: List[str] = []
+        for entry in entries or []:
+            label, detail = cls._split_character_bible_entry(entry)
+            if not label or not detail:
+                continue
+            detail2 = cls._strip_unrequested_face_marks_from_text(detail, source_text)
+            if detail2:
+                out.append(f"{cls._normalize_character_label(label)} ({detail2})")
+        return cls._clean_character_bible_entries(out)
+
     @classmethod
     def _clean_character_bible_entries(cls, entries: List[str]) -> List[str]:
         cleaned: List[str] = []
@@ -825,7 +897,7 @@ Rules:
   1) facial identity and face structure
   2) hairstyle or facial hair
   3) clothing style or outfit anchors
-- Good facial identity details include: face shape, eyes, eyebrows, nose, lips, jawline, cheekbones, skin details, freckles, scars, wrinkles.
+- Good facial identity details include: face shape, eyes, eyebrows, nose, lips, jawline, cheekbones, skin tone and age-appropriate natural skin texture. Do not invent freckles, moles, beauty marks, scars, tattoos, birthmarks, piercings, face paint, makeup motifs, blemishes, or other distinctive marks unless they are explicitly present in the user idea or predefined character bible; if explicitly present, preserve them exactly.
 - Good hair details include: hair length, hairstyle, color, texture, beard, mustache, clean-shaven.
 - Good clothing details include: jacket, shirt, dress, trousers, boots, accessories, colors, materials, signature outfit pieces.
 - Do not write vague filler like handsome face, pretty face, casual clothes, nice outfit.
@@ -2067,6 +2139,10 @@ Keep the global visual medium/style locked.
         narrative_beats: List[str] = []
         shot_plan: List[Dict[str, Any]] = []
         character_bibles: List[str] = self._clean_character_bible_entries(list(predefined_character_bibles or []))
+        # Only user-authored material may authorize distinctive facial/body marks.
+        # Generated story sections/prompts are deliberately excluded from this provenance source.
+        _user_mark_source = "\n".join([str(idea or "")] + [str(x or "") for x in (predefined_character_bibles or [])])
+        character_bibles = self._filter_character_bibles_by_user_marks(character_bibles, _user_mark_source)
         object_bibles: List[str] = []
         t2i_prompts: List[str] = []
         i2v_prompts: List[str] = []
@@ -2164,6 +2240,7 @@ Rules:
                     style_hint=style_hint,
                     t2i_model_hint=t2i_model_hint,
                 )
+                character_bibles = self._filter_character_bibles_by_user_marks(character_bibles, _user_mark_source)
                 self._log(self._format_lines_for_log("Character bible", character_bibles))
 
             character_block = "\n".join(f"- {line}" for line in character_bibles) if character_bibles else "none"
@@ -2180,7 +2257,72 @@ Rules:
                 count = int(sec["shot_count"])
                 duration = float(sec["duration_sec"])
                 next_summary = story_sections[sec_idx]["summary"] if sec_idx < len(story_sections) else "This is the final story section."
-                self._log(f"V3: expanding section {sec_idx}/{len(story_sections)} '{sec['name']}' into {count} connected prompts ({duration:.2f}s)...")
+                self._log(f"V4 story-first: expanding section {sec_idx}/{len(story_sections)} '{sec['name']}' into {count} connected prompts ({duration:.2f}s)...")
+
+                # Story-first V4: earn every shot slot with a distinct chronological event before framing it.
+                event_prompt = f"""
+Expand ONE story section into exactly {count} concrete chronological STORY EVENTS. This stage is story logic only, not cinematography.
+
+COMPLETE STORY STRUCTURE:
+{whole_structure}
+
+CURRENT PART:
+Name: {sec['name']}
+Story event: {sec['summary']}
+Screen-time budget: about {duration:.2f} seconds
+Event slots required: {count}
+
+PREVIOUS PART ENDED WITH:
+{previous_ending}
+
+NEXT PART WILL BE:
+{next_summary}
+
+Established character identities:
+{character_block}
+
+Every line must use exactly:
+EVENT=<one concrete visible event> | RESULT=<what becomes different because this event happened>
+
+Rules:
+- Return exactly {count} events in chronological order.
+- Each event must materially advance the story section. A new camera angle, close-up, reaction-only portrait, alternate viewpoint, or prettier composition is NOT a new event.
+- Standing, looking, posing, walking through another location, or showing the same action from another angle does not count unless it causes a new consequence or decision.
+- Prefer actions, interactions, discoveries, obstacles, attempts, failures, consequences, decisions, arrivals/departures, object use, environmental changes, or clear cause -> effect progression.
+- Do not use camera, lens, shot-size, framing, composition, lighting, or image-generation language.
+- Do not repeat the whole project premise. Work only on the CURRENT PART.
+- Keep continuity with the previous and next parts.
+- Do not invent unrelated subplots or recurring characters merely to fill slots.
+- Event N must be meaningfully different from event N-1 and must leave the story in a changed state.
+- Return only the numbered structured lines.
+""".strip()
+                event_lines = self._generate_numbered_list_with_retry(
+                    system_prompt=system,
+                    user_prompt=event_prompt,
+                    expected_count=count,
+                    temperature=0.70,
+                    max_tokens=max(900, count * 180),
+                    item_kind=f"section {sec_idx} story events",
+                )
+                story_events: List[Dict[str, str]] = []
+                for raw_event in event_lines:
+                    m = re.match(r"^\s*EVENT\s*=\s*(.*?)\s*\|\s*RESULT\s*=\s*(.*?)\s*$", str(raw_event or ''), flags=re.I)
+                    if not m:
+                        raise RuntimeError(f"V4 section {sec_idx} returned an invalid story event line: {raw_event}")
+                    ev = re.sub(r"\s+", " ", m.group(1)).strip(" .")
+                    result = re.sub(r"\s+", " ", m.group(2)).strip(" .")
+                    if not ev or not result:
+                        raise RuntimeError(f"V4 section {sec_idx} returned an empty story event/result.")
+                    story_events.append({"event": ev, "result": result})
+                if len(story_events) != count:
+                    raise RuntimeError(f"V4 section {sec_idx} returned {len(story_events)} story events; expected {count}.")
+                self._log(self._format_lines_for_log(
+                    f"Section {sec_idx} story events",
+                    [f"EVENT={x['event']} | RESULT={x['result']}" for x in story_events],
+                ))
+                events_block = "\n".join(
+                    f"{j+1}. EVENT={x['event']} | RESULT={x['result']}" for j, x in enumerate(story_events)
+                )
 
                 section_expand_prompt = f"""
 Create exactly {count} connected FINAL TEXT-TO-IMAGE SHOT PROMPTS for ONE story section.
@@ -2193,6 +2335,9 @@ Name: {sec['name']}
 Story event: {sec['summary']}
 Screen-time budget: about {duration:.2f} seconds
 Shots required: {count}
+
+LOCKED STORY EVENTS — one event per image, same numbering:
+{events_block}
 
 PREVIOUS PART ENDED WITH:
 {previous_ending}
@@ -2212,9 +2357,11 @@ PURPOSE=<why this shot exists> | VISUAL=<the full rich generation prompt for thi
 
 Rules:
 - Work ONLY on the CURRENT PART. Do not summarize or repeat the complete movie premise in each VISUAL.
-- Return exactly {count} genuinely different, chronological shots that together show this part unfolding.
-- The shots must belong together as one sequence: establish what is needed, show actions/consequences/reactions, and hand off naturally to the next part.
-- Do not create {count} paraphrases of the same image. Each shot must depict a different visible moment, viewpoint, subject focus, action, reaction, exterior/interior coverage, or consequence that is useful to this story part.
+- Return exactly {count} chronological images, one for each LOCKED STORY EVENT above.
+- Image N MUST depict Event N. Do not replace an event with coverage, a reaction portrait, an alternate angle, an establishing image, or decorative B-roll.
+- The shots must belong together as one sequence and preserve the event order exactly.
+- Different framing is allowed only after the event is locked; framing never creates or substitutes for story progression.
+- Do not create paraphrases of the same event. Each VISUAL must clearly show the unique action/change specified by its matching event.
 - A protagonist does NOT need to appear in every shot. Use exterior action, pursuers, environment, vehicles, objects, reaction shots, wide geography, overhead/aerial coverage, or other subjects when the story part requires them.
 - A recurring character/animal/object may appear ONLY when that specific shot needs it. Recurring means visually consistent when present, not present everywhere.
 - VISUAL is the actual final image-generation prompt. Make it rich, concrete and immediately renderable: visible subjects, location, action, spatial relationships, relevant environment, time/weather, and useful composition/framing.
@@ -2278,6 +2425,9 @@ Rules:
 
                 per_shot_duration = float(duration) / float(max(1, count))
                 for local_idx, item in enumerate(parsed_section, start=1):
+                    locked_event = story_events[local_idx - 1]
+                    item["story_event"] = str(locked_event.get("event") or "")
+                    item["story_result"] = str(locked_event.get("result") or "")
                     item["index"] = global_index
                     item["duration_sec"] = round(per_shot_duration, 2)
                     shot_plan.append(item)
@@ -2369,6 +2519,13 @@ Rules:
             if self._has_near_duplicate_prompts(t2i_prompts, threshold=0.95):
                 raise RuntimeError("V3 final T2I prompts contain near-duplicates. Planning stopped before image generation.")
             self._log(self._format_lines_for_log("Text-to-image prompts", t2i_prompts))
+
+        # Final hard provenance filter: generated image prompts may not re-invent face marks.
+        if t2i_prompts:
+            t2i_prompts = [self._strip_unrequested_face_marks_from_text(p, _user_mark_source) for p in t2i_prompts]
+            t2i_prompts = [p for p in t2i_prompts if p]
+            if len(t2i_prompts) != shot_count:
+                raise RuntimeError(f"Face-mark provenance filter left {len(t2i_prompts)}/{shot_count} T2I prompts; refusing silent shot loss.")
 
         if generate_i2v:
             self._log("V3: generating image-to-video prompts one story section at a time...")

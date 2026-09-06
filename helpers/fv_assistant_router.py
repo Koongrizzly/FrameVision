@@ -102,9 +102,9 @@ def _save_json_atomic(path: Path, data: Any) -> None:
 def _default_registry() -> Dict[str, Any]:
     return {
         "version": 1,
-        "default_image_model": "zimage_gguf",
-        "default_width": 1376,
-        "default_height": 768,
+        "default_image_model": "krea2",
+        "default_width": 1920,
+        "default_height": 1088,
         "max_custom_width": 2048,
         "max_custom_height": 2048,
         "max_custom_area": 2048 * 2048,
@@ -206,11 +206,20 @@ def _default_registry() -> Dict[str, Any]:
 
 
 class FrameVisionAssistantRouter:
-    def __init__(self, root: Optional[Path | str] = None):
+    def __init__(self, root: Optional[Path | str] = None, state_path: Optional[Path | str] = None, assistant_origin: str = "llama_chat", remote_chat_id: str = ""):
         self.root = Path(root).resolve() if root else _find_root()
         self.registry_path = self.root / "scripts" / "fv_assistant_image_models.json"
-        self.state_path = self.root / "temp" / "fv_assistant_state.json"
+        self.state_path = Path(state_path).resolve() if state_path else (self.root / "temp" / "fv_assistant_state.json")
+        self.assistant_origin = str(assistant_origin or "llama_chat").strip() or "llama_chat"
+        self.remote_chat_id = str(remote_chat_id or "").strip()
         self.registry = _load_json(self.registry_path, _default_registry())
+        self.registry["default_image_model"] = "krea2"
+        self.registry["default_width"] = 1920
+        self.registry["default_height"] = 1088
+
+    def reset_state(self) -> None:
+        """Clear only this router instance's conversational wizard state."""
+        self._clear_state()
 
     # ------------------------- wizard undo / trigger words -------------------------
     def _is_cancel_command(self, text: str) -> bool:
@@ -277,7 +286,7 @@ class FrameVisionAssistantRouter:
             if waiting == "image_prompt":
                 return "What should be in the image? Example: `a bee on a flower`."
             if waiting == "workflow_choice":
-                return "Default or custom?\n\nDefault uses Z-Image GGUF at 1376×768. Custom can use Z-Image GGUF, Lens, Chroma, Krea 2, Flux Klein, or HiDream."
+                return "Default or custom?\n\nDefault uses Krea 2 GGUF at 1920×1088. Custom can use Z-Image GGUF, Lens, Chroma, Krea 2, Flux Klein, or HiDream."
             if waiting == "custom_model_and_size":
                 return "Which model and size? Example: `z-image 1280x704`, `lens 1024x1024`, `chroma 1024x1024`, `krea2 1024x1024`, `flux klein 1024x1024`, or `hidream 1024x1024`."
             return "Please answer `default` or `custom`."
@@ -325,6 +334,30 @@ class FrameVisionAssistantRouter:
             prompt, model_id, width, height = direct
             return self._queue_image(prompt, model_id, width, height)
 
+        # A command may already contain model/size choices but still have no subject.
+        # Preserve those choices and ask for the actual image prompt.
+        if self._image_command_is_options_only(text):
+            pre_model = self._parse_model_id(text)
+            pre_size = self._parse_size(text)
+            pre_state = {
+                "pending_intent": "text_to_image",
+                "prompt": "",
+                "waiting_for": "image_prompt",
+                "created_at": time.time(),
+            }
+            if pre_model:
+                pre_state["model_id"] = pre_model
+            if pre_size:
+                pre_state["width"], pre_state["height"] = int(pre_size[0]), int(pre_size[1])
+            self._save_state(pre_state)
+            remembered = []
+            if pre_model:
+                remembered.append(str(self._model_cfg(pre_model).get("label") or pre_model))
+            if pre_size:
+                remembered.append(f"{pre_size[0]}×{pre_size[1]}")
+            note = f"\n\nI'll keep your settings: {', '.join(remembered)}." if remembered else ""
+            return AssistantRouteResult(True, "What should be in the image?\n\nExample: `a bee on a flower`." + note)
+
         prompt = self._extract_image_prompt(text)
         if prompt:
             self._save_state({
@@ -335,7 +368,7 @@ class FrameVisionAssistantRouter:
             })
             return AssistantRouteResult(
                 True,
-                "Default or custom?\n\nDefault uses Z-Image GGUF at 1376×768. Custom can use Z-Image GGUF, Lens, Chroma, Krea 2, Flux Klein, or HiDream up to 2048×2048, or a similar 16:9 / 9:16 size.",
+                "Use the default, or tell me the model/size you want.\n\nDefault = Krea 2 GGUF at 1920×1088.\nExample custom reply: `Krea 2 1080p landscape`.\nAvailable: Z-Image GGUF, Lens, Chroma, Krea 2, Flux Klein, HiDream.",
             )
 
         # Catch bare commands like "create an image" before the LLM can answer
@@ -367,10 +400,15 @@ class FrameVisionAssistantRouter:
         return True
 
     def _assistant_chat_result_flags(self) -> Dict[str, Any]:
-        return {
-            "assistant_origin": "llama_chat",
+        flags = {
+            "assistant_origin": self.assistant_origin,
             "assistant_chat_only": bool(self._assistant_chat_only_results_enabled()),
         }
+        if self.remote_chat_id:
+            flags["assistant_remote_chat_id"] = self.remote_chat_id
+            if self.assistant_origin == "telegram":
+                flags["telegram_chat_id"] = self.remote_chat_id
+        return flags
 
     def _ltx23_config(self) -> Dict[str, Any]:
         videos = self.registry.get("video_models") if isinstance(self.registry.get("video_models"), dict) else {}
@@ -714,11 +752,11 @@ class FrameVisionAssistantRouter:
             state["prompt"] = prompt
             state["waiting_for"] = "resolution_aspect"
             self._save_state(state)
-            return AssistantRouteResult(True, "What size do you want? Use `480p`, `704p`, `768p`, or `1088p` plus `16:9`, `9:16`, or `1:1`. Examples: `704p landscape`, `480p portrait`.")
+            return AssistantRouteResult(True, "What size do you want? Use `480p`, `544p`, `704p`, `768p`, or `1088p` plus `16:9`, `9:16`, or `1:1`. MiniMax `544p` = 960×544. Examples: `544p landscape`, `704p landscape`, `480p portrait`.")
         if waiting == "resolution_aspect":
             parsed = self._parse_modern_video_resolution_aspect(raw, engine)
             if not parsed:
-                return AssistantRouteResult(True, "Please choose a size like `704p landscape`, `480p portrait`, `768p 16:9`, or `1088p square`.")
+                return AssistantRouteResult(True, "Please choose a size like `544p landscape`, `960x544`, `704p landscape`, `480p portrait`, `768p 16:9`, or `1088p square`.")
             res_key, aspect_key, width, height = parsed
             state.update({"resolution_key": res_key, "aspect_key": aspect_key, "width": width, "height": height})
             state["waiting_for"] = "duration_fps"
@@ -765,15 +803,32 @@ class FrameVisionAssistantRouter:
         aspect = "9:16" if ("portrait" in low or "9:16" in low) else "1:1" if ("square" in low or "1:1" in low) else "16:9"
         if engine == "minimax_h3":
             presets = {
-                "480p": (832, 480), "704p": (1280, 704), "720p": (1280, 704),
-                "768p": (1344, 768), "1088p": (1920, 1088), "1080p": (1920, 1088),
+                "480p": (832, 480),
+                "544p": (960, 544),
+                "704p": (1280, 704),
+                "720p": (1280, 704),
+                "768p": (1344, 768),
+                "1088p": (1920, 1088),
+                "1080p": (1920, 1088),
             }
-            key = next((k for k in ("1088p", "1080p", "768p", "704p", "720p", "480p") if k in low), "")
+
+            # Also accept exact MiniMax dimensions such as 960x544.
+            exact = re.search(r"\b(\d{3,4})\s*[x×]\s*(\d{3,4})\b", low)
+            if exact:
+                ew, eh = int(exact.group(1)), int(exact.group(2))
+                if (ew, eh) == (960, 544):
+                    return ("544p", "16:9", 960, 544)
+                if (ew, eh) == (544, 960):
+                    return ("544p", "9:16", 544, 960)
+
+            key = next((k for k in ("1088p", "1080p", "768p", "704p", "720p", "544p", "480p") if k in low), "")
             if not key:
                 return None
             w, h = presets[key]
-            if aspect == "9:16": w, h = h, w
-            elif aspect == "1:1": w = h = min(w, h)
+            if aspect == "9:16":
+                w, h = h, w
+            elif aspect == "1:1":
+                w = h = min(w, h)
             return ("704p" if key == "720p" else key, aspect, w, h)
         # LTX 2.5 accepts arbitrary multiples; keep the wizard on known FrameVision buckets.
         presets = {"480p": (832, 480), "704p": (1280, 704), "720p": (1280, 704), "768p": (1344, 768), "1088p": (1920, 1088), "1080p": (1920, 1088)}
@@ -841,7 +896,18 @@ class FrameVisionAssistantRouter:
         payload_dir = self.root / "temp" / "ltx25_queue_payloads"; payload_dir.mkdir(parents=True, exist_ok=True)
         payload = payload_dir / f"ltx25_chat_{int(time.time()*1000)}_{seed}.json"; payload.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
         helper = self.root / "helpers" / ("ltx25_convrot_worker.py" if is_convrot else "ltx25_helper.py")
-        py = self.root / "environments" / ("ltx25_convrot" if is_convrot else "ltx25") / ("python.exe" if os.name == "nt" else "bin/python")
+        env_dir = self.root / "environments" / ("ltx25_convrot" if is_convrot else "ltx25")
+        if os.name == "nt":
+            py_candidates = [
+                env_dir / "Scripts" / "python.exe",
+                env_dir / "python.exe",
+            ]
+        else:
+            py_candidates = [
+                env_dir / "bin" / "python",
+                env_dir / "python",
+            ]
+        py = next((p for p in py_candidates if p.is_file()), py_candidates[0])
         if not py.exists() or not helper.exists():
             return AssistantRouteResult(True, f"LTX 2.5 is not ready. Missing runtime/helper: `{py}` or `{helper}`")
         cmd = [str(py), str(helper), "--job" if is_convrot else "--queue-job", str(payload)]
@@ -857,14 +923,76 @@ class FrameVisionAssistantRouter:
         self._clear_state()
         return AssistantRouteResult(True, f"Added LTX 2.5 to the queue: `{outfile.name}` ({job['width']}×{job['height']}, {job['frames']} frames at {job['fps']}fps).", True, "ltx25", "LTX 2.5", prompt, job["width"], job["height"], time.time(), "video", tuple([inp] if inp else []), str(outfile))
 
+    def _minimax_h3_saved_settings(self) -> Dict[str, Any]:
+        """Read the same persisted MiniMax state that the normal GUI restores.
+
+        Most MiniMax settings live in minimax_h3_gui_last.json, but current
+        FrameVision versions deliberately keep LoRAs in a separate
+        minimax_h3_loras.json so embedded helper recreation cannot wipe them.
+        Merge that dedicated LoRA state over the general saved settings.
+        """
+        preset_dir = self.root / "presets" / "setsave"
+        data = _load_json(preset_dir / "minimax_h3_gui_last.json", {})
+        data = dict(data) if isinstance(data, dict) else {}
+
+        lora_state = _load_json(preset_dir / "minimax_h3_loras.json", {})
+        if isinstance(lora_state, dict) and isinstance(lora_state.get("loras"), list):
+            data["loras"] = list(lora_state.get("loras") or [])
+            data["_lora_state_source"] = "minimax_h3_loras.json"
+        else:
+            data["_lora_state_source"] = "minimax_h3_gui_last.json"
+        return data
+
+    @staticmethod
+    def _minimax_h3_saved_loras(saved: Dict[str, Any]) -> list[dict]:
+        out = []
+        for item in list((saved or {}).get("loras") or []):
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip()
+            try:
+                strength = float(item.get("strength", 1.0))
+            except Exception:
+                strength = 1.0
+            if path and strength != 0.0 and bool(item.get("enabled", True)):
+                out.append({"path": path, "strength": strength})
+        return out
+
+    def minimax_h3_saved_settings_summary(self) -> str:
+        saved = self._minimax_h3_saved_settings()
+        loras = self._minimax_h3_saved_loras(saved)
+        lora_text = ", ".join(
+            f"{Path(str(x.get('path') or '')).name}@{float(x.get('strength') or 1.0):g}"
+            for x in loras
+        ) or "none"
+        return (
+            f"steps={int(saved.get('steps', 15) or 15)}, "
+            f"sampler={str(saved.get('sampler') or 'euler')}, "
+            f"scheduler={str(saved.get('scheduler') or 'simple')}, "
+            f"Sage Attention={'ON' if bool(saved.get('sage_attention_enabled', False)) else 'OFF'}, "
+            f"Spectrum={'ON' if bool(saved.get('spectrum_enabled', False)) else 'OFF'}, "
+            f"Comfy Kitchen={'ON' if bool(saved.get('comfy_kitchen_enabled', True)) else 'OFF'}, "
+            f"LoRA(s)={lora_text} "
+            f"[from {str(saved.get('_lora_state_source') or 'saved MiniMax state')}]"
+        )
+
     def _queue_minimax_h3_from_state(self, state: Dict[str, Any]) -> AssistantRouteResult:
-        saved = _load_json(self.root / "presets" / "setsave" / "minimax_h3_gui_last.json", {})
+        saved = self._minimax_h3_saved_settings()
         prompt = str(state.get("prompt") or "").strip()
         mode_name = str(state.get("video_mode") or "text")
         mode = 2 if mode_name == "reference" else 1 if mode_name in {"image", "continue"} else 0
         width, height = int(state.get("width") or 832), int(state.get("height") or 480)
         frames, fps = int(state.get("frames") or 243), 24
-        seed = int(saved.get("seed", -1) if saved.get("seed") is not None else -1)
+        # A caller can explicitly provide a seed (for example Telegram /redo).
+        # Prefer that per-job seed over the MiniMax GUI's saved/default seed.
+        # Previously this function ignored state["seed"], so Telegram reported a
+        # fresh redo seed while the worker received the old saved seed and
+        # reproduced the exact same clip.
+        state_seed = state.get("seed", None)
+        if state_seed is not None:
+            seed = int(state_seed)
+        else:
+            seed = int(saved.get("seed", -1) if saved.get("seed") is not None else -1)
         script = "helpers/generate_ref.py" if mode == 2 else "helpers/generate.py"
         args = [script, "--width", str(width), "--height", str(height), "--frames", str(frames), "--steps", str(int(saved.get("steps", 15) or 15)), "--cfg", str(float(saved.get("cfg", 1.0) or 1.0)), "--shift", str(float(saved.get("shift", 12) or 12)), "--audio-shift", str(float(saved.get("audio_shift", 3) or 3)), "--seed", str(seed), "--sampler", str(saved.get("sampler") or "euler"), "--scheduler", str(saved.get("scheduler") or "simple"), "--prompt", prompt]
         if mode_name == "image":
@@ -886,13 +1014,15 @@ class FrameVisionAssistantRouter:
         for key, flag in (("fl2va_model","--fl2va-checkpoint"),("ref2va_model","--ref2va-checkpoint"),("text_encoder_model","--text-encoder"),("video_vae_model","--video-vae"),("audio_vae_model","--audio-vae")):
             val=str(saved.get(key) or "").strip()
             if val: args += [flag,val]
-        for item in list(saved.get("loras") or []):
-            if isinstance(item,dict) and str(item.get("path") or "").strip() and float(item.get("strength",1.0) or 0.0)!=0.0:
-                args += ["--lora", str(item.get("path")), "--lora-strength", str(float(item.get("strength",1.0)))]
+        active_loras = self._minimax_h3_saved_loras(saved)
+        for item in active_loras:
+            args += ["--lora", str(item["path"]), "--lora-strength", str(float(item["strength"]))]
         out_dir = Path(str(saved.get("output_folder") or self.root / "output" / "video" / "minimax_h3")).resolve(); out_dir.mkdir(parents=True, exist_ok=True)
         name = str(state.get("output_name") or "").strip() or "minimax_h3_video"
         outfile = out_dir / f"{name}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"; args += ["--output", str(outfile)]
-        job={"id":uuid.uuid4().hex,"state":"pending","created_at":time.time(),"mode":mode,"mode_name":{"text":"Text to video (T2VA)","image":"Image / Continue Video (FL2VA)","continue":"Image / Continue Video (FL2VA)","reference":"Reference to video (Ref2VA)"}.get(mode_name,mode_name),"model_label":"MiniMax H3","output":str(outfile),"seed":seed,"resolution":f"{width} × {height}","frames":frames,"steps":int(saved.get("steps",15) or 15),"prompt":prompt,"args":args,"settings":saved,"continue_last_result":False,"manual_continue_video":str(state.get("source_video_path") or "") if mode_name=="continue" else "","continue_context_frames":int(saved.get("continue_context_frames",39) or 39),"glue_results":False,"continue_audio_memory":False}
+        job_settings = dict(saved)
+        job_settings["seed"] = seed
+        job={"id":uuid.uuid4().hex,"state":"pending","created_at":time.time(),"mode":mode,"mode_name":{"text":"Text to video (T2VA)","image":"Image / Continue Video (FL2VA)","continue":"Image / Continue Video (FL2VA)","reference":"Reference to video (Ref2VA)"}.get(mode_name,mode_name),"model_label":"MiniMax H3","output":str(outfile),"seed":seed,"resolution":f"{width} × {height}","frames":frames,"steps":int(saved.get("steps",15) or 15),"prompt":prompt,"args":args,"settings":job_settings,"active_loras":active_loras,"continue_last_result":False,"manual_continue_video":str(state.get("source_video_path") or "") if mode_name=="continue" else "","continue_context_frames":int(saved.get("continue_context_frames",39) or 39),"glue_results":False,"continue_audio_memory":False}
         try:
             try:
                 from helpers.queue_adapter import enqueue_minimax_h3_job
@@ -906,7 +1036,8 @@ class FrameVisionAssistantRouter:
         inputs=[]
         if state.get("input_image_path"): inputs.append(str(state.get("input_image_path")))
         inputs += [str(x) for x in list(state.get("reference_image_paths") or [])]
-        return AssistantRouteResult(True, f"Added MiniMax H3 to the queue: `{outfile.name}` ({width}×{height}, {frames} frames at 24fps).", True, "minimax_h3", "MiniMax H3", prompt, width, height, time.time(), "video", tuple(inputs), str(outfile))
+        _lora_note = ", ".join(f"{Path(str(x['path'])).name}@{float(x['strength']):g}" for x in active_loras) or "none"
+        return AssistantRouteResult(True, f"Added MiniMax H3 to the queue: `{outfile.name}` ({width}×{height}, {frames} frames at 24fps). Saved MiniMax LoRAs: {_lora_note}.", True, "minimax_h3", "MiniMax H3", prompt, width, height, time.time(), "video", tuple(inputs), str(outfile))
 
     def _ltx_prompt_question(self) -> str:
         return "What is the prompt?\n\nLTX can include sound/speech-style prompt details. If you want dialogue or sound effects, timestamps help. Example:\n`0s: a woman dances under the moonlight 3s: wind blows through the trees 6s: the woman sings \"what a beautiful night\"`\n\nLeave enough time between events so the model can follow them."
@@ -1723,7 +1854,7 @@ class FrameVisionAssistantRouter:
 
         model_id = parsed_model or str(self.registry.get("default_image_model") or "zimage_gguf")
         if not parsed_size:
-            raise ValueError("What size should I use? Example: `1280x704`, `1376x768`, or `2048x2048`.")
+            raise ValueError("What size should I use? Example: `1920x1088`, `1280x704`, or `2048x2048`.")
         width, height = parsed_size
         ok, msg, width, height = self._validate_size(width, height)
         if not ok:
@@ -1762,6 +1893,31 @@ class FrameVisionAssistantRouter:
         ]
         return any(re.match(pat, low, flags=re.IGNORECASE) for pat in bare_patterns)
 
+    def _image_command_is_options_only(self, text: str) -> bool:
+        """True when an image command contains settings but no actual subject/prompt.
+
+        Example: ``create an image with Krea 2 1080p landscape`` should remember
+        Krea/1080p and still ask what to draw instead of treating the settings as
+        the image prompt.
+        """
+        if not self._is_image_command(text):
+            return False
+        s = str(text or "")
+        s = re.sub(r"^\s*(?:create|make|generate|render|queue)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|photo|render)\b", " ", s, flags=re.IGNORECASE)
+        # Explicit sizes and common shorthand/aspect words.
+        s = re.sub(r"(?<!\d)\d{3,5}\s*(?:x|×|by)\s*\d{3,5}(?!\d)", " ", s, flags=re.IGNORECASE)
+        s = re.sub(r"\b(?:720p|1080p|full\s*hd|landscape|portrait|vertical|horizontal|square|16\s*:\s*9|9\s*:\s*16|1\s*:\s*1|default|custom)\b", " ", s, flags=re.IGNORECASE)
+        # Remove one/all known model aliases.
+        aliases = []
+        for model_id, cfg in dict(self.registry.get("models") or {}).items():
+            aliases.extend(list(cfg.get("aliases") or []))
+            aliases.append(model_id)
+        for alias in sorted({str(a) for a in aliases if str(a).strip()}, key=len, reverse=True):
+            s = re.sub(r"\b" + re.escape(alias) + r"\b", " ", s, flags=re.IGNORECASE)
+        s = re.sub(r"\b(?:with|using|use|at|in|resolution|size|model|of|the|please)\b", " ", s, flags=re.IGNORECASE)
+        s = re.sub(r"[^a-zA-Z0-9]+", " ", s)
+        return not bool(s.strip())
+
     def _handle_pending_image(self, text: str, state: Dict[str, Any]) -> AssistantRouteResult:
         low = text.lower().strip()
         if self._is_undo_command(text):
@@ -1772,23 +1928,58 @@ class FrameVisionAssistantRouter:
 
         prompt = str(state.get("prompt") or "").strip()
         waiting_for = str(state.get("waiting_for") or "").strip()
+        stored_model = str(state.get("model_id") or "").strip()
+        try:
+            stored_w = int(state.get("width") or 0)
+            stored_h = int(state.get("height") or 0)
+        except Exception:
+            stored_w = stored_h = 0
 
         if waiting_for == "image_prompt":
+            # Do not accept the wizard command itself as the image prompt.  Also let
+            # users provide/change model/size while we are waiting for the subject.
+            parsed_model = self._parse_model_id(text)
+            parsed_size = self._parse_size(text)
+            if self._is_bare_image_request(text) or self._image_command_is_options_only(text):
+                if parsed_model:
+                    state["model_id"] = parsed_model
+                if parsed_size:
+                    state["width"], state["height"] = int(parsed_size[0]), int(parsed_size[1])
+                self._save_state(state)
+                return AssistantRouteResult(True, "I still need the actual image prompt. What should be in the image?\n\nExample: `a bee on a flower`.")
             prompt = self._clean_prompt(text)
             if not prompt:
                 return AssistantRouteResult(True, "What should be in the image? Example: `a bee on a flower`.")
             state["prompt"] = prompt
-            state["waiting_for"] = "workflow_choice"
             state["created_at"] = time.time()
+            # If model + size were already given, we can continue immediately.
+            model_id = str(state.get("model_id") or "").strip()
+            try:
+                w, h = int(state.get("width") or 0), int(state.get("height") or 0)
+            except Exception:
+                w = h = 0
+            if model_id and w > 0 and h > 0:
+                ok, msg, w, h = self._validate_size(w, h)
+                if not ok:
+                    state["waiting_for"] = "custom_model_and_size"
+                    self._save_state(state)
+                    return AssistantRouteResult(True, msg)
+                return self._queue_image(prompt, model_id, w, h)
+            state["waiting_for"] = "workflow_choice"
             self._save_state(state)
+            if model_id:
+                label = str(self._model_cfg(model_id).get("label") or model_id)
+                return AssistantRouteResult(True, f"I have {label} selected. What size should I use? Example: `1280x704`, `1080p landscape`, or `1024x1024`.")
             return AssistantRouteResult(
                 True,
-                "Default or custom?\n\nDefault uses Z-Image GGUF at 1376×768. Custom can use Z-Image GGUF, Lens, Chroma, Krea 2, Flux Klein, or HiDream up to 2048×2048, or a similar 16:9 / 9:16 size.",
+                "Use the default, or tell me the model/size you want.\n\nDefault = Krea 2 GGUF at 1920×1088.\nExample custom reply: `Krea 2 1080p landscape`.\nAvailable: Z-Image GGUF, Lens, Chroma, Krea 2, Flux Klein, HiDream.",
             )
 
         if not prompt:
-            self._clear_state()
-            return AssistantRouteResult(True, "I lost the image prompt. Please say the image idea again.")
+            # Keep the wizard alive instead of losing the user's partially selected settings.
+            state["waiting_for"] = "image_prompt"
+            self._save_state(state)
+            return AssistantRouteResult(True, "I still need the image prompt. What should be in the image?")
 
         if low in ("default", "use default", "defaults"):
             model_id = str(self.registry.get("default_image_model") or "zimage_gguf")
@@ -1799,25 +1990,81 @@ class FrameVisionAssistantRouter:
         if low == "custom":
             state["waiting_for"] = "custom_model_and_size"
             self._save_state(state)
-            return AssistantRouteResult(True, "Which model and size? Example: `z-image 1280x704`, `lens 1024x1024`, `chroma 1024x1024`, `krea2 1024x1024`, `flux klein 1024x1024`, or `hidream 1024x1024`.")
+            return AssistantRouteResult(True, "Which model and size? Example: `krea 2 1080p landscape`, `z-image 1280x704`, `lens 1024x1024`, `chroma 1024x1024`, `flux klein 1024x1024`, or `hidream 1024x1024`.")
 
         parsed_model = self._parse_model_id(text)
         parsed_size = self._parse_size(text)
-        if parsed_model or parsed_size:
-            if parsed_size and not parsed_model:
-                unknown = self._looks_like_unknown_custom_model(text)
-                if unknown:
-                    return AssistantRouteResult(True, f"I do not know the image model `{unknown}` yet. Available image models: {self._available_model_names()}.")
-            model_id = parsed_model or str(self.registry.get("default_image_model") or "zimage_gguf")
-            if not parsed_size:
-                return AssistantRouteResult(True, "What size should I use? Example: `1280x704`, `1376x768`, or `2048x2048`.")
-            width, height = parsed_size
-            ok, msg, width, height = self._validate_size(width, height)
-            if not ok:
-                return AssistantRouteResult(True, msg)
-            return self._queue_image(prompt, model_id, width, height)
 
-        return AssistantRouteResult(True, "Please answer `default` or `custom`. For custom, say something like `z-image 1280x704`, `lens 1024x1024`, `chroma 1024x1024`, `krea2 1024x1024`, `flux klein 1024x1024`, or `hidream 1024x1024`.")
+        # Any model mentioned while the wizard is active is an override, including
+        # natural replies such as "use Krea 2 instead". Persist it before asking
+        # the next question so a later size-only reply cannot fall back to Z-Image.
+        if parsed_model:
+            stored_model = parsed_model
+            state["model_id"] = parsed_model
+        if parsed_size:
+            stored_w, stored_h = int(parsed_size[0]), int(parsed_size[1])
+            state["width"], state["height"] = stored_w, stored_h
+
+        if parsed_model or parsed_size or waiting_for in {"custom_model_and_size", "retry_or_change"}:
+            if not stored_model:
+                state["waiting_for"] = "custom_model_and_size"
+                self._save_state(state)
+                return AssistantRouteResult(True, f"Which image model should I use? Available: {self._available_model_names()}.")
+            if stored_w <= 0 or stored_h <= 0:
+                state["waiting_for"] = "custom_model_and_size"
+                self._save_state(state)
+                label = str(self._model_cfg(stored_model).get("label") or stored_model)
+                return AssistantRouteResult(True, f"{label} selected. What size should I use? Example: `1280x704`, `1080p landscape`, or `1024x1024`.")
+            ok, msg, width, height = self._validate_size(stored_w, stored_h)
+            if not ok:
+                state["waiting_for"] = "custom_model_and_size"
+                self._save_state(state)
+                return AssistantRouteResult(True, msg)
+            state["width"], state["height"] = width, height
+            self._save_state(state)
+            return self._queue_image(prompt, stored_model, width, height)
+
+        return AssistantRouteResult(True, "Please answer `default` or `custom`. For custom, say something like `krea 2 1080p landscape`, `z-image 1280x704`, `lens 1024x1024`, `chroma 1024x1024`, `flux klein 1024x1024`, or `hidream 1024x1024`.")
+
+    def _canonical_image_model_id(self, model_id: str) -> str:
+        """Normalize registry-specific image model keys to the router engines.
+
+        Older fv_assistant_image_models.json files sometimes used a different
+        dictionary key for the same backend.  Routing by that raw key could make
+        a valid Krea selection fall through to the Z-Image fallback.
+        """
+        mid = str(model_id or "").strip()
+        if not mid:
+            return ""
+        low = re.sub(r"[^a-z0-9]+", "", mid.lower())
+        direct = {
+            "zimagegguf": "zimage_gguf", "zimage": "zimage_gguf",
+            "lens": "lens", "lensturbou4": "lens",
+            "chroma": "chroma",
+            "krea2": "krea2", "krea2gguf": "krea2", "kreagguf": "krea2",
+            "fluxklein": "flux_klein", "klein": "flux_klein", "fluxkleingguf": "flux_klein",
+            "hidream": "hidream", "hidreamdev": "hidream",
+        }
+        if low in direct:
+            return direct[low]
+        cfg = dict((self.registry.get("models") or {}).get(mid) or {})
+        blob = " ".join([
+            mid, str(cfg.get("engine") or ""), str(cfg.get("queue_type") or ""),
+            str(cfg.get("label") or ""), " ".join(map(str, cfg.get("aliases") or [])),
+        ]).lower()
+        if "krea" in blob:
+            return "krea2"
+        if "chroma" in blob:
+            return "chroma"
+        if "lens" in blob:
+            return "lens"
+        if "klein" in blob:
+            return "flux_klein"
+        if "hidream" in blob or "hi dream" in blob:
+            return "hidream"
+        if "z-image" in blob or "zimage" in blob:
+            return "zimage_gguf"
+        return mid
 
     def _parse_model_id(self, text: str) -> str:
         low = " " + re.sub(r"[^a-z0-9]+", " ", text.lower()) + " "
@@ -1833,16 +2080,37 @@ class FrameVisionAssistantRouter:
         if not alias_hits:
             return ""
         alias_hits.sort(reverse=True)
-        return str(alias_hits[0][1])
+        return self._canonical_image_model_id(str(alias_hits[0][1]))
 
     def _parse_size(self, text: str) -> Optional[Tuple[int, int]]:
-        m = re.search(r"(?<!\d)(\d{3,5})\s*(?:x|×|by)\s*(\d{3,5})(?!\d)", text, flags=re.IGNORECASE)
-        if not m:
-            return None
-        try:
-            return int(m.group(1)), int(m.group(2))
-        except Exception:
-            return None
+        raw = str(text or "")
+        m = re.search(r"(?<!\d)(\d{3,5})\s*(?:x|×|by)\s*(\d{3,5})(?!\d)", raw, flags=re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1)), int(m.group(2))
+            except Exception:
+                return None
+
+        # Friendly shorthand used naturally in chat/Telegram.  Keep this small and
+        # predictable: the normal validator will still snap to model-safe multiples.
+        low = raw.lower()
+        orientation = "portrait" if any(x in low for x in ("portrait", "vertical", "9:16")) else "landscape"
+        if any(x in low for x in ("square", "1:1")):
+            orientation = "square"
+        presets = {
+            "720p": (1280, 720),
+            "1080p": (1920, 1080),
+            "full hd": (1920, 1080),
+        }
+        for key, (w, h) in presets.items():
+            if key in low:
+                if orientation == "portrait":
+                    return h, w
+                if orientation == "square":
+                    side = 1024 if key == "720p" else 1536
+                    return side, side
+                return w, h
+        return None
 
     def _looks_like_unknown_custom_model(self, text: str) -> str:
         """Return a friendly unknown model name when user typed a model-ish word.
@@ -2035,7 +2303,12 @@ class FrameVisionAssistantRouter:
         return True, ""
 
     def _queue_image(self, prompt: str, model_id: str, width: int, height: int) -> AssistantRouteResult:
+        model_id = self._canonical_image_model_id(model_id)
         cfg = self._model_cfg(model_id)
+        if not cfg:
+            # An older external registry can use a non-canonical key. Fall back to
+            # the built-in canonical definition rather than silently routing to Z-Image.
+            cfg = dict((_default_registry().get("models") or {}).get(model_id) or {})
         if not cfg:
             self._clear_state()
             available = ", ".join(str(v.get("label") or k) for k, v in (self.registry.get("models") or {}).items())
@@ -2048,6 +2321,9 @@ class FrameVisionAssistantRouter:
             return AssistantRouteResult(True, install_msg)
 
         seed = random.randint(1, 2_147_483_647)
+        # Some generators know their exact planned output file before the worker runs.
+        # Keep it on the router so remote frontends (Telegram) can watch that exact file.
+        self._last_enqueued_output_path = ""
         try:
             if model_id == "lens":
                 ok = self._enqueue_lens(prompt, cfg, width, height, seed)
@@ -2067,10 +2343,24 @@ class FrameVisionAssistantRouter:
         else:
             err = ""
 
-        self._clear_state()
         if ok:
-            return AssistantRouteResult(True, f"Queued {label}: `{prompt}` at {width}×{height}.", True, model_id, label, prompt, width, height, time.time(), "create", ())
-        return AssistantRouteResult(True, f"I could not add the {label} job to the FrameVision queue." + (f"\n\nError: {err}" if err else ""), False, model_id, label, prompt, width, height, time.time(), "create", ())
+            self._clear_state()
+            planned_output = str(getattr(self, "_last_enqueued_output_path", "") or "")
+            return AssistantRouteResult(True, f"Queued {label}: `{prompt}` at {width}×{height}.", True, model_id, label, prompt, width, height, time.time(), "create", (), planned_output)
+
+        # Keep the failed request editable.  This is especially useful remotely:
+        # after a queue failure the user can simply say "use Krea 2 instead" or
+        # provide another size without having to restart the whole wizard.
+        self._save_state({
+            "pending_intent": "text_to_image",
+            "prompt": prompt,
+            "model_id": model_id,
+            "width": int(width),
+            "height": int(height),
+            "waiting_for": "retry_or_change",
+            "created_at": time.time(),
+        })
+        return AssistantRouteResult(True, f"I could not add the {label} job to the FrameVision queue." + (f"\n\nError: {err}" if err else "") + "\n\nYou can change the model/size and retry, for example: `use Krea 2 instead`.", False, model_id, label, prompt, width, height, time.time(), "create", ())
 
     def _queue_image_edit(self, prompt: str, model_id: str, image_paths: list[str], requested_width: int = 0, requested_height: int = 0) -> AssistantRouteResult:
         cfg = self._model_cfg(model_id)
@@ -2354,7 +2644,11 @@ class FrameVisionAssistantRouter:
         sdcli = self._find_sd_cli()
         name = self._safe_krea2_name(str(prompt or "").splitlines()[0] if prompt else "krea2")
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        output_path = out_dir / f"{stamp}_{name}.png"
+        # Multiple Krea jobs can be queued in the same second with very similar first
+        # prompt lines (for example several Agent reference sheets). Add the seed to
+        # guarantee a unique planned output path so later jobs never overwrite earlier ones.
+        output_path = out_dir / f"{stamp}_{name}_{int(seed)}.png"
+        self._last_enqueued_output_path = str(output_path)
         model_name = str(diffusion.name if diffusion else "").lower()
         is_base = "krea" in model_name and "turbo" not in model_name
         steps = int(cfg.get("base_steps" if is_base else "default_steps", 30 if is_base else 8))
@@ -2696,6 +2990,7 @@ class FrameVisionAssistantRouter:
             width, height = self._hidream_reference_safe_size(refs, width, height)
             prompt = self._hidream_edit_prompt(prompt, refs)
         output_path = Path(str(forced_output_path or "")).expanduser() if str(forced_output_path or "").strip() else out_dir / f"hidream_{model_key}_{mode}_{int(time.time())}_{seed}.png"
+        self._last_enqueued_output_path = str(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         settings = {
@@ -3122,9 +3417,11 @@ def launch_planner_job(spec: Dict[str, Any]) -> Tuple[bool, str]:
         if not idea:
             return False, 'Planner idea is empty.'
         pane.prompt_edit.setPlainText(idea)
-        visual_style = str(spec.get('visual_style') or '').strip()
-        if visual_style and hasattr(pane, 'extra_info'):
-            pane.extra_info.setPlainText(visual_style)
+        extra_info = str(spec.get('extra_info') or spec.get('visual_style') or '').strip()
+        if extra_info and hasattr(pane, 'extra_info'):
+            # Planner Extra info is deliberately kept separate from the idea prompt.
+            # planner.py propagates this field into generated prompt construction.
+            pane.extra_info.setPlainText(extra_info)
 
         duration = max(5, int(spec.get('duration_sec') or 15))
         if hasattr(pane, 'spin_duration'):
@@ -3217,6 +3514,26 @@ def launch_planner_job(spec: Dict[str, Any]) -> Tuple[bool, str]:
         refs = [str(x) for x in (spec.get('minimax_reference_images') or []) if str(x).strip()]
         if refs:
             _add_minimax_refs(pane, refs)
+
+        # MiniMax H3 consistency helper:
+        # - user refs always win, so auto sheets are disabled/ignored;
+        # - without user refs, Agent-started Planner jobs default to creating
+        #   Krea 2 reference sheets for recurring Character Bible subjects.
+        if hasattr(pane, 'chk_create_ref_sheets'):
+            is_minimax = 'minimax' in model
+            explicit_auto = spec.get('create_ref_sheets')
+            if refs:
+                pane.chk_create_ref_sheets.setChecked(False)
+            elif is_minimax:
+                # If the Telegram wizard explicitly chose own refs, do not auto-create
+                # sheets. Otherwise no user refs means auto sheets are the default.
+                wants_own_refs = bool(spec.get('use_minimax_refs'))
+                if wants_own_refs:
+                    pane.chk_create_ref_sheets.setChecked(False)
+                else:
+                    pane.chk_create_ref_sheets.setChecked(True if explicit_auto is None else bool(explicit_auto))
+            else:
+                pane.chk_create_ref_sheets.setChecked(False)
 
         # Lyrics generation is intentionally delegated to Planner's own implementation.
         # Queue only after its async lyric worker has populated the lyrics box.

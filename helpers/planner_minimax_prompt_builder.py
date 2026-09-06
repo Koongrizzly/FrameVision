@@ -31,7 +31,7 @@ _ACTION_RE = re.compile(
     r"attack|attacks|ambush|chase|pursuit|escape|run|sprint|jump|leap|shoot|gunfire|"
     r"battle|duel|martial|stunt|crash|explosion|explodes|weapon|intercept|confront)\b", re.I
 )
-_SUSPENSE_RE = re.compile(r"\b(suspense|stalk|stalking|hiding|hide|search|threat|unease|mystery|watching|follows?|creeps?)\b", re.I)
+_SUSPENSE_RE = re.compile(r"\b(suspense|stalk|stalking|hiding|hide|search|threat|unease|mystery|follows?|creeps?)\b", re.I)
 _DIALOGUE_RE = re.compile(r"\b(says?|asks?|replies?|answers?|whispers?|shouts?|yells?|speaks?|dialogue|conversation|explains?|reveals?)\b", re.I)
 _HORROR_RE = re.compile(r"\b(horror|monster|demon|ghost|haunt|terrifying|gore|nightmare|creature)\b", re.I)
 
@@ -104,14 +104,24 @@ def choose_camera(text: str, flow: str) -> str:
     return "Automatic cinematic camera"
 
 def shot_count(duration: float, flow: str) -> int:
+    """Return the number of HARD MiniMax shot cuts to author.
+
+    MiniMax treats [Shot N] as a real edit, not merely a timing beat. Keep the
+    default conservative: simple actions stay continuous, while explicit
+    multi-shot/action/dialogue/reveal flows may use a small number of cuts.
+    """
     d = max(1.0, float(duration or 1.0))
-    if flow == "One continuous shot":
-        return 5 if d >= 12 else 4 if d >= 8 else 3
-    if d >= 13:
-        return 6
-    if d >= 9:
-        return 5
-    return 4 if d >= 6 else 3
+    if flow in ("Let H3 decide", "One continuous shot", "Slow, deliberate pacing"):
+        return 1
+    if flow == "Multiple cinematic shots":
+        return 2 if d < 10 else 3
+    if flow in ("Suspense / thriller buildup", "Horror escalation and reveal"):
+        return 2 if d < 9 else 3
+    if flow == "Dynamic action sequence":
+        return 2 if d < 7 else 3 if d < 12 else 4
+    if flow == "Fast commercial-style cuts":
+        return 3 if d < 9 else 4
+    return 1
 
 def timeline_ranges(duration: float, flow: str) -> List[Tuple[float,float]]:
     count = shot_count(duration, flow)
@@ -127,24 +137,41 @@ def _fmt_time(sec: float) -> str:
 def style_profile(style: str) -> str:
     return STYLE_PROFILES.get(style) or STYLE_PROFILES["Cinematic realism"]
 
-def flow_profile(flow: str, duration: float) -> str:
-    count = shot_count(duration, flow)
+def flow_profile(flow: str, duration: float, hard_shots: bool | None = None, beat_count: int | None = None) -> str:
+    count = max(1, int(beat_count or shot_count(duration, flow)))
+    if hard_shots is False:
+        if flow == "Dynamic action sequence":
+            return (
+                "Keep the action inside one continuous camera take. Use the timestamped beats to progress the choreography "
+                "through readable cause and effect without editorial cuts. Preserve screen direction and spatial continuity."
+            )
+        if flow == "Suspense / thriller buildup":
+            return "Build tension continuously inside the same shot, using the timestamped behavior changes and restrained camera movement rather than cuts."
+        if flow == "Horror escalation and reveal":
+            return "Escalate continuously inside the same shot from normality to evidence, reaction and reveal; do not turn timestamp changes into edits."
+        if flow == "Multiple cinematic shots":
+            return "Stage the dialogue or interaction as continuous coverage unless the described event explicitly introduces a new scene, subject or viewpoint."
+        if flow == "Slow, deliberate pacing":
+            return "Use patient continuous composition and restrained camera movement so every timestamped action and reaction registers."
+        return "Treat this as one continuous cinematic shot. Timestamps may introduce new behavior, but they do not imply a cut."
     if flow == "Dynamic action sequence":
         return (
-            f"Use {count} clearly differentiated cinematic action beats. Establish geography first, then use "
+            f"Use {count} clearly differentiated cinematic action shots. Establish geography first, then use "
             "controlled tracking, readable close combat or pursuit coverage, one clear impact/reaction beat, "
             "and a decisive climax. Keep body motion crisp and physically readable; do not ask subjects to move "
             "at extreme or blurry speed. Preserve screen direction and spatial continuity."
         )
     if flow == "Suspense / thriller buildup":
-        return f"Use {count} progressively tighter beats, delaying confirmation and ending on a decisive reveal."
+        return f"Use {count} progressively tighter motivated shots, delaying confirmation and ending on a decisive reveal."
     if flow == "Horror escalation and reveal":
-        return f"Use {count} escalating beats from normality to evidence, threatened reaction and a final reveal."
+        return f"Use {count} escalating motivated shots from normality to evidence, threatened reaction and a final reveal."
     if flow == "Multiple cinematic shots":
         return f"Use {count} distinct motivated shots that advance the beat and end on a consequence or reaction."
     if flow == "Slow, deliberate pacing":
         return "Use patient compositions and restrained camera movement so every action and reaction registers."
-    return f"Choose {count} clear cinematic beats that progress the action without repeating the same composition."
+    if count <= 1:
+        return "Treat this as one continuous cinematic shot. Do not introduce editorial cuts unless the described event itself clearly changes scene, subject or viewpoint."
+    return f"Use {count} clear cinematic shots only where the story beat genuinely benefits from a cut; do not cut merely to fill time."
 
 def camera_profile(camera: str, flow: str) -> str:
     if camera == "Static composition":
@@ -255,6 +282,55 @@ def _project_world_lock(project_idea: str) -> str:
         world = world[:1200].rsplit(" ", 1)[0] + "."
     return world
 
+
+def _timeline_beat_count(text: str, duration: float) -> int:
+    """Number of timestamped behavior beats, independent from editorial cuts."""
+    parts = _split_actions(text)
+    if len(parts) <= 1:
+        return 1
+    d = max(1.0, float(duration or 1.0))
+    # Keep useful behavior timing, but do not over-segment very short clips.
+    cap = 2 if d < 5.0 else 3 if d < 9.0 else 4 if d < 14.0 else 5
+    return max(1, min(len(parts), cap))
+
+
+def _needs_hard_shot_tags(text: str, flow: str, parts: Sequence[str]) -> bool:
+    """Decide whether MiniMax [Shot] hard-cut markers are actually justified.
+
+    Timestamps are timing instructions. [Shot] is reserved for editorial cuts:
+    a genuine scene/location/viewpoint transition, a newly introduced character,
+    or a deliberately multi-shot action/commercial sequence.
+    """
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not s:
+        return False
+
+    # Explicit editorial language always wins.
+    if re.search(r"\b(cut to|hard cut|smash cut|jump cut|match cut|new shot|next shot|wide shot|close[- ]?up shot|reaction shot)\b", s, re.I):
+        return True
+
+    # Clear change of place/time/viewpoint or a newly introduced on-screen subject.
+    if re.search(
+        r"\b(meanwhile|elsewhere|later that|the next morning|the next day|inside the|outside the|"
+        r"in another|at another|new location|different location|scene changes?|location changes?|"
+        r"another (?:man|woman|person|character|creature|animal)|a new (?:man|woman|person|character|creature|animal)|"
+        r"enters the (?:frame|scene|room)|appears in the (?:frame|scene)|arrives and|reveals? (?:another|a new))\b",
+        s,
+        re.I,
+    ):
+        return True
+
+    # Fast montage/commercial grammar is explicitly edit-driven.
+    if flow == "Fast commercial-style cuts":
+        return True
+
+    # Action can benefit from cuts, but only when there are genuinely several actions.
+    if flow == "Dynamic action sequence" and len(parts) >= 3:
+        return True
+
+    # Dialogue alone is NOT a reason to cut. MiniMax can stage a conversation in one take.
+    return False
+
 def build_prompt(
     *,
     project_idea: str,
@@ -271,10 +347,15 @@ def build_prompt(
     style = project_style if project_style in STYLE_PROFILES else infer_project_style(project_idea)
     flow = choose_flow(beat_text, story_role, section_key)
     camera = choose_camera(beat_text, flow)
-    count = shot_count(duration_sec, flow)
-    parts = _fit_actions(_split_actions(beat_text), count)
+    raw_parts = _split_actions(beat_text)
+    beat_count = _timeline_beat_count(beat_text, duration_sec)
+    # Timestamp beats describe behavior progression. Never manufacture extra actions merely
+    # because a clip has duration to fill.
+    parts = _fit_actions(raw_parts, beat_count) if len(raw_parts) > beat_count else list(raw_parts)
     parts = [_dialogue_tags(_subjectize(x, subjects), subjects) for x in parts]
-    ranges = timeline_ranges(duration_sec, flow)
+    hard_shots = _needs_hard_shot_tags(beat_text, flow, raw_parts)
+    d = max(1.0, float(duration_sec or 1.0))
+    ranges = [(d*i/max(1,len(parts)), d*(i+1)/max(1,len(parts))) for i in range(max(1,len(parts)))]
     world_lock = _project_world_lock(project_idea)
 
     subject_lines=[]
@@ -294,10 +375,17 @@ def build_prompt(
 
     timeline=[]
     for i,((a,b),action) in enumerate(zip(ranges,parts),start=1):
-        lead = "Fast cut to " if i == 1 else "Cut on motivated movement to "
-        timeline.append(
-            f"[Shot {i}] At {_fmt_time(a)}, {lead}{action.rstrip('.')}."
-        )
+        action = str(action or '').rstrip('.')
+        if hard_shots:
+            lead = "Begin with " if i == 1 else "Cut to "
+            timeline.append(f"[Shot {i}] At {_fmt_time(a)}, {lead}{action}.")
+        else:
+            if i == 1:
+                timeline.append(f"At {_fmt_time(a)}, {action}.")
+            else:
+                timeline.append(f"At {_fmt_time(a)}, continue in the same uninterrupted shot as the behavior changes: {action}.")
+    if not hard_shots and len(parts) > 1:
+        timeline.append("Keep all timestamped beats inside the same continuous camera take; timestamps mark behavior changes, not edits or cuts.")
     detailed = "\n".join(timeline)
 
     action_note = ""
@@ -335,7 +423,7 @@ def build_prompt(
         + f"{float(duration_sec):g}-second {ratio} {resolution} clip. SELECTED VISUAL STYLE LOCK — {style}: {style_profile(style)} "
         + f"PROJECT WORLD LOCK — {world_lock} Every shot must exist inside this story world. The character reference image controls identity only; "
           "never use its white, plain, solid-color or studio backdrop as the scene. "
-        + flow_profile(flow, duration_sec) + " " + camera_profile(camera, flow) + action_note + "\n" + detailed +
+        + flow_profile(flow, duration_sec, hard_shots=hard_shots, beat_count=len(parts)) + " " + camera_profile(camera, flow) + action_note + "\n" + detailed +
         "\noverall_soundscape:\n" + sound +
         "\nnon_diegetic_music:\n" + music
     )
@@ -345,6 +433,8 @@ def build_prompt(
         "flow": flow,
         "camera": camera,
         "duration_sec": float(duration_sec),
-        "shot_count": count,
+        "shot_count": (len(parts) if hard_shots else 1),
+        "timeline_beat_count": len(parts),
+        "hard_shot_tags": bool(hard_shots),
         "world_lock": world_lock,
     }

@@ -5449,7 +5449,13 @@ def _auto_cb_v2_validate(payload: Any, shots: List[Dict[str, Any]]) -> Tuple[boo
     return True, ""
 
 def _auto_cb_v2_normalize(payload: Dict[str, Any], shots: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Normalize Qwen output into {characters:[], shot_bindings:{sid:[C..]}}"""
+    """Normalize LLM output into {characters:[], shot_bindings:{sid:[C..]}}.
+
+    Do not post-filter appearance details here. The Character Bible prompt is
+    responsible for avoiding invented random markings, while tattoos, clown
+    makeup, scars, freckles, piercings, etc. explicitly requested by the user
+    must pass through unchanged.
+    """
     out: Dict[str, Any] = {"characters": [], "shot_bindings": {}}
     chars = payload.get("characters") if isinstance(payload.get("characters"), list) else []
     out["characters"] = [c for c in chars if isinstance(c, dict)]
@@ -9415,6 +9421,30 @@ class PipelineWorker(QThread):
     def request_stop(self) -> None:
         self._stop_requested = True
 
+    def _external_cancel_requested(self) -> bool:
+        """Consume a Telegram/queue cancellation request at a safe Planner checkpoint.
+
+        This intentionally does not participate in backend stop_check callbacks,
+        so an image/video already being generated is allowed to finish just like
+        the Planner's normal Cancel job behavior.
+        """
+        try:
+            marker = os.path.join(str(self.out_dir or ''), '_telegram_cancel_after_current.flag')
+            if marker and os.path.isfile(marker):
+                try:
+                    os.remove(marker)
+                except Exception:
+                    pass
+                self._stop_requested = True
+                try:
+                    self.signals.log.emit('[CANCEL] Remote cancel requested — stopping after the current image/clip.')
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
+        return False
+
 
 
     def post_review_command(self, cmd: Dict[str, Any]) -> None:
@@ -9453,7 +9483,7 @@ class PipelineWorker(QThread):
 
         # Command loop: CONTINUE / CANCEL / REGEN
         while True:
-            if self._stop_requested:
+            if self._external_cancel_requested() or self._stop_requested:
                 raise RuntimeError("Cancelled by user.")
             try:
                 cmd = self._review_cmd_q.get(timeout=0.25)
@@ -9536,7 +9566,7 @@ class PipelineWorker(QThread):
 
         # Command loop: CONTINUE / CANCEL / CLIP_REGEN / MARK_REVIEWED
         while True:
-            if self._stop_requested:
+            if self._external_cancel_requested() or self._stop_requested:
                 raise RuntimeError("Cancelled by user.")
             try:
                 cmd = self._review_cmd_q.get(timeout=0.25)
@@ -11534,7 +11564,7 @@ class PipelineWorker(QThread):
                     )
                     if p.stdout:
                         for _raw in p.stdout:
-                            if self._stop_requested:
+                            if self._external_cancel_requested() or self._stop_requested:
                                 try:
                                     p.kill()
                                 except Exception:
@@ -11712,7 +11742,7 @@ class PipelineWorker(QThread):
                     )
                     if p.stdout:
                         for _raw in p.stdout:
-                            if self._stop_requested:
+                            if self._external_cancel_requested() or self._stop_requested:
                                 try:
                                     p.kill()
                                 except Exception:
@@ -11771,7 +11801,7 @@ class PipelineWorker(QThread):
                 _max_strips = 64
                 _stripped = []
                 while True:
-                    if self._stop_requested:
+                    if self._external_cancel_requested() or self._stop_requested:
                         raise RuntimeError("Cancelled by user.")
                     try:
                         res = _t2i.generate_one_from_job(_t2i_job, images_dir)
@@ -11864,7 +11894,7 @@ class PipelineWorker(QThread):
         return str(out_file)
 
     def _tick(self, msg: str, pct: int, sleep_s: float = 0.25) -> None:
-        if self._stop_requested:
+        if self._external_cancel_requested() or self._stop_requested:
             raise RuntimeError("Cancelled by user.")
         self.signals.log.emit(msg)
         try:
@@ -12445,7 +12475,7 @@ class PipelineWorker(QThread):
                 _set_step(name, "skipped", why)
 
             def _run(name: str, fn, pct: int) -> None:
-                if self._stop_requested:
+                if self._external_cancel_requested() or self._stop_requested:
                     raise RuntimeError("Cancelled by user.")
                 self.signals.stage.emit(name)
                 self._tick(f"[RUN] {name}", pct, 0.05)
@@ -12609,7 +12639,7 @@ class PipelineWorker(QThread):
                 span = 6  # we occupy a small progress window before Plan
                 if proc.stdout:
                     for line in proc.stdout:
-                        if self._stop_requested:
+                        if self._external_cancel_requested() or self._stop_requested:
                             try:
                                 proc.terminate()
                             except Exception:
@@ -15770,7 +15800,9 @@ class PipelineWorker(QThread):
                                 "TASK: Create a stable AUTO Character Bible with ID binding and identity anchors for image generation. "
                                 "RULES: Character IDs must be C1, C2, C3... (stable within this run). "
                                 "Each character must include: id, optional display_name, optional role_tags, required identity_anchor. "
-                                "identity_anchor MUST describe only stable visual identity (face shape/cheekbones/nose, eye color/shape, hair color+hairstyle, skin tone, age range+build, 1-2 distinctive marks). "
+                                "identity_anchor MUST describe stable visual identity (face shape/cheekbones/nose/jaw, eye color/shape, eyebrows, hair color+hairstyle, skin tone, age range+build). "
+                                "Do not invent random distinctive marks or facial decorations just to make a character unique. "
+                                "If the user's idea/story explicitly includes tattoos, scars, freckles, face paint, clown makeup, piercings, birthmarks, markings or similar appearance details, preserve them exactly as intentional character features. "
                                 "identity_anchor MUST NOT include clothing or 'always wears' or outfits. "
                                 "Also return per-shot bindings: For each shot, specify present_characters as a list of character IDs. "
                                 "Do NOT rely on names appearing in the shot text."
@@ -16008,7 +16040,7 @@ class PipelineWorker(QThread):
                 for i, sh in enumerate(shots, start=1):
                     sid = str(sh.get("id") or f"S{i:02d}")
 
-                    if self._stop_requested:
+                    if self._external_cancel_requested() or self._stop_requested:
                         _cancel_after_current_image = True
                         self._stop_requested = False
                         if not _cancel_log_emitted:
@@ -17828,7 +17860,7 @@ class PipelineWorker(QThread):
                     except Exception:
                         pass
 
-                    if self._stop_requested:
+                    if self._external_cancel_requested() or self._stop_requested:
                         _cancel_after_current_image = True
                         self._stop_requested = False
                         if not _cancel_log_emitted:
@@ -18271,16 +18303,16 @@ class PipelineWorker(QThread):
                         ).strip()
                         _prog = _shot_obj.get("story_progression") if isinstance(_shot_obj.get("story_progression"), dict) else {}
                         _purpose = str(_shot_obj.get("shot_purpose") or _shot_obj.get("story_role") or "").strip()
-                        _context_bits = []
-                        if _purpose:
-                            _context_bits.append(f"Shot purpose: {_purpose}.")
-                        for _pk, _label in (("different_now", "Visible change"), ("harder_now", "Escalation"), ("revealed_now", "Revelation"), ("prepares_payoff", "Payoff setup")):
-                            _pv = str((_prog or {}).get(_pk) or "").strip()
-                            if _pv:
-                                _context_bits.append(f"{_label}: {_pv}.")
+
+                        # IMPORTANT: Planner metadata is context for planning, not
+                        # an on-screen action. Feeding labels such as "Shot purpose:",
+                        # "Visible change:" or "Escalation:" into MiniMax caused the
+                        # deterministic H3 builder to split them into timestamped
+                        # behavior beats. H3 could then restart/repeat the action at
+                        # ~2 seconds. The actual assigned event is the only action
+                        # text sent to the MiniMax prompt builder. story_role and
+                        # section_key are already passed separately below.
                         _beat = _beat_core
-                        if _context_bits:
-                            _beat = (_beat_core.rstrip(" .") + ". " + " ".join(_context_bits)).strip()
                         # Own Prompts can bind refs directly with <picture N>.  Parse those
                         # BEFORE semantic matching and convert them to H3 <Subject N> tokens.
                         # Example: `Use <picture 1> as Marcel ...` => physical ref #1,
@@ -18417,6 +18449,510 @@ class PipelineWorker(QThread):
                     except Exception:
                         pass
                 _run("I2V prompts (from shots)", step_i2v_prompts, 70)
+
+            # MiniMax H3 optional automatic reference-sheet pass.
+            # This intentionally runs AFTER I2V prompt creation so the Planner can decide which
+            # bible subjects really recur in the final clip list, then bind only those sheets to
+            # the clips that mention them.
+            def step_minimax_create_ref_sheets() -> None:
+                if _video_model_key(str((self.job.encoding or {}).get("video_model") or "")) != "minimax_h3":
+                    return
+                if not bool((self.job.encoding or {}).get("create_ref_sheets_enabled")):
+                    return
+
+                project = manifest.setdefault("project", {})
+                refs_meta = project.setdefault("references", {})
+                shot_map_now = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
+                shots_now = _load_shots_list(shots_path) or []
+                i2v_prompts_path_local = i2v_prompts_path
+                i2v_prompts_json_local = i2v_prompts_json
+
+                def _strip_auto_ref_sheet_state(reason: str = "") -> None:
+                    _auto_meta = refs_meta.get("auto_ref_sheets") if isinstance(refs_meta.get("auto_ref_sheets"), list) else []
+                    _auto_nums = set()
+                    _auto_files = set()
+                    for _it in _auto_meta:
+                        if not isinstance(_it, dict):
+                            continue
+                        try:
+                            _n = int(_it.get("subject_number") or 0)
+                        except Exception:
+                            _n = 0
+                        if _n > 0:
+                            _auto_nums.add(_n)
+                        _fp = str(_it.get("file") or "").strip()
+                        if _fp:
+                            _auto_files.add(_fp)
+                    _copied = []
+                    for _p in list(refs_meta.get("copied_files") or []):
+                        _ps = str(_p or "").strip()
+                        if _ps and _ps not in _auto_files:
+                            _copied.append(_ps)
+                    refs_meta["copied_files"] = list(_copied)
+                    refs_meta["ref_count"] = len(_copied)
+                    refs_meta["auto_ref_sheets"] = []
+                    refs_meta["auto_ref_sheet_count"] = 0
+                    try:
+                        refs_meta.pop("auto_ref_sheet_dir", None)
+                    except Exception:
+                        pass
+                    try:
+                        manifest.get("paths", {}).pop("auto_ref_sheets_dir", None)
+                    except Exception:
+                        pass
+                    for _sid, _rec in list(shot_map_now.items()):
+                        if not isinstance(_rec, dict):
+                            continue
+                        _prompt = str(_rec.get("i2v_prompt") or _rec.get("prompt") or "")
+                        if _prompt and _auto_nums:
+                            for _n in sorted(_auto_nums, reverse=True):
+                                try:
+                                    _prompt = re.sub(rf"(?im)^\s*<\s*Subject\s+{int(_n)}\s*>\s+is\s+.*?reference\s+image\s+{int(_n)}.*(?:\n|$)", "", _prompt)
+                                except Exception:
+                                    pass
+                                try:
+                                    _prompt = re.sub(rf"<\s*Subject\s+{int(_n)}\s*>\s+", "", _prompt, flags=re.I)
+                                except Exception:
+                                    pass
+                            try:
+                                _prompt = re.sub(r"(?is)^subject_definitions:\s*\n", "", _prompt, count=1)
+                            except Exception:
+                                pass
+                            try:
+                                _prompt = re.sub(r"\n{3,}", "\n\n", _prompt).strip()
+                            except Exception:
+                                _prompt = _prompt.strip()
+                            if _prompt:
+                                _rec["i2v_prompt"] = _prompt
+                        try:
+                            _prev = [int(x) for x in list(_rec.get("minimax_ref_indices") or [])]
+                        except Exception:
+                            _prev = []
+                        if _auto_nums:
+                            _prev = [x for x in _prev if x not in _auto_nums]
+                        _rec["minimax_ref_indices"] = _prev[:3]
+                        for _k in ("auto_ref_sheet_subject_numbers", "auto_ref_sheet_names", "ts_auto_ref_sheet_bind"):
+                            try:
+                                _rec.pop(_k, None)
+                            except Exception:
+                                pass
+                        shot_map_now[_sid] = _rec
+                    manifest["shots"] = shot_map_now
+                    if shots_now:
+                        _out_txt = []
+                        _out_json = []
+                        for _idx, _sh in enumerate(shots_now, start=1):
+                            _sid = str((_sh or {}).get("id") or f"S{_idx:02d}").strip()
+                            _rec = shot_map_now.get(_sid) if isinstance(shot_map_now.get(_sid), dict) else {}
+                            _prompt = str(_rec.get("i2v_prompt") or _rec.get("prompt") or "")
+                            _out_txt.append(f"{_sid}:\n{_prompt}")
+                            _out_json.append({
+                                "id": _sid,
+                                "prompt": _prompt,
+                                "negative": str(_rec.get("i2v_negative") or ""),
+                                "schema": _rec.get("i2v_schema") if isinstance(_rec.get("i2v_schema"), dict) else {},
+                                "minimax_ref_indices": list(_rec.get("minimax_ref_indices") or []),
+                            })
+                        _safe_write_text(i2v_prompts_path_local, "\n\n".join(_out_txt).strip() + "\n")
+                        _safe_write_json(i2v_prompts_json_local, {"schema_version": int(_PLANNER_I2V_SCHEMA_VERSION), "shots": _out_json})
+                    if reason:
+                        manifest.setdefault("settings", {})["create_ref_sheets_result"] = reason
+                    _safe_write_json(manifest_path, manifest)
+
+                # If the user already supplied MiniMax references, those are authoritative.
+                # Do not generate duplicate auto sheets on top of them.
+                _user_mm_refs = []
+                try:
+                    _user_mm_refs = [str(x) for x in list(((self.job.attachments or {}).get("minimax_video_refs") or [])) if str(x or "").strip()]
+                except Exception:
+                    _user_mm_refs = []
+                if not _user_mm_refs:
+                    try:
+                        _user_mm_refs = [str(x) for x in list(((self.job.encoding or {}).get("minimax_video_refs") or [])) if str(x or "").strip()]
+                    except Exception:
+                        _user_mm_refs = []
+                if _user_mm_refs:
+                    _strip_auto_ref_sheet_state("skipped_user_refs_present")
+                    self.signals.log.emit("[minimax-refsheet] MiniMax refs were supplied by the user; skipping auto ref-sheet creation and using only the provided refs")
+                    return
+
+                if not _krea2_runtime_ready():
+                    raise RuntimeError(
+                        "Create ref sheet(s) is enabled, but Krea 2 is not ready. "
+                        "Install/configure Krea 2 first or turn this Planner option off."
+                    )
+
+                bible = project.get("character_bible") if isinstance(project.get("character_bible"), list) else []
+                bible = [x for x in bible if isinstance(x, dict)]
+
+                def _norm_name(v: Any) -> str:
+                    return re.sub(r"\s+", " ", str(v or "").strip())
+
+                def _name_hits(text: str, name: str) -> bool:
+                    name = _norm_name(name)
+                    if not name:
+                        return False
+                    try:
+                        return bool(re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", str(text or ""), re.I))
+                    except Exception:
+                        return name.lower() in str(text or "").lower()
+
+                def _subject_description(c: Dict[str, Any]) -> str:
+                    # Auto Character Bible v2 gives us the strongest source: one stable,
+                    # clothing-free visual identity anchor. Prefer that verbatim over trying
+                    # to reconstruct identity from the older Character Bible fields.
+                    _anchor = str(c.get("identity_anchor") or "").strip()
+                    _role_tags = c.get("role_tags") if isinstance(c.get("role_tags"), list) else []
+                    if _anchor:
+                        _bits = [str(x).strip() for x in _role_tags if str(x).strip()]
+                        _bits.append(_anchor)
+                        return ", ".join(_bits)
+                    tax = str(c.get("taxonomy") or "human").strip().lower()
+                    parts: List[str] = []
+                    role = str(c.get("role") or "").strip()
+                    if role:
+                        parts.append(role)
+                    if tax == "animal":
+                        for v in (
+                            c.get("species"),
+                            ((c.get("anatomy") or {}).get("body_type") if isinstance(c.get("anatomy"), dict) else ""),
+                            ((c.get("anatomy") or {}).get("size_relative") if isinstance(c.get("anatomy"), dict) else ""),
+                            ((c.get("coat") or {}).get("color_primary") if isinstance(c.get("coat"), dict) else ""),
+                            ((c.get("coat") or {}).get("color_secondary") if isinstance(c.get("coat"), dict) else ""),
+                            ((c.get("coat") or {}).get("texture") if isinstance(c.get("coat"), dict) else ""),
+                            ((c.get("facial") or {}).get("eyes") if isinstance(c.get("facial"), dict) else ""),
+                            ((c.get("facial") or {}).get("ears") if isinstance(c.get("facial"), dict) else ""),
+                            ((c.get("limbs") or {}).get("tail") if isinstance(c.get("limbs"), dict) else ""),
+                        ):
+                            if str(v or "").strip():
+                                parts.append(str(v).strip())
+                    elif tax == "creature":
+                        for v in (c.get("base_anatomy"),):
+                            if str(v or "").strip():
+                                parts.append(str(v).strip())
+                        sc = c.get("skin_coat") if isinstance(c.get("skin_coat"), dict) else {}
+                        for v in (sc.get("covering"), sc.get("texture")):
+                            if str(v or "").strip():
+                                parts.append(str(v).strip())
+                        for v in list(sc.get("colors") or []) + list(c.get("distinctive_features") or []) + list(c.get("face_head") or []):
+                            if str(v or "").strip():
+                                parts.append(str(v).strip())
+                    else:
+                        for v in (c.get("age"), c.get("hair"), c.get("outfit")):
+                            if str(v or "").strip():
+                                parts.append(str(v).strip())
+                        for v in list(c.get("face_traits") or []) + list(c.get("vibe") or []):
+                            if str(v or "").strip():
+                                parts.append(str(v).strip())
+                    for v in list(c.get("palette") or []) + list(c.get("do_not_change") or []):
+                        if str(v or "").strip():
+                            parts.append(str(v).strip())
+                    # Keep the prompt focused; repeated bible fragments do not help Krea.
+                    uniq: List[str] = []
+                    for v in parts:
+                        vv = str(v or "").strip(" ,.;")
+                        if vv and vv.lower() not in {x.lower() for x in uniq}:
+                            uniq.append(vv)
+                    return ", ".join(uniq[:18])
+
+                # Decide who gets a sheet. IMPORTANT: the Planner/LLM does NOT get a
+                # "reference needed?" vote here. With this toggle enabled, a recurring
+                # bound character is an automatic reference subject.
+                candidates: List[Dict[str, Any]] = []
+                important_role_terms = (
+                    "main", "lead", "protagonist", "antagonist", "villain", "hero", "heroine",
+                    "companion", "sidekick", "partner", "co-star", "costar", "recurring", "primary",
+                )
+
+                # Strongest source: Auto Character Bible v2. It already knows exactly which
+                # stable character ID is present in each shot, even when the prompt compiler
+                # later replaces a display name such as Alex with "the person".
+                _acb = project.get("auto_character_bible_v2") if isinstance(project.get("auto_character_bible_v2"), dict) else {}
+                _acb_chars = _acb.get("characters") if isinstance(_acb.get("characters"), list) else []
+                _acb_bind = _acb.get("shot_bindings") if isinstance(_acb.get("shot_bindings"), dict) else {}
+                _clip_ids_by_cid: Dict[str, List[str]] = {}
+                for _sid, _ids in _acb_bind.items():
+                    if not isinstance(_ids, list):
+                        continue
+                    for _cid in _ids:
+                        _cid = str(_cid or "").strip()
+                        if _cid:
+                            _clip_ids_by_cid.setdefault(_cid, []).append(str(_sid))
+                for _c0 in _acb_chars:
+                    if not isinstance(_c0, dict):
+                        continue
+                    _cid = str(_c0.get("id") or "").strip()
+                    if not _cid:
+                        continue
+                    _clip_ids = list(dict.fromkeys(_clip_ids_by_cid.get(_cid) or []))
+                    _role_tags = [str(x).strip() for x in (_c0.get("role_tags") or []) if str(x).strip()] if isinstance(_c0.get("role_tags"), list) else []
+                    _role_low = " ".join(_role_tags).lower()
+                    _role_important = any(t in _role_low for t in important_role_terms)
+                    if len(_clip_ids) < 2 and not (_role_important and len(_clip_ids) >= 1):
+                        continue
+                    _cc = dict(_c0)
+                    _display = _norm_name(_cc.get("display_name"))
+                    _cc["name"] = _display or _cid
+                    _cc["role"] = ", ".join(_role_tags)
+                    _cc.setdefault("taxonomy", "human")
+                    _cc["_clip_ids"] = _clip_ids
+                    _cc["_source"] = "auto_character_bible_v2"
+                    candidates.append(_cc)
+
+                # Fallback for planner modes where Auto Character Bible v2 is unavailable:
+                # use the older Character Bible and count occurrences across the actual final
+                # I2V/shot text. This still treats 2+ occurrences as mandatory.
+                if not candidates:
+                    for c in bible:
+                        name = _norm_name(c.get("name"))
+                        if not name or name.lower() in ("character", "person", "subject"):
+                            continue
+                        clip_ids: List[str] = []
+                        for idx, sh in enumerate(shots_now, start=1):
+                            sid = str((sh or {}).get("id") or f"S{idx:02d}").strip()
+                            rec = shot_map_now.get(sid) if isinstance(shot_map_now.get(sid), dict) else {}
+                            hay = "\n".join([
+                                str(rec.get("i2v_prompt") or ""),
+                                str(rec.get("prompt") or ""),
+                                str((sh or {}).get("assigned_event") or ""),
+                                str((sh or {}).get("event") or ""),
+                                str((sh or {}).get("description") or ""),
+                                str((sh or {}).get("visual_description") or ""),
+                            ])
+                            if _name_hits(hay, name):
+                                clip_ids.append(sid)
+                        role_low = str(c.get("role") or "").lower()
+                        role_important = any(t in role_low for t in important_role_terms)
+                        if len(clip_ids) >= 2 or (role_important and len(clip_ids) >= 1):
+                            cc = dict(c)
+                            cc["_clip_ids"] = list(dict.fromkeys(clip_ids))
+                            cc["_source"] = "legacy_character_bible"
+                            candidates.append(cc)
+
+                # Last deterministic fallback: the story plan's named characters. This is
+                # useful if Character Bible generation was skipped/failed but the Planner still
+                # created a named recurring cast (for example Alex in eight shots).
+                if not candidates:
+                    try:
+                        _plan_for_refs = _safe_read_json(plan_path) if os.path.isfile(plan_path) else {}
+                        _plan_chars = _plan_characters(_plan_for_refs)
+                    except Exception:
+                        _plan_chars = []
+                    for _pc in (_plan_chars or []):
+                        if not isinstance(_pc, dict):
+                            continue
+                        _pname = _norm_name(_pc.get("name"))
+                        if not _pname or _pname.lower() in ("character", "person", "subject"):
+                            continue
+                        _clip_ids: List[str] = []
+                        for _idx, _sh in enumerate(shots_now, start=1):
+                            _sid = str((_sh or {}).get("id") or f"S{_idx:02d}").strip()
+                            _rec = shot_map_now.get(_sid) if isinstance(shot_map_now.get(_sid), dict) else {}
+                            _hay = "\n".join([
+                                str(_rec.get("i2v_prompt") or ""),
+                                str(_rec.get("prompt") or ""),
+                                str((_sh or {}).get("assigned_event") or ""),
+                                str((_sh or {}).get("event") or ""),
+                                str((_sh or {}).get("description") or ""),
+                                str((_sh or {}).get("visual_description") or ""),
+                            ])
+                            if _name_hits(_hay, _pname):
+                                _clip_ids.append(_sid)
+                        _prole = str(_pc.get("role") or "").strip()
+                        _role_important = any(t in _prole.lower() for t in important_role_terms)
+                        if len(_clip_ids) >= 2 or (_role_important and len(_clip_ids) >= 1):
+                            _desc = str(_pc.get("description") or "").strip()
+                            candidates.append({
+                                "name": _pname,
+                                "role": _prole,
+                                "taxonomy": _detect_character_taxonomy((_prole + " " + _desc).strip()),
+                                "identity_anchor": _desc,
+                                "_clip_ids": list(dict.fromkeys(_clip_ids)),
+                                "_source": "story_plan",
+                            })
+
+                if not candidates:
+                    self.signals.log.emit("[minimax-refsheet] no recurring named/bound subjects found; no sheet created")
+                    manifest.setdefault("settings", {})["create_ref_sheets_result"] = "no_recurring_subjects"
+                    _safe_write_json(manifest_path, manifest)
+                    return
+
+                # On resume/re-run, remove the previous auto-sheet entries from the physical pool first.
+                # They are added back below in stable order, which prevents duplicate refs and subject-number drift.
+                _old_auto_meta = refs_meta.get("auto_ref_sheets") if isinstance(refs_meta.get("auto_ref_sheets"), list) else []
+                _old_auto_files = {str(x.get("file") or "") for x in _old_auto_meta if isinstance(x, dict) and str(x.get("file") or "")}
+                copied_files = [
+                    str(x) for x in list(refs_meta.get("copied_files") or [])
+                    if x and os.path.isfile(str(x)) and str(x) not in _old_auto_files
+                ]
+                # Preserve user refs first. Auto sheets occupy whatever MiniMax slots remain (max 9).
+                slots_left = max(0, 9 - len(copied_files))
+                if slots_left <= 0:
+                    self.signals.log.emit("[minimax-refsheet] MiniMax reference pool already contains 9 images; auto sheets skipped")
+                    manifest.setdefault("settings", {})["create_ref_sheets_result"] = "reference_pool_full"
+                    _safe_write_json(manifest_path, manifest)
+                    return
+                candidates = candidates[:slots_left]
+
+                refs_dir = os.path.join(story_dir, "auto_ref_sheets")
+                os.makedirs(refs_dir, exist_ok=True)
+                existing_meta = refs_meta.get("auto_ref_sheets") if isinstance(refs_meta.get("auto_ref_sheets"), list) else []
+                existing_by_name = {str(x.get("name") or "").strip().lower(): x for x in existing_meta if isinstance(x, dict)}
+                generated: List[Dict[str, Any]] = []
+
+                for ci, c in enumerate(candidates, start=1):
+                    if self._external_cancel_requested() or self._stop_requested:
+                        raise RuntimeError("Cancelled by user.")
+                    name = _norm_name(c.get("name"))
+                    tax = str(c.get("taxonomy") or "human").strip().lower()
+                    desc = _subject_description(c)
+                    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_") or f"subject_{ci:02d}"
+                    out_file = os.path.join(refs_dir, f"{slug}_ref_sheet.png")
+                    desc_fp = _sha1_text(json.dumps({"name": name, "taxonomy": tax, "description": desc}, sort_keys=True, ensure_ascii=False))
+                    old = existing_by_name.get(name.lower()) or {}
+                    reuse = bool(
+                        str(old.get("fingerprint") or "") == desc_fp
+                        and str(old.get("file") or "")
+                        and os.path.isfile(str(old.get("file") or ""))
+                        and os.path.getsize(str(old.get("file") or "")) >= 1024
+                    )
+                    if reuse:
+                        out_file = str(old.get("file"))
+                        self.signals.log.emit(f"[minimax-refsheet] {name}: reusing existing sheet")
+                    else:
+                        type_word = "person" if tax == "human" else ("animal" if tax == "animal" else "creature")
+                        prompt = (
+                            f"Professional reference sheet for one single {type_word} named {name}. "
+                            f"Identity and design: {desc or 'preserve one unmistakably consistent identity and design'}. "
+                            "Show the exact same individual in three clearly separated panels only: "
+                            "panel 1 full-body front view, panel 2 full-body three-quarter view, panel 3 close-up face or head portrait. "
+                            "Same face, same body proportions, same hair or coat, same clothing or markings, same colors and distinctive features in every panel. "
+                            "Neutral clean studio background, even reference lighting, realistic high detail, unobstructed anatomy. "
+                            "Add clear readable labels beneath the panels exactly: FRONT VIEW, 3/4 VIEW, CLOSE-UP. "
+                            "This is one reference sheet of one individual, not three different characters, no extra people, no crowd, no duplicated subject."
+                        )
+                        self.signals.stage.emit(f"Create ref sheet(s) — {name} ({ci}/{len(candidates)})")
+                        self.signals.log.emit(f"[minimax-refsheet] FORCED recurring subject -> creating Krea 2 sheet for {name}; source={c.get('_source') or 'bible'}; clips={','.join(c.get('_clip_ids') or [])}")
+                        res = _run_krea2_planner_image(
+                            t2i_job={
+                                "engine": "krea2",
+                                "prompt": prompt,
+                                "negative_prompt": "multiple different characters, identity mismatch, different face, different outfit, cropped body, extra limbs, extra subject, crowd",
+                                "width": 1376,
+                                "height": 768,
+                                "seed": -1,
+                                "out_file": out_file,
+                            },
+                            images_dir=refs_dir,
+                            sid=f"refsheet_{slug}",
+                            aspect_mode="landscape",
+                            log_func=lambda m: self.signals.log.emit(str(m)),
+                            stop_check=lambda: bool(getattr(self, "_stop_requested", False)),
+                        )
+                        out_file = str(res.get("out_file") or out_file)
+
+                    subject_num = len(copied_files) + 1
+                    copied_files.append(out_file)
+                    generated.append({
+                        "name": name,
+                        "taxonomy": tax,
+                        "role": str(c.get("role") or ""),
+                        "file": out_file,
+                        "subject_number": int(subject_num),
+                        "clip_ids": list(c.get("_clip_ids") or []),
+                        "fingerprint": desc_fp,
+                        "description": desc,
+                    })
+                    try:
+                        self.signals.asset_created.emit(out_file)
+                    except Exception:
+                        pass
+
+                refs_meta["copied_files"] = list(copied_files)
+                refs_meta["ref_count"] = len(copied_files)
+                refs_meta["auto_ref_sheets"] = generated
+                refs_meta["auto_ref_sheet_dir"] = refs_dir
+                refs_meta["auto_ref_sheet_count"] = len(generated)
+                refs_meta["strategy"] = "user_plus_auto_ref_sheets" if len(copied_files) > len(generated) else "auto_ref_sheets"
+                manifest.setdefault("paths", {})["auto_ref_sheets_dir"] = refs_dir
+
+                # Bind only the relevant auto sheets to each shot. Existing user-ref Subject bindings
+                # stay untouched; the auto subject token is inserted only when that bible name occurs.
+                by_name = {str(x.get("name") or "").strip().lower(): x for x in generated}
+                out_txt2: List[str] = []
+                out_json2: List[Dict[str, Any]] = []
+                for idx, sh in enumerate(shots_now, start=1):
+                    sid = str((sh or {}).get("id") or f"S{idx:02d}").strip()
+                    rec = shot_map_now.get(sid) if isinstance(shot_map_now.get(sid), dict) else {}
+                    prompt = str(rec.get("i2v_prompt") or rec.get("prompt") or "")
+                    matched_nums: List[int] = []
+                    auto_defs: List[str] = []
+                    for nm, meta in by_name.items():
+                        name = str(meta.get("name") or "").strip()
+                        _relevant_here = bool(sid in list(meta.get("clip_ids") or [])) or _name_hits(prompt, name)
+                        if not _relevant_here:
+                            continue
+                        sn = int(meta.get("subject_number") or 0)
+                        if sn <= 0:
+                            continue
+                        # Replace the first plain-name occurrence with an explicit MiniMax subject token.
+                        token = f"<Subject {sn}> {name}"
+                        try:
+                            prompt2, nrep = re.subn(
+                                r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])",
+                                lambda _m: token,
+                                prompt,
+                                count=1,
+                                flags=re.I,
+                            )
+                        except Exception:
+                            prompt2, nrep = prompt, 0
+                        if nrep > 0:
+                            prompt = prompt2
+                        elif token.lower() not in prompt.lower():
+                            # The final I2V detector found the subject in shot metadata but not in the
+                            # formatted prompt body. Add a compact binding line rather than dropping the ref.
+                            prompt = f"{token} is the recurring subject matching reference image {sn}.\n" + prompt
+                        matched_nums.append(sn)
+                        auto_defs.append(f"<Subject {sn}> is {name}, matching reference image {sn}; preserve the exact identity and design from that reference sheet.")
+
+                    if auto_defs:
+                        # Put definitions at the top so the H3 prompt remains readable while the tagged
+                        # occurrence in detailed_description controls the per-shot physical ref selection.
+                        prompt = "subject_definitions:\n" + "\n".join(auto_defs) + "\n" + prompt
+                        prev_indices = []
+                        try:
+                            prev_indices = [int(x) for x in list(rec.get("minimax_ref_indices") or [])]
+                        except Exception:
+                            prev_indices = []
+                        for sn in matched_nums:
+                            if sn not in prev_indices:
+                                prev_indices.append(sn)
+                        rec["minimax_ref_indices"] = prev_indices[:3]
+                        rec["auto_ref_sheet_subject_numbers"] = list(matched_nums[:3])
+                        rec["auto_ref_sheet_names"] = [str(by_name[nm].get("name") or "") for nm in by_name if int(by_name[nm].get("subject_number") or 0) in matched_nums]
+                        rec["i2v_prompt"] = prompt
+                        rec["ts_auto_ref_sheet_bind"] = time.time()
+                        shot_map_now[sid] = rec
+                    out_txt2.append(f"{sid}:\n{prompt}")
+                    out_json2.append({
+                        "id": sid,
+                        "prompt": prompt,
+                        "negative": str(rec.get("i2v_negative") or ""),
+                        "schema": rec.get("i2v_schema") if isinstance(rec.get("i2v_schema"), dict) else {},
+                        "minimax_ref_indices": list(rec.get("minimax_ref_indices") or []),
+                    })
+
+                manifest["shots"] = shot_map_now
+                manifest.setdefault("settings", {})["create_ref_sheets_result"] = "done"
+                manifest["settings"]["create_ref_sheets_count"] = len(generated)
+                _safe_write_text(i2v_prompts_path, "\n\n".join(out_txt2).strip() + "\n")
+                _safe_write_json(i2v_prompts_json, {"schema_version": int(_PLANNER_I2V_SCHEMA_VERSION), "shots": out_json2})
+                _safe_write_json(manifest_path, manifest)
+                self.signals.log.emit(f"[minimax-refsheet] created/reused {len(generated)} sheet(s) and updated per-shot MiniMax bindings")
+
+            if _video_model_key(str((self.job.encoding or {}).get("video_model") or "")) == "minimax_h3" and bool((self.job.encoding or {}).get("create_ref_sheets_enabled")):
+                _run("Create ref sheet(s)", step_minimax_create_ref_sheets, 74)
 
             # Step F: Video clips (HunyuanVideo 1.5)
             # Creates stable per-shot MP4s for later assembly (Chunk 6).
@@ -19013,7 +19549,7 @@ class PipelineWorker(QThread):
                     shots_mtime = 0.0
 
                 for i, sh in enumerate(shots, start=1):
-                    if self._stop_requested:
+                    if self._external_cancel_requested() or self._stop_requested:
                         raise RuntimeError("Cancelled by user.")
 
                     sid = str(sh.get("id") or f"S{i:02d}")
@@ -19867,7 +20403,7 @@ class PipelineWorker(QThread):
                         )
                         assert proc.stdout is not None
                         for line in proc.stdout:
-                            if self._stop_requested:
+                            if self._external_cancel_requested() or self._stop_requested:
                                 if not stop_after_current:
                                     stop_after_current = True
                                     try:
@@ -19896,7 +20432,7 @@ class PipelineWorker(QThread):
                     )
                     assert proc.stdout is not None
                     for line in proc.stdout:
-                        if self._stop_requested:
+                        if self._external_cancel_requested() or self._stop_requested:
                             if not stop_after_current:
                                 stop_after_current = True
                                 try:
@@ -20121,7 +20657,7 @@ class PipelineWorker(QThread):
 
                 clips_out: List[Dict[str, Any]] = []
                 for i, sh in enumerate(shots, start=1):
-                    if self._stop_requested:
+                    if self._external_cancel_requested() or self._stop_requested:
                         raise RuntimeError("Cancelled by user.")
                     if not isinstance(sh, dict):
                         continue
@@ -21062,7 +21598,7 @@ class PipelineWorker(QThread):
 
                 cur_t = 0.0
                 for idx, it in enumerate(clips, start=1):
-                    if self._stop_requested:
+                    if self._external_cancel_requested() or self._stop_requested:
                         raise RuntimeError("Cancelled by user.")
 
                     if not isinstance(it, dict):
@@ -22023,7 +22559,7 @@ class PipelineWorker(QThread):
                     assert proc.stdout is not None
                     assert proc.stdin is not None
                     for line in proc.stdout:
-                        if self._stop_requested:
+                        if self._external_cancel_requested() or self._stop_requested:
                             try:
                                 proc.terminate()
                             except Exception:
@@ -22632,7 +23168,7 @@ class PipelineWorker(QThread):
                         last_json = None
                         assert proc.stdout is not None
                         for line in proc.stdout:
-                            if self._stop_requested:
+                            if self._external_cancel_requested() or self._stop_requested:
                                 try:
                                     proc.terminate()
                                 except Exception:
@@ -25186,7 +25722,7 @@ class PipelineWorker(QThread):
                     last_result = None
                     if proc.stdout:
                         for line in proc.stdout:
-                            if self._stop_requested:
+                            if self._external_cancel_requested() or self._stop_requested:
                                 try:
                                     proc.terminate()
                                 except Exception:
@@ -26961,6 +27497,33 @@ class PlannerPane(QWidget):
             pass
         self.chk_character_bible.toggled.connect(self._on_toggle_character_bible)
         lay.addWidget(self.chk_character_bible)
+
+        # MiniMax H3 only: automatically create recurring-subject reference sheets with Krea 2.
+        self.chk_create_ref_sheets = QCheckBox("Create ref sheet(s)")
+        self.chk_create_ref_sheets.setToolTip(
+            "MiniMax H3 only. After the image-to-video prompts are ready, detect recurring/important "
+            "characters or creatures from the Planner Character Bible, create one Krea 2 reference sheet "
+            "per subject (full front + 3/4 full + close-up), then bind only the relevant sheets to each MiniMax clip. "
+            "If MiniMax refs were already added by the user, auto sheet creation is skipped and only those provided refs are used."
+        )
+        self.chk_create_ref_sheets.setChecked(False)
+        try:
+            s = _load_planner_settings()
+            self.chk_create_ref_sheets.setChecked(bool(s.get("create_ref_sheets_enabled", False)))
+        except Exception:
+            pass
+        try:
+            f = self.chk_create_ref_sheets.font()
+            f.setBold(True)
+            self.chk_create_ref_sheets.setFont(f)
+        except Exception:
+            pass
+        self.chk_create_ref_sheets.toggled.connect(self._on_toggle_create_ref_sheets)
+        lay.addWidget(self.chk_create_ref_sheets)
+        try:
+            self.chk_create_ref_sheets.setVisible(False)
+        except Exception:
+            pass
 
         # Own Character Bible (manual 1–2) — overrides auto Character Bible when enabled
         self.chk_own_character_bible = QCheckBox("Own character bible")
@@ -31425,6 +31988,19 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         except Exception:
             pass
 
+    def _on_toggle_create_ref_sheets(self, on: bool) -> None:
+        """Persist the MiniMax H3 automatic Krea 2 reference-sheet toggle."""
+        try:
+            s = _load_planner_settings()
+            s["create_ref_sheets_enabled"] = bool(on)
+            _save_planner_settings(s)
+        except Exception:
+            pass
+        try:
+            _LOGGER.log_probe(f"Create ref sheet(s) toggled {'ON' if on else 'OFF'}")
+        except Exception:
+            pass
+
     def _on_toggle_alternative_storymode(self, on: bool) -> None:
         """Persist Alternative storymode toggle (direct Qwen prompt list)."""
         try:
@@ -32275,6 +32851,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         except Exception:
             visible = False
         for _name in (
+            "chk_create_ref_sheets",
             "lbl_minimax_h3_clip_length", "minimax_h3_clip_length_row",
             "lbl_minimax_h3_extra_lora1", "row_minimax_h3_extra_lora1",
             "lbl_minimax_h3_extra_lora2", "row_minimax_h3_extra_lora2",
@@ -33852,6 +34429,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             "chain_start_image_path": str((getattr(self, "edit_chain_start_image", None).text() if getattr(self, "edit_chain_start_image", None) else "") or '').strip(),
             "allow_edit_while_running": bool(getattr(self, "chk_allow_edit_while_running", None) and self.chk_allow_edit_while_running.isChecked()),
             "character_bible_enabled": bool(getattr(self, "chk_character_bible", None) and self.chk_character_bible.isChecked()),
+            "create_ref_sheets_enabled": bool(getattr(self, "chk_create_ref_sheets", None) and self.chk_create_ref_sheets.isChecked() and self._is_minimax_h3_video_model_selected()),
             "own_character_bible_enabled": bool(getattr(self, "chk_own_character_bible", None) and self.chk_own_character_bible.isChecked()),
             "alternative_storymode": bool(getattr(self, "chk_alternative_storymode", None) and self.chk_alternative_storymode.isChecked()),
             "own_storyline_enabled": bool(getattr(self, "chk_own_storyline", None) and self.chk_own_storyline.isChecked()),

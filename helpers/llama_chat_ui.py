@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+import math
 
 import base64
 import difflib
 import json
+import ast
 import mimetypes
 import os
 import random
+import shutil
 import re
 import socket
 import subprocess
@@ -2608,13 +2611,15 @@ class ChatCompletionThread(QtCore.QThread):
     failed = QtCore.Signal(str)
     speedUpdated = QtCore.Signal(str)
 
-    def __init__(self, base_url: str, messages: List[Dict], max_tokens: int, temperature: float, top_p: float, top_k: int = 40, repeat_penalty: float = 1.05, timeout_s: int = 600, parent=None):
+    def __init__(self, base_url: str, messages: List[Dict], max_tokens: int, temperature: float, top_p: float, top_k: int = 40, repeat_penalty: float = 1.05, timeout_s: int = 600, parent=None, enable_thinking: Optional[bool] = None, response_format: Optional[Dict[str, Any]] = None):
         super().__init__(parent)
         self.base_url = base_url.rstrip("/")
         self.messages = messages
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.enable_thinking = enable_thinking
+        self.response_format = dict(response_format or {}) if isinstance(response_format, dict) else None
         try:
             self.top_k = max(0, int(top_k))
         except Exception:
@@ -2686,7 +2691,7 @@ class ChatCompletionThread(QtCore.QThread):
             return "the same paragraph pair repeated three times"
         return ""
 
-    def _run_streaming(self, started_at: float) -> None:
+    def _run_streaming(self, started_at: float, grammar_fallback_reason: str = "") -> None:
         payload = {
             "model": "local-model",
             "messages": self.messages,
@@ -2700,6 +2705,26 @@ class ChatCompletionThread(QtCore.QThread):
             "reasoning_format": "none",
             "stream_options": {"include_usage": True},
         }
+        if self.enable_thinking is not None:
+            # llama.cpp applies this to Qwen chat templates. This is the real
+            # thinking switch; /no_think text alone is not reliable.
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": bool(self.enable_thinking)
+            }
+        if self.response_format and not grammar_fallback_reason:
+            payload["response_format"] = self.response_format
+        if self.response_format:
+            # The transport's grammar is not an instruction to the model when
+            # a server ignores it or cannot initialize it. Keep the same schema
+            # visible on both attempts, without mutating the caller's messages.
+            schema = dict(self.response_format.get("json_schema") or {}).get("schema")
+            if isinstance(schema, dict):
+                payload["messages"] = list(self.messages) + [{
+                    "role": "user",
+                    "content": "OUTPUT CONTRACT: Return one JSON value matching this exact schema. "
+                    "Use the specified property names; do not substitute scene/component headings. "
+                    "Do not return markdown or explanations.\n" + json.dumps(schema, ensure_ascii=False),
+                }]
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             f"{self.base_url}/v1/chat/completions",
@@ -2712,6 +2737,7 @@ class ChatCompletionThread(QtCore.QThread):
         usage: Dict[str, Any] = {}
         loop_reason = ""
         images: List[Dict] = []
+        finish_reason = ""
         try:
             with urllib.request.urlopen(req, timeout=float(self.timeout_s)) as resp:
                 for raw_line in resp:
@@ -2732,6 +2758,8 @@ class ChatCompletionThread(QtCore.QThread):
                     if not choices:
                         continue
                     choice = choices[0] if isinstance(choices[0], dict) else {}
+                    if choice.get("finish_reason"):
+                        finish_reason = str(choice["finish_reason"])
                     delta = choice.get("delta") or choice.get("message") or {}
                     if not isinstance(delta, dict):
                         continue
@@ -2755,7 +2783,29 @@ class ChatCompletionThread(QtCore.QThread):
                 msg = data.get("error", {}).get("message", raw or str(e))
             except Exception:
                 msg = raw or str(e)
-            self.failed.emit(str(msg))
+
+            # Some reasoning-capable GGUF/chat templates can still try to emit the
+            # special <think> token even when enable_thinking=False. When llama.cpp
+            # has converted response_format/json_schema into a grammar, that token
+            # is illegal before the JSON root and sampler initialization aborts with
+            # e.g. "Unexpected empty grammar stack after accepting piece: <think>".
+            # Retry at most once without transport grammar, retaining the schema
+            # in the messages. Record the fallback so raw logs reveal whether
+            # output was grammar-requested or unconstrained (not guaranteed valid).
+            msg_text = str(msg or "")
+            grammar_failure = (
+                "grammar" in msg_text.lower()
+                and (
+                    "failed to initialize samplers" in msg_text.lower()
+                    or "unexpected empty grammar stack" in msg_text.lower()
+                    or "accepting piece" in msg_text.lower()
+                )
+            )
+            if self.response_format and grammar_failure and not grammar_fallback_reason:
+                self._run_streaming(started_at, grammar_fallback_reason=msg_text)
+                return
+
+            self.failed.emit(msg_text)
             return
 
         elapsed_s = max(0.001, time.perf_counter() - started_at)
@@ -2785,6 +2835,10 @@ class ChatCompletionThread(QtCore.QThread):
             "speed_source": "api/estimate",
             "loop_detected": bool(loop_reason),
             "loop_reason": loop_reason,
+            "finish_reason": finish_reason,
+            "structured_output_requested": bool(self.response_format),
+            "grammar_fallback": bool(grammar_fallback_reason),
+            "grammar_fallback_reason": grammar_fallback_reason,
         })
 
     def run(self):
@@ -3086,6 +3140,19 @@ class SettingsDialog(QtWidgets.QDialog):
         self.ed_output_images = QtWidgets.QLineEdit()
         self.ed_output_videos = QtWidgets.QLineEdit()
         self.ed_output_edits = QtWidgets.QLineEdit()
+        # Telegram Remote Control (long polling; no inbound port required).
+        self.chk_telegram_enabled = QtWidgets.QCheckBox("Enable Telegram remote control")
+        self.ed_telegram_token = QtWidgets.QLineEdit()
+        self.ed_telegram_token.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.ed_telegram_token.setPlaceholderText("Bot token from BotFather")
+        self.ed_telegram_user_ids = QtWidgets.QLineEdit()
+        self.ed_telegram_user_ids.setPlaceholderText("Allowed Telegram user ID(s), comma separated")
+        self.chk_telegram_send_results = QtWidgets.QCheckBox("Send Telegram-started results back to Telegram")
+        self.chk_telegram_send_results.setChecked(True)
+        self.btn_telegram_restart = QtWidgets.QPushButton("Apply / Restart Telegram")
+        self.lbl_telegram_status = QtWidgets.QLabel("Telegram is off")
+        self.lbl_telegram_status.setWordWrap(True)
+        self.lbl_telegram_status.setObjectName("SubtleLabel")
         self.btn_browse_output_images = QtWidgets.QPushButton("Browse…")
         self.btn_browse_output_videos = QtWidgets.QPushButton("Browse…")
         self.btn_browse_output_edits = QtWidgets.QPushButton("Browse…")
@@ -3175,6 +3242,34 @@ class SettingsDialog(QtWidgets.QDialog):
         self.btn_browse_output_images.setToolTip(output_images_tip)
         self.btn_browse_output_videos.setToolTip(output_videos_tip)
         self.btn_browse_output_edits.setToolTip(output_edits_tip)
+
+        # Keep remote control at the top of Settings so it is easy to find.
+        telegram_box = QtWidgets.QGroupBox("Telegram Remote Control")
+        telegram_lay = QtWidgets.QGridLayout(telegram_box)
+        telegram_lay.setContentsMargins(10, 8, 10, 8)
+        telegram_lay.setHorizontalSpacing(8)
+        telegram_lay.setVerticalSpacing(8)
+        telegram_lay.addWidget(self.chk_telegram_enabled, 0, 0, 1, 3)
+        telegram_lay.addWidget(QtWidgets.QLabel("Bot token"), 1, 0)
+        telegram_lay.addWidget(self.ed_telegram_token, 1, 1, 1, 2)
+        telegram_lay.addWidget(QtWidgets.QLabel("Allowed user ID(s)"), 2, 0)
+        telegram_lay.addWidget(self.ed_telegram_user_ids, 2, 1, 1, 2)
+        telegram_lay.addWidget(self.chk_telegram_send_results, 3, 0, 1, 3)
+        telegram_lay.addWidget(self.btn_telegram_restart, 4, 0, 1, 1)
+        telegram_lay.addWidget(self.lbl_telegram_status, 4, 1, 1, 2)
+        telegram_hint = QtWidgets.QLabel("Uses Telegram long polling: FrameVision only makes outbound HTTPS connections. Only the listed Telegram user IDs are accepted.")
+        telegram_hint.setWordWrap(True)
+        telegram_hint.setObjectName("SubtleLabel")
+        telegram_lay.addWidget(telegram_hint, 5, 0, 1, 3)
+
+        ace_preset_hint = QtWidgets.QLabel(
+            "To have and use ACE-Step presets with genres and subgenres, open the ACE-Step tab in FrameVision, "
+            "create presets and save them in the Preset Manager. They will then show up here for the Agent to use."
+        )
+        ace_preset_hint.setWordWrap(True)
+        ace_preset_hint.setObjectName("SubtleLabel")
+        telegram_lay.addWidget(ace_preset_hint, 6, 0, 1, 3)
+        lay.addWidget(telegram_box)
 
         r = 0
         lbl_runner = QtWidgets.QLabel("Runner")
@@ -3345,6 +3440,11 @@ class SettingsDialog(QtWidgets.QDialog):
         self.chk_bubble_auto.toggled.connect(self._update_bubble_color_mode)
         self.chk_bubble_auto.toggled.connect(lambda *_: self.settingsChanged.emit())
         self.chk_results_chat_only.toggled.connect(lambda *_: self.settingsChanged.emit())
+        self.chk_telegram_enabled.toggled.connect(lambda *_: self.settingsChanged.emit())
+        self.chk_telegram_send_results.toggled.connect(lambda *_: self.settingsChanged.emit())
+        self.ed_telegram_token.textChanged.connect(lambda *_: self.settingsChanged.emit())
+        self.ed_telegram_user_ids.textChanged.connect(lambda *_: self.settingsChanged.emit())
+        self.btn_telegram_restart.clicked.connect(self._telegram_restart_clicked)
         self.chk_memory_enabled.toggled.connect(lambda *_: self.settingsChanged.emit())
         self.chk_memory_sources.toggled.connect(lambda *_: self.settingsChanged.emit())
         self.btn_bubble_auto_color.colorChanged.connect(lambda *_: self.settingsChanged.emit())
@@ -3379,6 +3479,19 @@ class SettingsDialog(QtWidgets.QDialog):
                 w.toggled.connect(self.settingsChanged)
         self.ed_system.textChanged.connect(self.settingsChanged)
         self._update_bubble_color_mode()
+
+    def _telegram_restart_clicked(self):
+        try:
+            self.settingsChanged.emit()
+            owner = self.parent()
+            if owner is not None and hasattr(owner, "_restart_telegram_bridge"):
+                owner._save_all()
+                owner._restart_telegram_bridge()
+        except Exception as exc:
+            try:
+                self.lbl_telegram_status.setText(f"Telegram error: {exc}")
+            except Exception:
+                pass
 
     def _update_bubble_color_mode(self):
         auto_mode = self.chk_bubble_auto.isChecked()
@@ -3635,7 +3748,16 @@ class SettingsDialog(QtWidgets.QDialog):
 # -----------------------------
 # Main window
 # -----------------------------
-class LlamaChatWindow(QtWidgets.QMainWindow):
+# Telegram Agent is kept in its own module; behavior remains implemented by the
+# existing methods moved there verbatim.
+try:
+    from helpers import telegram_agent as _telegram_agent_module  # type: ignore
+except Exception:
+    import telegram_agent as _telegram_agent_module  # type: ignore
+TelegramAgentMixin = _telegram_agent_module.TelegramAgentMixin
+
+
+class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
     framevisionFullscreenRequested = QtCore.Signal(bool)
 
     def __init__(self):
@@ -3719,6 +3841,24 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             except Exception:
                 FrameVisionAssistantRouter = None  # type: ignore
         self._fv_assistant_router = FrameVisionAssistantRouter(self.fv_root) if FrameVisionAssistantRouter else None
+        self._telegram_bridge = None
+        self._telegram_routers: Dict[str, Any] = {}
+        self._telegram_remote_wizards: Dict[str, Dict[str, Any]] = {}
+        self._telegram_remote_installs: Dict[str, Dict[str, Any]] = {}
+        # One remote LLM Agent request at a time. Deterministic Telegram commands
+        # still bypass the LLM entirely; this state is only used as a fallback for
+        # natural-language requests that the deterministic router does not understand.
+        self._telegram_agent_pending: Optional[Dict[str, Any]] = None
+        self._telegram_agent_thread: Optional[ChatCompletionThread] = None
+
+        # Autonomous Agent projects are different from the deterministic Planner:
+        # the LLM owns the story/clip/music plan, FrameVision only executes it.
+        self._telegram_autonomous_sessions: Dict[str, Dict[str, Any]] = {}
+        self._telegram_autonomous_timer = QtCore.QTimer(self)
+        self._telegram_autonomous_timer.setInterval(5000)
+        self._telegram_autonomous_timer.timeout.connect(self._telegram_autonomous_poll)
+        self._telegram_autonomous_timer.start()
+        self._telegram_autonomous_load_sessions()
 
         self._syncing_model_selectors = False
         self._loading_session_state = False
@@ -3778,6 +3918,157 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self._new_chat()
         else:
             self._select_session(self.current_session_id or self.sessions[0].id)
+
+        # Telegram is deliberately started only after settings, sessions and the
+        # assistant router are ready. It never loads the local LLM for direct commands.
+        try:
+            self._restart_telegram_bridge()
+        except Exception as exc:
+            try:
+                self.settings_dialog.lbl_telegram_status.setText(f"Telegram error: {exc}")
+            except Exception:
+                pass
+
+    # ---------- Telegram remote control ----------
+    def _telegram_allowed_ids(self) -> List[str]:
+        try:
+            raw = str(self.settings_dialog.ed_telegram_user_ids.text() or "")
+        except Exception:
+            raw = ""
+        return [x.strip() for x in re.split(r"[,;\s]+", raw) if x.strip()]
+
+    def _stop_telegram_bridge(self) -> None:
+        bridge = getattr(self, "_telegram_bridge", None)
+        self._telegram_bridge = None
+        if bridge is not None:
+            try:
+                bridge.stop()
+            except Exception:
+                pass
+            try:
+                bridge.wait(2500)
+            except Exception:
+                pass
+
+    def _restart_telegram_bridge(self) -> None:
+        self._stop_telegram_bridge()
+        try:
+            enabled = bool(self.settings_dialog.chk_telegram_enabled.isChecked())
+            token = str(self.settings_dialog.ed_telegram_token.text() or "").strip()
+            allowed = self._telegram_allowed_ids()
+        except Exception:
+            enabled, token, allowed = False, "", []
+        if not enabled:
+            try:
+                self.settings_dialog.lbl_telegram_status.setText("Telegram is off")
+            except Exception:
+                pass
+            return
+        try:
+            try:
+                from helpers.telegram_bridge import TelegramBridgeThread  # type: ignore
+            except Exception:
+                from telegram_bridge import TelegramBridgeThread  # type: ignore
+            if TelegramBridgeThread is None:
+                raise RuntimeError("PySide6 Telegram bridge is unavailable")
+            bridge = TelegramBridgeThread(self.fv_root, token, allowed, self)
+            bridge.incoming.connect(self._on_telegram_message)
+            bridge.statusChanged.connect(self._on_telegram_status)
+            self._telegram_bridge = bridge
+            bridge.start()
+            self.settings_dialog.lbl_telegram_status.setText("Connecting to Telegram…")
+        except Exception as exc:
+            self.settings_dialog.lbl_telegram_status.setText(f"Telegram failed: {exc}")
+
+    def _on_telegram_status(self, text: str) -> None:
+        try:
+            self.settings_dialog.lbl_telegram_status.setText(str(text or ""))
+        except Exception:
+            pass
+
+    def _telegram_send_text(self, chat_id: str, text: str) -> None:
+        bridge = getattr(self, "_telegram_bridge", None
+        )
+        if bridge is not None:
+            try:
+                bridge.send_text(str(chat_id), str(text or "Done."))
+            except Exception:
+                pass
+
+    def _telegram_router_for_chat(self, chat_id: str):
+        key = str(chat_id)
+        router = self._telegram_routers.get(key)
+        if router is not None:
+            return router
+        try:
+            from helpers.fv_assistant_router import FrameVisionAssistantRouter
+        except Exception:
+            from fv_assistant_router import FrameVisionAssistantRouter  # type: ignore
+        safe = re.sub(r"[^0-9A-Za-z_-]+", "_", key)
+        state_path = os.path.join(self.fv_root, "temp", "telegram", "states", f"assistant_{safe}.json")
+        router = FrameVisionAssistantRouter(self.fv_root, state_path=state_path, assistant_origin="telegram", remote_chat_id=key)
+        self._telegram_routers[key] = router
+        return router
+
+    def _telegram_capture_wizard_call(self, chat_id: str, state_attr: str, state: object, func, *args, **kwargs):
+        """Run an existing desktop wizard step for one Telegram chat without sharing its state."""
+        replies = []
+        old_state = getattr(self, state_attr, None)
+        old_reply = getattr(self, "_append_framevision_assistant_reply")
+        old_status = getattr(self, "_set_status")
+        old_track_music = getattr(self, "_track_ace15_music_job", None)
+        try:
+            setattr(self, state_attr, state)
+            self._append_framevision_assistant_reply = lambda text, *a, **k: replies.append(str(text or ""))
+            self._set_status = lambda *a, **k: None
+            # Telegram has its own result watcher; avoid creating a duplicate desktop music tracker.
+            if old_track_music is not None:
+                self._track_ace15_music_job = lambda *a, **k: None
+            result = func(*args, **kwargs)
+            new_state = getattr(self, state_attr, None)
+            return result, new_state, replies
+        finally:
+            setattr(self, state_attr, old_state)
+            self._append_framevision_assistant_reply = old_reply
+            self._set_status = old_status
+            if old_track_music is not None:
+                self._track_ace15_music_job = old_track_music
+
+    def _telegram_wizard_send_replies(self, chat_id: str, replies: object) -> None:
+        for reply in list(replies or []):
+            if str(reply or "").strip():
+                self._telegram_send_text(chat_id, str(reply))
+
+    def _telegram_start_remote_wizard(self, chat_id: str, kind: str, text: str, attachments: list) -> bool:
+        key = str(chat_id)
+        if kind == "music":
+            _, state, replies = self._telegram_capture_wizard_call(
+                key, "_pending_ace15_music_request", None, self._start_ace15_music_flow, text
+            )
+        elif kind == "planner":
+            _, state, replies = self._telegram_capture_wizard_call(
+                key, "_pending_planner_agent_request", None, self._planner_agent_start_flow, text, attachments
+            )
+        elif kind == "music_clip":
+            _, state, replies = self._telegram_capture_wizard_call(
+                key, "_pending_music_clip_agent_request", None, self._music_clip_agent_start_flow, text, attachments
+            )
+        else:
+            return False
+        self._telegram_wizard_send_replies(key, replies)
+        if state is not None:
+            self._telegram_remote_wizards[key] = {"kind": kind, "state": state}
+        else:
+            self._telegram_remote_wizards.pop(key, None)
+            if kind == "music":
+                try:
+                    bridge = getattr(self, "_telegram_bridge", None)
+                    if bridge is not None and bool(self.settings_dialog.chk_telegram_send_results.isChecked()):
+                        bridge.watch_result(key, "ace_step_15", "music", "", time.time() - 2.0)
+                except Exception:
+                    pass
+        return True
+
 
     # ---------- theme sync ----------
     def _install_theme_watchers(self):
@@ -4165,7 +4456,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "3. Send it once.\n"
             "4. Right-click that chat in the chat list.\n"
             "5. Choose Add to pinned chats.\n"
-            "6. Later, click the pinned chat to start a fresh chat with that saved instruction.\n\n"
+            "6. Add one or more tags (for example: video, minimax h3, prompt enhancer) and choose whether Agent may use it.\n"
+            "7. Later, click the pinned chat to start a fresh chat with that saved instruction.\n\n"
             "Pinned chats are reusable templates. They do not continue the old chat history unless you open the original normal chat."
         )
         self.lbl_pinned_chats_help.setObjectName("SubtleLabel")
@@ -4192,6 +4484,117 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         if lbl is not None:
             lbl.setVisible(not lbl.isVisible())
 
+    def _normalize_pinned_tags(self, value: Any) -> List[str]:
+        """Normalize pinned-chat skill tags while keeping them human readable."""
+        if isinstance(value, str):
+            raw = re.split(r"[,;\n]+", value)
+        elif isinstance(value, (list, tuple, set)):
+            raw = [str(x) for x in value]
+        else:
+            raw = []
+        aliases = {
+            "minimax": "minimax h3",
+            "minimaxh3": "minimax h3",
+            "mini max h3": "minimax h3",
+            "ltx23": "ltx 2.3",
+            "ltx 23": "ltx 2.3",
+            "ltx25": "ltx 2.5",
+            "ltx 25": "ltx 2.5",
+            "ace-step": "ace step",
+            "acestep": "ace step",
+            "krea2": "krea 2",
+            "z-image": "z image",
+            "zimage": "z image",
+            "prompt_enhancer": "prompt enhancer",
+            "story_enhancer": "story enhancer",
+            "ai video": "a.i. video",
+            "ai image": "images",
+        }
+        out: List[str] = []
+        seen = set()
+        for item in raw:
+            tag = re.sub(r"\s+", " ", str(item or "").strip().lower())
+            if not tag:
+                continue
+            tag = aliases.get(tag, tag)
+            if tag not in seen:
+                seen.add(tag)
+                out.append(tag[:64])
+        return out[:24]
+
+    def _pinned_tags_text(self, pinned: Dict[str, Any]) -> str:
+        return ", ".join(self._normalize_pinned_tags(pinned.get("tags", [])))
+
+    def _edit_pinned_chat_metadata_dialog(self, pinned: Dict[str, Any], *, creating: bool = False) -> bool:
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Create pinned chat" if creating else "Pinned chat settings")
+        dlg.resize(760, 650)
+        lay = QtWidgets.QVBoxLayout(dlg)
+
+        ed_name = QtWidgets.QLineEdit(str(pinned.get("name") or "Pinned Chat"))
+        ed_desc = QtWidgets.QPlainTextEdit(str(pinned.get("description") or ""))
+        ed_desc.setMaximumHeight(85)
+        ed_tags = QtWidgets.QLineEdit(self._pinned_tags_text(pinned))
+        ed_tags.setPlaceholderText("Example: video, minimax h3, prompt enhancer")
+        chk_agent = QtWidgets.QCheckBox("Allow Agent to use this pinned chat as a skill")
+        chk_agent.setChecked(bool(pinned.get("agent_enabled", True)))
+        ed_template = QtWidgets.QPlainTextEdit(str(pinned.get("template") or ""))
+
+        lay.addWidget(QtWidgets.QLabel("Name"))
+        lay.addWidget(ed_name)
+        lay.addWidget(QtWidgets.QLabel("Description"))
+        lay.addWidget(ed_desc)
+        lay.addWidget(QtWidgets.QLabel("Tags"))
+        lay.addWidget(ed_tags)
+        hint = QtWidgets.QLabel(
+            "Tags help Agent mode find the right pinned chat. Examples: images, video, a.i. video, music, lyrics, "
+            "prompt enhancer, story enhancer, minimax h3, ltx 2.5, ltx 2.3, ace step, krea 2, z image. "
+            "Use several tags when useful."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("SubtleLabel")
+        lay.addWidget(hint)
+        lay.addWidget(chk_agent)
+        lay.addWidget(QtWidgets.QLabel("Template instruction"))
+        lay.addWidget(ed_template, 1)
+
+        row = QtWidgets.QHBoxLayout()
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_save = QtWidgets.QPushButton("Save")
+        row.addStretch(1)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_save)
+        lay.addLayout(row)
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_save.clicked.connect(dlg.accept)
+
+        while True:
+            if dlg.exec() != QtWidgets.QDialog.Accepted:
+                return False
+            name = ed_name.text().strip()
+            tags = self._normalize_pinned_tags(ed_tags.text())
+            template = ed_template.toPlainText().strip()
+            if not name:
+                QtWidgets.QMessageBox.information(dlg, "Pinned chat", "Please give the pinned chat a name.")
+                continue
+            if creating and not tags:
+                QtWidgets.QMessageBox.information(
+                    dlg, "Pinned chat tags",
+                    "Please add at least one tag so Agent mode can understand what this pinned chat is for.\n\n"
+                    "Examples: `minimax h3, video, prompt enhancer` or `ace step, music, lyrics`."
+                )
+                continue
+            if not template:
+                QtWidgets.QMessageBox.information(dlg, "Pinned chat", "The template instruction cannot be empty.")
+                continue
+            pinned["name"] = name[:120]
+            pinned["description"] = ed_desc.toPlainText().strip()[:1000]
+            pinned["tags"] = tags
+            pinned["agent_enabled"] = bool(chk_agent.isChecked())
+            pinned["template"] = template
+            pinned["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            return True
+
     def _pinned_chat_path(self, pinned_id: str) -> str:
         return os.path.join(_memory_pinned_chats_dir(self.fv_root), f"{_safe_memory_filename(pinned_id or 'pinned_chat')}.json")
 
@@ -4209,6 +4612,8 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                 data.setdefault("id", os.path.splitext(fn)[0])
                 data.setdefault("name", str(data.get("title") or data.get("id") or "Pinned Chat"))
                 data.setdefault("template", str(data.get("template") or data.get("system_prompt") or ""))
+                data["tags"] = self._normalize_pinned_tags(data.get("tags", []))
+                data.setdefault("agent_enabled", True)
                 data["_path"] = os.path.join(root, fn)
                 self.pinned_chats.append(data)
         except Exception:
@@ -4234,8 +4639,19 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         for p in self.pinned_chats:
             name = str(p.get("name") or "Pinned Chat")
             desc = str(p.get("description") or p.get("template") or "")
-            item = QtWidgets.QListWidgetItem(name)
-            item.setToolTip((name + ("\n\n" + desc[:800] if desc else "")).strip())
+            tags = self._pinned_tags_text(p)
+            agent_enabled = bool(p.get("agent_enabled", True))
+            shown = name + (f"   [{tags}]" if tags else "")
+            if not agent_enabled:
+                shown += "   [Agent off]"
+            item = QtWidgets.QListWidgetItem(shown)
+            tip = name
+            if tags:
+                tip += f"\nTags: {tags}"
+            tip += f"\nAgent skill: {'enabled' if agent_enabled else 'disabled'}"
+            if desc:
+                tip += "\n\n" + desc[:800]
+            item.setToolTip(tip.strip())
             item.setData(QtCore.Qt.UserRole, str(p.get("id") or ""))
             lst.addItem(item)
         try:
@@ -4298,7 +4714,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         menu = QtWidgets.QMenu(self)
         act_start = menu.addAction("Start new chat from this")
         act_rename = menu.addAction("Rename pinned chat")
-        act_edit = menu.addAction("Edit template text")
+        act_edit = menu.addAction("Pinned chat settings / tags")
         act_delete = menu.addAction("Delete pinned chat")
         chosen = menu.exec(self.lst_pinned_chats.mapToGlobal(pos))
         if chosen == act_start:
@@ -4323,30 +4739,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._refresh_pinned_chats_view()
 
     def _edit_pinned_chat_template(self, pinned: Dict[str, Any]):
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Edit pinned chat template")
-        dlg.resize(760, 520)
-        lay = QtWidgets.QVBoxLayout(dlg)
-        ed_name = QtWidgets.QLineEdit(str(pinned.get("name") or "Pinned Chat"))
-        ed = QtWidgets.QPlainTextEdit(str(pinned.get("template") or ""))
-        lay.addWidget(QtWidgets.QLabel("Name"))
-        lay.addWidget(ed_name)
-        lay.addWidget(QtWidgets.QLabel("Template instruction"))
-        lay.addWidget(ed, 1)
-        row = QtWidgets.QHBoxLayout()
-        btn_cancel = QtWidgets.QPushButton("Cancel")
-        btn_save = QtWidgets.QPushButton("Save")
-        row.addStretch(1)
-        row.addWidget(btn_cancel)
-        row.addWidget(btn_save)
-        lay.addLayout(row)
-        btn_cancel.clicked.connect(dlg.reject)
-        btn_save.clicked.connect(dlg.accept)
-        if dlg.exec() != QtWidgets.QDialog.Accepted:
+        # Works for both new and old pinned-chat JSONs. Older chats simply start
+        # with an empty tags list and can be tagged here after installing the patch.
+        if not self._edit_pinned_chat_metadata_dialog(pinned, creating=False):
             return
-        pinned["name"] = ed_name.text().strip() or str(pinned.get("name") or "Pinned Chat")
-        pinned["template"] = ed.toPlainText().strip()
-        pinned["updated_at"] = datetime.now().isoformat(timespec="seconds")
         self._save_pinned_chat(pinned)
         self._refresh_pinned_chats_view()
 
@@ -5068,6 +5464,16 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         try:
+            self.settings_dialog.chk_telegram_enabled.setChecked(bool(data.get("telegram_remote_enabled", False)))
+            self.settings_dialog.ed_telegram_token.setText(str(data.get("telegram_bot_token") or ""))
+            raw_ids = data.get("telegram_allowed_user_ids", "")
+            if isinstance(raw_ids, list):
+                raw_ids = ", ".join(str(x) for x in raw_ids)
+            self.settings_dialog.ed_telegram_user_ids.setText(str(raw_ids or ""))
+            self.settings_dialog.chk_telegram_send_results.setChecked(bool(data.get("telegram_send_results", True)))
+        except Exception:
+            pass
+        try:
             self.settings_dialog.ed_output_images.setText(_path_for_settings_display(self.fv_root, str(data.get("assistant_images_output_dir") or os.path.join("output", "images"))))
             self.settings_dialog.ed_output_videos.setText(_path_for_settings_display(self.fv_root, str(data.get("assistant_videos_output_dir") or os.path.join("output", "video", "ltx23"))))
             self.settings_dialog.ed_output_edits.setText(_path_for_settings_display(self.fv_root, str(data.get("assistant_edits_output_dir") or os.path.join("output", "edits"))))
@@ -5138,6 +5544,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             "bubble_color_assistant": bubble_assistant,
             "bubble_color_user": bubble_user,
             "assistant_results_chat_only": bool(getattr(self.settings_dialog, "chk_results_chat_only", None).isChecked()) if getattr(self.settings_dialog, "chk_results_chat_only", None) is not None else True,
+            "telegram_remote_enabled": bool(getattr(self.settings_dialog, "chk_telegram_enabled", None).isChecked()) if getattr(self.settings_dialog, "chk_telegram_enabled", None) is not None else False,
+            "telegram_bot_token": str(getattr(self.settings_dialog, "ed_telegram_token", None).text().strip()) if getattr(self.settings_dialog, "ed_telegram_token", None) is not None else "",
+            "telegram_allowed_user_ids": str(getattr(self.settings_dialog, "ed_telegram_user_ids", None).text().strip()) if getattr(self.settings_dialog, "ed_telegram_user_ids", None) is not None else "",
+            "telegram_send_results": bool(getattr(self.settings_dialog, "chk_telegram_send_results", None).isChecked()) if getattr(self.settings_dialog, "chk_telegram_send_results", None) is not None else True,
             "assistant_images_output_dir": _path_for_settings_display(self.fv_root, getattr(self.settings_dialog, "ed_output_images", None).text().strip() if getattr(self.settings_dialog, "ed_output_images", None) is not None else os.path.join("output", "images")),
             "assistant_videos_output_dir": _path_for_settings_display(self.fv_root, getattr(self.settings_dialog, "ed_output_videos", None).text().strip() if getattr(self.settings_dialog, "ed_output_videos", None) is not None else os.path.join("output", "video", "ltx23")),
             "assistant_edits_output_dir": _path_for_settings_display(self.fv_root, getattr(self.settings_dialog, "ed_output_edits", None).text().strip() if getattr(self.settings_dialog, "ed_output_edits", None) is not None else os.path.join("output", "edits")),
@@ -6381,21 +6791,22 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         if not template:
             QtWidgets.QMessageBox.information(self, "Add to pinned chats", "This chat does not contain a reusable instruction yet.")
             return
-        name, ok = QtWidgets.QInputDialog.getText(self, "Add to pinned chats", "Pinned chat name:", text=session.title or "Pinned Chat")
-        if not ok:
-            return
-        name = str(name or "").strip() or session.title or "Pinned Chat"
         now = datetime.now().isoformat(timespec="seconds")
         data = {
             "id": str(uuid.uuid4()),
-            "name": name[:120],
+            "name": (session.title or "Pinned Chat")[:120],
             "description": template[:240],
             "template": template,
+            "tags": [],
+            "agent_enabled": True,
             "source_chat_id": session.id,
             "source_chat_title": session.title,
             "created_at": now,
             "updated_at": now,
         }
+        if not self._edit_pinned_chat_metadata_dialog(data, creating=True):
+            return
+        name = str(data.get("name") or "Pinned Chat")
         self._save_pinned_chat(data)
         self._load_pinned_chats()
         self._refresh_pinned_chats_view()
@@ -6933,6 +7344,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self.btn_stop.setEnabled(False)
         self._set_status("Ready", "ready")
         self._update_header()
+        if isinstance(getattr(self, "_telegram_agent_pending", None), dict):
+            QtCore.QTimer.singleShot(0, self._telegram_agent_continue_pending)
+            return
         if bool(getattr(self, "_planner_skill_waiting_for_server", False)):
             self._planner_skill_waiting_for_server = False
             QtCore.QTimer.singleShot(0, self._planner_agent_start_story_skill_generation)
@@ -6949,6 +7363,14 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(0, lambda sid=target_session_id: self._start_reply_request_for_session_id(sid))
 
     def _on_server_failed(self, message: str):
+        pending_agent = self._telegram_agent_pending if isinstance(getattr(self, "_telegram_agent_pending", None), dict) else None
+        if pending_agent:
+            try:
+                self._telegram_send_text(str(pending_agent.get("chat_id") or ""), "Could not load the local LLM for Telegram Agent: " + str(message or "unknown error"))
+            except Exception:
+                pass
+            self._telegram_agent_pending = None
+            self._telegram_agent_thread = None
         self._remove_llm_lock()
         tail = self.server_log_tail[-1] if self.server_log_tail else ""
         detail = message if not tail else f"{message}\n\nLast log line: {tail}"
@@ -9682,26 +10104,42 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             return max(5, int(m.group(1)) * 60 + int(m.group(2)))
         return 0
 
-    def _planner_agent_visual_style(self, text: str) -> str:
+    def _planner_agent_extra_info(self, text: str) -> str:
+        """Extract Planner Extra info without creating a separate visual-genre gate.
+
+        Planner's Extra info box is the persistent style/context channel.  For
+        MiniMax especially, the old visual-genre selector is no longer a
+        required field, but useful style words from the request still belong in
+        Extra info so Planner can carry them into every generated prompt.
+        """
         raw = str(text or '').strip()
         low = raw.lower()
-        # Explicit labels win and allow any free-form style, not only the common examples.
+        m = re.search(r'\bextra\s+info\s*:\s*([^\n]+)', raw, re.I)
+        if m:
+            return m.group(1).strip()
+        # Accept old explicit style/genre labels as Extra info for compatibility.
         m = re.search(r'\b(?:visual\s+)?(?:genre|style)\s*:\s*([^\n,;]+)', raw, re.I)
         if m:
             return m.group(1).strip()
         common = (
             ('photorealistic', 'photorealistic'), ('photo realistic', 'photorealistic'),
-            ('realistic', 'realistic cinematic'), ('pixar', 'Pixar-style 3D animation'),
+            ('realistic', 'realistic'), ('pixar', 'Pixar-style 3D animation'),
             ('manga', 'manga'), ('anime', 'anime'), ('cartoon', 'cartoon'),
             ('comic book', 'comic-book'), ('watercolor', 'watercolor'), ('watercolour', 'watercolor'),
             ('oil painting', 'oil painting'), ('claymation', 'claymation'),
             ('stop motion', 'stop-motion'), ('cyberpunk', 'cyberpunk'),
             ('surreal', 'surreal'), ('abstract', 'abstract'),
         )
+        found = []
         for token, value in common:
-            if re.search(r'\b' + re.escape(token) + r'\b', low):
-                return value
-        return ''
+            if re.search(r'\b' + re.escape(token) + r'\b', low) and value not in found:
+                found.append(value)
+        return ', '.join(found)
+
+    def _planner_agent_visual_style(self, text: str) -> str:
+        # Legacy compatibility for older callers. New Planner Agent code treats
+        # this as Extra info rather than a mandatory genre selector.
+        return self._planner_agent_extra_info(text)
 
     def _planner_agent_extract_spec(self, text: str, attachments: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         raw = str(text or '').strip()
@@ -9710,9 +10148,9 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         d = self._planner_agent_duration(raw)
         if d:
             spec['duration_sec'] = d
-        visual_style = self._planner_agent_visual_style(raw)
-        if visual_style:
-            spec['visual_style'] = visual_style
+        extra_info = self._planner_agent_extra_info(raw)
+        if extra_info:
+            spec['extra_info'] = extra_info
         if 'minimax' in low:
             spec['video_model'] = 'minimax_h3'
         elif ('ltx 2.5' in low) or ('ltx2.5' in low) or ('ltx25' in low):
@@ -9723,13 +10161,18 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             spec['video_model'] = 'hunyuan'
         elif 'wan 2.2' in low or 'wan2.2' in low:
             spec['video_model'] = 'wan22'
-        if '704' in low:
+        # Planner resolution parser. Keep MiniMax's native 960x544 / 544p
+        # distinct from the other presets so a Telegram reply such as
+        # "MiniMax H3, 544p, landscape" is accepted in one message.
+        if '960x544' in low or '960×544' in low or re.search(r'\b544p?\b', low):
+            spec['quality'] = '544p'
+        elif '704' in low:
             spec['quality'] = '704p'
         elif '480' in low:
             spec['quality'] = '480p'
         elif '1088' in low or '1080' in low:
             spec['quality'] = '1088p'
-        elif '1344' in low or '768' in low:
+        elif '1344' in low or re.search(r'\b768p?\b', low):
             spec['quality'] = '768p'
         if 'portrait' in low or '9:16' in low:
             spec['aspect'] = 'portrait'
@@ -9775,13 +10218,28 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                 pass
         if imgs:
             spec['minimax_reference_images'] = imgs[:9]
+
+        # MiniMax Planner auto reference-sheet override.  The default is handled
+        # by the Planner bridge: MiniMax + no supplied refs => ON.
+        # Only explicit wording changes that default.
+        if re.search(r'\b(?:no|disable|without|skip)\s+(?:auto\s+)?(?:character\s+)?ref(?:erence)?\s*sheet', low) or re.search(r'\bdo\s+not\s+create\s+(?:character\s+)?ref(?:erence)?\s*sheet', low):
+            spec['create_ref_sheets'] = False
+        elif re.search(r'\b(?:create|use|enable|auto(?:matically)?)\s+(?:character\s+)?ref(?:erence)?\s*sheet', low):
+            spec['create_ref_sheets'] = True
         return spec
 
     def _planner_agent_merge_reply(self, state: Dict[str, Any], text: str, attachments: Optional[List[Dict[str, Any]]] = None) -> None:
         parsed = self._planner_agent_extract_spec(text, attachments)
+        explicit = set(str(x) for x in (state.get('planner_custom_fields') or []))
         for k, v in parsed.items():
             if k != 'raw_request' and v not in (None, '', [], 0):
                 state[k] = v
+                if state.get('planner_defaults_decision') == 'custom' and k in {
+                    'video_model', 'quality', 'aspect', 'image_model', 'use_last_frame_as_start', 'create_ref_sheets'
+                }:
+                    explicit.add(k)
+        if explicit:
+            state['planner_custom_fields'] = sorted(explicit)
 
     def _planner_agent_apply_defaults(self, state: Dict[str, Any]) -> None:
         # These mirror the normal Planner path the user expects when no extra
@@ -9792,13 +10250,13 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         state.setdefault('aspect', 'landscape')
         state.setdefault('image_model', 'krea2')
         state.setdefault('use_last_frame_as_start', False)
+        # None means "automatic": MiniMax + no user refs => create sheets;
+        # other video models => off.
+        state.setdefault('create_ref_sheets', None)
 
     def _planner_agent_next_question(self, state: Dict[str, Any]) -> str:
         if not str(state.get('idea') or '').strip():
             return 'What is the idea/story for the Planner video?'
-        if not str(state.get('visual_style') or '').strip():
-            return ('What visual genre/style should the whole video use? For example: realistic, Pixar, manga, anime, cartoon, etc. '
-                    'I will pass this to the Planner as the project style so the images stay visually consistent.')
         if 'story_prompt_decision' not in state:
             return ('Is the idea you gave me the final story prompt, or shall I enhance the story idea first? '
                     'Answer "use it" or "enhance it".')
@@ -9823,13 +10281,32 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             return ('Shall I use the Planner defaults? '
                     'Krea 2 + LTX 2.3 + landscape + 704p + no last-frame-as-start-frame. '
                     'Answer yes to start with those defaults, or no and tell me what you want to change.')
-        if state.get('planner_defaults_decision') == 'custom' and not state.get('planner_custom_settings_received'):
-            return ('What would you like to change? You can specify only what matters, for example '
-                    '"use MiniMax", "LTX 2.5, portrait", "704p + Krea 2", or '
-                    '"use last frame as start frame". Anything you do not mention stays at the default.')
+        if state.get('planner_defaults_decision') == 'custom':
+            custom_fields = set(str(x) for x in (state.get('planner_custom_fields') or []))
+            if not state.get('planner_custom_settings_received'):
+                return ('What would you like to change? You can specify only what matters, for example '
+                        '"use MiniMax", "LTX 2.5, portrait", "480p + MiniMax", or '
+                        '"use last frame as start frame".')
+            # If the user declined the defaults and only changed the video model,
+            # do not silently inherit 704p. Resolution is expensive and must be
+            # explicit for a custom video-model choice. Aspect may still keep the
+            # normal landscape default when omitted.
+            if 'video_model' in custom_fields and 'quality' not in custom_fields:
+                if str(state.get('video_model') or '').lower() == 'minimax_h3':
+                    return ('You changed the video model to MiniMax H3. What resolution should I use? '
+                            'Choose 480p (832×480), 544p (960×544), 704p, 768p, or 1088p. '
+                            'You can include the aspect too, for example `480p landscape`.')
+                return ('You changed the video model. What resolution should I use? '
+                        'For example `704p landscape` or `480p portrait`.')
 
+        # Keep the Telegram choice for user-provided MiniMax refs.
+        # If the user says no, Planner can still auto-create its own ref sheets.
         if str(state.get('video_model') or '').lower() == 'minimax_h3' and 'use_minimax_refs' not in state:
-            return 'Do you want to use reference images with MiniMax? (yes/no)'
+            return (
+                'Do you want to provide your own MiniMax reference image(s)? (yes/no)\n\n'
+                'If you choose no, Planner will automatically create reference sheet(s) '
+                'for recurring characters when needed.'
+            )
         if bool(state.get('use_minimax_refs')) and not list(state.get('minimax_reference_images') or []):
             return 'Upload the MiniMax reference image(s) here, then send a message such as "use these". You can attach up to 9 images.'
         return ''
@@ -9869,25 +10346,41 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._planner_agent_launch_pending()
 
     def _planner_agent_story_skill_template(self) -> Tuple[str, str]:
-        """Return (name, template) for the configured Planner story-enhancement skill.
+        """Choose the best Agent-enabled pinned skill for Planner story enhancement.
 
-        For now this intentionally resolves one pinned chat by name.  It does not
-        switch the visible chat or import that pinned chat's old conversation.
+        Pinned-chat tags are intentionally the primary signal. This keeps the
+        feature portable: users can name their own chats however they like.
         """
-        wanted = 'advanced prompt writer for FrameVision'
         try:
             self._load_pinned_chats()
         except Exception:
             pass
-        wanted_low = wanted.strip().lower()
+        best = None
+        best_score = -1
         for pinned in list(getattr(self, 'pinned_chats', []) or []):
+            if not bool(pinned.get('agent_enabled', True)):
+                continue
+            template = str(pinned.get('template') or '').strip()
+            if not template:
+                continue
+            tags = set(self._normalize_pinned_tags(pinned.get('tags', [])))
             name = str(pinned.get('name') or '').strip()
-            if name.lower() == wanted_low:
-                template = str(pinned.get('template') or '').strip()
-                if template:
-                    return name, template
-        # A conservative fallback keeps the workflow usable if the pinned chat
-        # was renamed/deleted.  It deliberately avoids the old Planner enhancer.
+            blob = ' '.join([name.lower(), str(pinned.get('description') or '').lower(), ' '.join(tags)])
+            score = 0
+            for tag, weight in (
+                ('story enhancer', 8), ('prompt enhancer', 7), ('video', 5), ('a.i. video', 5),
+                ('planner', 5), ('prompt writer', 4), ('cinematic', 2),
+            ):
+                if tag in tags or tag in blob:
+                    score += weight
+            # Preserve compatibility with the old example skill without requiring its exact name.
+            if 'advanced prompt writer' in blob:
+                score += 4
+            if score > best_score:
+                best_score = score
+                best = (name or 'Pinned Agent skill', template)
+        if best is not None and best_score > 0:
+            return best
         fallback = (
             'You enhance short story ideas for the FrameVision video Planner. '
             'Preserve the user\'s concept and facts. Add useful visual actions, locations, '
@@ -9905,13 +10398,13 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
         self._pending_planner_agent_request = state
 
         skill_name, _template = self._planner_agent_story_skill_template()
-        if skill_name == 'advanced prompt writer for FrameVision':
+        if skill_name == 'built-in FrameVision story enhancer':
             self._append_framevision_assistant_reply(
-                'Enhancing the story idea with the pinned skill "advanced prompt writer for FrameVision"...'
+                'No suitable Agent-enabled pinned story/prompt skill was found, so I am using the built-in LLM story-enhancement instruction instead.'
             )
         else:
             self._append_framevision_assistant_reply(
-                'Pinned skill "advanced prompt writer for FrameVision" was not found, so I am using the built-in LLM story-enhancement instruction instead.'
+                f'Enhancing the story idea with pinned Agent skill "{skill_name}"...'
             )
 
         # Agent commands themselves do not require the LLM to be loaded.  Only
@@ -9940,10 +10433,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
 
         skill_name, template = self._planner_agent_story_skill_template()
         idea = str(state.get('story_original_idea') or state.get('idea') or '').strip()
-        style = str(state.get('visual_style') or '').strip()
+        style = str(state.get('extra_info') or '').strip()
         user_request = (
             'Enhance this story idea for use as the main idea/story prompt in FrameVision Planner.\n'
-            f'Visual style/genre: {style or "not specified"}\n\n'
+            f'Planner Extra info: {style or "not specified"}\n\n'
             f'Original story idea:\n{idea}\n\n'
             'Return the enhanced story idea only. Keep it as one coherent project-level story/concept, '
             'not a numbered shot list. Preserve the requested subject, events, style and intent.'
@@ -10074,16 +10567,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             return True
         if not str(state.get('idea') or '').strip():
             state['idea'] = str(text or '').strip()
-            # If the same answer explicitly includes a visual style, keep it too.
-            style = self._planner_agent_visual_style(text)
-            if style:
-                state['visual_style'] = style
-        elif not str(state.get('visual_style') or '').strip():
-            style = self._planner_agent_visual_style(text) or str(text or '').strip()
-            if not style:
-                self._append_framevision_assistant_reply('Please give me a visual genre/style, for example realistic, Pixar, manga or anime.')
-                return True
-            state['visual_style'] = style
+            # Keep any explicitly supplied style/context in Planner Extra info.
+            extra = self._planner_agent_extra_info(text)
+            if extra:
+                state['extra_info'] = extra
         elif 'story_prompt_decision' not in state:
             if re.search(r'\b(enhance|expand|improve|rewrite)\b', low):
                 self._planner_agent_begin_story_enhancement(state)
@@ -10137,6 +10624,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                 self._planner_agent_apply_defaults(state)
             elif re.match(r'^\s*(no|nope)\b', low):
                 state['planner_defaults_decision'] = 'custom'
+                state['planner_custom_fields'] = []
                 self._planner_agent_apply_defaults(state)
                 remainder = re.sub(r'^\s*(?:no|nope)\b[\s,;:.-]*', '', str(text or ''), flags=re.I).strip()
                 if remainder:
@@ -10150,6 +10638,7 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
                 meaningful = any(k in parsed for k in ('video_model', 'quality', 'aspect', 'image_model', 'use_last_frame_as_start'))
                 if meaningful:
                     state['planner_defaults_decision'] = 'custom'
+                    state['planner_custom_fields'] = []
                     self._planner_agent_apply_defaults(state)
                     self._planner_agent_merge_reply(state, text, attachments)
                     state['planner_custom_settings_received'] = True
@@ -10160,6 +10649,13 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
             self._planner_agent_apply_defaults(state)
             self._planner_agent_merge_reply(state, text, attachments)
             state['planner_custom_settings_received'] = True
+        elif state.get('planner_defaults_decision') == 'custom' and 'video_model' in set(state.get('planner_custom_fields') or []) and 'quality' not in set(state.get('planner_custom_fields') or []):
+            # Follow-up to an explicit custom video-model choice.
+            parsed = self._planner_agent_extract_spec(text, attachments)
+            if 'quality' not in parsed:
+                self._append_framevision_assistant_reply('Please choose the resolution first, for example `480p landscape` or `544p landscape`.')
+                return True
+            self._planner_agent_merge_reply(state, text, attachments)
         elif str(state.get('video_model') or '').lower() == 'minimax_h3' and 'use_minimax_refs' not in state:
             state['use_minimax_refs'] = bool(re.search(r'\b(yes|yeah|yep|use|reference)\b', low) and not re.search(r'\b(no|none|without)\b', low))
             self._planner_agent_merge_reply(state, text, attachments)
@@ -11479,6 +11975,10 @@ class LlamaChatWindow(QtWidgets.QMainWindow):
     # ---------- window ----------
     def closeEvent(self, event: QtGui.QCloseEvent):
         self.pending_generate_session_id = ""
+        try:
+            self._stop_telegram_bridge()
+        except Exception:
+            pass
         self._cleanup_boot_thread()
         self._stop_process_only()
         self._apply_settings_to_current_session()
@@ -11533,6 +12033,11 @@ def main():
     w.show()
     return app.exec()
 
+
+# Bind after the module has defined all helpers/classes and before standalone main()
+# can construct the window. TelegramAgentMixin methods then resolve the same
+# llama_chat_ui globals they used before being moved.
+_telegram_agent_module.bind_host_globals(globals())
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -42,6 +42,7 @@ def main():
     ap.add_argument("--vram-manager-auto", action="store_true", help="Automatically bypass VRAM Lab when native sampling is estimated to fit the detected GPU")
     ap.add_argument("--spectrum", action="store_true", help="Enable experimental bundled MiniMax H3 Spectrum feature forecasting")
     ap.add_argument("--sage-attention", action="store_true", help="Use SageAttention for the sampling worker")
+    ap.add_argument("--sol-attention", action="store_true", help="Use vendored Sol-Attn for eligible MiniMax H3 attention; falls back to existing attention otherwise")
     ap.add_argument("--disable-comfy-kitchen", action="store_true", help="Disable Comfy Kitchen quantized W4A8 / ConvRot acceleration for worker processes")
     ap.add_argument("--vram-residency-engine", choices=["static", "dynamic"], default="static")
     ap.add_argument("--vram-runtime-free-gb", type=float, default=0.5)
@@ -59,6 +60,14 @@ def main():
     ap.add_argument("--vram-residency-refill-interval", type=int, default=1)
     ap.add_argument("--vram-keep-text-encoder", action="store_true")
     ns = ap.parse_args()
+    # Sol-Attn is read by the vendored H3 model inside the isolated sampling
+    # worker. Keep it process-local so VAE/text helper workers are unaffected.
+    if ns.sol_attention:
+        os.environ["H3_SOL_ATTENTION"] = "1"
+        print("Sol-Attn: enabled for eligible MiniMax H3 attention (existing backend remains fallback)", flush=True)
+    else:
+        os.environ.pop("H3_SOL_ATTENTION", None)
+        print("Sol-Attn: disabled", flush=True)
     # Worker processes import the vendored Comfy stack afresh, so this environment
     # switch cleanly controls whether comfy.quant_ops may activate Comfy Kitchen.
     if ns.disable_comfy_kitchen:

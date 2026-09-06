@@ -727,6 +727,7 @@ class MainWindow(QMainWindow):
         self._build()
         self._apply_style()
         self.load_last()
+        self._connect_acceleration_persistence()
         self._load_lora_state()
         self._connect_lora_persistence()
         self._load_queue_state()
@@ -2320,8 +2321,13 @@ class MainWindow(QMainWindow):
 
         self.sage_attention_enabled = QCheckBox("Enable SageAttention")
         self.sage_attention_enabled.setChecked(False)
-        self.sage_attention_enabled.setToolTip("Transformer attention acceleration during sampling. Can be used together with Comfy Kitchen. Default: Off.")
+        self.sage_attention_enabled.setToolTip("Transformer attention acceleration during sampling. When Sol-Attn is enabled, SageAttention remains available as the fallback backend. Default: Off.")
         v.addWidget(self.sage_attention_enabled)
+
+        self.sol_attention_enabled = QCheckBox("Enable Sol Attention")
+        self.sol_attention_enabled.setChecked(False)
+        self.sol_attention_enabled.setToolTip("Sparse BF16 attention for eligible long MiniMax H3 sequences. Keeps packed conditioning KV exact and falls back to SageAttention/Comfy attention when Sol is unavailable. Default: Off.")
+        v.addWidget(self.sol_attention_enabled)
 
         self.comfy_kitchen_enabled = QCheckBox("Enable Comfy Kitchen W4A8 acceleration")
         self.comfy_kitchen_enabled.setChecked(True)
@@ -2407,7 +2413,7 @@ class MainWindow(QMainWindow):
 
         self.vram_manager_auto_bypass = QCheckBox("Automatic bypass when job fits")
         self.vram_manager_auto_bypass.setChecked(True)
-        self.vram_manager_auto_bypass.setToolTip("Recommended. At the start of each job, detect GPU total/free dedicated VRAM and estimate native MiniMax H3 sampling demand from resolution and frame count. If the job fits with safety headroom, VRAM Lab is completely bypassed: no sampling hooks, residency manager, allocator guard, or manager-specific Comfy arguments. Uncheck to force VRAM Manager on for every job while the master switch is enabled.")
+        self.vram_manager_auto_bypass.setToolTip("Recommended. At the start of each job, detect GPU total/free dedicated VRAM and estimate native MiniMax H3 sampling demand. Ref2VA jobs with 4 or more visual references automatically force full VRAM Manager protection because large reference conditioning can otherwise make a native diffusion decision spill into shared VRAM. Uncheck to force VRAM Manager on for every job while the master switch is enabled.")
         vf.addRow(self.vram_manager_auto_bypass)
 
         self.vram_residency_engine = QComboBox()
@@ -2840,6 +2846,7 @@ class MainWindow(QMainWindow):
             "play_result_queue_player": self.play_result_queue_player.isChecked(),
             "spectrum_enabled": self.spectrum_enabled.isChecked(),
             "sage_attention_enabled": self.sage_attention_enabled.isChecked(),
+            "sol_attention_enabled": self.sol_attention_enabled.isChecked(),
             "comfy_kitchen_enabled": self.comfy_kitchen_enabled.isChecked(),
             "use_hybrid_model": self.use_hybrid_model.isChecked(),
             "vram_manager_enabled": self.vram_manager_enabled.isChecked(), "vram_manager_auto_bypass": self.vram_manager_auto_bypass.isChecked(), "vram_residency_engine": self.vram_residency_engine.currentData(), "vram_runtime_free_gb": self.vram_runtime_free.value(),
@@ -2900,6 +2907,7 @@ class MainWindow(QMainWindow):
             self._sync_queue_preview_setting_visibility()
             self.spectrum_enabled.setChecked(bool(d.get("spectrum_enabled", False)))
             self.sage_attention_enabled.setChecked(bool(d.get("sage_attention_enabled", False)))
+            self.sol_attention_enabled.setChecked(bool(d.get("sol_attention_enabled", False)))
             self.comfy_kitchen_enabled.setChecked(bool(d.get("comfy_kitchen_enabled", True)))
             self.use_hybrid_model.setChecked(bool(d.get("use_hybrid_model", False)))
             self._sync_hybrid_model_controls(self.use_hybrid_model.isChecked())
@@ -2936,6 +2944,16 @@ class MainWindow(QMainWindow):
 
     def save_last(self):
         PRESET_DIR.mkdir(parents=True, exist_ok=True); (PRESET_DIR / "minimax_h3_gui_last.json").write_text(json.dumps(self.settings_dict(), indent=2), encoding="utf-8")
+
+    def _connect_acceleration_persistence(self):
+        # FrameVision can recreate the embedded MiniMax helper without the standalone
+        # window receiving closeEvent().  Persist these frequently changed acceleration
+        # toggles at the moment the user changes them so they survive helper recreation
+        # and application restart just like the dedicated LoRA state does.
+        self.sage_attention_enabled.toggled.connect(self.save_last)
+        self.sol_attention_enabled.toggled.connect(self.save_last)
+        self.comfy_kitchen_enabled.toggled.connect(self.save_last)
+
     def load_last(self):
         p = PRESET_DIR / "minimax_h3_gui_last.json"
         if p.is_file():
@@ -3634,11 +3652,24 @@ print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
         args += self.model_override_args()
         args += self.lora_args()
         if self.vram_manager_enabled.isChecked():
-            args += ["--vram-manager-auto" if self.vram_manager_auto_bypass.isChecked() else "--vram-manager"]
+            # Ref2VA conditioning grows sharply with the number of visual references.
+            # The runtime auto estimator currently accounts for that in the reference/text
+            # stages, but its diffusion estimate is resolution/frame based and can still
+            # select native diffusion after Qwen produced a very large conditioning tensor.
+            # On 24 GB cards this can cause WDDM spill and a severe sampling slowdown.
+            # Force full stage-aware residency protection for 4+ visual refs until the
+            # runtime estimator itself carries conditioning cost into the diffusion budget.
+            visual_ref_count = 0
+            if mode == 2:
+                visual_ref_count = len(self.ref_images.paths()) + len(self.ref_videos.paths())
+            force_ref2va_vram_manager = (mode == 2 and visual_ref_count >= 4)
+            use_auto_vram = self.vram_manager_auto_bypass.isChecked() and not force_ref2va_vram_manager
+            args += ["--vram-manager-auto" if use_auto_vram else "--vram-manager"]
             args += ["--vram-residency-engine", str(self.vram_residency_engine.currentData() or "static"), "--vram-runtime-free-gb", str(self.vram_runtime_free.value()), "--vram-text-headroom-gb", str(self.vram_text_headroom.value()), "--vram-diffusion-headroom-gb", str(self.vram_diffusion_headroom.value()), "--vram-offload-chunk-mb", str(self.vram_offload_chunk.value()), "--vram-max-resident-weights-gb", str(self.vram_max_weights.value()), "--vram-block-check-interval", str(self.vram_block_interval.value()), "--vram-async-streams", str(self.vram_async_streams.value()), "--vram-video-vae-reserve-gb", str(self.vram_video_vae_reserve.value()), "--vram-audio-vae-reserve-gb", str(self.vram_audio_vae_reserve.value()), "--vram-residency-target-free-gb", str(self.vram_residency_target_free.value()), "--vram-residency-warmup-blocks", str(self.vram_residency_warmup.value()), "--vram-residency-refill-interval", str(self.vram_residency_refill_interval.value())]
             args += ["--vram-residency-fill" if self.vram_residency_fill.isChecked() else "--no-vram-residency-fill"]
         if self.spectrum_enabled.isChecked(): args += ["--spectrum"]
         if self.sage_attention_enabled.isChecked(): args += ["--sage-attention"]
+        if self.sol_attention_enabled.isChecked(): args += ["--sol-attention"]
         if not self.comfy_kitchen_enabled.isChecked(): args += ["--disable-comfy-kitchen"]
         # Video-VAE tiling is independent from sampling-side VRAM Manager activation.
         # Keep the proven 256/128 defaults unless the user deliberately changes them for testing.

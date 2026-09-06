@@ -89,7 +89,7 @@ def main()->int:
     cmd=[str(PYTHON),str(script),"--width",str(ns.width),"--height",str(ns.height),"--frames",str(_native_frames),
          "--steps",str(steps),"--cfg","1.0","--shift","12","--audio-shift","3","--seed",str(ns.seed),
          "--sampler","euler","--scheduler","simple","--prompt",ns.prompt,"--output",str(out),
-         "--vram-manager-auto","--video-vae-tile-size","256","--video-vae-tile-overlap","128"]
+         "--vram-manager-auto","--video-vae-tile-size","256","--video-vae-tile-overlap","64"]
     if _native_frames > 719:
         cmd += ["--experimental-long-duration"]
     _active_lora_paths=set()
