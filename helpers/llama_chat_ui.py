@@ -8717,7 +8717,7 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
 
     def _ace15_write_config(self, state: Dict[str, Any]) -> Path:
         cfg = self._ace15_config()
-        out_dir = self._ace15_output_dir()
+        out_dir = Path(str(state.get("output_dir"))).resolve() if str(state.get("output_dir") or "").strip() else self._ace15_output_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         title_hint = self._ace15_sanitize_filename_part(str(state.get("title") or ""))
@@ -8831,7 +8831,8 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
         if not project_root.exists():
             return False, f"Ace-Step project root was not found: {project_root}", ""
         cfg_path = self._ace15_write_config(state)
-        out_dir = self._ace15_output_dir()
+        out_dir = Path(str(state.get("output_dir"))).resolve() if str(state.get("output_dir") or "").strip() else self._ace15_output_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
         title = str(state.get("title") or "").strip()
         sub = str(state.get("subgenre") or "Custom").strip() or "Custom"
         seed = int(state.get("seed") or 0)

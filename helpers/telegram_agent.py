@@ -600,13 +600,74 @@ class TelegramAgentMixin:
 
     # ------------------------- Autonomous story/music-video Agent -------------------------
     def _telegram_autonomous_dir(self) -> Path:
-        p = Path(self.fv_root) / "temp" / "telegram" / "agent_projects"
+        """Root for every autonomous Telegram job. No Agent artifacts belong in temp/."""
+        p = Path(self.fv_root) / "output" / "telegrambot"
         p.mkdir(parents=True, exist_ok=True)
         return p
 
-    def _telegram_autonomous_session_path(self, session_id: str) -> Path:
+    @staticmethod
+    def _telegram_autonomous_model_folder(model: object) -> str:
+        low = re.sub(r"[^a-z0-9]+", "", str(model or "").lower())
+        if "minimax" in low or low in {"h3", "minimaxh3"}:
+            return "minimaxh3"
+        if "ltx25" in low or "ltx2.5" in str(model or "").lower():
+            return "ltx25"
+        if "ltx23" in low or "ltx2.3" in str(model or "").lower():
+            return "ltx23"
+        return "other"
+
+    def _telegram_autonomous_guess_model(self, request: str) -> str:
+        low = str(request or "").lower()
+        if "ltx 2.5" in low or "ltx2.5" in low or "ltx25" in low:
+            return "ltx25"
+        if "ltx 2.3" in low or "ltx2.3" in low or "ltx23" in low:
+            return "ltx23"
+        if "minimax" in low or "h3" in low:
+            return "minimax_h3"
+        return "minimax_h3"
+
+    def _telegram_autonomous_ensure_job_dirs(self, session: Dict[str, Any], model: object = "") -> Dict[str, str]:
+        """Create and persist the single job-owned filesystem tree.
+
+        All autonomous Telegram artifacts must derive from these paths. The model
+        bucket is intentionally outside the job folder so Minimax/LTX test runs stay
+        separated without scattering files across FrameVision's global outputs.
+        """
+        sid = re.sub(r"[^0-9A-Za-z_-]+", "_", str(session.get("id") or "agent")) or "agent"
+        chosen = str(model or dict(session.get("plan") or {}).get("video_model") or session.get("video_model") or self._telegram_autonomous_guess_model(str(session.get("request") or "")))
+        bucket = self._telegram_autonomous_model_folder(chosen)
+        wanted_root = self._telegram_autonomous_dir() / bucket / sid
+        old_root_raw = str(session.get("job_root") or "").strip()
+        old_root = Path(old_root_raw) if old_root_raw else None
+        if old_root is not None and old_root != wanted_root and old_root.exists():
+            wanted_root.parent.mkdir(parents=True, exist_ok=True)
+            if not wanted_root.exists():
+                try:
+                    shutil.move(str(old_root), str(wanted_root))
+                except Exception:
+                    wanted_root.mkdir(parents=True, exist_ok=True)
+            else:
+                wanted_root.mkdir(parents=True, exist_ok=True)
+        else:
+            wanted_root.mkdir(parents=True, exist_ok=True)
+        names = ("refs", "story", "clips", "images", "assembled", "retries", "music")
+        paths = {name: str((wanted_root / name).resolve()) for name in names}
+        for value in paths.values():
+            Path(value).mkdir(parents=True, exist_ok=True)
+        session["job_root"] = str(wanted_root.resolve())
+        session["model_folder"] = bucket
+        session["paths"] = paths
+        return paths
+
+    def _telegram_autonomous_session_path(self, session_id: str, session: Optional[Dict[str, Any]] = None) -> Path:
+        if isinstance(session, dict):
+            paths = self._telegram_autonomous_ensure_job_dirs(session)
+            return Path(paths["story"]) / "session.json"
         safe = re.sub(r"[^0-9A-Za-z_-]+", "_", str(session_id or "agent"))
-        return self._telegram_autonomous_dir() / f"{safe}.json"
+        matches = list(self._telegram_autonomous_dir().glob(f"*/{safe}/story/session.json"))
+        if matches:
+            return matches[0]
+        return self._telegram_autonomous_dir() / "other" / safe / "story" / "session.json"
 
     def _telegram_autonomous_save_planning_diagnostic(
         self,
@@ -632,7 +693,8 @@ class TelegramAgentMixin:
                     )
             else:
                 raw = str(payload or "")
-            path = self._telegram_autonomous_dir() / f"{sid}_{phase_safe}_raw.txt"
+            paths = self._telegram_autonomous_ensure_job_dirs(session)
+            path = Path(paths["story"]) / f"{phase_safe}_raw.txt"
             path.write_text(raw, encoding="utf-8", errors="replace")
 
             info = {
@@ -645,7 +707,7 @@ class TelegramAgentMixin:
                 "error": str(error or ""),
                 "raw_file": str(path),
             }
-            meta = self._telegram_autonomous_dir() / f"{sid}_{phase_safe}_diagnostic.json"
+            meta = Path(paths["story"]) / f"{phase_safe}_diagnostic.json"
             meta.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
             return str(path)
         except Exception:
@@ -656,7 +718,7 @@ class TelegramAgentMixin:
             sid = str(session.get("id") or "").strip()
             if not sid:
                 return
-            path = self._telegram_autonomous_session_path(sid)
+            path = self._telegram_autonomous_session_path(sid, session)
             tmp = path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(str(tmp), str(path))
@@ -667,7 +729,11 @@ class TelegramAgentMixin:
         try:
             active_statuses = {"planning", "planning_retry", "building_story", "building_shots", "auditing_references", "music_preset_choice", "queueing", "queueing_media", "generating_refs", "generating", "review_ready", "assembling"}
             best: Dict[str, tuple[float, bool, Dict[str, Any]]] = {}
-            for path in self._telegram_autonomous_dir().glob("*.json"):
+            session_files = list(self._telegram_autonomous_dir().rglob("story/session.json"))
+            legacy_dir = Path(self.fv_root) / "temp" / "telegram" / "agent_projects"
+            if legacy_dir.exists():
+                session_files.extend(legacy_dir.glob("*.json"))
+            for path in session_files:
                 try:
                     data = json.loads(path.read_text(encoding="utf-8"))
                 except Exception:
@@ -2194,7 +2260,8 @@ class TelegramAgentMixin:
             sid = re.sub(r"[^0-9A-Za-z_-]+", "_", str(session.get("id") or "agent"))
             idx = int(session.get("batch_index") or 0)
             suffix = f"_{idx+1:02d}" if phase == "shots" else ""
-            path = self._telegram_autonomous_dir() / f"{sid}_{phase}{suffix}_raw.txt"
+            paths = self._telegram_autonomous_ensure_job_dirs(session, dict(session.get("plan") or {}).get("video_model"))
+            path = Path(paths["story"]) / f"{phase}{suffix}_raw.txt"
             path.write_text(str(payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, indent=2)), encoding="utf-8")
             session["last_raw_log"] = str(path)
         except Exception:
@@ -2203,7 +2270,9 @@ class TelegramAgentMixin:
     def _telegram_autonomous_write_json(self, session: Dict[str, Any], name: str, payload: Dict[str, Any]) -> None:
         try:
             sid = re.sub(r"[^0-9A-Za-z_-]+", "_", str(session.get("id") or "agent"))
-            path = self._telegram_autonomous_dir() / f"{sid}_{name}.json"
+            paths = self._telegram_autonomous_ensure_job_dirs(session, dict(session.get("plan") or {}).get("video_model"))
+            target_folder = "retries" if "retry" in str(name or "").lower() or "redo" in str(name or "").lower() else "story"
+            path = Path(paths[target_folder]) / f"{name}.json"
             path.write_text(json.dumps(payload or {}, ensure_ascii=False, indent=2), encoding="utf-8")
             session[f"{name}_path"] = str(path)
         except Exception:
@@ -2489,6 +2558,7 @@ class TelegramAgentMixin:
             "assembly_queued_at": 0.0,
             "last_notice": "",
         }
+        self._telegram_autonomous_ensure_job_dirs(session, self._telegram_autonomous_guess_model(session["request"]))
         self._telegram_autonomous_sessions[key] = session
         self._telegram_autonomous_save(session)
         self._telegram_send_text(
@@ -3071,7 +3141,8 @@ class TelegramAgentMixin:
             kind = self._telegram_autonomous_reference_asset_kind(ref)
             krea_prompt = self._telegram_autonomous_reference_asset_prompt(ref, n)
             try:
-                route = router._queue_image(krea_prompt, "krea2", 1920, 1088)
+                paths = self._telegram_autonomous_ensure_job_dirs(session, dict(session.get("plan") or {}).get("video_model"))
+                route = router._queue_image(krea_prompt, "krea2", 1920, 1088, output_dir=paths["refs"])
             except Exception as exc:
                 return False, f"Krea 2 reference `{name}` could not be queued: {exc}"
             if not bool(getattr(route, "queued", False)):
@@ -3504,6 +3575,8 @@ class TelegramAgentMixin:
             "duration_sec": float(frames) / 24.0,
             "seed": int(generation_seed),
             "output_name": f"{sid}_S{order:02d}_redo{redo_n:02d}",
+            "output_dir": self._telegram_autonomous_ensure_job_dirs(session, model)["retries"],
+            "job_work_dir": self._telegram_autonomous_ensure_job_dirs(session, model)["story"],
         }
         router = self._telegram_router_for_chat(key)
         try:
@@ -4276,6 +4349,8 @@ class TelegramAgentMixin:
             return
         plan = dict(session.get("plan") or {})
         model = str(plan.get("video_model") or "minimax_h3")
+        self._telegram_autonomous_ensure_job_dirs(session, model)
+        self._telegram_autonomous_save(session)
         router = self._telegram_router_for_chat(key)
 
         # Asset-first execution. The previous Agent could describe a Krea
@@ -4346,6 +4421,8 @@ class TelegramAgentMixin:
                 "fps": 24,
                 "duration_sec": float(frames) / 24.0,
                 "output_name": f"{sid}_S{i:02d}",
+                "output_dir": self._telegram_autonomous_ensure_job_dirs(session, model)["clips"],
+                "job_work_dir": self._telegram_autonomous_ensure_job_dirs(session, model)["story"],
             }
             try:
                 if model == "ltx25":
@@ -4397,6 +4474,7 @@ class TelegramAgentMixin:
                 "title": f"{sid}_music",
                 "bpm": int(music.get("bpm") or 0),
                 "seed": random.randint(1, 2147483647),
+                "output_dir": self._telegram_autonomous_ensure_job_dirs(session, model)["music"],
             }
             try:
                 # Agent mode must use the exact chosen FrameVision preset.  The
@@ -4573,7 +4651,7 @@ class TelegramAgentMixin:
             return False, f"Bundled FFmpeg was not found: {ffmpeg}"
 
         sid = str(session.get("id") or "agent")
-        out_dir = Path(self.fv_root) / "output" / "video" / "agent"
+        out_dir = Path(self._telegram_autonomous_ensure_job_dirs(session, dict(session.get("plan") or {}).get("video_model"))["assembled"])
         out_dir.mkdir(parents=True, exist_ok=True)
         revision = int(session.get("assembly_revision") or 0) + 1
         concat_file = self._telegram_autonomous_dir() / f"{sid}_concat_r{revision:02d}.txt"
@@ -4894,7 +4972,7 @@ class TelegramAgentMixin:
                     # Keep a predictable project-local copy so users can inspect
                     # exactly which refs the Agent handed to Ref2VA.
                     sid = str(session.get("id") or "agent")
-                    ref_dir = Path(self.fv_root) / "output" / "images" / "agent_refs" / sid
+                    ref_dir = Path(self._telegram_autonomous_ensure_job_dirs(session, dict(session.get("plan") or {}).get("video_model"))["refs"])
                     ref_dir.mkdir(parents=True, exist_ok=True)
                     for n, asset in enumerate(assets, start=1):
                         src = Path(str(asset.get("path") or ""))
@@ -5625,7 +5703,7 @@ class TelegramAgentMixin:
                     "Anything you leave open is for the Agent to decide.\n\n"
                     "Important: generation uses the LAST SAVED settings from the normal FrameVision model tabs. "
                     "Before starting a long Agent job, set/save the options you want there. For MiniMax H3 this includes loaded LoRAs and their strengths, "
-                    "steps, Sage Attention, Spectrum Forecaster, Comfy Kitchen, sampler/scheduler, VRAM settings and model overrides."
+                    "steps, Sage Attention, Sol Attention, Spectrum Forecaster, Comfy Kitchen, sampler/scheduler, VRAM settings and model overrides."
                 )
                 return
             # Project review/repair commands are handled before generic Telegram

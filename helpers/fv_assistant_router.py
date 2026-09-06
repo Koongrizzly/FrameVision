@@ -874,7 +874,7 @@ class FrameVisionAssistantRouter:
         }
         prompt = str(state.get("prompt") or "").strip()
         seed = random.randint(0, 2147483647)
-        out_dir = Path(str(settings.get("output") or self.root / "output")).resolve()
+        out_dir = Path(str(state.get("output_dir") or settings.get("output") or self.root / "output")).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
         name = str(state.get("output_name") or "").strip() or "ltx25_video"
         outfile = out_dir / f"{name}_seed{seed}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
@@ -893,7 +893,7 @@ class FrameVisionAssistantRouter:
             "use_int8_text_encoder": False, "int8_text_encoder_bundle": str(settings.get("int8_text") or ""), "enhance_prompt": False,
             "defer_trim": bool(settings.get("defer_trim", True)), "cache_prompt_embeddings": bool(settings.get("cache_prompt_embeddings", True)),
         }
-        payload_dir = self.root / "temp" / "ltx25_queue_payloads"; payload_dir.mkdir(parents=True, exist_ok=True)
+        payload_dir = Path(str(state.get("job_work_dir") or self.root / "temp" / "ltx25_queue_payloads")).resolve(); payload_dir.mkdir(parents=True, exist_ok=True)
         payload = payload_dir / f"ltx25_chat_{int(time.time()*1000)}_{seed}.json"; payload.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
         helper = self.root / "helpers" / ("ltx25_convrot_worker.py" if is_convrot else "ltx25_helper.py")
         env_dir = self.root / "environments" / ("ltx25_convrot" if is_convrot else "ltx25")
@@ -970,6 +970,7 @@ class FrameVisionAssistantRouter:
             f"sampler={str(saved.get('sampler') or 'euler')}, "
             f"scheduler={str(saved.get('scheduler') or 'simple')}, "
             f"Sage Attention={'ON' if bool(saved.get('sage_attention_enabled', False)) else 'OFF'}, "
+            f"Sol Attention={'ON' if bool(saved.get('sol_attention_enabled', False)) else 'OFF'}, "
             f"Spectrum={'ON' if bool(saved.get('spectrum_enabled', False)) else 'OFF'}, "
             f"Comfy Kitchen={'ON' if bool(saved.get('comfy_kitchen_enabled', True)) else 'OFF'}, "
             f"LoRA(s)={lora_text} "
@@ -1008,6 +1009,7 @@ class FrameVisionAssistantRouter:
             args += ["--vram-manager-auto" if bool(saved.get("vram_manager_auto_bypass", True)) else "--vram-manager"]
         if bool(saved.get("spectrum_enabled", False)): args += ["--spectrum"]
         if bool(saved.get("sage_attention_enabled", False)): args += ["--sage-attention"]
+        if bool(saved.get("sol_attention_enabled", False)): args += ["--sol-attention"]
         if not bool(saved.get("comfy_kitchen_enabled", True)): args += ["--disable-comfy-kitchen"]
         args += ["--video-vae-tile-size", str(int(saved.get("vram_video_vae_tile_size",256) or 256)), "--video-vae-tile-overlap", str(int(saved.get("vram_video_vae_tile_overlap",64) or 64))]
         # Model overrides and LoRAs saved by the GUI.
@@ -1017,7 +1019,7 @@ class FrameVisionAssistantRouter:
         active_loras = self._minimax_h3_saved_loras(saved)
         for item in active_loras:
             args += ["--lora", str(item["path"]), "--lora-strength", str(float(item["strength"]))]
-        out_dir = Path(str(saved.get("output_folder") or self.root / "output" / "video" / "minimax_h3")).resolve(); out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(str(state.get("output_dir") or saved.get("output_folder") or self.root / "output" / "video" / "minimax_h3")).resolve(); out_dir.mkdir(parents=True, exist_ok=True)
         name = str(state.get("output_name") or "").strip() or "minimax_h3_video"
         outfile = out_dir / f"{name}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"; args += ["--output", str(outfile)]
         job_settings = dict(saved)
@@ -1355,7 +1357,7 @@ class FrameVisionAssistantRouter:
         frames = int(state.get("frames") or int(defaults.get("frames", 121) or 121))
         fps = int(state.get("fps") or int(defaults.get("fps", 24) or 24))
         seed = random.randint(1, 2_147_483_647)
-        out_dir = (self.root / str(cfg.get("output_dir") or "output/video/ltx23/chat")).resolve()
+        out_dir = Path(str(state.get("output_dir"))).resolve() if str(state.get("output_dir") or "").strip() else (self.root / str(cfg.get("output_dir") or "output/video/ltx23/chat")).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
         name = str(state.get("output_name") or "").strip() or "ltx23_video"
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -2302,7 +2304,7 @@ class FrameVisionAssistantRouter:
                 return False, f"{label} is installed only partly or needs repair. Missing helper CLI: `{cli_py}`. Please update/repair FrameVision so helpers/hidream_cli.py is present."
         return True, ""
 
-    def _queue_image(self, prompt: str, model_id: str, width: int, height: int) -> AssistantRouteResult:
+    def _queue_image(self, prompt: str, model_id: str, width: int, height: int, output_dir: str = "") -> AssistantRouteResult:
         model_id = self._canonical_image_model_id(model_id)
         cfg = self._model_cfg(model_id)
         if not cfg:
@@ -2330,7 +2332,7 @@ class FrameVisionAssistantRouter:
             elif model_id == "chroma":
                 ok = self._enqueue_chroma(prompt, cfg, width, height, seed)
             elif model_id == "krea2":
-                ok = self._enqueue_krea2(prompt, cfg, width, height, seed)
+                ok = self._enqueue_krea2(prompt, cfg, width, height, seed, output_dir=output_dir)
             elif model_id == "flux_klein":
                 ok = self._enqueue_flux_klein(prompt, cfg, width, height, seed)
             elif model_id == "hidream":
@@ -2634,9 +2636,9 @@ class FrameVisionAssistantRouter:
         except Exception:
             return None
 
-    def _enqueue_krea2(self, prompt: str, cfg: Dict[str, Any], width: int, height: int, seed: int) -> bool:
+    def _enqueue_krea2(self, prompt: str, cfg: Dict[str, Any], width: int, height: int, seed: int, output_dir: str = "") -> bool:
         folder = self.root / str(cfg.get("folder") or "models/krea2")
-        out_dir = self.root / str(cfg.get("output_dir") or "output/images/krea2")
+        out_dir = Path(str(output_dir)).resolve() if str(output_dir or "").strip() else (self.root / str(cfg.get("output_dir") or "output/images/krea2")).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
         diffusion = self._find_best_krea2_diffusion_gguf(folder)
         llm = self._find_best_krea2_llm_gguf(folder)
