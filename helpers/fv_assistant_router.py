@@ -3880,7 +3880,68 @@ def _fill_qt_path_list(widget: Any, paths: List[str], limit: int = 0) -> int:
     return count
 
 
-def launch_music_clip_job(spec: Dict[str, Any]) -> Tuple[bool, str]:
+
+
+def control_latest_music_clip_job(action: str) -> Tuple[bool, str]:
+    """Route follow-up assistant commands to the newest live Music Clip Creator.
+
+    This prevents a bare command such as ``assemble`` from falling through to an
+    unrelated/older generic agent job.  The assistant-created MiniMax widget is
+    intentionally kept in _MUSIC_CLIP_WINDOWS, so it remains the authoritative
+    owner of its project until the run is finished or the application exits.
+    """
+    act = str(action or "").strip().lower()
+    win = None
+    for candidate in reversed(list(_MUSIC_CLIP_WINDOWS)):
+        try:
+            if candidate is not None and bool(getattr(candidate, "_assistant_run", False)):
+                win = candidate
+                break
+        except Exception:
+            continue
+    if win is None:
+        return False, "There is no active assistant Music Clip Creator project to control."
+
+    try:
+        if act in {"assemble", "assemble final", "assemble video", "finish", "finish video"}:
+            try:
+                win._sync_existing_generated_outputs()
+            except Exception:
+                pass
+            missing = []
+            try:
+                for shot in list(getattr(getattr(win, "project", None), "shots", []) or []):
+                    path = str(getattr(shot, "output_path", "") or "").strip()
+                    if not path or not os.path.isfile(path):
+                        missing.append(int(getattr(shot, "index", 0) or 0))
+            except Exception:
+                missing = []
+            if missing:
+                return False, "Cannot assemble the current Music Clip project yet; missing generated clips for shots: " + ", ".join(map(str, missing))
+            win._emit_music_clip_event("progress", message="Assembling the current Music Clip wizard project...")
+            win._assemble()
+            return True, "Assembling the current Music Clip wizard project."
+
+        if act in {"continue", "resume", "generate missing", "generate missing clips", "continue generation"}:
+            try:
+                win._sync_existing_generated_outputs()
+            except Exception:
+                pass
+            win._generate_all()
+            return True, "Continuing the current Music Clip wizard project."
+
+        if act in {"open", "show", "show project", "open project"}:
+            try:
+                win._write_assistant_handoff()
+            except Exception:
+                pass
+            return True, "Published the current Music Clip wizard project to the visible MiniMax Music Clip Creator."
+
+        return False, f"Unsupported Music Clip follow-up action: {action}"
+    except Exception as exc:
+        return False, f"Could not control the current Music Clip wizard project: {exc}"
+
+def launch_music_clip_job(spec: Dict[str, Any], event_callback=None) -> Tuple[bool, str]:
     """Configure and start the existing Music Clip Creator GUI workflow.
 
     The actual LTX 2.3/LTX 2.5/MiniMax implementation remains owned by
@@ -3904,14 +3965,55 @@ def launch_music_clip_job(spec: Dict[str, Any]) -> Tuple[bool, str]:
                 import minimax_music_clip as mm  # type: ignore
             win = mm.MiniMaxMusicClipWidget()
             _MUSIC_CLIP_WINDOWS.append(win)
+            try:
+                win._assistant_run = True
+                win._assistant_origin = str(spec.get("assistant_origin") or "framevision_chat").strip() or "framevision_chat"
+                win._assistant_remote_chat_id = str(spec.get("assistant_remote_chat_id") or "").strip()
+            except Exception:
+                pass
+            if callable(event_callback):
+                # Hidden assistant-launched widgets are not the host queue UI, so use
+                # a direct callback that remains valid even when queue-update signals
+                # are delivered to a different MiniMax widget instance.
+                try:
+                    win._assistant_event_callback = event_callback
+                except Exception:
+                    if hasattr(win, "music_clip_event"):
+                        try:
+                            win.music_clip_event.connect(event_callback)
+                        except Exception:
+                            pass
             win.edit_audio.setText(audio)
             if hasattr(win, 'edit_title') and not str(win.edit_title.text() or '').strip():
                 win.edit_title.setText(Path(audio).stem)
-            # MiniMax's project-wide concept lives in characters_subjects; keep the
-            # existing prompt builder in charge of turning it into shot prompts.
+            # Populate the full creative brief explicitly. Assistant jobs must not
+            # inherit stale values left in a previous desktop Music Clip project.
+            style_theme = str(spec.get('style_theme') or '').strip()
+            locations_world = str(spec.get('locations_world') or '').strip()
+            camera_choreography = str(spec.get('camera_choreography') or '').strip()
+            reference_purpose = str(spec.get('reference_purpose') or '').strip()
             try:
                 if hasattr(win, 'edit_idea'):
                     win.edit_idea.setPlainText(idea) if hasattr(win.edit_idea, 'setPlainText') else win.edit_idea.setText(idea)
+                if hasattr(win, 'edit_style'):
+                    win.edit_style.setText(style_theme)
+                if hasattr(win, 'edit_world'):
+                    win.edit_world.setText(locations_world)
+                if hasattr(win, 'edit_camera'):
+                    win.edit_camera.setText(camera_choreography)
+                if hasattr(win, 'edit_subjects'):
+                    # Empty is intentional when there are no references; this clears
+                    # any old continuity text rather than silently reusing it.
+                    win.edit_subjects.setPlainText(reference_purpose) if hasattr(win.edit_subjects, 'setPlainText') else win.edit_subjects.setText(reference_purpose)
+            except Exception:
+                pass
+            # Assistant jobs should always enter FrameVision's shared queue so the
+            # main Queue tab can see/continue/retry the work and final assembly is
+            # ordered behind all clip jobs. MiniMax will fall back to direct mode only
+            # if the queue adapter is genuinely unavailable.
+            try:
+                if getattr(win, 'check_framevision_queue', None) is not None:
+                    win.check_framevision_queue.setChecked(True)
             except Exception:
                 pass
             refs = [str(x) for x in (spec.get('minimax_references') or []) if str(x).strip()][:9]

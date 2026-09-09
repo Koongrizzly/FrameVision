@@ -3826,6 +3826,7 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
         self._pending_ace15_music_request: Optional[Dict[str, Any]] = None
         self._pending_planner_agent_request: Optional[Dict[str, Any]] = None
         self._pending_music_clip_agent_request: Optional[Dict[str, Any]] = None
+        self._music_clip_agent_has_active_project: bool = False
         self._pending_model_manager_request: Optional[Dict[str, Any]] = None
         self._planner_skill_thread: Optional[ChatCompletionThread] = None
         self._planner_skill_waiting_for_server: bool = False
@@ -3995,6 +3996,76 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+    def _telegram_send_media_path(self, chat_id: str, path: str, caption: str = "") -> bool:
+        """Best-effort delivery of an already-created local media file to Telegram.
+
+        TelegramBridge implementations used by FrameVision have changed over time,
+        so prefer an explicit media method when available and fall back to the
+        bridge's result watcher.  Failure here must never break the creator job.
+        """
+        path = str(path or "").strip()
+        if not path or not os.path.isfile(path):
+            return False
+        bridge = getattr(self, "_telegram_bridge", None)
+        if bridge is None:
+            return False
+        for name in ("send_video", "send_file", "send_document"):
+            fn = getattr(bridge, name, None)
+            if not callable(fn):
+                continue
+            for args in ((str(chat_id), path, str(caption or "")), (str(chat_id), path)):
+                try:
+                    fn(*args)
+                    return True
+                except TypeError:
+                    continue
+                except Exception:
+                    break
+        watcher = getattr(bridge, "watch_result", None)
+        if callable(watcher):
+            try:
+                watcher(str(chat_id), "music_clip", "video", path, time.time() - 2.0)
+                return True
+            except Exception:
+                pass
+        return False
+
+    def _telegram_music_clip_event(self, chat_id: str, event: Dict[str, Any]) -> None:
+        """Route asynchronous Music Clip Creator events back to their Telegram chat."""
+        try:
+            data = dict(event or {})
+        except Exception:
+            return
+        kind = str(data.get("type") or "").strip().lower()
+        if kind == "progress":
+            self._telegram_send_text(chat_id, str(data.get("message") or "Music Clip Creator is working..."))
+            return
+        if kind == "hybrid_fallback":
+            self._telegram_send_text(chat_id, str(data.get("message") or "Hybrid MiniMax model is unavailable; using normal Ref2VA."))
+            return
+        if kind == "clip_done":
+            path = str(data.get("path") or "").strip()
+            index = int(data.get("shot_index") or 0)
+            completed = int(data.get("completed") or 0)
+            total = int(data.get("total") or 0)
+            suffix = f" ({completed}/{total})" if completed and total else ""
+            caption = f"Music video clip {index} is ready{suffix}."
+            if not self._telegram_send_media_path(chat_id, path, caption):
+                self._telegram_send_text(chat_id, caption)
+            return
+        if kind in {"clip_failed", "error", "failed"}:
+            index = int(data.get("shot_index") or 0)
+            detail = str(data.get("message") or "Unknown error").strip()
+            prefix = f"Music video clip {index} failed" if index else "Music Clip Creator failed"
+            self._telegram_send_text(chat_id, f"{prefix}: {detail}")
+            return
+        if kind == "final_done":
+            path = str(data.get("path") or "").strip()
+            caption = "The final assembled music video is ready."
+            if not self._telegram_send_media_path(chat_id, path, caption):
+                self._telegram_send_text(chat_id, caption)
+            return
+
     def _telegram_router_for_chat(self, chat_id: str):
         key = str(chat_id)
         router = self._telegram_routers.get(key)
@@ -4017,9 +4088,19 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
         old_reply = getattr(self, "_append_framevision_assistant_reply")
         old_status = getattr(self, "_set_status")
         old_track_music = getattr(self, "_track_ace15_music_job", None)
+        old_music_clip_event_override = getattr(self, "_music_clip_agent_event_override", None)
+        old_music_clip_origin_override = getattr(self, "_music_clip_agent_origin_override", None)
         try:
             setattr(self, state_attr, state)
             self._append_framevision_assistant_reply = lambda text, *a, **k: replies.append(str(text or ""))
+            if state_attr == "_pending_music_clip_agent_request":
+                # The hidden widget outlives this synchronous Telegram wizard call.
+                # Give it a callback bound permanently to the originating chat
+                # instead of the desktop chat UI.
+                self._music_clip_agent_event_override = (
+                    lambda event, cid=str(chat_id): self._telegram_music_clip_event(cid, event)
+                )
+                self._music_clip_agent_origin_override = {"origin": "telegram", "chat_id": str(chat_id)}
             self._set_status = lambda *a, **k: None
             # Telegram has its own result watcher; avoid creating a duplicate desktop music tracker.
             if old_track_music is not None:
@@ -4033,6 +4114,8 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
             self._set_status = old_status
             if old_track_music is not None:
                 self._track_ace15_music_job = old_track_music
+            self._music_clip_agent_event_override = old_music_clip_event_override
+            self._music_clip_agent_origin_override = old_music_clip_origin_override
 
     def _telegram_wizard_send_replies(self, chat_id: str, replies: object) -> None:
         for reply in list(replies or []):
@@ -8275,7 +8358,7 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
         return saved
 
 
-    def _append_framevision_assistant_reply(self, text: str, thinking: str = "") -> None:
+    def _append_framevision_assistant_reply(self, text: str, thinking: str = "", attachments: Optional[List[Dict[str, Any]]] = None) -> None:
         """Append a deterministic FrameVision Assistant reply to the current chat."""
         s = self._current_session()
         if not s:
@@ -8285,17 +8368,18 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
             return
         now = datetime.now().isoformat(timespec="seconds")
         mid = str(uuid.uuid4())
+        safe_attachments = list(attachments or [])
         s.messages.append({
             "id": mid,
             "role": "assistant",
             "content": reply,
             "thinking": thinking or "",
-            "attachments": [],
+            "attachments": safe_attachments,
             "timestamp": now,
             "loading": False,
         })
         s.updated_at = now
-        self.chat_view.add_message("assistant", reply, thinking or "", attachments=[], message_id=mid, loading=False)
+        self.chat_view.add_message("assistant", reply, thinking or "", attachments=safe_attachments, message_id=mid, loading=False)
         self.chat_view.scroll_to_bottom(force=True)
         self._refresh_chat_list()
         self._update_header()
@@ -8717,7 +8801,7 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
 
     def _ace15_write_config(self, state: Dict[str, Any]) -> Path:
         cfg = self._ace15_config()
-        out_dir = Path(str(state.get("output_dir"))).resolve() if str(state.get("output_dir") or "").strip() else self._ace15_output_dir()
+        out_dir = self._ace15_output_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         title_hint = self._ace15_sanitize_filename_part(str(state.get("title") or ""))
@@ -8831,8 +8915,7 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
         if not project_root.exists():
             return False, f"Ace-Step project root was not found: {project_root}", ""
         cfg_path = self._ace15_write_config(state)
-        out_dir = Path(str(state.get("output_dir"))).resolve() if str(state.get("output_dir") or "").strip() else self._ace15_output_dir()
-        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = self._ace15_output_dir()
         title = str(state.get("title") or "").strip()
         sub = str(state.get("subgenre") or "Custom").strip() or "Custom"
         seed = int(state.get("seed") or 0)
@@ -9965,13 +10048,58 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
             if k != 'raw_request' and v not in (None, '', []):
                 state[k] = v
 
+    def _music_clip_agent_missing_brief_field(self, state: Dict[str, Any]) -> str:
+        """Return the next creative-brief field that the bot must collect.
+
+        Assistant-started music projects must never inherit stale creative text from
+        the desktop widget.  Every meaningful field is either supplied by the user,
+        explicitly defaulted/generated, or intentionally left blank when optional.
+        """
+        if not state.get('idea'):
+            return 'idea'
+        if str(state.get('clip_engine') or '') == 'minimax':
+            for key in ('style_theme', 'locations_world', 'camera_choreography'):
+                if key not in state or not str(state.get(key) or '').strip():
+                    return key
+        return ''
+
+    def _music_clip_agent_fill_quick_value(self, state: Dict[str, Any], field: str, reply: str) -> bool:
+        low = re.sub(r'\s+', ' ', str(reply or '').strip().lower()).strip(' .!?')
+        if low not in {'default', 'defaults', 'surprise me', 'surprise', 'automatic', 'auto'}:
+            return False
+        surprise = low in {'surprise me', 'surprise'}
+        idea = str(state.get('idea') or '').strip()
+        if field == 'idea':
+            state[field] = ('Create a visually evolving music video that follows the energy and structure of the song, '
+                            'with clear recurring subjects, changing environments, and a satisfying final visual payoff.')
+        elif field == 'style_theme':
+            state[field] = ('Bold cinematic pop-surrealism with expressive lighting, fashion-forward color, rhythmic motion, '
+                            'and a playful dreamlike edge.' if surprise else
+                            'Cinematic music-video look with coherent art direction, strong lighting, polished color, and visual continuity.')
+        elif field == 'locations_world':
+            state[field] = ('Sunlit city plaza; neon dance hall; moving night streets; rooftop at blue hour; surreal dawn landscape' if surprise else
+                            'A small set of coherent locations that evolve from day to night and match the main story.')
+        elif field == 'camera_choreography':
+            state[field] = ('Low-angle tracking; orbiting steadicam; whip-pan transitions; crane reveal; intimate handheld close-ups' if surprise else
+                            'Smooth tracking shots, medium performance coverage, selective close-ups, and wider establishing shots timed to musical changes.')
+        else:
+            return False
+        return True
+
     def _music_clip_agent_next_question(self, state: Dict[str, Any]) -> str:
         if not state.get('clip_engine'):
             return 'Which Music Clip Creator should I use: **LTX 2.3, LTX 2.5, or MiniMax H3**?'
         if not state.get('audio_path'):
             return 'Please attach the **music/audio track** that the videoclip should be built around.'
-        if not state.get('idea'):
-            return 'What is the main **idea / visual concept** for the music video?'
+        missing = self._music_clip_agent_missing_brief_field(state)
+        if missing == 'idea':
+            return 'What is the main **idea / visual concept** for the music video? You can also reply `surprise me`.'
+        if missing == 'style_theme':
+            return 'What **style / theme** should the music video use? Reply with your own description, `default`, or `surprise me`.'
+        if missing == 'locations_world':
+            return 'What **locations / world** should appear in the video? Reply with your own locations, `default`, or `surprise me`.'
+        if missing == 'camera_choreography':
+            return 'What **camera choreography** should it use? Reply with your own camera ideas, `default`, or `surprise me`.'
         engine = str(state.get('clip_engine') or '')
         if engine in {'ltx23', 'ltx25'} and 'use_msr' not in state:
             return 'Do you want to use the **Licon MSR reference workflow** for this LTX music video? (yes/no)'
@@ -9984,6 +10112,8 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
             return 'Do you want to use **reference image(s)** with MiniMax? (yes/no)'
         if engine == 'minimax' and state.get('minimax_refs_decision') == 'yes' and not state.get('minimax_references'):
             return 'Attach the MiniMax reference image(s) now (up to 9), then send `use these`.'
+        if engine == 'minimax' and state.get('minimax_refs_decision') == 'yes' and 'reference_purpose' not in state:
+            return 'How should the **reference image(s)** be used for continuity (identity, outfit, role, props, etc.)? Reply with details, `default`, or `skip`.'
         return ''
 
     def _music_clip_agent_start_flow(self, text: str, attachments: Optional[List[Dict[str, Any]]] = None) -> None:
@@ -10022,7 +10152,32 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
             self._pending_music_clip_agent_request = None
             self._append_framevision_assistant_reply('Cancelled the Music Clip Creator setup.')
             return True
+        # Capture plain-language answers according to the field we were asking
+        # about. Previously only an explicit "idea: ..." prefix was parsed,
+        # which caused the bot to repeat the question and then reuse stale GUI
+        # values for the other creative-brief fields.
+        # Only consume a plain-text reply as a creative-brief field when the
+        # wizard was ACTUALLY asking a creative-brief question.  v5 called
+        # _music_clip_agent_missing_brief_field() unconditionally, so the reply
+        # to the earlier engine question (for example "MiniMax H3") was stored
+        # as the idea.  Every later answer was then shifted down by one field.
+        expected_brief = ''
+        if state.get('clip_engine') and state.get('audio_path'):
+            expected_brief = self._music_clip_agent_missing_brief_field(state)
+
         self._music_clip_agent_merge_reply(state, text, attachments)
+        if expected_brief and not str(state.get(expected_brief) or '').strip():
+            if not self._music_clip_agent_fill_quick_value(state, expected_brief, text):
+                plain = str(text or '').strip()
+                # Engine-selection tokens are routing answers, never creative
+                # text.  Keep this guard even if the wizard state is malformed.
+                engine_token = re.sub(r'[^a-z0-9]+', '', plain.lower())
+                known_engine_tokens = {
+                    'minimax', 'minimaxh3', 'h3',
+                    'ltx23', 'ltx2.3', 'ltx25', 'ltx2.5',
+                }
+                if plain and engine_token not in {re.sub(r'[^a-z0-9]+', '', x) for x in known_engine_tokens}:
+                    state[expected_brief] = plain
         engine = str(state.get('clip_engine') or '')
         # If the user answered the MSR question, capture it even when the reply is just yes/no.
         if engine in {'ltx23', 'ltx25'} and 'use_msr' not in state:
@@ -10047,6 +10202,13 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
                     state['minimax_refs_decision'] = 'no'
             if imgs and state.get('minimax_refs_decision') == 'yes':
                 state['minimax_references'] = imgs[:9]
+            if state.get('minimax_refs_decision') == 'yes' and state.get('minimax_references') and 'reference_purpose' not in state:
+                # Do not mistake the yes/no or attachment acknowledgement for the
+                # purpose answer. Only consume a later free-text reply here.
+                if low in {'skip', 'none', 'no details', 'default', 'defaults'}:
+                    state['reference_purpose'] = ''
+                elif not imgs and low not in {'yes', 'y', 'yeah', 'yep', 'use these', 'references'}:
+                    state['reference_purpose'] = str(text or '').strip()
         self._pending_music_clip_agent_request = state
         q = self._music_clip_agent_next_question(state)
         if q:
@@ -10054,6 +10216,52 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
         else:
             self._music_clip_agent_launch_pending()
         return True
+
+    def _music_clip_agent_event(self, event: Dict[str, Any]) -> None:
+        """Surface progress/results from a hidden Music Clip Creator instance."""
+        try:
+            data = dict(event or {})
+        except Exception:
+            return
+        kind = str(data.get("type") or "").strip().lower()
+        if kind == "progress":
+            message = str(data.get("message") or "Music Clip Creator is working...").strip()
+            self._append_framevision_assistant_reply(message)
+            self._set_status(message, "working")
+            return
+        if kind == "hybrid_fallback":
+            self._append_framevision_assistant_reply(str(data.get("message") or "Hybrid MiniMax model is unavailable. Falling back to normal Ref2VA."))
+            self._set_status("MiniMax fallback active", "warning")
+            return
+        if kind == "clip_done":
+            path = str(data.get("path") or "").strip()
+            index = int(data.get("shot_index") or 0)
+            attachments = [_make_attachment_entry(path)] if path and os.path.isfile(path) else []
+            self._append_framevision_assistant_reply(
+                f"Music video clip {index} is ready. Check it while I continue with the remaining clips.",
+                attachments=attachments,
+            )
+            self._set_status(f"Music clip {index} ready", "success")
+            return
+        if kind == "clip_failed":
+            index = int(data.get("shot_index") or 0)
+            detail = str(data.get("message") or "").strip()
+            log_path = str(data.get("log_path") or "").strip()
+            extra = f"\n\n{detail}" if detail else ""
+            if log_path:
+                extra += f"\nLog: {log_path}"
+            self._append_framevision_assistant_reply(f"Music video clip {index} failed, but the remaining clips can continue.{extra}")
+            self._set_status(f"Music clip {index} failed", "error")
+            return
+        if kind == "final_done":
+            path = str(data.get("path") or "").strip()
+            attachments = [_make_attachment_entry(path)] if path and os.path.isfile(path) else []
+            self._append_framevision_assistant_reply("The final assembled music video is ready.", attachments=attachments)
+            self._set_status("Music video finished", "success")
+            return
+        if kind == "failed":
+            self._append_framevision_assistant_reply(f"Music Clip Creator failed: {str(data.get('message') or 'Unknown error')}")
+            self._set_status("Music Clip Creator failed", "error")
 
     def _music_clip_agent_launch_pending(self) -> None:
         state = dict(getattr(self, '_pending_music_clip_agent_request', None) or {})
@@ -10063,11 +10271,63 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
                 from helpers.fv_assistant_router import launch_music_clip_job  # type: ignore
             except Exception:
                 from fv_assistant_router import launch_music_clip_job  # type: ignore
-            ok, msg = launch_music_clip_job(state)
+            event_callback = getattr(self, "_music_clip_agent_event_override", None)
+            origin_info = getattr(self, "_music_clip_agent_origin_override", None)
+            if isinstance(origin_info, dict) and str(origin_info.get("origin") or "").strip():
+                state["assistant_origin"] = str(origin_info.get("origin") or "").strip()
+                state["assistant_remote_chat_id"] = str(origin_info.get("chat_id") or "").strip()
+            else:
+                # A wizard launched from FrameVision chat stays in FrameVision chat.
+                state["assistant_origin"] = "framevision_chat"
+                state.pop("assistant_remote_chat_id", None)
+            if not callable(event_callback):
+                event_callback = self._music_clip_agent_event
+            ok, msg = launch_music_clip_job(state, event_callback=event_callback)
+            if ok:
+                self._music_clip_agent_has_active_project = True
         except Exception as exc:
             ok, msg = False, f'Could not start Music Clip Creator: {exc}'
         self._append_framevision_assistant_reply(msg)
         self._set_status('Music Clip Creator started' if ok else 'Music Clip Creator failed', 'success' if ok else 'error')
+
+    def _music_clip_agent_followup_action(self, text: str) -> str:
+        """Recognize commands that belong to the active Music Clip wizard."""
+        if not bool(getattr(self, "_music_clip_agent_has_active_project", False)):
+            return ""
+        low = re.sub(r'\s+', ' ', str(text or '').strip().lower()).strip(' .!?')
+        mapping = {
+            'assemble': 'assemble',
+            'assemble it': 'assemble',
+            'assemble video': 'assemble',
+            'assemble final': 'assemble',
+            'assemble final video': 'assemble',
+            'finish': 'assemble',
+            'finish video': 'assemble',
+            'continue': 'continue',
+            'resume': 'continue',
+            'continue generation': 'continue',
+            'generate missing': 'continue',
+            'generate missing clips': 'continue',
+            'open project': 'open',
+            'show project': 'open',
+        }
+        return mapping.get(low, "")
+
+    def _music_clip_agent_handle_followup(self, text: str) -> bool:
+        action = self._music_clip_agent_followup_action(text)
+        if not action:
+            return False
+        try:
+            try:
+                from helpers.fv_assistant_router import control_latest_music_clip_job  # type: ignore
+            except Exception:
+                from fv_assistant_router import control_latest_music_clip_job  # type: ignore
+            ok, msg = control_latest_music_clip_job(action)
+        except Exception as exc:
+            ok, msg = False, f'Could not control the current Music Clip wizard project: {exc}'
+        self._append_framevision_assistant_reply(msg)
+        self._set_status('Music Clip Creator working' if ok else 'Music Clip Creator action failed', 'working' if ok else 'error')
+        return True
 
     def _planner_agent_is_start_command(self, text: str) -> bool:
         if not self._agent_triggers_enabled():
@@ -10756,6 +11016,16 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
                 return
             self._music_clip_agent_start_flow(text, attachments)
             return
+
+        # Follow-up ownership: once the Music Clip wizard has launched a project,
+        # short commands such as "assemble" belong to that project.  Handle them
+        # before Planner/general-agent routing so an older job cannot steal them.
+        if self._agent_triggers_enabled() and self._music_clip_agent_followup_action(text):
+            s = self._append_user_message_to_current_session(text, attachments)
+            if not s:
+                return
+            if self._music_clip_agent_handle_followup(text):
+                return
 
         if self._agent_triggers_enabled() and getattr(self, "_pending_planner_agent_request", None) is not None and (text or attachments):
             s = self._append_user_message_to_current_session(text, attachments)

@@ -91,6 +91,7 @@ HELPERS_DIR = ROOT / "helpers"
 OUTPUT_ROOT = ROOT / "output" / "videoclips" / "minimaxh3"
 SETTINGS_PATH = ROOT / "presets" / "minimax_music_clip_settings.json"
 AUTOSAVE_PATH = ROOT / "presets" / "setsave" / "minimax_music_clip.json"
+ASSISTANT_HANDOFF_PATH = ROOT / "presets" / "setsave" / "minimax_music_clip_assistant_handoff.json"
 WHISPER_DIR = ROOT / "presets" / "bin" / "whisper"
 WHISPER_MODEL = WHISPER_DIR / "ggml-small.bin"
 WHISPER_RUNTIME_ZIP = WHISPER_DIR / "_whisper_runtime.zip"
@@ -1931,6 +1932,13 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
     logs_dir.mkdir(parents=True, exist_ok=True)
     width, height = RESOLUTION_PRESETS[project.resolution][project.aspect]
     refs_by_name = {r.name: r for r in project.references if r.enabled and Path(r.path).is_file()}
+    hybrid_checkpoint: Optional[Path] = None
+    if project.use_hybrid_model:
+        hybrid = Path(str(project.hybrid_model_path or "").strip())
+        if hybrid.is_file():
+            hybrid_checkpoint = hybrid.resolve()
+        else:
+            progress(f"__MINIMAX_HYBRID_FALLBACK__|{hybrid}")
     results: List[Dict[str, Any]] = []
     targets = [s for s in project.shots if s.index in shot_indices]
     for pos, shot in enumerate(targets, start=1):
@@ -1967,11 +1975,8 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             "--ref-audio", str(audio_chunk),
             "--output", str(out_path),
         ]
-        if project.use_hybrid_model:
-            hybrid = Path(str(project.hybrid_model_path or "").strip())
-            if not hybrid.is_file():
-                raise RuntimeError("Use hybrid model is enabled, but the selected hybrid .safetensors file was not found.")
-            cmd += ["--ref2va-checkpoint", str(hybrid.resolve())]
+        if hybrid_checkpoint is not None:
+            cmd += ["--ref2va-checkpoint", str(hybrid_checkpoint)]
         if project.vram_manager_enabled:
             cmd += ["--vram-manager-auto" if project.vram_auto_bypass else "--vram-manager"]
             cmd += [
@@ -2241,6 +2246,10 @@ def _assembly_task(progress, project: MusicProject) -> str:
 class MiniMaxMusicClipWidget(QWidget):
     """Embeddable MiniMax Music Clip Creator widget."""
 
+    # Optional integration signal used by hidden/assistant-launched instances.
+    # Payload examples: {"type": "clip_done", "shot_index": 2, "path": "..."}.
+    music_clip_event = Signal(object)
+
     def __init__(self, parent: Optional[QWidget] = None, queue_adapter=None):
         super().__init__(parent)
         self.queue_adapter = queue_adapter
@@ -2249,6 +2258,25 @@ class MiniMaxMusicClipWidget(QWidget):
         self.worker: Optional[FunctionWorker] = None
         self._autosave_last_text = ""
         self._one_click_active = False
+        self._assistant_emitted_clip_paths = set()
+        self._hybrid_fallback_announced = False
+        self._assistant_event_callback = None
+        self._assistant_origin = "desktop_ui"
+        self._assistant_remote_chat_id = ""
+        self._assistant_run = False
+        self._one_click_assemble_after_generation = False
+        self._assistant_handoff_mtime_ns = 0
+        self._assistant_output_monitor = QTimer(self)
+        self._assistant_output_monitor.setInterval(1500)
+        self._assistant_output_monitor.timeout.connect(self._assistant_poll_outputs)
+        self._assistant_monitor_final_path = ""
+        self._assistant_monitor_total = 0
+        self._assistant_queue_assembly_when_ready = False
+        self._assistant_assembly_queued = False
+        self._assistant_handoff_timer = QTimer(self)
+        self._assistant_handoff_timer.setInterval(1000)
+        self._assistant_handoff_timer.timeout.connect(self._poll_assistant_handoff)
+        self._assistant_handoff_timer.start()
         _cleanup_music_clip_temp_artifacts()
         self._build_ui()
         # Give every persistent control a stable identity. FrameVision also has a
@@ -2268,6 +2296,143 @@ class MiniMaxMusicClipWidget(QWidget):
         # accidentally persist values injected into the wrong controls.
         QTimer.singleShot(0, self._startup_reassert_project_state)
         QTimer.singleShot(250, self._startup_reassert_project_state)
+
+    def _emit_music_clip_event(self, event_type: str, **payload) -> None:
+        """Best-effort event bridge for assistant/hidden launches."""
+        event = {"type": str(event_type or "status")}
+        event.update(payload)
+        callback = getattr(self, "_assistant_event_callback", None)
+        if bool(getattr(self, "_assistant_run", False)):
+            # Assistant jobs have exactly one reply target. Never broadcast to the
+            # widget signal as a fallback: a Telegram-origin job must not leak into
+            # FrameVision chat, and a FrameVision-chat job must not leak to Telegram.
+            if callable(callback):
+                try:
+                    callback(event)
+                except Exception:
+                    pass
+            return
+        if callable(callback):
+            try:
+                callback(event)
+                return
+            except Exception:
+                pass
+        try:
+            self.music_clip_event.emit(event)
+        except Exception:
+            pass
+
+    def _assistant_start_output_monitor(self, final_path: str = "") -> None:
+        """Monitor queued outputs even when this hidden widget is not the host queue UI."""
+        self._assistant_monitor_final_path = str(final_path or "")
+        self._assistant_monitor_total = len(self.project.shots)
+        if not self._assistant_output_monitor.isActive():
+            self._assistant_output_monitor.start()
+        self._assistant_poll_outputs()
+
+    def _assistant_poll_outputs(self) -> None:
+        completed = 0
+        for shot in list(self.project.shots or []):
+            output = str(getattr(shot, "output_path", "") or "").strip()
+            if not output or not Path(output).is_file():
+                continue
+            completed += 1
+            try:
+                norm_path = str(Path(output).resolve())
+            except Exception:
+                norm_path = output
+            if norm_path not in self._assistant_emitted_clip_paths:
+                self._assistant_emitted_clip_paths.add(norm_path)
+                self._emit_music_clip_event("clip_done", shot_index=int(shot.index), path=norm_path, completed=completed, total=self._assistant_monitor_total)
+        final = str(getattr(self, "_assistant_monitor_final_path", "") or "").strip()
+        if final and Path(final).is_file():
+            try:
+                final = str(Path(final).resolve())
+            except Exception:
+                pass
+            self._emit_music_clip_event("final_done", path=final)
+            self._assistant_output_monitor.stop()
+            return
+
+        # For assistant runs do not put assembly into the queue ahead of unfinished
+        # clip files.  Some FrameVision queue configurations do not guarantee that a
+        # later assembly item will physically execute after every MiniMax child job.
+        # Queue it only once the output monitor can see every planned clip on disk.
+        if (
+            bool(getattr(self, "_assistant_queue_assembly_when_ready", False))
+            and not bool(getattr(self, "_assistant_assembly_queued", False))
+            and self._assistant_monitor_total > 0
+            and completed >= self._assistant_monitor_total
+        ):
+            self._assistant_assembly_queued = True
+            self._assistant_queue_assembly_when_ready = False
+            self._emit_music_clip_event("progress", message="All clips are ready. Queueing final music-video assembly now...")
+            try:
+                self._queue_assembly()
+            except Exception as exc:
+                self._assistant_assembly_queued = False
+                self._emit_music_clip_event("failed", message=f"Could not queue final assembly: {exc}")
+
+    def _notify_hybrid_fallback(self, missing_path: str = "") -> None:
+        if self._hybrid_fallback_announced:
+            return
+        self._hybrid_fallback_announced = True
+        message = (
+            "Hybrid MiniMax checkpoint is unavailable; falling back to the normal Ref2VA checkpoint for this music clip run."
+        )
+        if missing_path:
+            message += f" Missing: {missing_path}"
+        self.status.setText(message)
+        self._emit_music_clip_event("hybrid_fallback", message=message, missing_path=missing_path, fallback="ref2va")
+
+    def _write_assistant_handoff(self) -> None:
+        """Publish the assistant-run project so the visible MiniMax tab can adopt it."""
+        if not bool(getattr(self, "_assistant_run", False)):
+            return
+        try:
+            self._pull_ui()
+            payload = {
+                "version": 1,
+                "updated_ns": time.time_ns(),
+                "project_path": str(self.project_path or ""),
+                "assistant_origin": str(getattr(self, "_assistant_origin", "desktop_ui") or "desktop_ui"),
+                "assistant_remote_chat_id": str(getattr(self, "_assistant_remote_chat_id", "") or ""),
+                "project": asdict(self.project),
+            }
+            ASSISTANT_HANDOFF_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = ASSISTANT_HANDOFF_PATH.with_suffix(ASSISTANT_HANDOFF_PATH.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(str(tmp), str(ASSISTANT_HANDOFF_PATH))
+            try:
+                self._assistant_handoff_mtime_ns = ASSISTANT_HANDOFF_PATH.stat().st_mtime_ns
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _poll_assistant_handoff(self) -> None:
+        """Visible widgets live-sync the latest assistant-created Music Clip project."""
+        if bool(getattr(self, "_assistant_run", False)):
+            return
+        try:
+            if not ASSISTANT_HANDOFF_PATH.is_file():
+                return
+            stat = ASSISTANT_HANDOFF_PATH.stat()
+            if stat.st_mtime_ns <= int(getattr(self, "_assistant_handoff_mtime_ns", 0) or 0):
+                return
+            data = json.loads(ASSISTANT_HANDOFF_PATH.read_text(encoding="utf-8"))
+            project_data = data.get("project") if isinstance(data, dict) else None
+            if not isinstance(project_data, dict):
+                return
+            self.project = self._project_from_dict(project_data)
+            self.project_path = str(data.get("project_path") or "")
+            self._assistant_handoff_mtime_ns = stat.st_mtime_ns
+            self._sync_ui_from_project()
+            self._write_autosave(force=True)
+            self.status.setText("Loaded the latest Music Clip project created by the assistant.")
+        except Exception:
+            pass
 
     def _assign_persistence_object_names(self) -> None:
         """Use stable names so host-level persistence never depends on widget order."""
@@ -3181,8 +3346,24 @@ class MiniMaxMusicClipWidget(QWidget):
 
         self._pull_ui()
         self.project.audio_path = audio
+        # Assistant-launched runs must use FrameVision's shared queue whenever possible
+        # so the main app knows about every shot and the final assembly job.
+        if bool(getattr(self, "_assistant_run", False)) and getattr(self, "check_framevision_queue", None) is not None:
+            if not self.check_framevision_queue.isChecked():
+                self.check_framevision_queue.setChecked(True)
+            if not self._queue_mode_active():
+                self._emit_music_clip_event(
+                    "progress",
+                    message="FrameVision shared queue is unavailable. Running directly; I will still assemble automatically when all clips finish."
+                )
+        if self.project.use_hybrid_model:
+            hybrid = Path(str(self.project.hybrid_model_path or "").strip())
+            if not hybrid.is_file():
+                self._notify_hybrid_fallback(str(hybrid))
         self._ensure_project_output_folder(reset_generated_state=True)
+        self._write_assistant_handoff()
         self._one_click_active = True
+        self._emit_music_clip_event("progress", message="Analyzing the song and its structure...")
         # Show the stage that is actually running; the user can still inspect/change tabs.
         self.tabs.setCurrentIndex(2)
         self._set_busy("Video clip: analyzing track structure...")
@@ -3199,6 +3380,7 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _one_click_analysis_done(self, result: AnalysisResult) -> None:
         self.project.analysis = result
+        self._emit_music_clip_event("progress", message="Song analysis finished. Preparing timing and shot plan...")
         self._populate_analysis()
         self._write_autosave(force=True)
 
@@ -3207,6 +3389,7 @@ class MiniMaxMusicClipWidget(QWidget):
             return
 
         if _whisper_cpp_ready():
+            self._emit_music_clip_event("progress", message="Transcribing lyrics for clip timing...")
             self._set_busy("Video clip: transcribing lyrics with Whisper.cpp...")
             self._one_click_start_worker_when_idle(_whisper_task, self._one_click_whisper_done, self.project.audio_path)
             return
@@ -3241,6 +3424,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self._one_click_build_plan_and_queue()
 
     def _one_click_build_plan_and_queue(self) -> None:
+        self._emit_music_clip_event("progress", message="Building the music-video shot plan...")
         self.tabs.setCurrentIndex(3)
         self._pull_ui()
         self._ensure_project_output_folder(reset_generated_state=True)
@@ -3255,6 +3439,7 @@ class MiniMaxMusicClipWidget(QWidget):
             self._populate_shots()
             self._populate_review()
             self._write_autosave(force=True)
+            self._write_assistant_handoff()
         except Exception as exc:
             self._one_click_active = False
             self._set_ready("Video clip planning failed.")
@@ -3277,20 +3462,39 @@ class MiniMaxMusicClipWidget(QWidget):
         if self._queue_mode_active():
             if missing:
                 self._queue_shots(missing)
-            # Assembly is deliberately enqueued last. The standalone queue therefore
-            # reaches it only after all physical shot jobs ahead of it have finished.
-            self._queue_assembly()
+            out_dir = Path(self.project.output_dir or OUTPUT_ROOT / _safe_stem(self.project.audio_path)).resolve()
+            final_path = out_dir / f"{_safe_stem(self.project.title or self.project.audio_path)}_minimax_music_video.mp4"
+            if bool(getattr(self, "_assistant_run", False)):
+                # Assistant jobs are monitored across queue workers.  Wait for all
+                # physical clips to exist before submitting the final assembly item.
+                self._assistant_queue_assembly_when_ready = bool(missing)
+                self._assistant_assembly_queued = False
+                if not missing:
+                    self._queue_assembly()
+                    self._assistant_assembly_queued = True
+                self._assistant_start_output_monitor(str(final_path))
+            else:
+                # Interactive desktop behavior remains unchanged.
+                self._queue_assembly()
+            self._emit_music_clip_event(
+                "progress",
+                message=(f"Queued {len(missing)} clip{'s' if len(missing) != 1 else ''}. I will send each clip here as soon as it finishes, then assemble the final video." if missing else "All clips already exist. Final assembly is queued."),
+                total=len(missing),
+            )
             self._one_click_active = False
             self._set_ready(
-                f"Video clip queued: {len(missing)} shot{'s' if len(missing) != 1 else ''} + final trim/assembly."
+                (f"Video clip queued: {len(missing)} shot{'s' if len(missing) != 1 else ''}; final assembly will queue after the clips finish."
+                 if bool(getattr(self, "_assistant_run", False)) else
+                 f"Video clip queued: {len(missing)} shot{'s' if len(missing) != 1 else ''} + final trim/assembly.")
                 if missing else "All shot files already exist; final trim/assembly queued."
             )
             return
 
-        # Direct/standalone helper fallback: generate first; assembly remains the
-        # explicit next action because there is no host queue dependency mechanism.
+        # Direct fallback. Interactive users can still generate shots manually, but
+        # an assistant-launched one-click run must finish the complete deliverable.
         self._one_click_active = False
         if missing:
+            self._one_click_assemble_after_generation = bool(getattr(self, "_assistant_run", False))
             self._generate_indices(missing)
         else:
             self._assemble()
@@ -3314,6 +3518,10 @@ class MiniMaxMusicClipWidget(QWidget):
     def _worker_progress(self, text: str) -> None:
         marker = "__MINIMAX_SHOT_DONE__|"
         fail_marker = "__MINIMAX_SHOT_FAILED__|"
+        fallback_marker = "__MINIMAX_HYBRID_FALLBACK__|"
+        if text.startswith(fallback_marker):
+            self._notify_hybrid_fallback(text[len(fallback_marker):].strip())
+            return
         if text.startswith(marker):
             parts = text.split("|", 2)
             if len(parts) == 3:
@@ -3324,6 +3532,10 @@ class MiniMaxMusicClipWidget(QWidget):
                             shot.output_path = output_path; shot.status = "Generated"; break
                     self._populate_review(select_index=index)
                     self.status.setText(f"Shot {index} finished. Continuing with the remaining shots...")
+                    norm_path = str(Path(output_path).resolve()) if output_path else ""
+                    if norm_path and norm_path not in self._assistant_emitted_clip_paths:
+                        self._assistant_emitted_clip_paths.add(norm_path)
+                        self._emit_music_clip_event("clip_done", shot_index=index, path=norm_path)
                     return
                 except Exception:
                     pass
@@ -3337,6 +3549,8 @@ class MiniMaxMusicClipWidget(QWidget):
                             shot.status = "Failed"; break
                     self._populate_review(select_index=index)
                     self.status.setText(f"Shot {index} failed. Continuing with the remaining shots...")
+                    log_path = parts[2] if len(parts) >= 3 else ""
+                    self._emit_music_clip_event("clip_failed", shot_index=index, log_path=log_path)
                     return
                 except Exception:
                     pass
@@ -3345,7 +3559,10 @@ class MiniMaxMusicClipWidget(QWidget):
     def _worker_failed(self, message: str) -> None:
         if hasattr(self, "btn_stop_generation"):
             self.btn_stop_generation.setEnabled(False)
-        self._set_ready("Failed."); QMessageBox.critical(self, "MiniMax Music Clip Creator", message)
+        self._set_ready("Failed.")
+        self._emit_music_clip_event("failed", message=str(message or "MiniMax Music Clip Creator failed."))
+        if self.isVisible():
+            QMessageBox.critical(self, "MiniMax Music Clip Creator", message)
 
     def _start_analysis(self) -> None:
         audio = self._require_audio()
@@ -3750,9 +3967,11 @@ class MiniMaxMusicClipWidget(QWidget):
         ]
         if self.project.use_hybrid_model:
             hybrid = Path(str(self.project.hybrid_model_path or "").strip())
-            if not hybrid.is_file():
-                raise RuntimeError("Use hybrid model is enabled, but the selected hybrid .safetensors file was not found.")
-            args += ["--ref2va-checkpoint", str(hybrid.resolve())]
+            if hybrid.is_file():
+                args += ["--ref2va-checkpoint", str(hybrid.resolve())]
+            else:
+                # Omit the override: generate_ref.py then uses the normal Ref2VA checkpoint.
+                self._notify_hybrid_fallback(str(hybrid))
         if self.project.vram_manager_enabled:
             args += ["--vram-manager-auto" if self.project.vram_auto_bypass else "--vram-manager"]
             args += [
@@ -3804,6 +4023,10 @@ class MiniMaxMusicClipWidget(QWidget):
             "music_retry_once": True,
             "music_project_output": str(out_dir),
             "music_recreated_to_new_name": bool(used_retry_name),
+            "assistant_origin": str(getattr(self, "_assistant_origin", "desktop_ui") or "desktop_ui"),
+            "assistant_reply_target": str(getattr(self, "_assistant_origin", "desktop_ui") or "desktop_ui"),
+            "telegram_chat_id": (str(getattr(self, "_assistant_remote_chat_id", "") or "")
+                                 if str(getattr(self, "_assistant_origin", "") or "") == "telegram" else ""),
         }
 
     def _queue_shots(self, indices: Sequence[int]) -> None:
@@ -3854,6 +4077,10 @@ class MiniMaxMusicClipWidget(QWidget):
             "prompt": "Assemble trimmed Music Clip shots and mux the original master song.",
             "music_assembly": True,
             "music_project_output": str(out_dir),
+            "assistant_origin": str(getattr(self, "_assistant_origin", "desktop_ui") or "desktop_ui"),
+            "assistant_reply_target": str(getattr(self, "_assistant_origin", "desktop_ui") or "desktop_ui"),
+            "telegram_chat_id": (str(getattr(self, "_assistant_remote_chat_id", "") or "")
+                                 if str(getattr(self, "_assistant_origin", "") or "") == "telegram" else ""),
         }
         self.queue_adapter(spec)
         self.status.setText("Added final Music Clip assembly to the MiniMax queue.")
@@ -3864,6 +4091,25 @@ class MiniMaxMusicClipWidget(QWidget):
         if changed or (job and (job.get("music_shot_index") or job.get("music_assembly"))):
             self._populate_review(select_index=(int(job.get("music_shot_index")) if job and job.get("music_shot_index") else None))
             self._write_autosave(force=True)
+        if job and job.get("music_shot_index"):
+            try:
+                index = int(job.get("music_shot_index"))
+            except Exception:
+                index = 0
+            output = str(job.get("output") or job.get("output_path") or "").strip()
+            if output and Path(output).is_file():
+                norm_path = str(Path(output).resolve())
+                if norm_path not in self._assistant_emitted_clip_paths:
+                    self._assistant_emitted_clip_paths.add(norm_path)
+                    self._emit_music_clip_event("clip_done", shot_index=index, path=norm_path)
+            else:
+                status = str(job.get("status") or job.get("stage") or "").strip().lower()
+                if status in {"failed", "error"}:
+                    self._emit_music_clip_event("clip_failed", shot_index=index, message=str(job.get("error") or job.get("message") or "Queue job failed."))
+        if job and job.get("music_assembly"):
+            final = str(job.get("output") or job.get("output_path") or "").strip()
+            if final and Path(final).is_file():
+                self._emit_music_clip_event("final_done", path=str(Path(final).resolve()))
 
     def _generate_selected(self) -> None:
         rows = sorted({i.row() for i in self.review_table.selectedIndexes()})
@@ -3930,7 +4176,15 @@ class MiniMaxMusicClipWidget(QWidget):
             self._set_ready("Generation stopped. Finished clips were kept; unfinished clips remain planned.")
         else:
             self._set_ready("Generation finished." if not failures else f"Generation finished with {len(failures)} failed shot(s).")
-        if failures: QMessageBox.warning(self, "Some shots failed", "\n\n".join(failures[:5]))
+        self._write_assistant_handoff()
+        if failures:
+            self._emit_music_clip_event("error", message=f"Music Clip generation finished with {len(failures)} failed shot(s); final assembly was not started.")
+            if self.isVisible():
+                QMessageBox.warning(self, "Some shots failed", "\n\n".join(failures[:5]))
+        elif bool(getattr(self, "_one_click_assemble_after_generation", False)) and not cancelled and not _GENERATION_CANCEL.is_set():
+            self._one_click_assemble_after_generation = False
+            self._emit_music_clip_event("progress", message="All clips are ready. Assembling the final music video...")
+            QTimer.singleShot(0, self._assemble)
 
     def _assemble(self) -> None:
         if not self.project.shots: QMessageBox.warning(self, "No plan", "Create and generate the shot plan first."); return
@@ -3941,7 +4195,14 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _assembly_done(self, path: str) -> None:
         self._set_ready(f"Final video saved: {path}")
-        QMessageBox.information(self, "Finished", f"Final music video saved:\n{path}")
+        try:
+            final_path = str(Path(path).resolve())
+        except Exception:
+            final_path = str(path or "")
+        self._write_assistant_handoff()
+        self._emit_music_clip_event("final_done", path=final_path)
+        if self.isVisible():
+            QMessageBox.information(self, "Finished", f"Final music video saved:\n{path}")
 
     def _open_output_folder(self) -> None:
         self._pull_ui()
