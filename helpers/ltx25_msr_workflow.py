@@ -8,12 +8,91 @@ It prepares arguments for the native FrameVision helper ``ltx25_msr_pipeline``.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Sequence
 
 
 DEFAULT_MSR_RELATIVE = Path("models") / "ltx-2.5" / "msr" / "LTX-2.5-Licon-MSR-V1.safetensors"
+
+
+_BG_REMOVE_HELPER = None
+_BG_REMOVE_HELPER_ERROR = ""
+
+
+def _load_background_helper(app_root: Path):
+    global _BG_REMOVE_HELPER, _BG_REMOVE_HELPER_ERROR
+    if _BG_REMOVE_HELPER is not None:
+        return _BG_REMOVE_HELPER
+    candidates = [
+        app_root / "helpers" / "background.py",
+        Path(__file__).resolve().with_name("background.py"),
+    ]
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            spec = importlib.util.spec_from_file_location("fv_background_helper_ltx", str(candidate))
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _BG_REMOVE_HELPER = module
+            _BG_REMOVE_HELPER_ERROR = ""
+            return module
+        except Exception as exc:
+            _BG_REMOVE_HELPER_ERROR = str(exc)
+    if not _BG_REMOVE_HELPER_ERROR:
+        _BG_REMOVE_HELPER_ERROR = "helpers/background.py was not found"
+    return None
+
+
+def _prepare_msr_reference_cutout(path: str, out_dir: Path, app_root: Path) -> tuple[str, str]:
+    helper = _load_background_helper(app_root)
+    if helper is None:
+        return path, _BG_REMOVE_HELPER_ERROR or "background helper unavailable"
+    models_dir = Path(helper.ROOT) / "models" / "bg"
+    modnet = helper.OnnxModel(helper._modnet_model_path(models_dir), "MODNet")
+    biref = helper.OnnxModel(helper._birefnet_model_path(models_dir), "BiRefNet")
+    if modnet.is_available():
+        engine = "modnet"
+        engine_label = "MODNet"
+    elif biref.is_available():
+        engine = "birefnet"
+        engine_label = "BiRefNet"
+    else:
+        return path, f"no MODNet/BiRefNet model found in {models_dir}"
+    source = Path(path).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cached = out_dir / f"{source.stem}_cutout.png"
+    try:
+        if cached.is_file() and cached.stat().st_mtime >= source.stat().st_mtime:
+            return str(cached), f"{engine_label} cached cutout"
+    except Exception:
+        pass
+    try:
+        produced = helper.remove_background_file(str(source), engine=engine, mode="keep_subject", feather=6, out_dir=str(out_dir))
+        return str(produced), f"{engine_label} cutout"
+    except Exception as exc:
+        return path, f"background removal failed: {exc}"
+
+
+def _maybe_remove_reference_backgrounds(args: argparse.Namespace, app_root: Path, refs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    enabled = bool(getattr(args, "msr_remove_reference_backgrounds", False) or getattr(args, "remove_background_images_ref", False))
+    if not enabled:
+        return refs
+    output_path = _clean(getattr(args, "output_path", ""))
+    cache_dir = (Path(output_path).expanduser().resolve().parent if output_path else (app_root / "output" / "video")) / "_msr_reference_cutouts"
+    prepared: list[tuple[str, str]] = []
+    for option, value in refs:
+        if option == "--msr-background":
+            prepared.append((option, value))
+            continue
+        new_value, note = _prepare_msr_reference_cutout(value, cache_dir, app_root)
+        print(f"[ltx25-msr] {Path(value).name}: {note}", flush=True)
+        prepared.append((option, new_value))
+    return prepared
 
 
 @dataclass
@@ -92,6 +171,7 @@ def prepare_ltx25_msr_plan(
     root = Path(app_root).resolve()
     msr_model = _resolve_msr_model(args, root)
     refs = _collect_refs(args)
+    refs = _maybe_remove_reference_backgrounds(args, root, refs)
 
     audio_path = _clean(getattr(args, "audio_path", ""))
     if not audio_path or not Path(audio_path).expanduser().is_file():

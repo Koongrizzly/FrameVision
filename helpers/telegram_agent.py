@@ -600,74 +600,13 @@ class TelegramAgentMixin:
 
     # ------------------------- Autonomous story/music-video Agent -------------------------
     def _telegram_autonomous_dir(self) -> Path:
-        """Root for every autonomous Telegram job. No Agent artifacts belong in temp/."""
-        p = Path(self.fv_root) / "output" / "telegrambot"
+        p = Path(self.fv_root) / "temp" / "telegram" / "agent_projects"
         p.mkdir(parents=True, exist_ok=True)
         return p
 
-    @staticmethod
-    def _telegram_autonomous_model_folder(model: object) -> str:
-        low = re.sub(r"[^a-z0-9]+", "", str(model or "").lower())
-        if "minimax" in low or low in {"h3", "minimaxh3"}:
-            return "minimaxh3"
-        if "ltx25" in low or "ltx2.5" in str(model or "").lower():
-            return "ltx25"
-        if "ltx23" in low or "ltx2.3" in str(model or "").lower():
-            return "ltx23"
-        return "other"
-
-    def _telegram_autonomous_guess_model(self, request: str) -> str:
-        low = str(request or "").lower()
-        if "ltx 2.5" in low or "ltx2.5" in low or "ltx25" in low:
-            return "ltx25"
-        if "ltx 2.3" in low or "ltx2.3" in low or "ltx23" in low:
-            return "ltx23"
-        if "minimax" in low or "h3" in low:
-            return "minimax_h3"
-        return "minimax_h3"
-
-    def _telegram_autonomous_ensure_job_dirs(self, session: Dict[str, Any], model: object = "") -> Dict[str, str]:
-        """Create and persist the single job-owned filesystem tree.
-
-        All autonomous Telegram artifacts must derive from these paths. The model
-        bucket is intentionally outside the job folder so Minimax/LTX test runs stay
-        separated without scattering files across FrameVision's global outputs.
-        """
-        sid = re.sub(r"[^0-9A-Za-z_-]+", "_", str(session.get("id") or "agent")) or "agent"
-        chosen = str(model or dict(session.get("plan") or {}).get("video_model") or session.get("video_model") or self._telegram_autonomous_guess_model(str(session.get("request") or "")))
-        bucket = self._telegram_autonomous_model_folder(chosen)
-        wanted_root = self._telegram_autonomous_dir() / bucket / sid
-        old_root_raw = str(session.get("job_root") or "").strip()
-        old_root = Path(old_root_raw) if old_root_raw else None
-        if old_root is not None and old_root != wanted_root and old_root.exists():
-            wanted_root.parent.mkdir(parents=True, exist_ok=True)
-            if not wanted_root.exists():
-                try:
-                    shutil.move(str(old_root), str(wanted_root))
-                except Exception:
-                    wanted_root.mkdir(parents=True, exist_ok=True)
-            else:
-                wanted_root.mkdir(parents=True, exist_ok=True)
-        else:
-            wanted_root.mkdir(parents=True, exist_ok=True)
-        names = ("refs", "story", "clips", "images", "assembled", "retries", "music")
-        paths = {name: str((wanted_root / name).resolve()) for name in names}
-        for value in paths.values():
-            Path(value).mkdir(parents=True, exist_ok=True)
-        session["job_root"] = str(wanted_root.resolve())
-        session["model_folder"] = bucket
-        session["paths"] = paths
-        return paths
-
-    def _telegram_autonomous_session_path(self, session_id: str, session: Optional[Dict[str, Any]] = None) -> Path:
-        if isinstance(session, dict):
-            paths = self._telegram_autonomous_ensure_job_dirs(session)
-            return Path(paths["story"]) / "session.json"
+    def _telegram_autonomous_session_path(self, session_id: str) -> Path:
         safe = re.sub(r"[^0-9A-Za-z_-]+", "_", str(session_id or "agent"))
-        matches = list(self._telegram_autonomous_dir().glob(f"*/{safe}/story/session.json"))
-        if matches:
-            return matches[0]
-        return self._telegram_autonomous_dir() / "other" / safe / "story" / "session.json"
+        return self._telegram_autonomous_dir() / f"{safe}.json"
 
     def _telegram_autonomous_save_planning_diagnostic(
         self,
@@ -693,8 +632,7 @@ class TelegramAgentMixin:
                     )
             else:
                 raw = str(payload or "")
-            paths = self._telegram_autonomous_ensure_job_dirs(session)
-            path = Path(paths["story"]) / f"{phase_safe}_raw.txt"
+            path = self._telegram_autonomous_dir() / f"{sid}_{phase_safe}_raw.txt"
             path.write_text(raw, encoding="utf-8", errors="replace")
 
             info = {
@@ -707,7 +645,7 @@ class TelegramAgentMixin:
                 "error": str(error or ""),
                 "raw_file": str(path),
             }
-            meta = Path(paths["story"]) / f"{phase_safe}_diagnostic.json"
+            meta = self._telegram_autonomous_dir() / f"{sid}_{phase_safe}_diagnostic.json"
             meta.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
             return str(path)
         except Exception:
@@ -718,7 +656,7 @@ class TelegramAgentMixin:
             sid = str(session.get("id") or "").strip()
             if not sid:
                 return
-            path = self._telegram_autonomous_session_path(sid, session)
+            path = self._telegram_autonomous_session_path(sid)
             tmp = path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(str(tmp), str(path))
@@ -729,11 +667,7 @@ class TelegramAgentMixin:
         try:
             active_statuses = {"planning", "planning_retry", "building_story", "building_shots", "auditing_references", "music_preset_choice", "queueing", "queueing_media", "generating_refs", "generating", "review_ready", "assembling"}
             best: Dict[str, tuple[float, bool, Dict[str, Any]]] = {}
-            session_files = list(self._telegram_autonomous_dir().rglob("story/session.json"))
-            legacy_dir = Path(self.fv_root) / "temp" / "telegram" / "agent_projects"
-            if legacy_dir.exists():
-                session_files.extend(legacy_dir.glob("*.json"))
-            for path in session_files:
+            for path in self._telegram_autonomous_dir().glob("*.json"):
                 try:
                     data = json.loads(path.read_text(encoding="utf-8"))
                 except Exception:
@@ -1709,12 +1643,10 @@ class TelegramAgentMixin:
             "Recurrence alone does not justify a reference. Interchangeable incidental items have incidental continuity_need. "
             "essential means recognition is necessary to follow the story; useful means visual differences would be distracting; "
             "incidental means appearance can vary without changing the scene's meaning. "
-            "The continuity_need field MUST contain exactly one token: essential, useful, or incidental. Put the explanation only in reason. "
-            "The type field MUST contain exactly one token: character, animal, vehicle, object, or location. "
-            "State the stable visual features and explain the continuity decision in reason using the story, not generic praise. "
+            "State the stable visual features and explain the continuity need using the story, not generic praise. "
             "Record the identity's narrative role separately from appearance. "
-            "For EVERY visible appearance provide its exact locked slot plus a concise relationship/action statement identifying what that subject does in that slot. "
-            "Do not copy or paraphrase beat text into the response; FrameVision attaches the canonical locked beat itself after validating the slot. "
+            "For EVERY visible appearance provide its exact slot and a short verbatim quote from that beat supporting its presence, "
+            "plus a concise relationship/action statement identifying what that subject does in that slot. "
             "Being mentioned, owned, remembered, or discussed is not proof of visible presence. Resolve pronouns from story context. "
             "Do not infer that an associated identity is present merely because another related identity appears. "
             "Use existing_id only for the same identity in the provisional catalog, otherwise use an empty string. "
@@ -1733,7 +1665,7 @@ class TelegramAgentMixin:
         def obj(properties):
             return {"type": "object", "additionalProperties": False, "properties": properties, "required": list(properties)}
         string = {"type": "string"}
-        evidence = obj({"slot": {"type": "integer", "minimum": 1}, "relationship": string})
+        evidence = obj({"slot": {"type": "integer", "minimum": 1}, "quote": string, "relationship": string})
         candidate = obj({
             "existing_id": string, "name": string,
             "type": {"type": "string", "enum": ["character", "animal", "vehicle", "object", "location"]},
@@ -1768,20 +1700,6 @@ class TelegramAgentMixin:
                 if not isinstance(item.get(field), str) or not item[field].strip():
                     raise ValueError(f"Candidate {index + 1} needs {field}.")
             need, kind = item.get("continuity_need"), item.get("type")
-            # When llama.cpp cannot initialize json_schema grammar for a reasoning
-            # chat template, the bounded transport retry is intentionally plain JSON.
-            # Canonicalize only an otherwise-valid enum token that the model has
-            # accidentally followed with prose (for example "Essential. ...").
-            # This does not infer a category: the first token itself must be one of
-            # the contract values, and all other values remain hard failures.
-            if isinstance(need, str):
-                match = re.match(r"^\s*(essential|useful|incidental)(?=\s|[.,:;!?-]|$)", need, flags=re.I)
-                if match:
-                    need = match.group(1).casefold()
-                    item["continuity_need"] = need
-            if isinstance(kind, str):
-                kind = kind.strip().casefold()
-                item["type"] = kind
             if need not in priority or kind not in {"character", "animal", "vehicle", "object", "location"}:
                 raise ValueError(f"Candidate {index + 1} has an invalid continuity_need or type.")
             rid = str(item.get("existing_id") or "").strip()
@@ -1797,17 +1715,16 @@ class TelegramAgentMixin:
                 if not isinstance(appearance, dict):
                     raise ValueError("Each appearance needs slot, quote and relationship.")
                 order = appearance.get("slot")
+                quote = appearance.get("quote")
                 relationship = appearance.get("relationship")
                 if type(order) is not int or order not in by_slot or order in orders:
                     raise ValueError("Appearance slot must be a unique existing locked slot.")
+                if not isinstance(quote, str) or not quote.strip() or normalize(quote) not in normalize(by_slot[order].get("beat") or ""):
+                    raise ValueError(f"Appearance evidence for slot {order} must quote its locked beat.")
                 if not isinstance(relationship, str) or not relationship.strip():
                     raise ValueError(f"Appearance at slot {order} needs its subject's relationship/action.")
                 orders.add(order)
-                evidence.append({
-                    "slot": order,
-                    "quote": str(by_slot[order].get("beat") or ""),
-                    "relationship": relationship,
-                })
+                evidence.append(dict(appearance))
             eligible = len(orders) >= 2 and priority[need] > 0
             if eligible and (not isinstance(item.get("stable_features"), str) or not item["stable_features"].strip()):
                 raise ValueError("A selected identity needs stable_features that justify visual consistency.")
@@ -2260,8 +2177,7 @@ class TelegramAgentMixin:
             sid = re.sub(r"[^0-9A-Za-z_-]+", "_", str(session.get("id") or "agent"))
             idx = int(session.get("batch_index") or 0)
             suffix = f"_{idx+1:02d}" if phase == "shots" else ""
-            paths = self._telegram_autonomous_ensure_job_dirs(session, dict(session.get("plan") or {}).get("video_model"))
-            path = Path(paths["story"]) / f"{phase}{suffix}_raw.txt"
+            path = self._telegram_autonomous_dir() / f"{sid}_{phase}{suffix}_raw.txt"
             path.write_text(str(payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, indent=2)), encoding="utf-8")
             session["last_raw_log"] = str(path)
         except Exception:
@@ -2270,9 +2186,7 @@ class TelegramAgentMixin:
     def _telegram_autonomous_write_json(self, session: Dict[str, Any], name: str, payload: Dict[str, Any]) -> None:
         try:
             sid = re.sub(r"[^0-9A-Za-z_-]+", "_", str(session.get("id") or "agent"))
-            paths = self._telegram_autonomous_ensure_job_dirs(session, dict(session.get("plan") or {}).get("video_model"))
-            target_folder = "retries" if "retry" in str(name or "").lower() or "redo" in str(name or "").lower() else "story"
-            path = Path(paths[target_folder]) / f"{name}.json"
+            path = self._telegram_autonomous_dir() / f"{sid}_{name}.json"
             path.write_text(json.dumps(payload or {}, ensure_ascii=False, indent=2), encoding="utf-8")
             session[f"{name}_path"] = str(path)
         except Exception:
@@ -2558,7 +2472,6 @@ class TelegramAgentMixin:
             "assembly_queued_at": 0.0,
             "last_notice": "",
         }
-        self._telegram_autonomous_ensure_job_dirs(session, self._telegram_autonomous_guess_model(session["request"]))
         self._telegram_autonomous_sessions[key] = session
         self._telegram_autonomous_save(session)
         self._telegram_send_text(
@@ -3141,8 +3054,7 @@ class TelegramAgentMixin:
             kind = self._telegram_autonomous_reference_asset_kind(ref)
             krea_prompt = self._telegram_autonomous_reference_asset_prompt(ref, n)
             try:
-                paths = self._telegram_autonomous_ensure_job_dirs(session, dict(session.get("plan") or {}).get("video_model"))
-                route = router._queue_image(krea_prompt, "krea2", 1920, 1088, output_dir=paths["refs"])
+                route = router._queue_image(krea_prompt, "krea2", 1920, 1088)
             except Exception as exc:
                 return False, f"Krea 2 reference `{name}` could not be queued: {exc}"
             if not bool(getattr(route, "queued", False)):
@@ -3161,6 +3073,7 @@ class TelegramAgentMixin:
                 "user_label": str(ref.get("user_label") or ""),
                 "global_ref_label": str(ref.get("global_ref_label") or ""),
                 "prompt": krea_prompt,
+                "appearance_prompt": base_prompt,
                 "clip_orders": list(ref.get("clip_orders") or []),
                 "path": output_path,
                 "queued_at": float(getattr(route, "queued_at", 0.0) or time.time()),
@@ -3260,65 +3173,99 @@ class TelegramAgentMixin:
                 out.append(asset)
         return out[:9]
 
-    def _telegram_autonomous_full_reference_prompt(self, clip: Dict[str, Any], assets: list[dict]) -> str:
-        """Build the MiniMax full-reference six-section prompt contract.
+    def _telegram_autonomous_minimax_h3_prompt(self, clip: Dict[str, Any], assets: Optional[list[dict]] = None) -> str:
+        """Build a MiniMax H3 / Ref2VA generation prompt at queue time.
 
-        Reference images define reusable subjects, so Picture labels are cited
-        inside Subject definitions rather than duplicated as standalone picture
-        entries.  This follows the supplied Full-Reference Mode guide and keeps
-        labels aligned with reference_image_paths order.
+        The planning LLM is allowed to keep writing ordinary semantic shot prose.
+        This adapter converts that prose into the MiniMax contract only when the
+        selected video model is MiniMax H3.  Reference numbering is assigned here
+        from the *actual* reference_image_paths order, so <Picture N>/<Subject N>
+        can never drift away from the images sent to Ref2VA.
         """
         selected = [dict(x) for x in list(assets or []) if isinstance(x, dict)][:9]
         base_prompt = str(clip.get("prompt") or "").strip()
         purpose = str(clip.get("purpose") or "").strip()
-        if not selected:
+        try:
+            duration = max(0.1, float(clip.get("duration") or 6.0))
+        except Exception:
+            duration = 6.0
+
+        # Do not wrap twice when a replacement prompt was already authored in
+        # the new MiniMax format.  This also makes manual /redo prompt overrides
+        # safe for advanced users.
+        upper = base_prompt.upper()
+        if "SCENE:" in upper and "AUDIO:" in upper and "CAMERA:" in upper and re.search(r"\[00:0?0(?:\.0+)?-", base_prompt):
             return base_prompt
 
-        definitions = []
-        summary_subjects = []
-        retention = []
-        for n, asset in enumerate(selected, start=1):
-            name = str(asset.get("name") or "the recurring subject").strip()
-            # Krea asset prompts often contain sheet-layout instructions.  The
-            # source name is enough to bind identity without leaking those
-            # instructions into the target shot.
-            definition = (
-                f"<Subject {n}> is {name}, whose canonical appearance comes from <Picture {n}>. "
-                "Preserve its identity, proportions, colors, materials or clothing, and distinctive visible features."
-            )
-            definitions.append(definition)
-            summary_subjects.append(f"<Subject {n}>")
-            retention.append(
-                f"<Subject {n}> (visible appearances in this clip): fully_preserved - "
-                f"the canonical identity and defining visible characteristics of {name} are retained from <Picture {n}>."
-            )
+        blocks = []
+        if selected:
+            if len(selected) == 1:
+                ref_lines = [
+                    "REFERENCE IMAGE:",
+                    "",
+                    "Use the single provided reference image for <Subject 1> and preserve the referenced subject's exact visual identity. "
+                    "Use the image for identity/appearance continuity only; do not copy its reference-sheet background into the target scene.",
+                ]
+            else:
+                pairs = ", ".join(f"<Picture {n}> for <Subject {n}>" for n in range(1, len(selected) + 1))
+                ref_lines = [
+                    "REFERENCE IMAGES:",
+                    "",
+                    f"Use the provided reference images as follows: {pairs}. Preserve each referenced subject's exact visual identity. "
+                    "Use the images for identity/appearance continuity only; do not copy their reference-sheet backgrounds into the target scene.",
+                ]
+            blocks.append("\n".join(ref_lines))
 
-        joined_subjects = ", ".join(summary_subjects)
-        # Keep a single playback description. The old wrapper introduced each
-        # subject as an opening scene before appending another scene opening.
-        # Preserve already-labelled timelines instead of nesting a new Shot 1.
-        detail = base_prompt
-        for n, asset in enumerate(selected, start=1):
-            name = str(asset.get("name") or "").strip()
-            if name and not re.search(r"<Subject\s+" + str(n) + r">", detail):
-                # Bind an explicit name only; no role/name guessing and no new
-                # action that could move a referenced subject into another shot.
-                detail = re.sub(r"(?<!\w)" + re.escape(name) + r"(?!\w)",
-                                lambda m: f"<Subject {n}>, " + m.group(0), detail, count=1, flags=re.I)
-        if not re.search(r"\[Shot\s+\d+\]", detail, flags=re.I):
-            detail = "[Shot 1] " + detail
-        return (
-            "subject_definitions:\n" + "\n".join(definitions)
-            + "\n\nsummary:\n"
-            + f"[reference generation] The target clip uses {joined_subjects} for visual identity continuity."
-            + "\n\nretention_analysis:\n" + "\n".join(retention)
-            + "\n\ndetailed_description:\n"
-            + "The scene follows the visual style and lighting described below.\n"
-            + detail
-            + "\n\noverall_soundscape:\n"
-            + "Use only the diegetic ambience, physical sound effects, and spoken content explicitly described in the shot; otherwise use natural scene ambience."
-            + "\n\nnon_diegetic_music:\nN/A"
+            defs = ["SUBJECT DEFINITIONS:", ""]
+            for n, asset in enumerate(selected, start=1):
+                name = str(asset.get("name") or f"Referenced subject {n}").strip()
+                appearance = str(asset.get("appearance_prompt") or asset.get("source_prompt") or "").strip()
+                # Older saved sessions do not have appearance_prompt.  Avoid
+                # leaking Krea board/layout instructions from asset['prompt'];
+                # the actual reference image is authoritative in that case.
+                defs.append(f"<Subject {n}> — {name.upper()}")
+                defs.append("")
+                if appearance:
+                    defs.append(appearance)
+                else:
+                    defs.append(f"Use the exact canonical appearance of {name} from <Picture {n}>.")
+                defs.append(f"Preserve the exact identity, proportions, colors, materials, clothing and distinctive visible features from <Picture {n}> throughout the entire video.")
+                defs.append("")
+            blocks.append("\n".join(defs).rstrip())
+
+        # The semantic shot prose remains authoritative for scene content.  It is
+        # placed in the timed action block instead of being rewritten with brittle
+        # heuristics that could change the story or assign dialogue to the wrong
+        # character.
+        scene_intro = purpose or "Follow the described shot exactly with realistic spatial and temporal continuity."
+        blocks.append(
+            "SCENE:\n\n"
+            + scene_intro
+            + "\nMaintain the environment, subject identity, lighting and physical continuity described in the timed action block below."
         )
+
+        end_stamp = f"{duration:04.1f}"
+        blocks.append(
+            f"[00:00.0-00:{end_stamp}]\n\n"
+            + base_prompt
+        )
+
+        blocks.append(
+            "AUDIO:\n\n"
+            "Use natural diegetic ambience and synchronized physical sound effects implied by the action. "
+            "Any spoken dialogue explicitly present in the timed action must remain clear, natural and intelligible. "
+            "Do not invent dialogue, narration or background music unless the shot explicitly requests it."
+        )
+        blocks.append(
+            "CAMERA:\n\n"
+            "Follow the camera framing, lens feel and movement described in the timed action. Keep the clip as one physically continuous take unless the prompt explicitly requires otherwise. "
+            "Do not introduce unrelated cutaways or viewpoints. Keep all referenced subjects visually consistent throughout the entire video."
+        )
+        return "\n\n".join(x for x in blocks if str(x).strip()).strip()
+
+    def _telegram_autonomous_full_reference_prompt(self, clip: Dict[str, Any], assets: list[dict]) -> str:
+        """Backward-compatible alias for the MiniMax H3 / Ref2VA formatter."""
+        return self._telegram_autonomous_minimax_h3_prompt(clip, assets)
 
     def _telegram_autonomous_assign_reference_labels(self, session: Dict[str, Any]) -> list[Dict[str, Any]]:
         """Assign stable, human-facing labels such as Vehicle Ref 1.
@@ -3536,10 +3483,10 @@ class TelegramAgentMixin:
         prompt = rewritten_prompt or original_prompt
         if correction and not rewritten_prompt:
             prompt += "\n\nREGENERATION CORRECTION FROM USER: " + correction
-        if selected_assets:
+        if model == "minimax_h3":
             prompt_clip = dict(clip)
             prompt_clip["prompt"] = prompt
-            prompt = self._telegram_autonomous_full_reference_prompt(prompt_clip, selected_assets)
+            prompt = self._telegram_autonomous_minimax_h3_prompt(prompt_clip, selected_assets)
 
         # Redos default to a fresh random seed. The user can request an exact
         # seed or ask to reuse the last seed FrameVision recorded for this slot.
@@ -3575,8 +3522,6 @@ class TelegramAgentMixin:
             "duration_sec": float(frames) / 24.0,
             "seed": int(generation_seed),
             "output_name": f"{sid}_S{order:02d}_redo{redo_n:02d}",
-            "output_dir": self._telegram_autonomous_ensure_job_dirs(session, model)["retries"],
-            "job_work_dir": self._telegram_autonomous_ensure_job_dirs(session, model)["story"],
         }
         router = self._telegram_router_for_chat(key)
         try:
@@ -4349,8 +4294,6 @@ class TelegramAgentMixin:
             return
         plan = dict(session.get("plan") or {})
         model = str(plan.get("video_model") or "minimax_h3")
-        self._telegram_autonomous_ensure_job_dirs(session, model)
-        self._telegram_autonomous_save(session)
         router = self._telegram_router_for_chat(key)
 
         # Asset-first execution. The previous Agent could describe a Krea
@@ -4407,8 +4350,8 @@ class TelegramAgentMixin:
                 wanted = max(9, int(round(duration * 24.0)))
                 frames = max(9, int(round((wanted - 1) / 8.0)) * 8 + 1)
             clip_refs = self._telegram_autonomous_reference_paths_for_clip(session, clip) if model == "minimax_h3" else []
-            if clip_refs:
-                prompt = self._telegram_autonomous_full_reference_prompt(clip, clip_refs)
+            if model == "minimax_h3":
+                prompt = self._telegram_autonomous_minimax_h3_prompt(clip, clip_refs)
             state = {
                 "video_mode": "reference" if clip_refs else "text",
                 "reference_image_paths": [str(x.get("path") or "") for x in clip_refs],
@@ -4421,8 +4364,6 @@ class TelegramAgentMixin:
                 "fps": 24,
                 "duration_sec": float(frames) / 24.0,
                 "output_name": f"{sid}_S{i:02d}",
-                "output_dir": self._telegram_autonomous_ensure_job_dirs(session, model)["clips"],
-                "job_work_dir": self._telegram_autonomous_ensure_job_dirs(session, model)["story"],
             }
             try:
                 if model == "ltx25":
@@ -4474,7 +4415,6 @@ class TelegramAgentMixin:
                 "title": f"{sid}_music",
                 "bpm": int(music.get("bpm") or 0),
                 "seed": random.randint(1, 2147483647),
-                "output_dir": self._telegram_autonomous_ensure_job_dirs(session, model)["music"],
             }
             try:
                 # Agent mode must use the exact chosen FrameVision preset.  The
@@ -4651,7 +4591,7 @@ class TelegramAgentMixin:
             return False, f"Bundled FFmpeg was not found: {ffmpeg}"
 
         sid = str(session.get("id") or "agent")
-        out_dir = Path(self._telegram_autonomous_ensure_job_dirs(session, dict(session.get("plan") or {}).get("video_model"))["assembled"])
+        out_dir = Path(self.fv_root) / "output" / "video" / "agent"
         out_dir.mkdir(parents=True, exist_ok=True)
         revision = int(session.get("assembly_revision") or 0) + 1
         concat_file = self._telegram_autonomous_dir() / f"{sid}_concat_r{revision:02d}.txt"
@@ -4972,7 +4912,7 @@ class TelegramAgentMixin:
                     # Keep a predictable project-local copy so users can inspect
                     # exactly which refs the Agent handed to Ref2VA.
                     sid = str(session.get("id") or "agent")
-                    ref_dir = Path(self._telegram_autonomous_ensure_job_dirs(session, dict(session.get("plan") or {}).get("video_model"))["refs"])
+                    ref_dir = Path(self.fv_root) / "output" / "images" / "agent_refs" / sid
                     ref_dir.mkdir(parents=True, exist_ok=True)
                     for n, asset in enumerate(assets, start=1):
                         src = Path(str(asset.get("path") or ""))
@@ -5703,7 +5643,7 @@ class TelegramAgentMixin:
                     "Anything you leave open is for the Agent to decide.\n\n"
                     "Important: generation uses the LAST SAVED settings from the normal FrameVision model tabs. "
                     "Before starting a long Agent job, set/save the options you want there. For MiniMax H3 this includes loaded LoRAs and their strengths, "
-                    "steps, Sage Attention, Sol Attention, Spectrum Forecaster, Comfy Kitchen, sampler/scheduler, VRAM settings and model overrides."
+                    "steps, Sage Attention, Spectrum Forecaster, Comfy Kitchen, sampler/scheduler, VRAM settings and model overrides."
                 )
                 return
             # Project review/repair commands are handled before generic Telegram

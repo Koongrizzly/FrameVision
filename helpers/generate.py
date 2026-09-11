@@ -36,7 +36,7 @@ def main():
     ap.add_argument("--frames", type=int, default=362); ap.add_argument("--experimental-long-duration", action="store_true", help="Allow H3 native-grid research durations beyond the normal 719-frame range, up to 2385 frames"); ap.add_argument("--steps", type=int, default=15)
     ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
     ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0)
-    ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="simple")
+    ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="beta")
     ap.add_argument("--first-frame"); ap.add_argument("--last-frame"); ap.add_argument("--continue-video"); ap.add_argument("--continue-context-frames", type=int, default=39); ap.add_argument("--continue-audio-memory", action="store_true", help="Experimental: use source clip audio as continuation memory/context"); ap.add_argument("--glue-source"); ap.add_argument("--output")
     ap.add_argument("--fl2va-checkpoint"); ap.add_argument("--ref2va-checkpoint"); ap.add_argument("--text-encoder"); ap.add_argument("--video-vae"); ap.add_argument("--audio-vae")
     ap.add_argument("--lora", action="append", default=[]); ap.add_argument("--lora-strength", action="append", type=float, default=[])

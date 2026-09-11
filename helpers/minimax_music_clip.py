@@ -21,6 +21,7 @@ small project JSON and calls the existing helpers/generate_ref.py backend.
 """
 
 import json
+import importlib.util
 import hashlib
 import concurrent.futures
 import math
@@ -108,6 +109,99 @@ MUSIC_FRAME_MIN = 124
 MUSIC_FRAME_DEFAULT_MAX = 396
 MUSIC_FRAME_GRID = tuple(range(MUSIC_FRAME_MIN, MUSIC_FRAME_DEFAULT_MAX + 1, 17))
 FPS = 24.0
+
+
+_BG_REMOVE_HELPER = None
+_BG_REMOVE_HELPER_ERROR = ""
+
+
+def _load_background_helper():
+    global _BG_REMOVE_HELPER, _BG_REMOVE_HELPER_ERROR
+    if _BG_REMOVE_HELPER is not None:
+        return _BG_REMOVE_HELPER
+    candidates = [
+        ROOT / "helpers" / "background.py",
+        Path(__file__).resolve().with_name("background.py"),
+    ]
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            spec = importlib.util.spec_from_file_location("fv_background_helper", str(candidate))
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _BG_REMOVE_HELPER = module
+            _BG_REMOVE_HELPER_ERROR = ""
+            return module
+        except Exception as exc:
+            _BG_REMOVE_HELPER_ERROR = str(exc)
+    if not _BG_REMOVE_HELPER_ERROR:
+        _BG_REMOVE_HELPER_ERROR = "helpers/background.py was not found"
+    return None
+
+
+def _remove_background_from_reference_image(path: str, out_dir: Path) -> tuple[str, str]:
+    try:
+        helper = _load_background_helper()
+        if helper is None:
+            return path, _BG_REMOVE_HELPER_ERROR or "background helper unavailable"
+        models_dir = Path(helper.ROOT) / "models" / "bg"
+        modnet = helper.OnnxModel(helper._modnet_model_path(models_dir), "MODNet")
+        biref = helper.OnnxModel(helper._birefnet_model_path(models_dir), "BiRefNet")
+        if modnet.is_available():
+            engine = "modnet"
+            engine_label = "MODNet"
+        elif biref.is_available():
+            engine = "birefnet"
+            engine_label = "BiRefNet"
+        else:
+            return path, f"no MODNet/BiRefNet model found in {models_dir}"
+        source = Path(path).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cached = out_dir / f"{source.stem}_cutout.png"
+        try:
+            if cached.is_file() and cached.stat().st_mtime >= source.stat().st_mtime:
+                return str(cached), f"{engine_label} cached cutout"
+        except Exception:
+            pass
+        produced = helper.remove_background_file(
+            str(source),
+            engine=engine,
+            mode="keep_subject",
+            feather=6,
+            out_dir=str(out_dir),
+        )
+        return str(produced), f"{engine_label} cutout"
+    except Exception as exc:
+        return path, f"background removal failed: {exc}"
+
+
+def _should_remove_reference_background(kind: str) -> bool:
+    return _normalise_reference_kind(kind) in ("Character", "Object / Prop")
+
+
+def _prepare_music_generation_references(project: MusicProject, refs: Sequence[ReferenceAsset], out_dir: str | Path) -> tuple[List[ReferenceAsset], List[str]]:
+    if not bool(getattr(project, "remove_reference_backgrounds", True)):
+        return list(refs), []
+    cache_dir = Path(out_dir).resolve() / "_reference_cutouts"
+    prepared: List[ReferenceAsset] = []
+    notes: List[str] = []
+    for ref in refs:
+        if not _should_remove_reference_background(ref.kind):
+            prepared.append(ref)
+            continue
+        new_path, note = _remove_background_from_reference_image(ref.path, cache_dir)
+        if os.path.normcase(str(new_path)) != os.path.normcase(str(ref.path)):
+            prepared.append(ReferenceAsset(name=ref.name, kind=ref.kind, path=str(new_path), description=ref.description, enabled=ref.enabled))
+            notes.append(f"{ref.name}: {note}")
+        else:
+            prepared.append(ref)
+            if note and ("failed" in note.lower() or "unavailable" in note.lower() or "no modnet" in note.lower()):
+                notes.append(f"{ref.name}: {note}; using original reference")
+    return prepared, notes
+
 
 
 def _music_project_identity(title: str, audio_path: str) -> str:
@@ -419,6 +513,7 @@ class MusicProject:
     shift: float = 12.0
     audio_shift: float = 3.0
     ref_image_size: str = "match"
+    remove_reference_backgrounds: bool = True
     sage_attention: bool = False
     spectrum: bool = False
     use_hybrid_model: bool = False
@@ -1962,6 +2057,9 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             # Last-resort safety: Ref2VA music shots should not silently ignore all images.
             selected_names = [next(iter(refs_by_name))]
         selected = [refs_by_name[n] for n in selected_names[:9]]
+        selected, ref_cleanup_notes = _prepare_music_generation_references(project, selected, out_dir)
+        for note in ref_cleanup_notes:
+            progress(f"Shot {shot.index}: {note}")
         generation_prompt = build_generation_prompt(project, shot, selected)
         (raw_dir / f"shot_{shot.index:03d}_prompt.txt").write_text(generation_prompt, encoding="utf-8")
         cmd = [
@@ -2753,7 +2851,16 @@ class MiniMaxMusicClipWidget(QWidget):
             "When disabled, character references are still rotated in a stable round-robin order so later references are not ignored. "
             "Backgrounds, style refs and other non-character references keep their normal behavior. Rebuild prompts or create a new plan to refresh assignments."
         )
+
         lay.addWidget(self.check_randomize_ref_characters)
+        self.check_remove_ref_backgrounds = QCheckBox("Remove backgrounds from Character and Object / Prop references", body)
+        self.check_remove_ref_backgrounds.setChecked(True)
+        self.check_remove_ref_backgrounds.setToolTip(
+            "Default: on. Character and prop reference images are pre-cleaned before MiniMax Ref2VA generation. "
+            "MODNet is preferred for people because it keeps the subject while dropping the source background. "
+            "If MODNet is unavailable the helper falls back to BiRefNet. Background / Location and Style / Mood refs stay untouched."
+        )
+        lay.addWidget(self.check_remove_ref_backgrounds)
         self.refs_table = QTableWidget(0, 6, body)
         # Put the useful editable fields first. Long filenames/paths are supporting
         # metadata and must never consume the reference tab at the expense of role
@@ -3063,6 +3170,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.shift = self.spin_shift.value()
         self.project.audio_shift = self.spin_audio_shift.value()
         self.project.ref_image_size = self.combo_ref_size.currentText()
+        self.project.remove_reference_backgrounds = bool(getattr(self, "check_remove_ref_backgrounds", None) and self.check_remove_ref_backgrounds.isChecked())
         self.project.turbo_lora_path = self.edit_turbo_lora.text().strip()
         self.project.turbo_lora_strength = self.spin_turbo_lora.value()
         self.project.extra_lora1_path = self.edit_extra_lora1.text().strip()
@@ -3105,6 +3213,8 @@ class MiniMaxMusicClipWidget(QWidget):
         self.edit_hybrid_model.setText(str(getattr(p, "hybrid_model_path", "") or ""))
         self.check_vram_manager.setChecked(bool(p.vram_manager_enabled)); self.check_vram_auto_bypass.setChecked(bool(p.vram_auto_bypass)); self.check_sage.setChecked(p.sage_attention); self.check_spectrum.setChecked(p.spectrum)
         self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
+        if getattr(self, "check_remove_ref_backgrounds", None) is not None:
+            self.check_remove_ref_backgrounds.setChecked(bool(getattr(p, "remove_reference_backgrounds", True)))
         self.check_framevision_queue.setChecked(bool(getattr(p, "use_framevision_queue", False)))
         if getattr(self, "check_hypir_x1_upscale", None) is not None:
             self.check_hypir_x1_upscale.setChecked(bool(getattr(p, "use_hypir_x1_upscale", False)))
@@ -3200,7 +3310,7 @@ class MiniMaxMusicClipWidget(QWidget):
         for name in (
             "resolution", "aspect", "max_frames", "head_padding", "tail_padding",
             "phrase_snap_tolerance", "steps", "cfg", "shift", "audio_shift",
-            "ref_image_size", "turbo_lora_path", "turbo_lora_strength",
+            "ref_image_size", "remove_reference_backgrounds", "turbo_lora_path", "turbo_lora_strength",
             "extra_lora1_path", "extra_lora1_strength", "extra_lora2_path", "extra_lora2_strength",
             "use_hybrid_model", "hybrid_model_path",
             "vram_manager_enabled", "vram_auto_bypass", "vram_residency_engine",
@@ -3946,6 +4056,9 @@ class MiniMaxMusicClipWidget(QWidget):
         if not selected_names and refs_by_name:
             selected_names = [next(iter(refs_by_name))]
         selected = [refs_by_name[n] for n in selected_names[:9]]
+        selected, ref_cleanup_notes = _prepare_music_generation_references(self.project, selected, out_dir)
+        for note in ref_cleanup_notes:
+            self.status.setText(f"Shot {shot.index}: {note}")
         generation_prompt = build_generation_prompt(self.project, shot, selected)
 
         # Persist the exact text handed to MiniMax for audit/debugging. This makes it

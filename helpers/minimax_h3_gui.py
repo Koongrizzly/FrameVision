@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, sys, subprocess, time, socket, urllib.request, re, uuid, html, shutil, hashlib, tempfile, threading, zipfile
+import json, os, sys, subprocess, time, socket, urllib.request, re, uuid, html, shutil, hashlib, tempfile, threading, zipfile, importlib.util
 from datetime import datetime
 from pathlib import Path
 
@@ -43,6 +43,75 @@ APP_UPDATE_ZIP = f"https://api.github.com/repos/{APP_UPDATE_REPO}/zipball"
 APP_UPDATE_STATE = PRESET_DIR / "minimax_h3_update_state.json"
 APP_UPDATE_EXCLUDED_TOP = {"environments", "models", "output", "logs", "jobs", ".git"}
 APP_UPDATE_EXCLUDED_PREFIXES = {"presets/setsave", "h3_prompt_builder/.runtime"}
+
+
+_BG_REMOVE_HELPER = None
+_BG_REMOVE_HELPER_ERROR = ""
+
+
+def _load_background_helper():
+    global _BG_REMOVE_HELPER, _BG_REMOVE_HELPER_ERROR
+    if _BG_REMOVE_HELPER is not None:
+        return _BG_REMOVE_HELPER
+    candidates = [
+        ROOT / "helpers" / "background.py",
+        Path(__file__).resolve().with_name("background.py"),
+    ]
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            spec = importlib.util.spec_from_file_location("fv_background_helper_gui", str(candidate))
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _BG_REMOVE_HELPER = module
+            _BG_REMOVE_HELPER_ERROR = ""
+            return module
+        except Exception as exc:
+            _BG_REMOVE_HELPER_ERROR = str(exc)
+    if not _BG_REMOVE_HELPER_ERROR:
+        _BG_REMOVE_HELPER_ERROR = "helpers/background.py was not found"
+    return None
+
+
+def _prepare_ref2va_reference_images(paths, out_dir: Path):
+    prepared = []
+    notes = []
+    helper = _load_background_helper()
+    if helper is None:
+        return list(paths), [(_BG_REMOVE_HELPER_ERROR or "background helper unavailable")]
+    models_dir = Path(helper.ROOT) / "models" / "bg"
+    modnet = helper.OnnxModel(helper._modnet_model_path(models_dir), "MODNet")
+    biref = helper.OnnxModel(helper._birefnet_model_path(models_dir), "BiRefNet")
+    if modnet.is_available():
+        engine = "modnet"
+        engine_label = "MODNet"
+    elif biref.is_available():
+        engine = "birefnet"
+        engine_label = "BiRefNet"
+    else:
+        return list(paths), [f"No MODNet/BiRefNet model found in {models_dir}"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for item in list(paths or []):
+        source = Path(str(item)).expanduser().resolve()
+        cached = out_dir / f"{source.stem}_cutout.png"
+        try:
+            if cached.is_file() and cached.stat().st_mtime >= source.stat().st_mtime:
+                prepared.append(str(cached))
+                notes.append(f"{source.name}: {engine_label} cached cutout")
+                continue
+        except Exception:
+            pass
+        try:
+            produced = helper.remove_background_file(str(source), engine=engine, mode="keep_subject", feather=6, out_dir=str(out_dir))
+            prepared.append(str(produced))
+            notes.append(f"{source.name}: {engine_label} cutout")
+        except Exception as exc:
+            prepared.append(str(source))
+            notes.append(f"{source.name}: background removal failed ({exc}); using original reference")
+    return prepared, notes
 
 
 if not _FRAMEVISION_EMBEDDED_IMPORT:
@@ -911,8 +980,16 @@ class MainWindow(QMainWindow):
 
         self.ref_group = QGroupBox("Ref2VA references"); rfl = QVBoxLayout(self.ref_group)
         note = QLabel("Prompt tags follow the native order: <Picture 1..9>, <Audio n> paired before <Video n>, then standalone <Audio n>."); note.setWordWrap(True); rfl.addWidget(note)
+
         self.ref_size = QComboBox(); self.ref_size.addItems(["match", "max"])
+        self.ref_remove_backgrounds = QCheckBox("Remove backgrounds from reference images")
+        self.ref_remove_backgrounds.setChecked(True)
+        self.ref_remove_backgrounds.setToolTip(
+            "Default: on. Still reference images are pre-cleaned before Ref2VA generation. "
+            "MODNet is preferred, with BiRefNet fallback when MODNet is unavailable. Videos and standalone audio refs are not changed."
+        )
         rs = QFormLayout(); rs.addRow("Reference image size", self.ref_size); rfl.addLayout(rs)
+        rfl.addWidget(self.ref_remove_backgrounds)
         self.ref_images = RefList("Reference images (max 9)", "Images (*.png *.jpg *.jpeg *.webp *.bmp)", 9)
         self.ref_videos = RefList("Reference videos (max 3; soundtrack extracted when present)", "Video (*.mp4 *.mov *.mkv *.webm *.avi)", 3)
         self.ref_audios = RefList("Voice / standalone reference audio (max 3)", "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg)", 3)
@@ -2834,7 +2911,7 @@ class MainWindow(QMainWindow):
             "continue_video": self.continue_video.path(), "continue_context_frames": int(self.continue_context.currentData() or 39),
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
             "continue_audio_memory": self.continue_audio_memory.isChecked(),
-            "ref_size": self.ref_size.currentText(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(),
+            "ref_size": self.ref_size.currentText(), "ref_remove_backgrounds": self.ref_remove_backgrounds.isChecked(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(),
             "ref_audio_subjects": [int(combo.currentData() or 0) for combo in self.ref_audio_subjects],
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
@@ -2876,7 +2953,7 @@ class MainWindow(QMainWindow):
             self.steps.setValue(int(d.get("steps", 15))); self.seed.setValue(int(d.get("seed", -1))); self.prompt.setPlainText(d.get("prompt", "")); self.first.edit.setText(d.get("first", "")); self.last.edit.setText(d.get("last", "")); self.continue_video.edit.setText(d.get("continue_video", ""))
             ctx=int(d.get("continue_context_frames",39)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 1)
             self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_last_result.setChecked(bool(d.get("continue_last_result", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self._sync_continue_video_options()
-            self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", []))
+            self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_remove_backgrounds.setChecked(bool(d.get("ref_remove_backgrounds", True))); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", []))
             saved_voice_subjects = d.get("ref_audio_subjects", []) or []
             for i, combo in enumerate(self.ref_audio_subjects):
                 subject_n = int(saved_voice_subjects[i]) if i < len(saved_voice_subjects) else 0
@@ -3640,10 +3717,20 @@ print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
             if not self.first.path() and not self.last.path() and not manual_continue_video and not continue_last:
                 QMessageBox.warning(self,"Visual input required","Choose a first frame, last frame, Continue video, or Continue last result for FL2VA."); return
         elif mode==2:
-            refs=self.ref_images.paths()+self.ref_videos.paths()+self.ref_audios.paths()
+            prepared_ref_images = self.ref_images.paths()
+            if self.ref_remove_backgrounds.isChecked() and self.ref_images.paths():
+                try:
+                    output_folder = self.output_folder.path() or str(DEFAULT_OUTPUT_DIR)
+                    prepared_ref_images, prep_notes = _prepare_ref2va_reference_images(self.ref_images.paths(), Path(output_folder) / "_ref2va_reference_cutouts")
+                    if prep_notes:
+                        self._append_filtered_log("\n".join(prep_notes), ["cutout", "background removal", "using original", "No MODNet", "helper unavailable"])
+                except Exception as exc:
+                    prepared_ref_images = self.ref_images.paths()
+                    self.append_log(f"Ref background removal warning: {exc}\n")
+            refs=prepared_ref_images+self.ref_videos.paths()+self.ref_audios.paths()
             if not refs: QMessageBox.warning(self,"Reference required","Add at least one Ref2VA reference."); return
             args += ["--ref-image-size",self.ref_size.currentText()]
-            for pth in self.ref_images.paths(): args += ["--ref-image",pth]
+            for pth in prepared_ref_images: args += ["--ref-image",pth]
             for pth in self.ref_videos.paths(): args += ["--ref-video",pth]
             for i, pth in enumerate(self.ref_audios.paths()):
                 args += ["--ref-audio", pth]
@@ -3661,7 +3748,7 @@ print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
             # runtime estimator itself carries conditioning cost into the diffusion budget.
             visual_ref_count = 0
             if mode == 2:
-                visual_ref_count = len(self.ref_images.paths()) + len(self.ref_videos.paths())
+                visual_ref_count = len(prepared_ref_images) + len(self.ref_videos.paths())
             force_ref2va_vram_manager = (mode == 2 and visual_ref_count >= 4)
             use_auto_vram = self.vram_manager_auto_bypass.isChecked() and not force_ref2va_vram_manager
             args += ["--vram-manager-auto" if use_auto_vram else "--vram-manager"]
