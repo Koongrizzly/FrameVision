@@ -210,18 +210,51 @@ def _planner_llama_effective_template(model_path: str, template_kind: str, templ
     return (kind, value)
 
 
+def _planner_story_auto_context_floor(duration_sec: float = 0.0, shot_count: int = 0) -> int:
+    """Automatic llama.cpp context floor for Planner story work.
+
+    This is deliberately a floor, not the final context.  Every structured call is
+    still measured from its actual prompt + requested output and may grow beyond it.
+    Duration/shot count simply give long-form stories more working room up front.
+    """
+    try:
+        duration = max(0.0, float(duration_sec or 0.0))
+    except Exception:
+        duration = 0.0
+    try:
+        shots = max(0, int(shot_count or 0))
+    except Exception:
+        shots = 0
+    # Either signal may drive the floor.  This also remains useful for models where
+    # the final clip count differs slightly from the nominal duration estimate.
+    scale = max(duration / 60.0, shots / 12.0)
+    if scale <= 2.0:
+        return 8192
+    if scale <= 5.0:
+        return 12288
+    if scale <= 10.0:
+        return 16384
+    if scale <= 20.0:
+        return 24576
+    return 32768
+
+
 def _planner_llama_settings(snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     src = snapshot if isinstance(snapshot, dict) else (_load_planner_settings() or {})
     runner = str(src.get('own_llama_runner_path') or '').strip()
     if not runner:
         runner = _planner_default_llama_runner()
+    auto_ctx = _planner_story_auto_context_floor(
+        src.get('_auto_story_duration_sec', 0.0),
+        src.get('_auto_story_shot_count', 0),
+    )
     return {
         'enabled': bool(src.get('own_llama_enabled', False)),
         'runner_path': runner,
         'model_path': str(src.get('own_llama_model_path') or '').strip(),
         'template_kind': str(src.get('own_llama_template_kind') or 'smart').strip() or 'smart',
         'template_value': str(src.get('own_llama_template_value') or '').strip(),
-        'ctx_size': int(src.get('own_llama_ctx_size', 8192) or 8192),
+        'ctx_size': int(auto_ctx),
         'top_p': float(src.get('own_llama_top_p', 0.9) or 0.9),
     }
 
@@ -229,6 +262,31 @@ def _planner_llama_settings(snapshot: Optional[Dict[str, Any]] = None) -> Dict[s
 def _planner_llama_is_enabled(snapshot: Optional[Dict[str, Any]] = None) -> bool:
     cfg = _planner_llama_settings(snapshot)
     return bool(cfg.get('enabled'))
+
+
+def _planner_llama_auto_context_size(system_prompt: str, user_prompt: str, max_new_tokens: int, configured_ctx: int) -> int:
+    """Return a safe llama.cpp context size for the current structured call.
+
+    The user's configured context remains the floor. Longer story calls may raise it
+    automatically so input + requested output cannot collide with an 8K default.
+    The estimate is intentionally conservative for JSON / code-like prompts.
+    """
+    configured = max(1024, int(configured_ctx or 8192))
+    chars = len(str(system_prompt or '')) + len(str(user_prompt or ''))
+    # JSON, IDs and punctuation tokenize less efficiently than plain prose.
+    estimated_input_tokens = max(256, int((chars / 3.2) + 0.999))
+    requested_output = max(256, int(max_new_tokens or 0))
+    required = estimated_input_tokens + requested_output + 1024
+    # llama.cpp context values do not need powers of two; use a 1024-token step.
+    required = int(((required + 1023) // 1024) * 1024)
+    effective = max(configured, required)
+    hard_cap = 131072
+    if effective > hard_cap:
+        raise RuntimeError(
+            f'Planner story call needs about {required} context tokens, above the supported {hard_cap}. '
+            'Reduce the story input/attachments or split the job.'
+        )
+    return effective
 
 def _planner_story_creativity_profile(snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Return planner creativity settings. Own llama gets a looser storytelling path.
@@ -397,10 +455,16 @@ def _planner_clean_generated_prompt_line(text: str) -> str:
     return s
 
 
-def _planner_run_llama_text(*, system_prompt: str, user_prompt: str, temperature: float = 0.3, max_new_tokens: int = 1024, planner_llama_settings: Optional[Dict[str, Any]] = None) -> str:
+def _planner_run_llama_text(*, system_prompt: str, user_prompt: str, temperature: float = 0.3, max_new_tokens: int = 1024, planner_llama_settings: Optional[Dict[str, Any]] = None, json_mode: bool = False) -> str:
     cfg = _planner_llama_settings(planner_llama_settings)
     if not bool(cfg.get('enabled')):
         raise RuntimeError('Own llama is not enabled.')
+    # Long-story safety: 8192 is only the UI/default floor. Raise context per call
+    # from the actual prompt size + requested completion budget when necessary.
+    cfg = dict(cfg)
+    cfg['ctx_size'] = _planner_llama_auto_context_size(
+        system_prompt, user_prompt, int(max_new_tokens), int(cfg.get('ctx_size') or 8192)
+    )
     runner = _planner_resolve_llama_server_executable(str(cfg.get('runner_path') or ''))
     model = os.path.abspath(str(cfg.get('model_path') or '').strip())
     if not runner or not os.path.isfile(runner):
@@ -530,11 +594,21 @@ def _planner_run_llama_text(*, system_prompt: str, user_prompt: str, temperature
                 hint = ' The selected GGUF is being treated like a multimodal model during startup. Planner own-llama text mode should not use mmproj; update planner.py to the latest patch.'
             raise RuntimeError(f'Local llama-server exited before becoming ready (exit code {last_exit if last_exit is not None else 1}). Check runner/model/template settings or open logs/planner_own_llama_server.log.{hint}{extra}')
 
+        _sys = str(system_prompt or '')
+        _usr = str(user_prompt or '')
+        if json_mode:
+            _sys = (
+                'DIRECT STRUCTURED OUTPUT MODE. Do not reveal reasoning or analysis. '
+                'Do not emit <think> tags. Start the response with { and return only the requested JSON object. '
+                + _sys
+            )
+            # Qwen3-family templates understand /no_think; other models simply treat it as a direct-output instruction.
+            _usr = _usr.rstrip() + '\n\n/no_think'
         payload = {
             'model': 'local-model',
             'messages': [
-                {'role': 'system', 'content': str(system_prompt or '')},
-                {'role': 'user', 'content': str(user_prompt or '')},
+                {'role': 'system', 'content': _sys},
+                {'role': 'user', 'content': _usr},
             ],
             'stream': False,
             'max_tokens': int(max_new_tokens),
@@ -542,7 +616,19 @@ def _planner_run_llama_text(*, system_prompt: str, user_prompt: str, temperature
             'top_p': float(cfg.get('top_p') or 0.9),
             'reasoning_format': 'none',
         }
-        code, data = _planner_http_post_json(f'{base_url}/v1/chat/completions', payload, timeout=360.0)
+        if json_mode:
+            payload['chat_template_kwargs'] = {'enable_thinking': False}
+            payload['response_format'] = {'type': 'json_object'}
+        # Large structured outputs (notably long-story continuity bibles) can take
+        # several minutes on local GGUFs. Scale timeout with the requested output.
+        _story_http_timeout = float(max(360.0, min(1800.0, 180.0 + (int(max_new_tokens) * 0.08))))
+        code, data = _planner_http_post_json(f'{base_url}/v1/chat/completions', payload, timeout=_story_http_timeout)
+        if code >= 400 and json_mode:
+            # Older llama.cpp builds may not understand the optional structured-output fields.
+            # Keep /no_think + direct-output system instruction, but retry without those API extensions.
+            payload.pop('chat_template_kwargs', None)
+            payload.pop('response_format', None)
+            code, data = _planner_http_post_json(f'{base_url}/v1/chat/completions', payload, timeout=_story_http_timeout)
         if code >= 400:
             msg = ((data or {}).get('error') or {}).get('message') or f'HTTP {code}'
             raise RuntimeError(str(msg))
@@ -604,6 +690,62 @@ def _planner_load_offline_storyline_backend() -> Tuple[Optional[Any], Optional[A
         _OFFLINE_STORYLINE_BACKEND_ERROR = f"{type(exc).__name__}: {exc}"
     _OFFLINE_STORYLINE_BACKEND_CACHE = (client_cls, generator_cls, backend_path)
     return _OFFLINE_STORYLINE_BACKEND_CACHE
+
+
+class _PlannerStoryLLMClient:
+    """Single story-engine transport for both built-in Qwen and optional own GGUF.
+
+    Story architecture must not fork based on which text model is selected.  Only
+    transport changes; the StorylineGenerator receives the same contract either way.
+    """
+    def __init__(self, *, encoding: Optional[Dict[str, Any]], story_dir: str, prompts_used_path: str = "", log_callback: Optional[Callable[[str], None]] = None):
+        self.encoding = dict(encoding or {})
+        self.story_dir = str(story_dir or "")
+        self.prompts_used_path = str(prompts_used_path or "")
+        self.log_callback = log_callback
+        self.counter = 0
+
+    def _log(self, msg: str) -> None:
+        if callable(self.log_callback):
+            try:
+                self.log_callback(str(msg))
+            except Exception:
+                pass
+
+    def start(self) -> None:
+        return
+
+    def stop(self) -> None:
+        return
+
+    def generate(self, system_prompt: str, user_prompt: str, *, temperature: float = 0.55, max_tokens: int = 4096, json_mode: bool = False) -> str:
+        self.counter += 1
+        if self.prompts_used_path:
+            try:
+                _append_prompt_used(self.prompts_used_path, f"Story stage {self.counter}", system_prompt, user_prompt)
+            except Exception:
+                pass
+        if _planner_llama_is_enabled(self.encoding):
+            self._log(f"[story] LLM stage {self.counter}: own GGUF")
+            return _planner_run_llama_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=float(temperature),
+                max_new_tokens=int(max_tokens),
+                planner_llama_settings=self.encoding,
+                json_mode=bool(json_mode),
+            )
+        self._log(f"[story] LLM stage {self.counter}: built-in Qwen3-VL")
+        log_path = os.path.join(self.story_dir, f"story_llm_{self.counter:02d}.txt")
+        return _qwen_text_call(
+            step_name=f"Story stage {self.counter}",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            log_path=log_path,
+            temperature=float(temperature),
+            max_new_tokens=int(max_tokens),
+            planner_llama_settings=None,
+        )
 
 
 def _planner_action_safe_camera_text(text: Any) -> str:
@@ -3681,8 +3823,8 @@ _WAN22_PRESETS = {
 _LTX25_PRESETS = {
     # LTX 2.5 is a separate backend. Do not copy LTX 2.3 sampler/LoRA jargon here.
     # Planner quality controls resolution only for now; runtime defaults come from ltx25_helper.py.
-    "low": {"model":"ltx25", "engine":"framevision_ltx25", "quality":"low", "res":"832x480",
-            "res_landscape":"832x480", "res_portrait":"480x832", "res_square":"480x480",
+    "low": {"model":"ltx25", "engine":"framevision_ltx25", "quality":"low", "res":"832x448",
+            "res_landscape":"832x448", "res_portrait":"448x832", "res_square":"448x448",
             "fps":24, "min_sec":3.0, "max_sec":10.0, "max_frames":241, "label":"480p"},
     "medium": {"model":"ltx25", "engine":"framevision_ltx25", "quality":"medium", "res":"1280x704",
             "res_landscape":"1280x704", "res_portrait":"704x1280", "res_square":"704x704",
@@ -3730,6 +3872,39 @@ def _planner_ltx25_frames(frames: int, max_frames: int = 241) -> int:
     except Exception:
         n = 121
     return int(max(9, n - ((n - 1) % 8)))
+
+def _planner_ltx25_valid_resolution(width: int, height: int) -> tuple[int, int]:
+    """Return a nearby LTX 2.5 two-stage resolution with both axes divisible by 64.
+
+    Prefer preserving aspect ratio over independently rounding each axis, because
+    independently snapping a 16:9-ish request can noticeably change framing.
+    Exact valid dimensions are returned unchanged.
+    """
+    try:
+        w = max(64, int(width))
+        h = max(64, int(height))
+    except Exception:
+        return 832, 448
+    if (w % 64) == 0 and (h % 64) == 0:
+        return w, h
+    target_ratio = float(w) / float(h)
+    target_area = float(w * h)
+    wc = sorted(set(max(64, 64 * n) for n in range(max(1, round(w / 64) - 2), round(w / 64) + 3)))
+    hc = sorted(set(max(64, 64 * n) for n in range(max(1, round(h / 64) - 2), round(h / 64) + 3)))
+    candidates = []
+    for cw in wc:
+        for ch in hc:
+            ratio_err = abs((float(cw) / float(ch)) - target_ratio) / target_ratio
+            area_err = abs(float(cw * ch) - target_area) / target_area
+            dim_err = (abs(cw - w) / float(w)) + (abs(ch - h) / float(h))
+            # Aspect ratio is the strongest constraint; then stay near requested size.
+            undershoot = (max(0, w - cw) / float(w)) + (max(0, h - ch) / float(h))
+            score = (ratio_err * 8.0) + area_err + (dim_err * 0.35) + (undershoot * 0.20)
+            candidates.append((score, ratio_err, dim_err, -cw * ch, cw, ch))
+    if not candidates:
+        return 832, 448
+    _score, _ratio_err, _dim_err, _neg_area, cw, ch = min(candidates)
+    return int(cw), int(ch)
 
 _LTX23_PRESETS = {
     # Public FrameVision-native LTX 2.3 presets.
@@ -5175,7 +5350,11 @@ def _planner_i2v_prompts_are_current(path: str) -> bool:
         first = shots[0] if isinstance(shots[0], dict) else {}
         prompt = str(first.get('prompt') or '').strip()
         schema = first.get('schema') if isinstance(first.get('schema'), dict) else {}
-        return bool(prompt) and bool(schema) and str(schema.get('mode') or '').startswith('direct_visible_motion')
+        mode = str(schema.get('mode') or '')
+        return bool(prompt) and bool(schema) and (
+            mode.startswith('direct_visible_motion')
+            or mode.startswith('agent_story_authoritative')
+        )
     except Exception:
         return False
 
@@ -13036,25 +13215,24 @@ class PipelineWorker(QThread):
             # the manual Own Character Bible is enabled. Disabling it here forces the old
             # JSON-enforced planning path, which is the branch that throws the
             # "Model response did not contain parseable JSON" error for this combo.
+            # Agent-style story engine is the ONE automated story path.  It is
+            # intentionally independent of model choice: built-in Qwen and an
+            # optional own GGUF use the same blueprint/beat/prompt architecture.
             _planner_use_offline_storyline_creator = bool(
-                _planner_llama_is_enabled(self.job.encoding)
-                and (not bool(_own_storyline_enabled))
-                and bool(_offline_storyline_client_cls)
+                (not bool(_own_storyline_enabled))
                 and bool(_offline_storyline_gen_cls)
             )
-            _offline_storyline_expected = bool(
-                _planner_llama_is_enabled(self.job.encoding)
-                and (not bool(_own_storyline_enabled))
-            )
+            _offline_storyline_expected = bool(not bool(_own_storyline_enabled))
             try:
                 if _offline_storyline_expected:
                     _why = []
-                    if not bool(_offline_storyline_client_cls) or not bool(_offline_storyline_gen_cls):
+                    if not bool(_offline_storyline_gen_cls):
                         _why.append(f"backend unavailable ({_OFFLINE_STORYLINE_BACKEND_ERROR or _offline_storyline_backend_path})")
                     if _planner_use_offline_storyline_creator:
-                        self.signals.log.emit(f"[planner] Offline Storyline Creator backend ACTIVE: {_offline_storyline_backend_path}")
+                        _llm_name = "own GGUF" if _planner_llama_is_enabled(self.job.encoding) else "built-in Qwen3-VL"
+                        self.signals.log.emit(f"[planner] Story creation: {_llm_name}: {_offline_storyline_backend_path}")
                     else:
-                        self.signals.log.emit("[planner] Offline Storyline Creator backend NOT active: " + "; ".join(_why or ["gate conditions not met"]))
+                        self.signals.log.emit("[planner] Story creation backend unavailable: " + "; ".join(_why or ["gate conditions not met"]))
             except Exception:
                 pass
 
@@ -13126,11 +13304,19 @@ class PipelineWorker(QThread):
                 style_hint = str(self.job.extra_info or '').strip()
                 negative_hint = str(self.job.negatives or '').strip()
                 _llm_cfg = _planner_llama_settings(self.job.encoding)
-                runner_path = str(_llm_cfg.get('runner_path') or '').strip()
-                model_path = str(_llm_cfg.get('model_path') or '').strip()
-                ctx_size = int(_llm_cfg.get('ctx_size') or 8192)
-                top_p = float(_llm_cfg.get('top_p') or 0.9)
-                client = _offline_storyline_client_cls(runner_path, model_path, ctx_size=ctx_size, top_p=top_p)
+                if _planner_llama_is_enabled(self.job.encoding):
+                    model_path = str(_llm_cfg.get('model_path') or '').strip()
+                else:
+                    model_path = str(_qwen_model_dir())
+                _story_llm_encoding = dict(self.job.encoding or {})
+                _story_llm_encoding['_auto_story_duration_sec'] = float(max(1.0, float(getattr(self.job, 'approx_duration_sec', 0) or 0.0)))
+                _story_llm_encoding['_auto_story_shot_count'] = int(prompt_count)
+                client = _PlannerStoryLLMClient(
+                    encoding=_story_llm_encoding,
+                    story_dir=story_dir,
+                    prompts_used_path=qwen_prompts_used,
+                    log_callback=self.signals.log.emit,
+                )
                 generator = _offline_storyline_gen_cls(client, log_callback=self.signals.log.emit)
                 shots_path_local = os.path.join(story_dir, "shots.json")
                 shots_raw_path_local = os.path.join(story_dir, "shots_raw.txt")
@@ -13191,7 +13377,10 @@ class PipelineWorker(QThread):
                         t2i_model_hint=t2i_model_hint,
                         i2v_model_hint=i2v_model_hint,
                         predefined_character_bibles=list(_own_prompts) if bool(_own_active) else None,
+                        predefined_character_entries=(_planner_get_own_character_entries(self.job.encoding) if bool(_own_active) else None),
                         target_duration_sec=float(max(1.0, float(getattr(self.job, "approx_duration_sec", 0) or 0.0))),
+                        reference_guidance=str(_refs_guidance_excerpt or ""),
+                        audio_context=(str(_transcript_excerpt or "") if _lyrics_mode == "lyrics" else ""),
                     )
                 finally:
                     try:
@@ -13203,6 +13392,8 @@ class PipelineWorker(QThread):
                 narrative_beats = list(getattr(project, 'narrative_beats', None) or [])
                 story_bible = list(getattr(project, 'story_bible', None) or [])
                 directed_shot_plan = list(getattr(project, 'shot_plan', None) or [])
+                _offline_meta = dict(getattr(project, 'metadata', None) or {})
+                _continuity_bundle = _offline_meta.get("continuity_bundle") if isinstance(_offline_meta.get("continuity_bundle"), dict) else {}
                 t2i_prompts = _offline_force_style_and_strip_negative(list(getattr(project, 'text_to_image_prompts', None) or []), style_hint, negative_hint)
                 i2v_prompts = _offline_force_style_and_strip_negative(list(getattr(project, 'image_to_video_prompts', None) or []), '', negative_hint)
                 if not beats or not t2i_prompts or not i2v_prompts:
@@ -13279,6 +13470,8 @@ class PipelineWorker(QThread):
                         "story_role": purpose_raw or str(_phase_for_index(i, len(beats))),
                         "parent_narrative_beat": beat_index_raw,
                         "duration_sec": float(directed.get("duration_sec") or 0.0),
+                        "present_character_ids": list(directed.get("present_character_ids") or []),
+                        "present_object_ids": list(directed.get("present_object_ids") or []),
                         "gen_fps": int(gen_profile.get("fps", 20)),
                         "gen_res": str(gen_profile.get("res", "384p")),
                         "steps": int(gen_profile.get("steps", 9)),
@@ -13294,8 +13487,16 @@ class PipelineWorker(QThread):
                         _own_line = str(_own_line or '').strip()
                         if _own_line and _own_line not in _offline_character_bibles:
                             _offline_character_bibles.append(_own_line)
-                _safe_write_json(character_bible_path_local, {"lines": _offline_character_bibles})
-                _safe_write_json(object_bible_path_local, {"lines": list(getattr(project, 'object_bibles', None) or [])})
+                _safe_write_json(character_bible_path_local, {
+                    "lines": _offline_character_bibles,
+                    "characters": list(_continuity_bundle.get("characters") or []),
+                    "shot_bindings": dict(_continuity_bundle.get("shot_bindings") or {}),
+                })
+                _safe_write_json(object_bible_path_local, {
+                    "lines": list(getattr(project, 'object_bibles', None) or []),
+                    "objects": list(_continuity_bundle.get("objects") or []),
+                    "shot_bindings": dict(_continuity_bundle.get("shot_bindings") or {}),
+                })
 
                 try:
                     _ms = manifest.setdefault("settings", {}) if isinstance(manifest.setdefault("settings", {}), dict) else {}
@@ -13331,6 +13532,8 @@ class PipelineWorker(QThread):
                         "story_section": str(directed.get("section") or ""),
                         "shot_purpose": str(directed.get("purpose") or ""),
                         "continuity_change": str(directed.get("change") or ""),
+                        "present_character_ids": list(directed.get("present_character_ids") or []),
+                        "present_object_ids": list(directed.get("present_object_ids") or []),
                         "seed_int": int(_planner_seed_int_for_job(str(beat), (self.job.encoding or {}).get("planner_job_variation_seed"), sid=sid, purpose="image") or 0),
                         "phase": str(_phase_for_index(i, len(beats))),
                         "prompt_spec": t2i_prompt,
@@ -13346,7 +13549,7 @@ class PipelineWorker(QThread):
                         "i2v_negative": negative_hint,
                         "i2v_schema": {
                             "schema_version": int(_PLANNER_I2V_SCHEMA_VERSION),
-                            "mode": "offline_storyline_creator_raw",
+                            "mode": "agent_story_authoritative_v1",
                             "prompt_raw": i2v_prompt,
                             "wrapper_disabled": True,
                         },
@@ -13373,7 +13576,7 @@ class PipelineWorker(QThread):
                         "negative": negative_hint,
                         "schema": {
                             "schema_version": int(_PLANNER_I2V_SCHEMA_VERSION),
-                            "mode": "offline_storyline_creator_raw",
+                            "mode": "agent_story_authoritative_v1",
                             "prompt_raw": i2v_prompt,
                             "wrapper_disabled": True,
                         },
@@ -13400,7 +13603,8 @@ class PipelineWorker(QThread):
                     "directed_shot_plan": directed_shot_plan,
                     "character_bibles": _offline_character_bibles,
                     "object_bibles": list(getattr(project, 'object_bibles', None) or []),
-                    "metadata": dict(getattr(project, 'metadata', None) or {}),
+                    "continuity_bundle": _continuity_bundle,
+                    "metadata": _offline_meta,
                 }
                 manifest["paths"]["plan_json"] = plan_path
                 manifest["paths"]["plan_raw_txt"] = plan_raw_path
@@ -13415,11 +13619,11 @@ class PipelineWorker(QThread):
                 manifest.setdefault("settings", {})["i2v_schema_version"] = int(_PLANNER_I2V_SCHEMA_VERSION)
                 manifest["shots"] = shot_map
                 for _step_name, _note in (
-                    ("Plan (story + constraints)", "Offline Storyline Creator backend generated plan + prompts."),
-                    ("Shots (seeded shot list)", "Offline Storyline Creator backend generated shots from story outline."),
-                    ("Character Bible", "Offline Storyline Creator backend handled character/object bible output."),
-                    ("Image prompts (from shots)", "Offline Storyline Creator backend supplied text-to-image prompts."),
-                    ("I2V prompts (from shots)", "Offline Storyline Creator backend supplied image-to-video prompts."),
+                    ("Plan (story + constraints)", "Story pipeline generated locked blueprint, shots, continuity bible and prompts."),
+                    ("Shots (seeded shot list)", "Story pipeline generated authoritative shots from locked beats."),
+                    ("Character Bible", "Story pipeline generated the authoritative continuity bible after shot locking."),
+                    ("Image prompts (from shots)", "Story pipeline supplied authoritative start-frame prompts."),
+                    ("I2V prompts (from shots)", "Story pipeline supplied authoritative video-action prompts."),
                 ):
                     _srec = manifest["steps"].get(_step_name) or {}
                     _srec.update({"status": "done", "fingerprint": plan_fingerprint if _step_name == "Plan (story + constraints)" else shots_fingerprint_local, "note": _note, "ts": time.time()})
@@ -14677,8 +14881,8 @@ class PipelineWorker(QThread):
                     manifest.setdefault("settings", {})["n_shots"] = len(_load_shots_list(shots_path))
                 except Exception:
                     pass
-                _skip("Shots (seeded shot list)", "Offline Storyline Creator backend already wrote shots.json")
-                _set_step("Shots (seeded shot list)", "done", "Offline Storyline Creator backend reused existing shots.json")
+                _skip("Shots (seeded shot list)", "Story pipeline already wrote authoritative shots.json")
+                _set_step("Shots (seeded shot list)", "done", "Story pipeline reused authoritative shots.json")
             elif _resume_run and _resume_shots:
                 manifest["paths"]["shots_json"] = shots_path
                 if _file_ok(shots_raw_path, 1):
@@ -14895,8 +15099,8 @@ class PipelineWorker(QThread):
 
             if bool(_planner_use_offline_storyline_creator) and _file_ok(character_bible_path, 2):
                 manifest.setdefault("paths", {})["character_bible_json"] = character_bible_path
-                _skip("Character Bible", "Offline Storyline Creator backend already wrote character_bible.json")
-                _set_step("Character Bible", "done", "Offline Storyline Creator backend reused character_bible.json")
+                _skip("Character Bible", "Story pipeline already wrote authoritative character_bible.json")
+                _set_step("Character Bible", "done", "Story pipeline reused authoritative character_bible.json")
 
             elif _planner_use_direct_ref_edit:
                 # Direct reference-image edit runs should rely on storyline + shot prompts only.
@@ -15629,8 +15833,8 @@ class PipelineWorker(QThread):
             # Only regenerate when the prompt file is actually missing.
             if bool(_planner_use_offline_storyline_creator) and _file_ok(image_prompts_path, 10):
                 manifest["paths"]["image_prompts_txt"] = image_prompts_path
-                _skip("Image prompts (from shots)", "Offline Storyline Creator backend already wrote image_prompts.txt")
-                _set_step("Image prompts (from shots)", "done", "Offline Storyline Creator backend reused image_prompts.txt")
+                _skip("Image prompts (from shots)", "Story pipeline already wrote authoritative image_prompts.txt")
+                _set_step("Image prompts (from shots)", "done", "Story pipeline reused authoritative image_prompts.txt")
             elif _resume_run and _file_ok(image_prompts_path, 10):
                 manifest["paths"]["image_prompts_txt"] = image_prompts_path
                 _skip("Image prompts (from shots)", "Resume: reused existing image_prompts.txt")
@@ -15768,13 +15972,18 @@ class PipelineWorker(QThread):
 
 # Character bible (locks)
                 plan_obj = _safe_read_json(plan_path) if os.path.exists(plan_path) else {}
-                bible = [] if (not _planner_use_character_bible) else _ensure_character_bible(manifest, plan_obj)
+                # Automated storymode has one authoritative continuity bible, created by
+                # offline_storyline_creator.py. Do not create a legacy/Auto-CB-v2 bible
+                # after it. Own Character Bible remains a separate user override.
+                bible = [] if (_planner_use_offline_storyline_creator or (not _planner_use_character_bible)) else _ensure_character_bible(manifest, plan_obj)
 
-                # AUTO Character Bible v2 (hard gate): generate stable IDs + identity anchors + per-shot bindings.
-                _auto_cb_v2 = _auto_cb_v2_enabled(
-                    bool(_planner_auto_character_bible_enabled),
-                    bool(_own_active),
-                    bool(_own_storyline_enabled),
+                _auto_cb_v2 = bool(
+                    (not _planner_use_offline_storyline_creator)
+                    and _auto_cb_v2_enabled(
+                        bool(_planner_auto_character_bible_enabled),
+                        bool(_own_active),
+                        bool(_own_storyline_enabled),
+                    )
                 )
                 if _auto_cb_v2 and _HAVE_QWEN_TEXT and (_qwen_generate_text is not None):
                     try:
@@ -16298,6 +16507,16 @@ class PipelineWorker(QThread):
                             except Exception:
                                 prompt = str(seed_txt or '').strip()
                             prompt = str(prompt or '').replace("\n", " ").replace("\r", " ").replace("\\n", " ").strip()
+                        # Own Character Bible is the manual override/escape hatch. Even when
+                        # the story pipeline owns the raw prompt, preserve the established
+                        # codeword replacement behavior and never run an automatic character
+                        # bible on top of it.
+                        if bool(_own_active):
+                            try:
+                                prompt = _apply_own_character_codeword_replacements(str(prompt or ''), getattr(self.job, "encoding", {}))
+                                prompt = _cleanup_own_character_prompt_before_t2i(str(prompt or ''), getattr(self.job, "encoding", {}))
+                            except Exception:
+                                pass
                             prompt = " ".join(prompt.split())
 
                         negative = _ascii_only(str(negative or ''))
@@ -16788,7 +17007,7 @@ class PipelineWorker(QThread):
                         
                         # Auto Character Bible v2 (hard gate): append identity anchors for the characters present in this shot.
                         try:
-                            if _auto_cb_v2_enabled(bool(_planner_auto_character_bible_enabled), bool(_own_active), bool(_own_storyline_enabled)):
+                            if (not _planner_use_offline_storyline_creator) and _auto_cb_v2_enabled(bool(_planner_auto_character_bible_enabled), bool(_own_active), bool(_own_storyline_enabled)):
                                 _cm = _auto_cb_v2_char_map(manifest)
                                 _sb = _auto_cb_v2_bindings(manifest)
                                 _present = []
@@ -18438,8 +18657,8 @@ class PipelineWorker(QThread):
             if (not _split_i2v_forces_regen) and bool(_planner_use_offline_storyline_creator) and _file_ok(i2v_prompts_path, 10) and _file_ok(i2v_prompts_json, 10) and _planner_i2v_prompts_are_current(i2v_prompts_json):
                 manifest["paths"]["i2v_prompts_txt"] = i2v_prompts_path
                 manifest["paths"]["i2v_prompts_json"] = i2v_prompts_json
-                _skip("I2V prompts (from shots)", "Offline Storyline Creator backend already wrote i2v prompts")
-                _set_step("I2V prompts (from shots)", "done", "Offline Storyline Creator backend reused i2v prompt files")
+                _skip("I2V prompts (from shots)", "Story pipeline already wrote authoritative i2v prompts")
+                _set_step("I2V prompts (from shots)", "done", "Story pipeline reused authoritative i2v prompt files")
             elif (not _split_i2v_forces_regen) and _file_ok(i2v_prompts_path, 10) and _file_ok(i2v_prompts_json, 10) and _planner_i2v_prompts_are_current(i2v_prompts_json):
                 _skip("I2V prompts (from shots)", "i2v prompts already exist")
             else:
@@ -19042,7 +19261,12 @@ class PipelineWorker(QThread):
                 if not shots: raise RuntimeError("shots.json is empty; cannot generate LTX 2.5 clips")
                 _vram_release("before ltx25")
                 prof = _resolve_generation_profile(self.job.encoding.get("video_model") or "", self.job.encoding.get("gen_quality_preset") or "", self.job.encoding.get("planner_upscale"))
-                w, h = _planner_profile_wh(prof); fps = int(prof.get("fps") or 24); max_frames = int(prof.get("max_frames") or 241)
+                w, h = _planner_profile_wh(prof)
+                _requested_w, _requested_h = int(w), int(h)
+                w, h = _planner_ltx25_valid_resolution(_requested_w, _requested_h)
+                if (w, h) != (_requested_w, _requested_h):
+                    self.signals.log.emit(f"[ltx25] Resolution adjusted for two-stage LTX 2.5: {_requested_w}x{_requested_h} -> {w}x{h} (64-pixel alignment)")
+                fps = int(prof.get("fps") or 24); max_frames = int(prof.get("max_frames") or 241)
                 shot_map = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
                 clips_out=[]; cli=(_root()/"helpers"/"planner_ltx25_cli.py").resolve()
                 if not cli.is_file(): raise RuntimeError(f"Missing LTX 2.5 planner CLI: {cli}")
@@ -19050,6 +19274,12 @@ class PipelineWorker(QThread):
                 for it in ((manifest.get("paths") or {}).get("images") or []):
                     if isinstance(it,dict) and it.get("id") and it.get("file"): id_to_img[str(it["id"])]=str(it["file"])
                 for i, sh in enumerate(shots, start=1):
+                    # Planner Cancel is "stop after the current clip". Never launch a
+                    # new LTX 2.5 process once either the local button or remote marker
+                    # has requested cancellation.
+                    if self._external_cancel_requested() or self._stop_requested:
+                        raise RuntimeError("Cancelled by user.")
+
                     sid=str((sh or {}).get("id") or f"S{i:02d}"); rec=shot_map.get(sid) if isinstance(shot_map.get(sid),dict) else {}
                     prompt=str(rec.get("i2v_prompt") or rec.get("prompt") or (sh or {}).get("prompt") or '').strip()
                     if not prompt: prompt=str((sh or {}).get("description") or self.job.prompt or '').strip()
@@ -19060,17 +19290,105 @@ class PipelineWorker(QThread):
                     out_file=os.path.join(clips_dir,f"{self.job.job_id}_{sid}.mp4")
                     args=[sys.executable,str(cli),"--prompt",prompt,"--output",out_file,"--width",str(w),"--height",str(h),"--frames",str(frames),"--fps",str(fps),"--seed",str(seed)]
                     img=id_to_img.get(sid,'')
-                    if img and os.path.isfile(img): args += ["--image",img]
+                    _ltx_image = img
+                    _normalized_image = ''
+                    if img and os.path.isfile(img):
+                        # Validate the start image before handing it to the separate LTX CLI.
+                        # A manually regenerated/replaced PNG can be visually fine while its
+                        # dimensions, mode, or file encoding differ from the original Planner image.
+                        try:
+                            from PIL import Image as _PlannerLTXImage  # type: ignore
+                            with _PlannerLTXImage.open(img) as _im:
+                                _im.load()
+                                _src_size = tuple(_im.size)
+                                _src_mode = str(_im.mode or '')
+                                self.signals.log.emit(f"[ltx25] {sid} start image: {_src_size[0]}x{_src_size[1]} mode={_src_mode}")
+                                # The selected Planner quality preset controls VIDEO output
+                                # resolution only. Preserve the source image resolution for LTX
+                                # image conditioning; do not pre-resize/crop a high-quality image.
+                                if _src_mode != 'RGB':
+                                    _fixed = _im.convert('RGB')
+                                    _normalized_image = os.path.join(clips_dir, f".{self.job.job_id}_{sid}_ltx25_input.png")
+                                    _fixed.save(_normalized_image, format='PNG')
+                                    _ltx_image = _normalized_image
+                                    self.signals.log.emit(
+                                        f"[ltx25] {sid} start image pixel format normalized: "
+                                        f"{_src_size[0]}x{_src_size[1]} {_src_mode} -> RGB (resolution preserved)"
+                                    )
+                                elif _src_size != (int(w), int(h)):
+                                    self.signals.log.emit(
+                                        f"[ltx25] {sid} using full-resolution start image "
+                                        f"{_src_size[0]}x{_src_size[1]}; video output remains {w}x{h}"
+                                    )
+                        except Exception as _img_err:
+                            raise RuntimeError(f"LTX 2.5 start image validation failed for {sid}: {_img_err}") from _img_err
+                        args += ["--image",_ltx_image]
                     self.signals.stage.emit(f"Clips (LTX 2.5) — {sid} ({i}/{len(shots)})")
                     self.signals.log.emit(f"[ltx25] {sid}: {w}x{h}, {frames} frames @ {fps}fps, image={'yes' if img else 'no'}")
-                    subprocess.run(args,cwd=str(_root()),check=True)
+
+                    # Do not use blocking subprocess.run here: while LTX is rendering,
+                    # poll the Planner cancel state so we remember a request immediately.
+                    # Capture the child output to a temporary file so a failed CLI cannot hide
+                    # its real error behind a generic CalledProcessError. A file avoids PIPE
+                    # back-pressure while the model is running and preserves cancel polling.
+                    _cancel_after_current = False
+                    _cancel_logged = False
+                    _cli_log_path = ''
+                    try:
+                        _cli_log = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', errors='replace', suffix=f'_{sid}_ltx25.log', delete=False)
+                        _cli_log_path = _cli_log.name
+                        proc = subprocess.Popen(args, cwd=str(_root()), stdout=_cli_log, stderr=subprocess.STDOUT, text=True)
+                        while proc.poll() is None:
+                            if self._external_cancel_requested() or self._stop_requested:
+                                _cancel_after_current = True
+                                if not _cancel_logged:
+                                    self.signals.log.emit(f"[ltx25] Cancel requested — finishing {sid}, then stopping before the next clip.")
+                                    _cancel_logged = True
+                            time.sleep(0.20)
+                        rc = int(proc.returncode or 0)
+                        _cli_log.flush(); _cli_log.close()
+                    except Exception:
+                        try:
+                            _cli_log.close()
+                        except Exception:
+                            pass
+                        raise
+                    if rc != 0:
+                        if _cancel_after_current or self._stop_requested:
+                            raise RuntimeError("Cancelled by user.")
+                        _tail = ''
+                        try:
+                            with open(_cli_log_path, 'r', encoding='utf-8', errors='replace') as _f:
+                                _lines = _f.readlines()
+                            _tail = ''.join(_lines[-120:]).strip()
+                        except Exception as _read_err:
+                            _tail = f"(Could not read LTX 2.5 child log: {_read_err})"
+                        self.signals.log.emit(f"[ltx25] {sid} CLI failed with exit code {rc}")
+                        if _tail:
+                            self.signals.log.emit("[ltx25] Child output (tail):\n" + _tail)
+                        raise RuntimeError(f"LTX 2.5 CLI failed for {sid} with exit code {rc}. See the [ltx25] child output above for the actual backend error.")
+                    try:
+                        if _cli_log_path and os.path.isfile(_cli_log_path): os.remove(_cli_log_path)
+                    except Exception:
+                        pass
+                    try:
+                        if _normalized_image and os.path.isfile(_normalized_image): os.remove(_normalized_image)
+                    except Exception:
+                        pass
+
                     if not os.path.isfile(out_file) or os.path.getsize(out_file)<1024: raise RuntimeError(f"LTX 2.5 output missing/too small: {out_file}")
                     item={"id":sid,"file":out_file,"frames":frames,"fps":fps,"duration_sec":round(frames/fps,2),"seed":seed,"resolution":f"{w}x{h}","model_key":"ltx25","video_model":"ltx25"}
                     clips_out.append(item); rec.update({"clip_file":out_file,"clip_seed":seed,"video_model":"ltx25","model_key":"ltx25"}); shot_map[sid]=rec
                     manifest.setdefault("paths",{})["clips"]=clips_out; manifest["paths"]["clips_dir"]=clips_dir; manifest["shots"]=shot_map
                     manifest.setdefault("settings",{})["video_engine"]="ltx25"; manifest["settings"]["video_model"]="ltx25"; manifest["settings"]["video_profile"]=prof; _safe_write_json(manifest_path,manifest)
+                    # Keep the partial clip manifest current as well, so a cancelled run
+                    # can resume from the clips that completed successfully.
+                    _safe_write_json(clips_manifest_path,{"clips":clips_out,"profile":prof,"engine":"ltx25"})
                     try: self.signals.asset_created.emit(out_file)
                     except Exception: pass
+
+                    if _cancel_after_current or self._external_cancel_requested() or self._stop_requested:
+                        raise RuntimeError("Cancelled by user.")
                 _safe_write_json(clips_manifest_path,{"clips":clips_out,"profile":prof,"engine":"ltx25"})
 
             def step_video_clips_minimax_h3() -> None:
@@ -27648,16 +27966,10 @@ class PlannerPane(QWidget):
         except Exception:
             pass
 
-        own_llama_lay.addWidget(QLabel("Context size"), 4, 0)
-        self.spin_own_llama_ctx = QSpinBox()
-        self.spin_own_llama_ctx.setRange(1024, 131072)
-        self.spin_own_llama_ctx.setSingleStep(1024)
-        try:
-            s = _load_planner_settings()
-            self.spin_own_llama_ctx.setValue(int(s.get("own_llama_ctx_size", 8192) or 8192))
-        except Exception:
-            self.spin_own_llama_ctx.setValue(8192)
-        own_llama_lay.addWidget(self.spin_own_llama_ctx, 4, 1)
+        self.lbl_own_llama_auto_context = QLabel("Context and story expansion are handled automatically from the entered duration.")
+        self.lbl_own_llama_auto_context.setWordWrap(True)
+        self.lbl_own_llama_auto_context.setToolTip("Planner automatically scales llama.cpp context, structured output budgets and story blueprint depth for longer story durations.")
+        own_llama_lay.addWidget(self.lbl_own_llama_auto_context, 4, 0, 1, 3)
         self.lbl_own_llama_note = QLabel("Used for Plan, Shots, Alternative storymode, Auto Character Bible and AI lyrics. Recommended tested model: Dark Champion Q4_K_M.")
         self.lbl_own_llama_note.setWordWrap(True)
         own_llama_lay.addWidget(self.lbl_own_llama_note, 5, 0, 1, 3)
@@ -27666,7 +27978,6 @@ class PlannerPane(QWidget):
             self.edit_own_llama_runner.textChanged.connect(self._on_own_llama_settings_changed)
             self.edit_own_llama_model.textChanged.connect(self._on_own_llama_settings_changed)
             self.cmb_own_llama_template.currentIndexChanged.connect(self._on_own_llama_settings_changed)
-            self.spin_own_llama_ctx.valueChanged.connect(self._on_own_llama_settings_changed)
             self.btn_own_llama_runner.clicked.connect(self._browse_own_llama_runner)
             self.btn_own_llama_model.clicked.connect(self._browse_own_llama_model)
             self.btn_download_advised_llama.clicked.connect(self._download_advised_llama)
@@ -31968,7 +32279,6 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             'own_llama_model_path': str((getattr(self, 'edit_own_llama_model', None).text() if getattr(self, 'edit_own_llama_model', None) else '') or '').strip(),
             'own_llama_template_kind': str(item[0] or 'smart'),
             'own_llama_template_value': str(item[1] or ''),
-            'own_llama_ctx_size': int((getattr(self, 'spin_own_llama_ctx', None).value() if getattr(self, 'spin_own_llama_ctx', None) else 8192) or 8192),
             'own_llama_top_p': 0.9,
         }
 

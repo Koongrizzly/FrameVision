@@ -830,8 +830,8 @@ class FrameVisionAssistantRouter:
             elif aspect == "1:1":
                 w = h = min(w, h)
             return ("704p" if key == "720p" else key, aspect, w, h)
-        # LTX 2.5 accepts arbitrary multiples; keep the wizard on known FrameVision buckets.
-        presets = {"480p": (832, 480), "704p": (1280, 704), "720p": (1280, 704), "768p": (1344, 768), "1088p": (1920, 1088), "1080p": (1920, 1088)}
+        # LTX 2.5 wizard uses the same safe low preset as Planner.
+        presets = {"480p": (832, 448), "704p": (1280, 704), "720p": (1280, 704), "768p": (1344, 768), "1088p": (1920, 1088), "1080p": (1920, 1088)}
         key = next((k for k in ("1088p", "1080p", "768p", "704p", "720p", "480p") if k in low), "")
         if not key:
             return None
@@ -1142,7 +1142,7 @@ class FrameVisionAssistantRouter:
             except Exception:
                 pass
         table = {
-            ("480p", "16:9"): (832, 512), ("480p", "9:16"): (512, 832), ("480p", "1:1"): (640, 640),
+            ("480p", "16:9"): (832, 448), ("480p", "9:16"): (448, 832), ("480p", "1:1"): (448, 448),
             ("704p", "16:9"): (1280, 704), ("704p", "9:16"): (704, 1280), ("704p", "1:1"): (1024, 1024),
             ("1088p", "16:9"): (1920, 1088), ("1088p", "9:16"): (1088, 1920), ("1088p", "1:1"): (1440, 1440),
         }

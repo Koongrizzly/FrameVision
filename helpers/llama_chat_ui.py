@@ -10555,7 +10555,7 @@ class LlamaChatWindow(TelegramAgentMixin, QtWidgets.QMainWindow):
             if 'video_model' in custom_fields and 'quality' not in custom_fields:
                 if str(state.get('video_model') or '').lower() == 'minimax_h3':
                     return ('You changed the video model to MiniMax H3. What resolution should I use? '
-                            'Choose 480p (832×480), 544p (960×544), 704p, 768p, or 1088p. '
+                            'Choose 480p (832×448), 544p (960×544), 704p, 768p, or 1088p. '
                             'You can include the aspect too, for example `480p landscape`.')
                 return ('You changed the video model. What resolution should I use? '
                         'For example `704p landscape` or `480p portrait`.')

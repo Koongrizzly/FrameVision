@@ -1,150 +1,197 @@
 from __future__ import annotations
 
 import json
-import os
 import math
-import difflib
-import queue
-import random
+import os
 import re
 import socket
 import subprocess
-import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-try:
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
-    from tkinter.scrolledtext import ScrolledText
-except Exception as exc:  # pragma: no cover
-    raise SystemExit(f"Tkinter is required to run this app: {exc}")
-
-APP_NAME = "Offline Storyline Creator"
 APP_DIR = Path.home() / ".offline_storyline_creator"
-SETTINGS_PATH = APP_DIR / "settings.json"
-DEFAULT_OUTPUT_DIR = APP_DIR / "exports"
 
 
 def _strip_llm_protocol_artifacts(text: str) -> str:
-    """Remove reasoning/protocol chatter that own llama/Qwen-style models may leak."""
-    try:
-        s = str(text or "")
-    except Exception:
-        return ""
+    s = str(text or "")
     if not s:
         return ""
     s = re.sub(r"(?is)<think\b[^>]*>.*?</think>", "", s)
-    s = re.sub(r"(?is)<\|(?:channel|start_header_id)\|>\s*(?:analysis|thought|reasoning)\s*(?:<\|channel\|>|<\|end_header_id\|>)?.*?(?=<\|(?:channel|start_header_id)\|>\s*(?:final|assistant|response)\b|$)", "", s)
     s = re.sub(r"(?i)<\|/?(?:begin_of_text|end_of_text|eot_id|im_start|im_end|start_header_id|end_header_id|channel|message|assistant|user|system|final|analysis|thought|reasoning)[^>]*\|?>", "", s)
-    s = re.sub(r"(?im)^\s*(?:analysis|thought|reasoning)\s*[:：]\s*$.*?(?=^\s*(?:final|answer|response)\s*[:：]\s*$|\Z)", "", s, flags=re.DOTALL)
     s = re.sub(r"(?im)^\s*(?:final|answer|response)\s*[:：]\s*", "", s)
     return s.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
-def _is_prompt_heading_or_meta(text: str) -> bool:
-    """Reject workflow headings/commentary that image models literalize as UI/text."""
-    try:
-        s = str(text or "").strip()
-    except Exception:
-        return True
-    if not s:
-        return True
-    s = _strip_llm_protocol_artifacts(s).strip()
-    s0 = re.sub(r"^\s*(?:#{1,6}\s*)+", "", s)
-    s0 = re.sub(r"^\s*(?:[-*•]\s*)+", "", s0).strip("`*_ \t\r\n")
-    low = re.sub(r"\s+", " ", s0).strip().lower().strip(":;.-–—")
-    if not low:
-        return True
-    bad_exact = {
-        "map beats to prompts", "map beat to prompt", "beats to prompts", "beat to prompt",
-        "prompt list", "prompts", "image prompts", "text-to-image prompts", "text to image prompts",
-        "t2i prompts", "shot prompts", "story beats", "beats", "character bible", "object bible",
-        "negative prompt", "negative prompts", "json", "output", "result",
-        "here are the prompts", "here are the image prompts", "below are the prompts",
-    }
-    if low in bad_exact:
-        return True
-    if low.startswith(("here are", "sure,", "of course", "certainly", "i will", "i can", "note:", "rules:", "task:", "instruction:", "instructions:", "section:", "step ")):
-        return True
-    if s0.endswith(":") and len(low.split()) <= 7:
-        return True
-    if re.match(r"^\*\*[^*]{1,80}:\*\*$", s.strip()):
-        return True
-    if re.match(r"^(?:#+\s*)?(?:map|convert|rewrite|create|generate|return|output)\b.{0,90}:?$", low):
-        return True
+def _clean_line(value: Any) -> str:
+    s = _strip_llm_protocol_artifacts(str(value or ""))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.strip("`*_ \t\r\n")
+
+
+def _parse_json(text: str) -> Any:
+    raw = _strip_llm_protocol_artifacts(text).strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
+    raw = re.sub(r"\s*```$", "", raw)
+    dec = json.JSONDecoder()
+    for i, ch in enumerate(raw):
+        if ch not in "[{":
+            continue
+        try:
+            obj, _ = dec.raw_decode(raw[i:])
+            return obj
+        except Exception:
+            continue
+    raise RuntimeError("Model response did not contain parseable JSON.\n\nRaw output:\n" + raw[:6000])
+
+
+def _sig(text: str) -> set[str]:
+    stop = {"the","a","an","and","or","to","of","in","on","at","with","as","for","from","into","his","her","their","he","she","they","it","is","are","was","were","then","while","this","that","shot","scene","camera"}
+    return {w for w in re.findall(r"[a-z0-9]+", str(text or "").lower()) if len(w) > 2 and w not in stop}
+
+
+def _name_key(value: Any) -> str:
+    s = _clean_line(value).lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _subject_present(text: str, names: List[str], role_tags: List[str]) -> bool:
+    hay = _name_key(text)
+    if not hay:
+        return False
+    for token in list(names or []) + list(role_tags or []):
+        tk = _name_key(token)
+        if tk and tk in hay:
+            return True
     return False
 
 
+def _compose_identity_line(item: Dict[str, Any], kind: str = "character") -> str:
+    name = _clean_line(item.get("display_name") or item.get("name") or item.get("id") or kind.title())
+    tags = [_clean_line(x) for x in (item.get("role_tags") or []) if _clean_line(x)]
+    identity = _clean_line(item.get("identity_anchor") or item.get("visual_identity") or item.get("continuity_role") or "")
+    wardrobe = _clean_line(item.get("wardrobe_anchor") or item.get("wardrobe") or "")
+    parts: List[str] = []
+    if tags:
+        parts.append(f"role/look: {', '.join(tags)}")
+    if identity:
+        parts.append(identity)
+    if wardrobe:
+        parts.append(f"wardrobe/material: {wardrobe}")
+    detail = "; ".join([p for p in parts if p])
+    if detail:
+        return f"{name}: {detail}"
+    return name
 
 
-def _looks_like_instruction_leak(text: str) -> bool:
-    """Reject leaked LLM task/instruction text before it reaches image generation.
+def _ensure_unique_identity_lines(lines: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for line in lines or []:
+        s = _clean_line(line)
+        if not s:
+            continue
+        key = _name_key(s)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
 
-    This is quality control only: it catches protocol/prompt scaffolding such as
-    "Input:", "Rules:", "Object Bible", and "Return exactly".
-    """
-    try:
-        s = str(text or "").strip()
-    except Exception:
-        return True
+
+def _identity_prefix_for_shot(characters: List[Dict[str, Any]], objects: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for c in characters or []:
+        line = _compose_identity_line(c, "character")
+        if line:
+            parts.append(line)
+    for o in objects or []:
+        line = _compose_identity_line(o, "object")
+        if line:
+            parts.append(line)
+    if not parts:
+        return ""
+    return "Maintain continuity for visible recurring subjects: " + " | ".join(parts)
+
+
+def _inline_identity_details(item: Dict[str, Any]) -> str:
+    identity = _clean_line(item.get("identity_anchor") or item.get("visual_identity") or item.get("continuity_role") or "")
+    wardrobe = _clean_line(item.get("wardrobe_anchor") or item.get("wardrobe") or "")
+    parts: List[str] = []
+    if identity:
+        parts.append(identity)
+    if wardrobe:
+        parts.append(wardrobe)
+    if not parts:
+        tags = [_clean_line(x) for x in (item.get("role_tags") or []) if _clean_line(x)]
+        if tags:
+            parts.append(", ".join(tags))
+    return "; ".join([p for p in parts if p])
+
+
+def _item_aliases(item: Dict[str, Any]) -> List[str]:
+    raw = [item.get("display_name"), item.get("name"), item.get("id")] + list(item.get("role_tags") or [])
+    out: List[str] = []
+    seen: set[str] = set()
+    for value in raw:
+        alias = _clean_line(value)
+        key = _name_key(alias)
+        if not alias or not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(alias)
+    out.sort(key=lambda x: (-len(_name_key(x)), x.lower()))
+    return out
+
+
+def _inject_identity_once(prompt: str, item: Dict[str, Any]) -> Tuple[str, bool]:
+    s = _clean_line(prompt)
+    details = _inline_identity_details(item)
+    if not s or not details:
+        return s, False
+    details_key = _name_key(details)
+    if details_key and details_key in _name_key(s):
+        return s, False
+    aliases = _item_aliases(item)
+    chosen = None
+    for alias in aliases:
+        pattern = re.compile(rf"(?<!\w)({re.escape(alias)})(?!\w)", re.IGNORECASE)
+        m = pattern.search(s)
+        if not m:
+            continue
+        if chosen is None or m.start() < chosen[0].start() or (m.start() == chosen[0].start() and len(alias) > len(chosen[1])):
+            chosen = (m, alias)
+    if chosen is None:
+        return s, False
+    m, _alias = chosen
+    expanded = f"{m.group(1)} ({details})"
+    return s[:m.start()] + expanded + s[m.end():], True
+
+
+def _inject_bound_identities(prompt: str, characters: List[Dict[str, Any]], objects: List[Dict[str, Any]]) -> str:
+    s = _clean_line(prompt)
     if not s:
-        return True
-    low = re.sub(r"\s+", " ", s.lower())
-    leak_needles = (
-        "**input:**", "input:**", "input: story", "input: source",
-        "**rules:**", "rules:**", "rules:",
-        "original request:", "partial output already received:",
-        "source prompts:", "source:",
-        "draft text-to-image prompts", "draft image-to-video prompts",
-        "text-to-image prompts below", "image-to-video prompts below",
-        "story beats", "object bible", "character bible",
-        "return exactly", "return only", "numbered prompts",
-        "system prompt", "user prompt", "assistant prompt",
-        "markdown fences", "json",
-    )
-    return any(n in low for n in leak_needles)
-
-
-def _looks_truncated_generated_item(text: str) -> bool:
-    """Catch obvious cut-off lines so retry happens instead of rendering garbage."""
-    try:
-        s = str(text or "").strip()
-    except Exception:
-        return True
-    if not s:
-        return True
-    if s.endswith((",", ":", ";", "-", "—", "–", "(", "[")):
-        return True
-    last = re.sub(r"[^a-zA-Z]+", "", s.split()[-1].lower()) if s.split() else ""
-    return last in {"a", "an", "the", "of", "with", "without", "and", "or", "to", "from", "into", "onto", "in", "on", "at", "by", "for", "while", "as", "through", "across"}
-
-def _clean_generated_list_item(text: str) -> str:
-    try:
-        s = str(text or "")
-    except Exception:
-        return ""
-    s = _strip_llm_protocol_artifacts(s)
-    s = s.replace("\r", " ").replace("\n", " ")
-    s = " ".join(s.split()).strip()
-    s = re.sub(r"^\s*(?:#{1,6}\s*)+", "", s).strip()
-    s = re.sub(r"^\s*(?:\d{1,3}\s*[\.)\]:-]|\[[Ss]?\d{1,3}\]\s*[:\-]?|[-*•])\s*", "", s).strip()
-    s = re.sub(r"(?i)^\s*(?:prompt|image prompt|text-to-image prompt|t2i prompt|subject|context)\s*[:：]\s*", "", s).strip()
-    s = s.strip("`*_ \t")
-    if _is_prompt_heading_or_meta(s):
-        return ""
-    if _looks_like_instruction_leak(s) or _looks_truncated_generated_item(s):
-        return ""
+        return s
+    missing_prefixes: List[str] = []
+    for item in list(characters or []) + list(objects or []):
+        s, changed = _inject_identity_once(s, item)
+        if changed:
+            continue
+        details = _inline_identity_details(item)
+        name = _clean_line(item.get("display_name") or item.get("name") or item.get("id") or "")
+        if details and name:
+            token = f"{name} ({details})"
+            if _name_key(token) not in _name_key(s):
+                missing_prefixes.append(token)
+    if missing_prefixes:
+        s = ". ".join(missing_prefixes) + ". " + s
     return s
 
 
-# -----------------------------
-# Data model
-# -----------------------------
 @dataclass
 class StoryProject:
     title: str
@@ -156,7 +203,6 @@ class StoryProject:
     text_to_image_prompts: List[str]
     image_to_video_prompts: List[str]
     metadata: Dict[str, Any]
-    # V2 planning layers. Defaults keep old saved projects/loaders compatible.
     story_bible: List[str] = field(default_factory=list)
     narrative_beats: List[str] = field(default_factory=list)
     shot_plan: List[Dict[str, Any]] = field(default_factory=list)
@@ -165,14 +211,6 @@ class StoryProject:
         return asdict(self)
 
 
-# -----------------------------
-# Local llama-server client
-# Based on the same overall flow as the uploaded planner reference:
-# - resolve runner/model
-# - start local llama-server
-# - wait for /health
-# - call /v1/chat/completions
-# -----------------------------
 class LocalLlamaClient:
     def __init__(self, runner_path: str, model_path: str, ctx_size: int = 8192, top_p: float = 0.9):
         self.runner_path = self._resolve_server_executable(runner_path)
@@ -189,8 +227,7 @@ class LocalLlamaClient:
         raw = os.path.abspath(str(path or "").strip())
         if not raw:
             return ""
-        base = os.path.basename(raw).lower()
-        if "server" in base:
+        if "server" in os.path.basename(raw).lower():
             return raw
         folder = os.path.dirname(raw)
         for name in ("llama-server.exe", "llama-server", "server.exe", "server"):
@@ -223,14 +260,9 @@ class LocalLlamaClient:
             return int(exc.code), data
 
     @staticmethod
-    def _http_post_json(url: str, payload: Dict[str, Any], timeout: float = 300.0) -> Tuple[int, Dict[str, Any]]:
+    def _http_post_json(url: str, payload: Dict[str, Any], timeout: float = 360.0) -> Tuple[int, Dict[str, Any]]:
         body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
@@ -249,7 +281,7 @@ class LocalLlamaClient:
             return ""
         content = message.get("content", "")
         if isinstance(content, list):
-            parts: List[str] = []
+            parts = []
             for item in content:
                 if isinstance(item, dict):
                     txt = item.get("text", item.get("content", ""))
@@ -257,7 +289,7 @@ class LocalLlamaClient:
                         parts.append(str(txt))
                 elif isinstance(item, str):
                     parts.append(item)
-            return "\n".join(p for p in parts if p.strip()).strip()
+            return "\n".join(parts).strip()
         if isinstance(content, dict):
             return str(content.get("text", content.get("content", "")) or "").strip()
         return str(content or "").strip()
@@ -270,61 +302,28 @@ class LocalLlamaClient:
             raise RuntimeError(f"GGUF model not found: {self.model_path or '[empty]'}")
         if self.proc and self.proc.poll() is None:
             return
-
         self.port = self._pick_free_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
-
-        args = [
-            self.runner_path,
-            "-m", self.model_path,
-            "--host", "127.0.0.1",
-            "--port", str(self.port),
-            "-c", str(self.ctx_size),
-            "--reasoning-budget", "0",
-        ]
-
-        creationflags = 0
-        if os.name == "nt":
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-        with open(self.log_path, "w", encoding="utf-8", errors="replace") as fh:
-            fh.write("[offline_storyline_creator]\n")
-            fh.write(f"runner={self.runner_path}\n")
-            fh.write(f"model={self.model_path}\n")
-            fh.write(f"args={json.dumps(args, ensure_ascii=False)}\n\n")
-
-        log_handle = open(self.log_path, "a", encoding="utf-8", errors="replace")
+        args = [self.runner_path, "-m", self.model_path, "--host", "127.0.0.1", "--port", str(self.port), "-c", str(self.ctx_size), "--reasoning-budget", "0"]
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = open(self.log_path, "w", encoding="utf-8", errors="replace")
         try:
-            self.proc = subprocess.Popen(
-                args,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                cwd=os.path.dirname(self.runner_path),
-                creationflags=creationflags,
-            )
+            self.proc = subprocess.Popen(args, stdout=log_handle, stderr=subprocess.STDOUT, cwd=os.path.dirname(self.runner_path), creationflags=creationflags)
         finally:
             log_handle.close()
-
-        start = time.time()
-        last_status = "Starting local llama-server..."
-        while time.time() - start <= 240:
+        started = time.time()
+        while time.time() - started <= 240:
             if self.proc.poll() is not None:
-                raise RuntimeError(
-                    f"llama-server exited before becoming ready. Check {self.log_path}."
-                )
+                raise RuntimeError(f"llama-server exited before becoming ready. Check {self.log_path}.")
             try:
-                code, payload = self._http_get_json(f"{self.base_url}/health", timeout=4.0)
+                code, _ = self._http_get_json(f"{self.base_url}/health", timeout=4.0)
                 if code == 200:
                     return
-                if code == 503:
-                    last_status = str(((payload or {}).get("error") or {}).get("message") or "Loading model...")
-                else:
-                    last_status = f"Waiting for server... ({code})"
             except Exception:
                 pass
             time.sleep(1.0)
-
-        raise RuntimeError(f"Timed out waiting for llama-server. Last status: {last_status}")
+        raise RuntimeError("Timed out waiting for llama-server.")
 
     def stop(self) -> None:
         if self.proc is None:
@@ -341,38 +340,54 @@ class LocalLlamaClient:
         finally:
             self.proc = None
 
-    def generate(self, system_prompt: str, user_prompt: str, *, temperature: float = 0.6, max_tokens: int = 4096) -> str:
+    def generate(self, system_prompt: str, user_prompt: str, *, temperature: float = 0.55, max_tokens: int = 4096, json_mode: bool = False) -> str:
         if not self.base_url or not self.proc or self.proc.poll() is not None:
             self.start()
-
+        direct_system = str(system_prompt or "")
+        direct_user = str(user_prompt or "")
+        if json_mode:
+            direct_system = (
+                "DIRECT STRUCTURED OUTPUT MODE. Do not reveal reasoning or analysis. "
+                "Do not emit <think> tags. Start the response with { and return only the requested JSON object. "
+                + direct_system
+            )
+            # Qwen3-family chat templates understand /no_think; models that do not simply see it as an extra instruction.
+            direct_user = direct_user.rstrip() + "\n\n/no_think"
         payload = {
             "model": "local-model",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            "messages": [{"role": "system", "content": direct_system}, {"role": "user", "content": direct_user}],
             "stream": False,
             "max_tokens": int(max_tokens),
             "temperature": float(temperature),
             "top_p": float(self.top_p),
             "reasoning_format": "none",
         }
+        if json_mode:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            payload["response_format"] = {"type": "json_object"}
         code, data = self._http_post_json(f"{self.base_url}/v1/chat/completions", payload)
+        if code >= 400 and json_mode:
+            # Compatibility fallback for older llama.cpp servers that do not accept one of the optional JSON/thinking fields.
+            payload.pop("chat_template_kwargs", None)
+            payload.pop("response_format", None)
+            code, data = self._http_post_json(f"{self.base_url}/v1/chat/completions", payload)
         if code >= 400:
             msg = ((data or {}).get("error") or {}).get("message") or f"HTTP {code}"
             raise RuntimeError(str(msg))
         choices = (data or {}).get("choices") or []
         if not choices:
             raise RuntimeError("No choices returned by llama-server.")
-        message = choices[0].get("message") or {}
-        text = _strip_llm_protocol_artifacts(self._extract_message_text(message))
-        return text.strip()
+        return _strip_llm_protocol_artifacts(self._extract_message_text(choices[0].get("message") or {})).strip()
 
 
-# -----------------------------
-# Story pipeline
-# -----------------------------
 class StorylineGenerator:
+    """Agent-style Planner story engine.
+
+    This intentionally does NOT inherit the old offline-storyline pipeline.  It
+    mirrors the Telegram Agent architecture: locked whole-story blueprint ->
+    chunked chronological beats -> separate shot-direction pass -> prompt output.
+    """
+
     def __init__(self, client: LocalLlamaClient, log_callback: Optional[Callable[[str], None]] = None):
         self.client = client
         self.log_callback = log_callback
@@ -384,2844 +399,837 @@ class StorylineGenerator:
             except Exception:
                 pass
 
-    @staticmethod
-    def _format_lines_for_log(title: str, lines: List[str]) -> str:
-        if not lines:
-            return f"{title}: [empty]"
-        body = "\n".join(f"[{idx+1:02d}] {line}" for idx, line in enumerate(lines))
-        return f"{title}:\n{body}"
-
-    @staticmethod
-    def _extract_numbered_lines(text: str, expected_count: int) -> List[str]:
-        raw_text = _strip_llm_protocol_artifacts(str(text or "")).replace("\r", "").strip()
-        if not raw_text:
-            raise RuntimeError(f"Model returned 0 usable items, expected {expected_count}.\n\nRaw output:\n{text}")
-
-        lines = [ln.strip() for ln in raw_text.split("\n") if ln.strip()]
-        prompts: List[str] = []
-        line_rx = re.compile(r"^\s*(?:\[?\(?)(\d{1,3})(?:\]?\)?)\s*[:.\-\]]?\s*(.+)$")
-
-        for line in lines:
-            m = line_rx.match(line)
-            if m:
-                _item = _clean_generated_list_item(m.group(2).strip())
-                if _item:
-                    prompts.append(_item)
-
-        if len(prompts) >= expected_count:
-            return prompts[:expected_count]
-
-        block_rx = re.compile(
-            r"(?:^|[\n\t ])(?:\[?\(?)(\d{1,3})(?:\]?\)?)\s*[:.\-\]]?\s*(.+?)(?=(?:[\n\t ]+(?:\[?\(?\d{1,3}(?:\]?\)?))\s*[:.\-\]]?)|$)",
-            re.DOTALL,
-        )
-        block_matches = [_clean_generated_list_item(m.group(2).strip()) for m in block_rx.finditer(raw_text) if m.group(2).strip()]
-        block_matches = [x for x in block_matches if x]
-        if len(block_matches) >= expected_count:
-            return block_matches[:expected_count]
-
-        paragraphs = [_clean_generated_list_item(p.strip()) for p in re.split(r"\n\s*\n", raw_text) if p.strip()]
-        paragraphs = [x for x in paragraphs if x]
-        if len(paragraphs) >= expected_count:
-            return paragraphs[:expected_count]
-
-        if len(lines) >= expected_count:
-            cleaned = [_clean_generated_list_item(line_rx.sub(r"\2", ln).strip()) for ln in lines]
-            cleaned = [x for x in cleaned if x]
-            if len(cleaned) >= expected_count:
-                return cleaned[:expected_count]
-
-        usable_count = max(len(prompts), len(block_matches), len(paragraphs), len(lines))
-        raise RuntimeError(
-            f"Model returned {usable_count} usable items, expected {expected_count}.\n\nRaw output:\n{text}"
-        )
-
-    @staticmethod
-    def _clean_style_hint(style_hint: str) -> str:
-        raw = re.sub(r"\s+", " ", str(style_hint or "").strip())
-        if not raw:
-            return ""
-        low = raw.lower()
-        if "pixar" in low and "style" not in low:
-            if any(tok in low for tok in ("animated", "animation", "3d", "rendered", "render")):
-                return "Pixar animated style"
-            return "Pixar style"
-        return raw
-
-    @staticmethod
-    def _normalize_prompt_text(text: str) -> str:
-        s = re.sub(r"\s+", " ", str(text or "").strip())
-        s = re.sub(r"\s+([,.;:!?])", r"\1", s)
-        s = re.sub(r"([,.;:!?]){2,}", lambda m: m.group(1), s)
-        return s.strip(" ,")
-
-    @staticmethod
-    def _style_equivalent_already_present(base_text: str, style_hint: str) -> bool:
-        base_low = str(base_text or "").lower()
-        style_low = str(style_hint or "").lower().strip()
-        if not base_low or not style_low:
-            return False
-        if style_low in base_low:
-            return True
-
-        # Smarter dedupe for common Pixar variants so we do not append
-        # ", pixar style" to lines that already say things like
-        # "Pixar-style illustration" or "Pixar animation style".
-        if "pixar" in style_low:
-            pixar_markers = (
-                "pixar style",
-                "pixar-style",
-                "pixar animated style",
-                "pixar animation style",
-                "pixar animated",
-                "pixar animation",
-                "pixar-style animation",
-                "pixar-style animated",
-                "pixar-style illustration",
-                "in pixar style",
-                "rendered in pixar",
-            )
-            if any(marker in base_low for marker in pixar_markers):
-                return True
-        return False
-
-    @staticmethod
-    def _apply_style_to_prompt(prompt: str, style_hint: str) -> str:
-        base = StorylineGenerator._normalize_prompt_text(prompt)
-        style = StorylineGenerator._normalize_prompt_text(style_hint)
-        if not base or not style:
-            return base
-        if StorylineGenerator._style_equivalent_already_present(base, style):
-            return base
-        return f"{base}, {style}"
-
-    def _apply_style_to_prompt_list(self, prompts: List[str], style_hint: str) -> List[str]:
-        style = self._clean_style_hint(style_hint)
-        normalized = [self._normalize_prompt_text(p) for p in prompts]
-        if not style:
-            return normalized
-        return [self._apply_style_to_prompt(p, style) for p in normalized]
-
-    @staticmethod
-    def _clean_prompt_list_items(prompts: List[str], fallback_items: Optional[List[str]] = None) -> List[str]:
-        cleaned: List[str] = []
-        fallbacks = list(fallback_items or [])
-        for idx, item in enumerate(list(prompts or [])):
-            s = _clean_generated_list_item(item)
-            if not s and idx < len(fallbacks):
-                s = _clean_generated_list_item(fallbacks[idx])
-            if s:
-                cleaned.append(s)
-        return cleaned
-
-
-    @staticmethod
-    def _clean_direct_i2v_prompt(prompt: str) -> str:
-        """Keep only direct visible motion instructions suitable for literal I2V models."""
-        raw = StorylineGenerator._normalize_prompt_text(prompt)
-        if not raw:
-            return ""
-        raw = raw.replace(";", ". ")
-        raw = re.sub(r"\b(?:camera move|focus on this beat|end by|identity anchors)\s*[:.]\s*", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r",\s*sparks? flying(?: between them)?\b.*?(?=[.!?]|$)", "", raw, flags=re.IGNORECASE)
-        parts = re.split(r"(?<=[.!?])\s+", raw)
-        motion_rx = re.compile(
-            r"\b(?:walk|run|step|enter|leave|turn|look|glance|watch|notice|reach|touch|hold|grab|raise|lower|open|close|"
-            r"dance|sway|spin|jump|lean|nod|smile|laugh|speak|talk|move|approach|pull|push|lift|drop|throw|catch|"
-            r"drive|fly|bank|roll|fight|strike|kick|wave|point|sit|stand|kneel|brush|follow|cross|climb|descend|rise|"
-            r"fall|pass|pause|stop|continue|toss|sip|drink|blink|breathe|gesture|pan|track|tilt|push in|pull back|"
-            r"pulse|flicker|drift|ripple|moving|driving|breathing|gesturing)\w*\b",
-            flags=re.IGNORECASE,
-        )
-        kept: List[str] = []
-        for part in parts:
-            text = re.sub(r"\s+", " ", part).strip(" ,.;:-")
-            if not text:
-                continue
-            low = text.lower()
-            if re.match(r"^(?:start from|use the (?:uploaded|source) image|keep the same|preserve|do not|don't|avoid|bridge|introduce|transition|payoff|build tension|force a decision)\b", low):
-                continue
-            if any(term in low for term in ("next beat", "story beat", "who wants what", "what has become harder", "what payoff is being prepared")):
-                continue
-            if not motion_rx.search(text):
-                continue
-            text = re.sub(r"\s+and\s+(?:(?:start|begin)(?:s|ning)?\s+to\s+)?(?:understand|realize|feel|know|remember)\b.*$", "", text, flags=re.IGNORECASE).strip(" ,.;:-")
-            text = re.sub(r"\bthey notice each other(?:'s|’s) unique style\b", "They turn toward each other and exchange a brief look", text, flags=re.IGNORECASE)
-            if text:
-                kept.append(text)
-            if len(kept) >= 3:
-                break
-        if not kept:
-            return "The visible subject makes one clear natural movement."
-        out = ". ".join(kept).strip()
-        if len(out) > 420:
-            out = out[:420].rsplit(" ", 1)[0].rstrip(" ,.;:-")
-        return out.rstrip(" .") + "."
-
-
-
-    @staticmethod
-    def _strip_json_fences(text: str) -> str:
-        raw = str(text or "").replace("\r", "").strip()
-        raw = re.sub(r"^\s*```(?:json|JSON)?\s*", "", raw)
-        raw = re.sub(r"\s*```\s*$", "", raw).strip()
-        return raw
-
-    @staticmethod
-    def _first_json_array_block(text: str) -> str:
-        raw = StorylineGenerator._strip_json_fences(text)
-        start = raw.find("[")
-        if start < 0:
-            return ""
-        depth = 0
-        in_string = False
-        escape = False
-        for idx in range(start, len(raw)):
-            ch = raw[idx]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-                continue
-            if ch == '"':
-                in_string = True
-            elif ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    return raw[start:idx + 1]
-        return ""
-
-    @staticmethod
-    def _extract_json_string_list(text: str) -> List[str]:
-        """Best-effort JSON list extractor for local LLM output.
-
-        Local models sometimes wrap JSON in markdown fences or add a short note
-        before/after it. This accepts a plain JSON array, a fenced JSON array, or
-        the first valid array inside the response. It intentionally returns []
-        instead of raising so older line-based parsing can still be used.
-        """
-        raw = StorylineGenerator._strip_json_fences(text)
-        candidates = [raw]
-        block = StorylineGenerator._first_json_array_block(raw)
-        if block and block != raw:
-            candidates.insert(0, block)
-
-        for candidate in candidates:
-            if not candidate:
-                continue
+    def _json_call(self, system: str, user: str, label: str, *, max_tokens: int = 5000, retries: int = 3) -> Any:
+        last = None
+        feedback = ""
+        for attempt in range(1, retries + 1):
             try:
-                data = json.loads(candidate)
-            except Exception:
-                continue
-
-            if isinstance(data, dict):
-                for key in ("entries", "characters", "character_bibles", "objects", "object_bibles", "items", "lines", "prompts", "result"):
-                    val = data.get(key)
-                    if isinstance(val, list):
-                        data = val
-                        break
-
-            if not isinstance(data, list):
-                continue
-
-            out: List[str] = []
-            for item in data:
-                if isinstance(item, str):
-                    value = item
-                elif isinstance(item, dict):
-                    label = item.get("label") or item.get("name") or item.get("character") or item.get("object") or ""
-                    detail = item.get("detail") or item.get("description") or item.get("identity") or item.get("visual_identity") or ""
-                    value = f"{label} ({detail})" if label and detail else ""
-                else:
-                    value = ""
-                value = re.sub(r"\s+", " ", str(value or "")).strip(" ,")
-                if value:
-                    out.append(value)
-            if out:
-                return out
-        return []
+                text = self.client.generate(system, user + feedback, temperature=0.30 if attempt == 1 else 0.18, max_tokens=max_tokens, json_mode=True)
+                return _parse_json(text)
+            except Exception as exc:
+                last = exc
+                self._log(f"[story] {label} attempt {attempt}/{retries} failed: {exc}")
+                feedback = "\n\nYour previous response was invalid. Return ONLY the requested JSON shape with every required item present."
+        raise RuntimeError(f"{label} failed after {retries} attempts: {last}")
 
     @staticmethod
-    def _extract_character_bible_lines(text: str) -> List[str]:
-        json_lines = StorylineGenerator._extract_json_string_list(text)
-        source_lines = json_lines if json_lines else [ln.strip() for ln in str(text or "").replace("\r", "").split("\n") if ln.strip()]
-
-        cleaned: List[str] = []
-        rx = re.compile(r"^\s*(?:[-*•]|\[?\(?\d{1,3}\]?\)?[.:\-]?)\s*(.+)$")
-        seen: set[str] = set()
-        for line in source_lines:
-            body = str(line or "").strip()
-            m = rx.match(body)
-            if m:
-                body = m.group(1).strip()
-            body = re.sub(r"\s+", " ", body).strip(" ,")
-            body = body.strip('"').strip("'").strip(" ,")
-            if not body or "(" not in body or ")" not in body:
-                continue
-            key = body.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            cleaned.append(body)
-        return cleaned
-
-
-    @staticmethod
-    def _split_character_bible_entry(entry: str) -> Tuple[str, str]:
-        m = re.match(r"^\s*(.+?)\s*\((.+)\)\s*$", str(entry or "").strip())
-        if not m:
-            return "", ""
-        label = re.sub(r"\s+", " ", m.group(1)).strip(" ,")
-        detail = re.sub(r"\s+", " ", m.group(2)).strip(" ,")
-        return label, detail
-
-    @staticmethod
-    def _normalize_character_label(label: str) -> str:
-        raw = re.sub(r"\s+", " ", str(label or "").strip(" ,"))
-        if not raw:
-            return ""
-        low = raw.lower()
-        if low.startswith(("his ", "her ", "their ", "its ", "my ", "our ")):
-            return low
-        if raw[0].isupper() and " " not in raw and "'" not in raw:
-            return raw
-        if low.startswith(("the ", "a ", "an ")):
-            words = low.split()
-            if words[0] != "the":
-                low = "the " + " ".join(words[1:])
-            return low
-        return "the " + low
-
-    @staticmethod
-    def _looks_like_character_label(label: str, detail: str) -> bool:
-        low = f"{label} {detail}".lower()
-        object_terms = {
-            "slab", "rock", "rubble", "briefcase", "bag", "cape", "sword", "gun", "car", "truck", "bench",
-            "lamppost", "jewel", "jewels", "building", "tower", "door", "window", "helmet", "mask", "concrete",
-            "fire", "explosion", "smoke", "road", "street", "chair", "table", "weapon", "stone", "crystal",
-            "artifact", "device", "machine", "vehicle", "ship"
-        }
-        living_terms = {
-            "man", "men", "woman", "women", "boy", "girl", "child", "kid", "teen", "adult", "person", "people",
-            "citizen", "citizens", "hero", "superhero", "villain", "henchman", "dog", "cat", "alien", "creature",
-            "monster", "dragon", "bird", "wolf", "bear", "fox", "rabbit", "horse", "cow", "baby", "mother",
-            "father", "king", "queen", "soldier", "guard", "driver", "pilot", "wizard", "witch", "robot", "android",
-            "detective", "teacher", "student", "sidekick", "giant", "elf", "orc", "demon", "angel"
-        }
-        if any(term in low for term in living_terms):
-            return True
-        if any(term in low for term in object_terms):
-            return False
-        return False
-
-    _FACE_MARK_TERMS = {
-        "freckles": ("freckle", "freckles", "freckled"),
-        "moles": ("mole", "moles"),
-        "beauty marks": ("beauty mark", "beauty marks"),
-        "scars": ("scar", "scars", "scarred"),
-        "tattoos": ("tattoo", "tattoos", "tattooed"),
-        "birthmarks": ("birthmark", "birthmarks"),
-        "piercings": ("piercing", "piercings", "pierced"),
-        "face paint": ("face paint", "face-paint", "facepaint"),
-        "clown makeup": ("clown makeup", "clown make-up"),
-        "blemishes": ("blemish", "blemishes"),
-    }
-
-    @classmethod
-    def _allowed_face_mark_keys(cls, source_text: str) -> set[str]:
-        low = str(source_text or "").lower()
-        allowed: set[str] = set()
-        for key, variants in cls._FACE_MARK_TERMS.items():
-            if any(re.search(r"\b" + re.escape(v) + r"\b", low) for v in variants):
-                allowed.add(key)
-        return allowed
-
-    @classmethod
-    def _strip_unrequested_face_marks_from_text(cls, text: str, source_text: str) -> str:
-        """Remove invented facial/body mark phrases unless the user/predefined bible requested them.
-
-        This is deterministic provenance enforcement after LLM generation.  The LLM may
-        suggest freckles/scars/etc. despite prompt instructions; those phrases must not
-        become identity anchors unless they existed in user-authored source material.
-        """
-        raw = str(text or "").strip()
-        if not raw:
-            return raw
-        allowed = cls._allowed_face_mark_keys(source_text)
-        forbidden_variants = []
-        for key, variants in cls._FACE_MARK_TERMS.items():
-            if key not in allowed:
-                forbidden_variants.extend(variants)
-        if not forbidden_variants:
-            return raw
-
-        # Character bible / prompt prose is mostly comma/semicolon delimited. Remove the
-        # smallest phrase containing an unrequested mark rather than damaging the rest.
-        chunks = re.split(r"([,;])", raw)
-        kept = []
-        i = 0
-        while i < len(chunks):
-            chunk = chunks[i]
-            if chunk in {",", ";"}:
-                i += 1
-                continue
-            low = chunk.lower()
-            bad = any(re.search(r"\b" + re.escape(v) + r"\b", low) for v in forbidden_variants)
-            if not bad and chunk.strip():
-                kept.append(chunk.strip())
-            i += 1
-        out = ", ".join(kept)
-        out = re.sub(r"\s{2,}", " ", out).strip(" ,;.-")
-        return out
-
-    @classmethod
-    def _filter_character_bibles_by_user_marks(cls, entries: List[str], source_text: str) -> List[str]:
-        out: List[str] = []
-        for entry in entries or []:
-            label, detail = cls._split_character_bible_entry(entry)
-            if not label or not detail:
-                continue
-            detail2 = cls._strip_unrequested_face_marks_from_text(detail, source_text)
-            if detail2:
-                out.append(f"{cls._normalize_character_label(label)} ({detail2})")
-        return cls._clean_character_bible_entries(out)
-
-    @classmethod
-    def _clean_character_bible_entries(cls, entries: List[str]) -> List[str]:
-        cleaned: List[str] = []
-        seen: set[str] = set()
-        for entry in entries:
-            label, detail = cls._split_character_bible_entry(entry)
-            if not label or not detail:
-                continue
-            if not cls._looks_like_character_label(label, detail):
-                continue
-            norm_label = cls._normalize_character_label(label)
-            norm_detail = cls._clean_bible_detail(detail, kind="character")
-            if not norm_detail:
-                continue
-            full = f"{norm_label} ({norm_detail})"
-            key = full.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            cleaned.append(full)
-        return cleaned
-
-
-    @staticmethod
-    def _character_detail_category_flags(label: str, detail: str) -> Dict[str, bool]:
-        low = f"{label} {detail}".lower()
-        detail_low = str(detail or '').lower()
-        face_terms = (
-            'face', 'facial', 'eyes', 'eye ', 'eyebrow', 'eyebrows', 'lashes', 'cheek', 'cheekbones', 'jaw', 'jawline',
-            'nose', 'lips', 'mouth', 'chin', 'forehead', 'freckles', 'scar', 'wrinkle', 'skin', 'oval face', 'round face',
-            'square face', 'heart-shaped face', 'almond-shaped eyes'
-        )
-        hair_terms = (
-            'hair', 'hairstyle', 'hairline', 'bangs', 'fringe', 'ponytail', 'bun', 'braid', 'braids', 'curl', 'curly',
-            'wavy', 'straight hair', 'short hair', 'long hair', 'bob cut', 'pixie cut', 'beard', 'mustache', 'moustache',
-            'clean-shaven', 'sideburns', 'fur', 'mane', 'coat pattern'
-        )
-        clothing_terms = (
-            'jacket', 'coat', 'hoodie', 'shirt', 't-shirt', 'blouse', 'dress', 'skirt', 'jeans', 'pants', 'trousers',
-            'boots', 'shoes', 'sneakers', 'scarf', 'hat', 'cap', 'gloves', 'armor', 'armour', 'uniform', 'robe', 'suit',
-            'vest', 'sweater', 'cardigan', 'kimono', 'cape', 'apron', 'necklace', 'earrings', 'bracelet', 'belt'
-        )
-        species_terms = ('dog', 'cat', 'alien', 'creature', 'monster', 'dragon', 'wolf', 'bear', 'fox', 'rabbit', 'horse', 'bird')
-        is_humanish = not any(term in low for term in species_terms)
-        return {
-            'face': any(term in detail_low for term in face_terms),
-            'hair': any(term in detail_low for term in hair_terms),
-            'clothing': any(term in detail_low for term in clothing_terms),
-            'humanish': is_humanish,
-        }
-
-    @classmethod
-    def _character_entry_needs_strengthening(cls, entry: str) -> bool:
-        label, detail = cls._split_character_bible_entry(entry)
-        if not label or not detail:
-            return False
-        flags = cls._character_detail_category_flags(label, detail)
-        comma_parts = [p.strip() for p in re.split(r",|;", detail) if p.strip()]
-        if flags['humanish']:
-            score = int(flags['face']) + int(flags['hair']) + int(flags['clothing'])
-            if score < 3:
-                return True
-            if len(comma_parts) < 5:
-                return True
-            return False
-        # for non-human characters, still require at least body/fur/pattern + one style anchor
-        if len(comma_parts) < 4:
-            return True
-        return not (flags['hair'] or flags['clothing'] or flags['face'])
-
-    def _strengthen_character_bibles(self, *, entries: List[str], idea: str, story_outline: List[str], draft_prompts: List[str], shot_count: int, style_hint: str, t2i_model_hint: str) -> List[str]:
-        cleaned = self._clean_character_bible_entries(entries)
-        if not cleaned:
-            return []
-        weak = [entry for entry in cleaned if self._character_entry_needs_strengthening(entry)]
-        if not weak:
-            return cleaned
-        self._log(f"Strengthening {len(weak)} weak character bible entr{'y' if len(weak)==1 else 'ies'}...")
-        source_parts: List[str] = []
-        if story_outline:
-            source_parts.append("Story beats:\n" + "\n".join(f"{idx+1}. {beat}" for idx, beat in enumerate(story_outline)))
-        if draft_prompts:
-            source_parts.append("Draft text-to-image prompts:\n" + "\n".join(f"{idx+1}. {prompt}" for idx, prompt in enumerate(draft_prompts)))
-        source_block = "\n\n".join(source_parts) if source_parts else f"User idea:\n{idea.strip()}"
-        weak_block = "\n".join(f"- {entry}" for entry in weak)
-        rewrite_prompt = f"""
-Rewrite only the weak character bible entries below so they become strong visual identity anchors for text-to-image consistency.
-
-{source_block}
-
-Weak character bible entries:
-{weak_block}
-
-Global style hint: {style_hint or 'none'}
-Target text-to-image model: {t2i_model_hint or 'none'}
-
-Rules:
-- Return ONLY valid JSON.
-- Return a JSON array of exactly {len(weak)} strings.
-- Do not use markdown fences, bullets, numbering, explanations, or comments.
-- Keep the same character labels, in the same order as the weak entries.
-- Each string must use this exact format: Name or label (detailed visual identity)
-- For human or human-like characters, the identity inside parentheses must include all three:
-  1) facial identity and face structure
-  2) hairstyle or facial hair
-  3) clothing style or outfit anchors
-- Good facial identity details include: face shape, eyes, eyebrows, nose, lips, jawline, cheekbones, skin tone and age-appropriate natural skin texture. Do not invent freckles, moles, beauty marks, scars, tattoos, birthmarks, piercings, face paint, makeup motifs, blemishes, or other distinctive marks unless they are explicitly present in the user idea or predefined character bible; if explicitly present, preserve them exactly.
-- Good hair details include: hair length, hairstyle, color, texture, beard, mustache, clean-shaven.
-- Good clothing details include: jacket, shirt, dress, trousers, boots, accessories, colors, materials, signature outfit pieces.
-- Do not write vague filler like handsome face, pretty face, casual clothes, nice outfit.
-- Do not include actions, poses, camera framing, emotion, or location.
-- Keep the label stable and natural.
-""".strip()
-        raw = self.client.generate(
-            system_prompt=(
-                "You are a strict JSON generator for an offline prompt tool. "
-                "Return only one valid JSON array of strings. "
-                "No chain-of-thought, thinking, explanations, markdown fences, bullets, or commentary."
-            ),
-            user_prompt=rewrite_prompt,
-            temperature=0.25,
-            max_tokens=max(500, len(weak) * 180),
-        )
-        rewritten_source = self._extract_json_string_list(raw)
-        if not rewritten_source:
-            # Keep the old parser as a fallback because small local models do
-            # still sometimes ignore JSON instructions. Do not crash the whole
-            # story pipeline just because the repair pass formatted badly.
-            rewritten_source = self._extract_character_bible_lines(raw)
-            if rewritten_source:
-                self._log("Character bible strengthening used legacy line fallback.")
-            else:
-                self._log("Character bible strengthening returned no parseable entries; keeping original bible entries.")
-        rewritten = self._clean_character_bible_entries(rewritten_source)
-        by_label = {}
-        for entry in rewritten:
-            label, detail = self._split_character_bible_entry(entry)
-            if label and detail:
-                by_label[self._normalize_character_label(label)] = entry
-        merged = []
-        for entry in cleaned:
-            label, detail = self._split_character_bible_entry(entry)
-            key = self._normalize_character_label(label)
-            replacement = by_label.get(key)
-            if replacement and not self._character_entry_needs_strengthening(replacement):
-                merged.append(replacement)
-            else:
-                merged.append(entry)
-        return self._clean_character_bible_entries(merged)
-    @staticmethod
-    def _looks_like_object_label(label: str, detail: str) -> bool:
-        low = f"{label} {detail}".lower()
-        recurring_object_terms = {
-            "guitar", "sword", "helmet", "mask", "briefcase", "backpack", "bag", "camera", "book", "journal",
-            "necklace", "ring", "amulet", "artifact", "orb", "crystal", "staff", "wand", "microphone", "coffee cup",
-            "mug", "bicycle", "bike", "motorcycle", "car", "truck", "van", "ship", "spaceship", "robot", "drone",
-            "doll", "toy", "key", "watch", "communicator", "phone", "tablet", "laptop", "lantern", "umbrella",
-            "suitcase", "case", "crown", "shield", "hammer", "glasses", "sneakers", "boots"
-        }
-        background_terms = {
-            "rock", "rubble", "bench", "lamppost", "building", "tower", "road", "street", "window", "door",
-            "wall", "floor", "ground", "smoke", "fire", "explosion", "sky", "cloud", "tree", "grass", "chair",
-            "table", "box", "boxes", "cardboard", "concrete", "bridge", "cart", "stall", "vendor cart", "city"
-        }
-        if any(term in low for term in background_terms):
-            return False
-        return any(term in low for term in recurring_object_terms)
-
-    @staticmethod
-    def _clean_bible_detail(detail: str, kind: str) -> str:
-        raw = re.sub(r"\s+", " ", str(detail or "")).strip(" ,")
-        if not raw:
-            return ""
-        parts = [p.strip(" ,") for p in re.split(r",|;", raw) if p.strip(" ,")]
-        if not parts:
-            return ""
-        banned_common = {
-            "in the background", "background", "shown as", "close-up", "wide shot", "low angle", "high angle",
-            "silhouette", "against the", "looking up", "looking at", "watching", "pointing", "running",
-            "walking", "sitting", "standing", "floating", "drifting", "holding", "firing", "mid-yawn",
-            "on the surface", "on the moon", "at the horizon", "in the sky", "earth", "horizon", "cratered",
-        }
-        kept: List[str] = []
-        for part in parts:
-            low = part.lower()
-            if any(term in low for term in banned_common):
-                continue
-            if kind == "character":
-                if low.startswith(("wearing a ", "wearing an ")):
-                    part = re.sub(r"^wearing\s+", "", part, flags=re.I)
-                if low.startswith(("shown ", "looking ", "pointing ", "standing ", "sitting ", "running ", "walking ")):
-                    continue
-            kept.append(part)
-        return ", ".join(kept[:6]).strip(" ,")
-
-    @classmethod
-    def _clean_object_bible_entries(cls, entries: List[str]) -> List[str]:
-        cleaned: List[str] = []
-        seen: set[str] = set()
-        for entry in entries:
-            label, detail = cls._split_character_bible_entry(entry)
-            if not label or not detail:
-                continue
-            norm_label = re.sub(r"\s+", " ", label).strip(" ,").lower()
-            norm_detail = cls._clean_bible_detail(detail, kind="object")
-            if not norm_label or not norm_detail:
-                continue
-            if not cls._looks_like_object_label(norm_label, norm_detail):
-                continue
-            full = f"{norm_label} ({norm_detail})"
-            key = full.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            cleaned.append(full)
-        return cleaned
-
-    @staticmethod
-    def _strip_leading_article(text: str) -> str:
-        return re.sub(r"^(?:the|a|an)\s+", "", str(text or "").strip(), flags=re.I).strip()
-
-    @classmethod
-    def _infer_character_roles(cls, label: str, detail: str) -> set[str]:
-        low = f"{label} {detail}".lower()
-        roles: set[str] = set()
-        role_groups = {
-            "man": {" man", "male", "gentleman", "husband", "father", "king", "boyfriend"},
-            "woman": {" woman", "female", "lady", "wife", "mother", "queen", "girlfriend"},
-            "boy": {" boy", "young boy", "little boy"},
-            "girl": {" girl", "young girl", "little girl"},
-            "dog": {" dog", "puppy", "hound", "canine"},
-            "cat": {" cat", "kitten", "feline"},
-            "alien": {" alien", "extraterrestrial"},
-            "robot": {" robot", "android", "machine being"},
-        }
-        padded = f" {low} "
-        for role, markers in role_groups.items():
-            if any(marker in padded for marker in markers):
-                roles.add(role)
-        return roles
-
-    @classmethod
-    def _character_entry_variants(cls, label: str, detail: str) -> List[str]:
-        raw_label = re.sub(r"\s+", " ", str(label or "").strip(" ,"))
-        if not raw_label:
-            return []
-        stripped = cls._strip_leading_article(raw_label)
-        variants = [raw_label]
-        low = raw_label.lower()
-        if stripped and stripped.lower() != low:
-            variants.append(stripped)
-        if stripped:
-            variants.extend([
-                f"the {stripped}",
-                f"a {stripped}",
-                f"an {stripped}",
-            ])
-        for role in cls._infer_character_roles(label, detail):
-            if role == "man":
-                variants.extend(["the man", "a man", "man"])
-            elif role == "woman":
-                variants.extend(["the woman", "a woman", "woman"])
-            elif role == "boy":
-                variants.extend(["the boy", "a boy", "boy"])
-            elif role == "girl":
-                variants.extend(["the girl", "a girl", "girl"])
-            elif role == "dog":
-                variants.extend(["the dog", "a dog", "dog"])
-            elif role == "cat":
-                variants.extend(["the cat", "a cat", "cat"])
-            elif role == "alien":
-                variants.extend(["the alien", "an alien", "alien"])
-            elif role == "robot":
-                variants.extend(["the robot", "a robot", "robot"])
-        unique: List[str] = []
-        seen: set[str] = set()
-        for item in variants:
-            cleaned = re.sub(r"\s+", " ", str(item or "").strip(" ,")).lower()
-            if not cleaned or cleaned in seen:
-                continue
-            seen.add(cleaned)
-            unique.append(cleaned)
-        unique.sort(key=len, reverse=True)
-        return unique
-
-    @classmethod
-    def _inject_single_character_bible(cls, text: str, label: str, detail: str) -> str:
-        updated = str(text or "")
-        if not updated.strip() or not label or not detail:
-            return updated
-        inline = f"{label} ({detail}),"
-        inline_low = inline.lower().rstrip(',')
-        if inline_low in updated.lower():
-            return cls._postprocess_inline_bible_prompt(updated)
-        for variant in cls._character_entry_variants(label, detail):
-            pattern = re.compile(rf"(?<!\w){re.escape(variant)}(?!\w)", re.I)
-            match = pattern.search(updated)
-            if not match:
-                continue
-            replacement = inline
-            if variant in {"man", "woman", "boy", "girl", "dog", "cat", "alien", "robot"}:
-                prev = updated[max(0, match.start()-4):match.start()].lower()
-                if prev.endswith(("a ", "an ", "the ")):
-                    continue
-            updated = updated[:match.start()] + replacement + updated[match.end():]
-            return cls._postprocess_inline_bible_prompt(updated)
-        return cls._postprocess_inline_bible_prompt(updated)
-
-    @classmethod
-    def _expand_gendered_pair_reference(cls, text: str, character_bibles: List[str]) -> str:
-        if len(character_bibles) != 2:
-            return text
-        parsed = []
-        for entry in character_bibles:
-            label, detail = cls._split_character_bible_entry(entry)
-            if label and detail:
-                parsed.append((label, detail, cls._infer_character_roles(label, detail)))
-        if len(parsed) != 2:
-            return text
-        male = next((item for item in parsed if "man" in item[2] or "boy" in item[2]), None)
-        female = next((item for item in parsed if "woman" in item[2] or "girl" in item[2]), None)
-        if not male or not female:
-            return text
-        replacement = f"{male[0]} ({male[1]}), and {female[0]} ({female[1]}),"
-        patterns = [
-            r"\ba man and a woman\b",
-            r"\bthe man and the woman\b",
-            r"\bman and woman\b",
-            r"\bwoman and man\b",
-            r"\ba woman and a man\b",
-            r"\bthe woman and the man\b",
-        ]
-        updated = str(text or "")
-        for pat in patterns:
-            updated2 = re.sub(pat, replacement, updated, count=1, flags=re.I)
-            if updated2 != updated:
-                return cls._postprocess_inline_bible_prompt(updated2)
-        return updated
-
-    @classmethod
-    def _force_character_bibles_in_prompts(cls, prompts: List[str], character_bibles: List[str]) -> List[str]:
-        if not prompts or not character_bibles:
-            return prompts
-        cleaned_entries = cls._clean_character_bible_entries(character_bibles)
-        if not cleaned_entries:
-            return prompts
-        pairs: List[Tuple[str, str]] = []
-        for entry in cleaned_entries:
-            label, detail = cls._split_character_bible_entry(entry)
-            if label and detail:
-                pairs.append((label, detail))
-        forced: List[str] = []
-        for prompt in prompts:
-            updated = cls._expand_gendered_pair_reference(prompt, cleaned_entries)
-            for label, detail in pairs:
-                updated = cls._inject_single_character_bible(updated, label, detail)
-            forced.append(cls._postprocess_inline_bible_prompt(updated))
-        return forced
-
-
-    @staticmethod
-    def _object_label_occurrence_count(label: str, texts: List[str]) -> int:
-        norm_label = re.sub(r"\s+", " ", str(label or "").strip().lower())
-        if not norm_label:
-            return 0
-        variants = {norm_label}
-        for prefix in ("the ", "a ", "an "):
-            if norm_label.startswith(prefix):
-                variants.add(norm_label[len(prefix):].strip())
-        count = 0
-        for txt in texts or []:
-            low = re.sub(r"\s+", " ", str(txt or "").lower())
-            if not low:
-                continue
-            if any(re.search(r"\b" + re.escape(v) + r"\b", low) for v in variants if v):
-                count += 1
-        return count
-
-    @classmethod
-    def _filter_object_bibles_by_recurrence(cls, entries: List[str], texts: List[str], min_hits: int = 2) -> List[str]:
-        if not entries:
-            return []
-        kept: List[str] = []
-        seen: set[str] = set()
-        for entry in entries:
-            label, detail = cls._split_character_bible_entry(entry)
-            if not label or not detail:
-                continue
-            if cls._object_label_occurrence_count(label, texts) < min_hits:
-                continue
-            normalized_label = re.sub(r"\s+", " ", label).strip(" ,").lower()
-            full = f"{normalized_label} ({detail})"
-            key = full.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            kept.append(full)
-        return kept
-    @staticmethod
-    def _ensure_inline_bible_commas(text: str) -> str:
-        if not text:
-            return text
-        updated = str(text)
-        updated = re.sub(r"([A-Za-z][^.,;:!?()]{0,80})\s*\(([^)]+)\)\s*(['’]s)", lambda m: f"{m.group(1).strip()} ({m.group(2).strip()}),", updated)
-        updated = re.sub(r"\b([^.,;:!?()]{1,80}?)\s*\(([^)]+)\)(?!\s*,)", lambda m: f"{m.group(1).strip()} ({m.group(2).strip()}),", updated)
-        updated = re.sub(r"\),\s*,+", "), ", updated)
-        updated = re.sub(r"\),\s+([.!?])", r")\1", updated)
-        updated = re.sub(r"\s{2,}", " ", updated).strip(" ,")
-        return updated
-
-    @classmethod
-    def _dedupe_inline_bibles_per_prompt(cls, prompts: List[str], bible_entries: List[str]) -> List[str]:
-        if not prompts or not bible_entries:
-            return prompts
-        pairs = []
-        for entry in bible_entries:
-            label, detail = cls._split_character_bible_entry(entry)
-            if label and detail:
-                pairs.append((label, detail))
-        pairs.sort(key=lambda item: len(item[0]), reverse=True)
-        fixed: List[str] = []
-        for prompt in prompts:
-            updated = cls._ensure_inline_bible_commas(prompt)
-            for label, detail in pairs:
-                inline_with_comma = f"{label} ({detail}),"
-                inline_without_comma = f"{label} ({detail})"
-                pattern = re.compile(re.escape(inline_with_comma) + r"|" + re.escape(inline_without_comma), re.IGNORECASE)
-                first = True
-                def repl(match):
-                    nonlocal first
-                    if first:
-                        first = False
-                        return inline_with_comma
-                    return label
-                updated = pattern.sub(repl, updated)
-            updated = cls._ensure_inline_bible_commas(updated)
-            fixed.append(updated)
-        return fixed
-
-    @staticmethod
-    def _collapse_repeated_parenthetical_chunks(text: str) -> str:
-        out = str(text or "")
-        if not out:
-            return out
-        for _ in range(8):
-            prev = out
-            out = re.sub(r"\(([^()]{8,500})\)\s*,?\s*\(\1\)", r"(\1)", out, flags=re.IGNORECASE)
-            out = re.sub(r"\b([^,.;:!?()]{2,120}?)\s*\(([^()]{8,500})\)\s*,?\s*\1\s*\(\2\)", r"\1 (\2)", out, flags=re.IGNORECASE)
-            if out == prev:
-                break
-        return re.sub(r"\s{2,}", " ", out).strip(" ,")
-
-    @staticmethod
-    def _postprocess_inline_bible_prompt(prompt: str) -> str:
-        text = StorylineGenerator._ensure_inline_bible_commas(prompt)
-        text = StorylineGenerator._collapse_repeated_parenthetical_chunks(text)
-        text = re.sub(r"\)\s*,\s*'s\s+", "), ", text)
-        text = re.sub(r"\)\s*,\s*’s\s+", "), ", text)
-
-        def _drop_stacked_article(match: re.Match) -> str:
-            label = match.group(1).strip()
-            prefix = match.group(2) or ""
-            if prefix:
-                return f"{prefix}{label[:1].upper()}{label[1:]}"
-            return label
-
-        text = re.sub(
-            r"(?i)(?:(?:a|an|the)\s+)(the\s+[A-Za-z][^,.;:!?]{0,120}?\([^)]*\),?)",
-            lambda m: _drop_stacked_article(m),
-            text,
-        )
-        text = re.sub(
-            r"(^|[.!?]\s+)(the\s+[A-Za-z][^,.;:!?]{0,120}?\([^)]*\),?)",
-            lambda m: _drop_stacked_article(m),
-            text,
-        )
-        text = re.sub(r"([Tt]he)\s+", r"", text)
-        text = re.sub(r"([Aa]n?)\s+", r"", text)
-        text = re.sub(r"\s+,", ",", text)
-        text = StorylineGenerator._collapse_repeated_parenthetical_chunks(text)
-        text = re.sub(r"\s{2,}", " ", text).strip(" ,")
-        return text
-
-    @classmethod
-    def _expand_known_two_character_groups(cls, prompts: List[str], character_bibles: List[str]) -> List[str]:
-        if not prompts or not character_bibles:
-            return prompts
-        pairs = []
-        for entry in character_bibles:
-            label, detail = cls._split_character_bible_entry(entry)
-            if label and detail:
-                pairs.append((label, detail))
-        if len(pairs) != 2:
-            return prompts
-        left = f"{pairs[0][0]} ({pairs[0][1]}), and {pairs[1][0]} ({pairs[1][1]}),"
-        starts = ("the ", "a ", "an ")
-        vague = {"the people", "the group", "the crowd", "the team", "the family"}
-        lowered_labels = {pairs[0][0].lower(), pairs[1][0].lower()}
-        if lowered_labels & vague:
-            return prompts
-        group_patterns = [
-            r"the\s+couple",
-            r"a\s+couple",
-            r"couple",
-            r"the\s+pair",
-            r"a\s+pair",
-            r"pair",
-            r"the\s+duo",
-            r"a\s+duo",
-            r"duo",
-        ]
-        fixed=[]
-        for prompt in prompts:
-            updated = str(prompt or "")
-            # only expand if the prompt does not already contain both known characters inline
-            low = updated.lower()
-            if not all(lbl in low for lbl in lowered_labels):
-                for pat in group_patterns:
-                    updated2 = re.sub(pat, left, updated, count=1, flags=re.I)
-                    if updated2 != updated:
-                        updated = updated2
-                        break
-            updated = cls._postprocess_inline_bible_prompt(updated)
-            fixed.append(updated)
-        return fixed
-
-    def _generate_object_bibles(self, *, idea: str, story_outline: List[str], draft_prompts: List[str], shot_count: int, style_hint: str, t2i_model_hint: str) -> List[str]:
-        source_parts: List[str] = []
-        if story_outline:
-            source_parts.append("Story beats:\n" + "\n".join(f"{idx+1}. {beat}" for idx, beat in enumerate(story_outline)))
-        if draft_prompts:
-            source_parts.append("Draft text-to-image prompts:\n" + "\n".join(f"{idx+1}. {prompt}" for idx, prompt in enumerate(draft_prompts)))
-        source_block = "\n\n".join(source_parts) if source_parts else f"User idea:\n{idea.strip()}"
-        bible_prompt = f"""
-Create an object bible only for distinct recurring or clearly reused story objects that should stay visually consistent across the story.
-
-{source_block}
-
-Global style hint: {style_hint or 'none'}
-Target text-to-image model: {t2i_model_hint or 'none'}
-
-Rules:
-- Return one entry per line.
-- Include only recurring or reused important objects, props, instruments, vehicles, weapons, accessories, or artifacts that matter visually across multiple beats.
-- Good examples: a guitar used through the story, a flying motorcycle, a magic sword, a special helmet, a briefcase, a communicator, a red bicycle.
-- Do not create entries for generic scenery or one-off background items such as rocks, rubble, buildings, roads, benches, lampposts, smoke, fire, trees, or random boxes.
-- Write each line in this exact format: object label (detailed visual identity)
-- Put the descriptive identity inside parentheses immediately after the object label.
-- Keep the object label short and stable, such as the guitar, the flying motorcycle, the briefcase, the silver helmet.
-- The text inside parentheses must be visual and specific: material, color, shape, size, wear, lights, markings, special parts, and other identifying details.
-- Do not write separate explanations, keys, numbers, or summaries.
-- Return only the object bible lines.
-""".strip()
-        raw = self.client.generate(
-            system_prompt=(
-                "You are an offline story and prompt engine. "
-                "Follow the requested format exactly. "
-                "Do not output chain-of-thought, thinking, explanations, JSON, markdown fences, or commentary. "
-                "Return only the requested lines."
-            ),
-            user_prompt=bible_prompt,
-            temperature=0.4,
-            max_tokens=max(800, shot_count * 160),
-        )
-        entries = self._extract_character_bible_lines(raw)
-        cleaned = self._clean_object_bible_entries(entries)
-        recurrence_texts = list(story_outline or []) + list(draft_prompts or [])
-        return self._filter_object_bibles_by_recurrence(cleaned, recurrence_texts, min_hits=2)
-
-    @classmethod
-    def _force_object_bibles_in_prompts(cls, prompts: List[str], object_bibles: List[str]) -> List[str]:
-        """Inject recurring object identity without asking the LLM to rewrite the prompt."""
-        entries = cls._clean_object_bible_entries(object_bibles)
-        if not prompts or not entries:
-            return prompts
-        parsed: List[Tuple[str, str]] = []
-        for entry in entries:
-            label, detail = cls._split_character_bible_entry(entry)
-            if label and detail:
-                parsed.append((label, detail))
-        out: List[str] = []
-        for prompt in prompts:
-            updated = str(prompt or '')
-            for label, detail in parsed:
-                inline = f"{label} ({detail})"
-                if inline.lower() in updated.lower():
-                    continue
-                variants = [label, cls._strip_leading_article(label)]
-                replaced = False
-                for variant in sorted({v for v in variants if v}, key=len, reverse=True):
-                    pat = re.compile(r'(?<!\\w)' + re.escape(variant) + r'(?!\\w)', re.I)
-                    m = pat.search(updated)
-                    if not m:
-                        continue
-                    updated = updated[:m.start()] + inline + updated[m.end():]
-                    replaced = True
-                    break
-            out.append(cls._postprocess_inline_bible_prompt(updated))
-        return out
-
-    def _inject_object_bibles_into_t2i(self, *, story_outline: List[str], draft_prompts: List[str], object_bibles: List[str], shot_count: int, style_hint: str, negative_hint: str, t2i_model_hint: str) -> List[str]:
-        if not draft_prompts or not object_bibles:
-            return draft_prompts
-        object_bibles = self._clean_object_bible_entries(object_bibles)
-        if not object_bibles:
-            return draft_prompts
-        # Do not run another creative rewrite pass just to add identity.  Every
-        # extra rewrite can mutate action, location, or story state.  Inject only
-        # the stable object phrase into the already-authored prompt.
-        return self._force_object_bibles_in_prompts(draft_prompts, object_bibles)
-        beats_block = "\n".join(f"{idx+1}. {beat}" for idx, beat in enumerate(story_outline)) if story_outline else "none"
-        draft_block = "\n".join(f"{idx+1}. {draft}" for idx, draft in enumerate(draft_prompts))
-        bible_block = "\n".join(f"- {entry}" for entry in object_bibles)
-        inject_prompt = f"""
-Rewrite the numbered text-to-image prompts below so each prompt injects the matching recurring object bible inline.
-
-Story beats:
-{beats_block}
-
-Object bible:
-{bible_block}
-
-Draft text-to-image prompts:
-{draft_block}
-
-Global style hint: {style_hint or 'none'}
-Negative notes to avoid: {negative_hint or 'none'}
-Target text-to-image model: {t2i_model_hint or 'none'}
-
-Rules:
-- Return exactly {shot_count} numbered prompts.
-- Keep each prompt faithful to its matching story beat and draft prompt.
-- Use the exact same object label from the object bible every time that object appears.
-- When a listed object appears in a prompt, write the label followed immediately by its parenthetical bible and then a comma, for example: the guitar (red electric guitar, white pickguard, worn strap), ...
-- Inject each object bible only once per prompt, even if that same object is mentioned more than once.
-- Only inject recurring important objects from the object bible. Do not start tagging random background scenery.
-- Keep wording natural and rewrite the sentence if needed so the object bible sits cleanly inline.
-- Do not convert the prompt into a legend, key, or explanation.
-- Do not append a separate object section at the end of any prompt.
-- Keep each prompt direct, visual, and usable for text-to-image.
-- Return only the numbered prompts.
-""".strip()
-        prompts = self._generate_numbered_list_with_retry(
-            system_prompt=(
-                "You are an offline story and prompt engine. "
-                "Follow the requested format exactly. "
-                "Do not output chain-of-thought, thinking, explanations, JSON, markdown fences, or commentary. "
-                "Return only the requested numbered lines."
-            ),
-            user_prompt=inject_prompt,
-            expected_count=shot_count,
-            temperature=0.4,
-            max_tokens=max(1200, shot_count * 260),
-            item_kind="numbered prompts",
-        )
-        prompts = self._dedupe_inline_bibles_per_prompt(prompts, object_bibles)
-        return [self._postprocess_inline_bible_prompt(p) for p in prompts]
-
-    def _generate_character_bibles(self, *, idea: str, story_outline: List[str], draft_prompts: List[str], shot_count: int, style_hint: str, t2i_model_hint: str) -> List[str]:
-        source_parts: List[str] = []
-        if story_outline:
-            source_parts.append("Story beats:\n" + "\n".join(f"{idx+1}. {beat}" for idx, beat in enumerate(story_outline)))
-        if draft_prompts:
-            source_parts.append("Draft text-to-image prompts:\n" + "\n".join(f"{idx+1}. {prompt}" for idx, prompt in enumerate(draft_prompts)))
-        source_block = "\n\n".join(source_parts) if source_parts else f"User idea:\n{idea.strip()}"
-        bible_prompt = f"""
-Create a character bible for every distinct recurring or important living character, person, animal, creature, alien, or named figure that appears in the source below.
-
-{source_block}
-
-Global style hint: {style_hint or 'none'}
-Target text-to-image model: {t2i_model_hint or 'none'}
-
-Rules:
-- Return one entry per line.
-- Include humans, animals, aliens, creatures, and named figures that matter visually in the story.
-- If the story clearly has multiple recurring characters with the same role, keep them separate with stable labels such as the first astronaut and the second astronaut.
-- Write each line in this exact format: Name or label (detailed visual identity)
-- Put the descriptive identity inside parentheses immediately after the name or label.
-- Keep the name or label short and natural, such as Peter, his dog, the green alien, the old woman, the taxi driver.
-- The text inside parentheses must be detailed and visual: age or life stage when relevant, build, face, hair or fur, clothing or accessories, colors, species traits, and other stable identifying details.
-- Only include stable appearance traits. Do not include actions, poses, camera framing, current emotion, location, or shot-specific details.
-- Do not write separate explanations, keys, character numbers, or summaries.
-- Do not write lines like character 1 is ..., character 2 is ...
-- Do not group different characters together in one line.
-- Do not create bible entries for props, objects, rubble, vehicles, buildings, weapons, scenery, or other non-living things.
-- Use one stable label per character and keep it natural, for example: the superhero, the young child, his dog, Peter, the old woman.
-- Return only the character bible lines.
-""".strip()
-        raw = self.client.generate(
-            system_prompt=(
-                "You are an offline story and prompt engine. "
-                "Follow the requested format exactly. "
-                "Do not output chain-of-thought, thinking, explanations, JSON, markdown fences, or commentary. "
-                "Return only the requested lines."
-            ),
-            user_prompt=bible_prompt,
-            temperature=0.5,
-            max_tokens=max(600, shot_count * 220),
-        )
-        initial_entries = self._clean_character_bible_entries(self._extract_character_bible_lines(raw))
-        return self._strengthen_character_bibles(
-            entries=initial_entries,
-            idea=idea,
-            story_outline=story_outline,
-            draft_prompts=draft_prompts,
-            shot_count=shot_count,
-            style_hint=style_hint,
-            t2i_model_hint=t2i_model_hint,
-        )
-
-    def _inject_character_bibles_into_t2i(self, *, story_outline: List[str], draft_prompts: List[str], character_bibles: List[str], shot_count: int, style_hint: str, negative_hint: str, t2i_model_hint: str) -> List[str]:
-        if not draft_prompts or not character_bibles:
-            return draft_prompts
-        character_bibles = self._clean_character_bible_entries(character_bibles)
-        if not character_bibles:
-            return draft_prompts
-        # Identity injection must not become another storytelling pass.  Keep the
-        # shot exactly as authored and deterministically expand only known labels.
-        prompts = self._force_character_bibles_in_prompts(draft_prompts, character_bibles)
-        prompts = self._dedupe_inline_bibles_per_prompt(prompts, character_bibles)
-        return [self._postprocess_inline_bible_prompt(p) for p in prompts]
-        beats_block = "\n".join(f"{idx+1}. {beat}" for idx, beat in enumerate(story_outline)) if story_outline else "none"
-        draft_block = "\n".join(f"{idx+1}. {draft}" for idx, draft in enumerate(draft_prompts))
-        bible_block = "\n".join(f"- {entry}" for entry in character_bibles)
-        inject_prompt = f"""
-Rewrite the numbered text-to-image prompts below so each prompt injects the matching character bible inline.
-
-Story beats:
-{beats_block}
-
-Character bible:
-{bible_block}
-
-Draft text-to-image prompts:
-{draft_block}
-
-Global style hint: {style_hint or 'none'}
-Negative notes to avoid: {negative_hint or 'none'}
-Target text-to-image model: {t2i_model_hint or 'none'}
-
-Rules:
-- Return exactly {shot_count} numbered prompts.
-- Keep each prompt faithful to its matching story beat and draft prompt.
-- Use the exact same character label from the character bible every time that character appears.
-- Keep labels consistent across all prompts. Do not switch between forms like a superhero, superhero, and the superhero. Pick the bible label and reuse it.
-- Only inject a character bible when that character is a clear visible subject or important visible entity in that shot. Do not force a character bible into environment-only or object-focused shots.
-- When a listed character appears in a prompt, write the label followed immediately by its parenthetical bible and then a comma, for example: the superhero (detail...), moves through the scene.
-- Inject each character bible only once per prompt, even if that same character is mentioned more than once in the sentence.
-- Do not create character bibles for props, objects, rubble, vehicles, buildings, weapons, or scenery.
-- Do not convert the prompt into a legend, key, cast list, or explanation.
-- Do not add lines like character 1 is ..., character 2 is ...
-- Do not append a separate character section at the end of any prompt.
-- Keep possessive wording natural and readable. Rewrite the sentence if needed so the inline bible does not become awkward.
-- Keep each prompt direct, visual, and usable for text-to-image.
-- Return only the numbered prompts.
-""".strip()
-        prompts = self._generate_numbered_list_with_retry(
-            system_prompt=(
-                "You are an offline story and prompt engine. "
-                "Follow the requested format exactly. "
-                "Do not output chain-of-thought, thinking, explanations, JSON, markdown fences, or commentary. "
-                "Return only the requested numbered lines."
-            ),
-            user_prompt=inject_prompt,
-            expected_count=shot_count,
-            temperature=0.4,
-            max_tokens=max(1200, shot_count * 260),
-            item_kind="numbered prompts",
-        )
-        prompts = self._force_character_bibles_in_prompts(prompts, character_bibles)
-        prompts = self._dedupe_inline_bibles_per_prompt(prompts, character_bibles)
-        return [self._postprocess_inline_bible_prompt(p) for p in prompts]
-
-    @staticmethod
-    def _extract_contiguous_numbered_prefix(text: str, expected_count: int) -> List[str]:
-        """Return clean items 1..N only when numbering is contiguous from 1.
-
-        Used for strict continuation retries.  If item 1 is cut off or polluted by
-        instruction text, this returns an empty list so the whole step is retried.
-        """
-        raw_text = _strip_llm_protocol_artifacts(str(text or "")).replace("\r", "").strip()
-        if not raw_text:
-            return []
-        line_rx = re.compile(r"^\s*(?:\[?\(?)(\d{1,3})(?:\]?\)?)\s*[:.\-\]]?\s*(.+)$")
-        out: List[str] = []
-        want = 1
-        for line in [ln.strip() for ln in raw_text.split("\n") if ln.strip()]:
-            m = line_rx.match(line)
-            if not m:
-                continue
-            try:
-                num = int(m.group(1))
-            except Exception:
-                continue
-            if num != want:
-                break
-            item = _clean_generated_list_item(m.group(2).strip())
-            if not item:
-                break
-            out.append(item)
-            want += 1
-            if len(out) >= expected_count:
-                break
-        return out[:expected_count]
-
-    def _generate_numbered_list_with_retry(self, *, system_prompt: str, user_prompt: str, expected_count: int, temperature: float, max_tokens: int, item_kind: str) -> List[str]:
-        """Generate a clean exact numbered list.
-
-        Important: never pass instruction leakage or partial/truncated lines through
-        to images/video.  Retry until a clean complete list is collected, then abort
-        loudly instead of accepting garbage.
-        """
-        max_attempts = 6
-        last_raw = ""
-        last_error = ""
-        # This is an output cap, not context size.  Never lower the caller budget.
-        effective_max_tokens = max(int(max_tokens or 0), int(expected_count) * 220, 1200)
-
-        for attempt in range(1, max_attempts + 1):
-            retry_note = "" if attempt == 1 else f"\n\nPrevious attempt failed because it did not produce exactly {expected_count} clean {item_kind}. Regenerate the full list from item 1. Return only clean numbered lines. Do not include Input, Rules, Story beats, Object Bible, Character Bible, Source, Draft prompts, explanations, or markdown."
-            raw = _strip_llm_protocol_artifacts(self.client.generate(
-                system_prompt=system_prompt,
-                user_prompt=(user_prompt + retry_note),
-                temperature=temperature if attempt == 1 else max(0.2, min(temperature, 0.45)),
-                max_tokens=effective_max_tokens,
-            ))
-            last_raw = raw
-            try:
-                items = self._extract_numbered_lines(raw, expected_count)
-                # Hard final validation: all items must survive the same cleaner.
-                cleaned = [_clean_generated_list_item(x) for x in items]
-                cleaned = [x for x in cleaned if x]
-                if len(cleaned) == expected_count:
-                    if attempt > 1:
-                        self._log(f"Clean {item_kind} generated on retry {attempt}/{max_attempts}.")
-                    return cleaned
-                last_error = f"Only {len(cleaned)}/{expected_count} clean items after validation."
-            except RuntimeError as exc:
-                last_error = str(exc)
-
-            prefix = self._extract_contiguous_numbered_prefix(raw, expected_count)
-            have = len(prefix)
-            if have > 0 and have < expected_count:
-                missing = expected_count - have
-                self._log(f"Model returned {have}/{expected_count} clean {item_kind}; requesting the remaining {missing} item(s)...")
-                continuation_prompt = f"""
-The previous answer for {item_kind} stopped early.
-You already returned clean items 1 through {have}.
-Now continue and return exactly the missing items only.
-
-Continue from item {have + 1} through item {expected_count}.
-Do not repeat items 1 through {have}.
-Do not restart from 1.
-Return only numbered lines.
-Do not include Input, Rules, Story beats, Object Bible, Character Bible, Source, Draft prompts, explanations, or markdown.
-
-Original request:
-{user_prompt}
-
-Clean partial output already accepted:
-{chr(10).join(f'{idx+1}. {item}' for idx, item in enumerate(prefix))}
-""".strip()
-                cont_raw = _strip_llm_protocol_artifacts(self.client.generate(
-                    system_prompt=system_prompt,
-                    user_prompt=continuation_prompt,
-                    temperature=max(0.2, min(temperature, 0.45)),
-                    max_tokens=max(effective_max_tokens, missing * 260, 1200),
-                ))
-                last_raw = (raw.strip() + "\n" + cont_raw.strip()).strip()
-                try:
-                    # Parse the continuation by its actual requested numbering.
-                    cont_items: List[str] = []
-                    line_rx = re.compile(r"^\s*(?:\[?\(?)(\d{1,3})(?:\]?\)?)\s*[:.\-\]]?\s*(.+)$")
-                    want = have + 1
-                    for line in [ln.strip() for ln in cont_raw.replace("\r", "").split("\n") if ln.strip()]:
-                        m = line_rx.match(line)
-                        if not m:
-                            continue
-                        try:
-                            num = int(m.group(1))
-                        except Exception:
-                            continue
-                        if num != want:
-                            continue
-                        item = _clean_generated_list_item(m.group(2).strip())
-                        if not item:
-                            break
-                        cont_items.append(item)
-                        want += 1
-                        if len(prefix) + len(cont_items) >= expected_count:
-                            break
-                    combined = prefix + cont_items
-                    if len(combined) == expected_count:
-                        self._log(f"Clean {item_kind} completed by strict continuation retry.")
-                        return combined
-                    last_error = f"Continuation produced {len(combined)}/{expected_count} clean items."
-                except Exception as exc:
-                    last_error = f"Continuation failed: {exc}"
-            else:
-                self._log(f"Retrying {item_kind}: attempt {attempt}/{max_attempts} was not a clean complete list.")
-
-        raise RuntimeError(
-            f"Could not generate exactly {expected_count} clean {item_kind} after {max_attempts} attempts.\n"
-            f"Last error: {last_error}\n\nRaw output:\n{last_raw}"
-        )
-
-    def _refine_prompt_list(self, *, kind: str, source_beats: List[str], draft_prompts: List[str], shot_count: int, style_hint: str, negative_hint: str, t2i_model_hint: str = "", i2v_model_hint: str = "") -> List[str]:
-        if not source_beats or not draft_prompts:
-            return draft_prompts
-        beats_block = "\n".join(f"{idx+1}. {beat}" for idx, beat in enumerate(source_beats))
-        draft_block = "\n".join(f"{idx+1}. {draft}" for idx, draft in enumerate(draft_prompts))
-        style_hint = self._clean_style_hint(style_hint)
-        if not style_hint:
-            style_hint = 'consistent cinematic realistic style'
-        negative_hint = self._normalize_prompt_text(negative_hint)
-        if kind == "t2i":
-            refine_prompt = f"""
-Rewrite the numbered text-to-image prompts below so each line stays faithful to its matching story beat.
-
-Story beats:
-{beats_block}
-
-Draft prompts:
-{draft_block}
-
-Global style hint: {style_hint or 'none'}
-Negative notes to avoid: {negative_hint or 'none'}
-Target text-to-image model: {t2i_model_hint or 'none'}
-
-Rules:
-- Return exactly {shot_count} numbered prompts.
-- Keep each prompt faithful to its matching story beat.
-- Make the beat visually unambiguous: actor, target, physical action, contact/result, and reaction where relevant.
-- Give each prompt a distinct visual purpose; remove repetitive standing, looking, mood-only, or interchangeable compositions.
-- Preserve spatial continuity and established direction when adjacent beats share the same action/location.
-- Do not invent outcomes, props, or resolutions that are not in the beat.
-- Do not change the core action, subject, or setting.
-- Keep each line image-focused and concrete.
-- Static framing/composition may be specified, but do not add camera movement.
-- Keep the wording compact and usable.
-- Return only the numbered prompts.
-""".strip()
-            max_tokens = shot_count * 170
-        else:
-            refine_prompt = f"""
-Rewrite the numbered image-to-video prompts below so each line stays faithful to its matching story beat and source image prompt.
-
-Story beats:
-{beats_block}
-
-Draft prompts:
-{draft_block}
-
-Global style hint: {style_hint or 'none'}
-Target image-to-video model: {i2v_model_hint or 'none'}
-
-Rules:
-- Return exactly {shot_count} numbered prompts.
-- This is for image-to-video: start from an already existing image and animate what is visible in that image.
-- Keep each prompt faithful to its matching story beat.
-- Focus on one dominant visible action chain per shot.
-- When useful, express a compact action -> effect -> reaction rather than a single vague verb.
-- Make interactions explicit: who moves, what they touch/hit/grab/avoid, where the target moves, and who reacts.
-- Optional: add one small secondary motion or one simple camera move only if useful.
-- Avoid repeating the same camera move or body action across neighboring shots when another clear coverage choice fits.
-- Preserve established screen direction and scene geography during continuous action.
-- Use direct positive motion sentences. Describe only what should visibly happen.
-- Never include workflow instructions such as start from the image, keep the same, preserve, avoid, do not, next beat, transition, payoff, build tension, reveal, or force a decision.
-- Keep every recurring subject that is visible in the source image visible during the shot.
-- Any camera move must be unambiguous, short, and keep all visible subjects in frame; never request a reveal of a new location.
-- Prefer actions over poses. Do not write poster captions, static pose descriptions, or appearance-only lines.
-- Do not invent resolutions, props, or actions that are not in the beat.
-- Do not flatten the action into idle breathing, standing, or drifting unless the beat itself is calm.
-- Keep each line compact, motion-first, and directly usable for animation.
-- Return only the numbered prompts.
-""".strip()
-            max_tokens = shot_count * 150
-        return self._generate_numbered_list_with_retry(system_prompt=(
-            "You are an offline story and prompt engine. "
-            "Follow the requested format exactly. "
-            "Do not output chain-of-thought, thinking, explanations, JSON, markdown fences, or commentary. "
-            "Return only the requested numbered lines. "
-            "Keep the writing concrete, visual, direct, and faithful to the source beats. "
-            "For image-to-video, favor visible action over static pose or appearance descriptions."
-        ), user_prompt=refine_prompt, expected_count=shot_count, temperature=0.45, max_tokens=max_tokens, item_kind=f"{kind} prompts")
-
-
-    def enhance_story_idea(self, *, idea: str, extra_info: str = "", style_hint: str = "") -> str:
-        """Turn a simple user idea into a richer story seed before normal generation."""
-        base = re.sub(r"\s+", " ", str(idea or "").strip())
-        extra = re.sub(r"\s+", " ", str(extra_info or "").strip())
-        style = self._clean_style_hint(style_hint)
-        if not base:
-            raise ValueError("Prompt is empty.")
-        spice = random.choice([
-            "unlikely friendship", "urgent rescue", "comic adventure", "small mystery", "emotional discovery",
-            "rising danger", "bittersweet wonder", "chaotic teamwork", "hidden secret", "heroic sacrifice",
-            "dreamlike journey", "coming home", "lost-and-found quest", "festival energy", "night adventure",
-            "stormy race against time", "strange visitor", "protecting something fragile", "learning courage",
-            "turning rivals into allies",
-        ])
-        angle = random.choice([
-            "make the characters want something specific",
-            "add a clear obstacle and a satisfying ending",
-            "give the story an emotional arc",
-            "add visual motifs that can repeat across shots",
-            "make it feel more cinematic and purposeful",
-            "turn the simple idea into a stronger beginning-middle-ending seed",
-            "make the adventure more memorable without making it complicated",
-        ])
-        system_prompt = (
-            "You are an offline story idea enhancer for visual image/video prompt generation. "
-            "Improve weak or simple story ideas into stronger story seeds. "
-            "Keep the user's original subject and intent. "
-            "Do not add moral warnings, safety policy text, refusals, lectures, or platform restrictions. "
-            "Return only the enhanced story seed text."
-        )
-        user_prompt = f"""
-Enhance this simple story idea before it is sent to a storyline/prompt worker.
-
-Original idea:
-{base}
-
-Extra info from user:
-{extra or 'none'}
-
-Style hint:
-{style or 'none'}
-
-Random creative direction for this version:
-- {spice}
-- {angle}
-
-Output rules:
-- Return one fresh enhanced version only.
-- Keep it compact: 1 to 3 short paragraphs or 6 to 10 useful lines.
-- Preserve the original idea; do not replace it with an unrelated story.
-- Add meaning: hook, goal, conflict, emotional arc, ending direction, and visual motifs when useful.
-- Make this useful for later text-to-image and image-to-video prompt creation.
-- No numbered shot list yet.
-- No markdown title like "Enhanced Story" unless it is part of the story itself.
-""".strip()
-        raw = self.client.generate(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            temperature=0.95,
-            max_tokens=900,
-        )
-        cleaned = _strip_llm_protocol_artifacts(raw or "").strip()
-        cleaned = re.sub(r"(?im)^\s*(?:enhanced story idea|enhanced story seed|story seed)\s*[:：]\s*", "", cleaned).strip()
-        cleaned = cleaned.strip('` \t\r\n')
-        if not cleaned:
-            raise RuntimeError("Model returned an empty enhanced story idea.")
-        return cleaned
-
-    @staticmethod
-    def _director_brief(idea: str) -> str:
-        """Choose a compact directing grammar without forcing a fixed shot template."""
-        low = str(idea or "").lower()
-        action_terms = ("action", "chase", "race", "fight", "battle", "crash", "escape", "rescue", "attack", "explosion", "pursuit")
-        comedy_terms = ("comedy", "comic", "funny", "joke", "gag", "absurd", "prank")
-        suspense_terms = ("thriller", "suspense", "horror", "mystery", "stalk", "tense", "danger")
-        performance_terms = ("concert", "band", "singer", "singing", "performance", "stage", "dance", "music video")
-        if any(term in low for term in action_terms):
-            return (
-                "Dynamic action sequence: establish usable geography, then vary pursuit/tracking, close physical detail, "
-                "reaction/scale, and escalation as appropriate. Preserve screen direction and make each beat change the situation."
-            )
-        if any(term in low for term in comedy_terms):
-            return (
-                "Visual comedy sequence: establish the normal situation quickly, make the setup physically clear, escalate through visible consequences, "
-                "show readable reactions, and land the payoff cleanly. Faster cuts are allowed when they strengthen the joke."
-            )
-        if any(term in low for term in suspense_terms):
-            return (
-                "Suspense sequence: establish geography and the threat clearly, alternate information and reaction, increase pressure through concrete changes, "
-                "and make each beat reveal or worsen something rather than repeating atmosphere."
-            )
-        if any(term in low for term in performance_terms):
-            return (
-                "Performance sequence: vary coverage between performer action, instrument/body detail, audience/environment reaction, and wider scale. "
-                "Every beat should contain new visible performance behavior rather than another static lineup."
-            )
-        return (
-            "Cinematic narrative sequence: give every beat a distinct visual purpose, preserve geography and continuity, and progress through "
-            "visible cause, consequence, and reaction instead of repeating poses or mood."
-        )
-
-    @staticmethod
-    def _v2_narrative_beat_count(shot_count: int) -> int:
-        """Keep plot beats larger than shots so the story can breathe."""
-        shots = max(1, int(shot_count or 1))
-        if shots <= 4:
-            return shots
-        # Roughly 2-3 shots per meaningful story beat. Cap the first-pass
-        # outline so long videos do not force the writer to invent filler.
-        return max(4, min(shots, min(18, int(round(shots / 2.5)))))
-
-    @staticmethod
-    def _parse_v2_shot_plan(lines: List[str], expected_count: int) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
-        valid_sections = {"hook", "setup", "build", "turn", "climax", "resolve", "resolution"}
-        for idx, raw in enumerate(list(lines or [])[:expected_count], start=1):
-            text = re.sub(r"\s+", " ", str(raw or "").strip())
-            parts: Dict[str, str] = {}
-            for chunk in text.split(" | "):
-                if "=" not in chunk:
-                    continue
-                key, value = chunk.split("=", 1)
-                parts[key.strip().upper()] = value.strip()
-            visual = parts.get("VISUAL") or text
-            purpose = parts.get("PURPOSE") or "Advance the current story beat with one readable visual event."
-            change = parts.get("CHANGE") or "The visible situation advances from the previous shot."
-            section = (parts.get("SECTION") or "build").strip().lower()
-            if section not in valid_sections:
-                section = "build"
-            if section == "resolution":
-                section = "resolve"
-            try:
-                beat_index = max(1, int(re.sub(r"[^0-9]", "", parts.get("BEAT", "")) or idx))
-            except Exception:
-                beat_index = idx
-            out.append({
-                "index": idx,
-                "beat_index": beat_index,
-                "section": section,
-                "purpose": purpose,
-                "visual": visual,
-                "change": change,
-            })
-        return out
-
-    @staticmethod
-    def _v3_section_count(shot_count: int) -> int:
-        """Number of major story parts; deliberately much smaller than shot count."""
-        shots = max(1, int(shot_count or 1))
-        if shots <= 4:
-            return shots
-        return max(5, min(9, int(round(shots / 3.5))))
-
-    @staticmethod
-    def _parse_story_sections(lines: List[str], expected_count: int) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
-        default_names = ["Opening", "Setup", "Inciting incident", "Build", "Escalation", "Turn", "Climax", "Resolution", "Outro"]
-        for idx, raw in enumerate(list(lines or [])[:expected_count], start=1):
-            text = re.sub(r"\s+", " ", str(raw or "").strip())
-            parts: Dict[str, str] = {}
-            for chunk in text.split(" | "):
-                if "=" in chunk:
-                    k, v = chunk.split("=", 1)
-                    parts[k.strip().upper()] = v.strip()
-            name = parts.get("PART") or parts.get("SECTION") or (default_names[idx-1] if idx-1 < len(default_names) else f"Part {idx}")
-            summary = parts.get("STORY") or parts.get("SUMMARY") or parts.get("EVENT") or text
-            try:
-                weight = float(re.sub(r"[^0-9.]", "", parts.get("WEIGHT", "")) or 1.0)
-            except Exception:
-                weight = 1.0
-            out.append({"index": idx, "name": name.strip(), "summary": summary.strip(), "weight": max(0.2, min(5.0, weight))})
-        return out
-
-    @staticmethod
-    def _allocate_section_shots(sections: List[Dict[str, Any]], shot_count: int, total_duration_sec: float = 0.0) -> List[Dict[str, Any]]:
-        """Allocate exact shots (and approximate seconds) across story sections by weight."""
+    def _lock_section_budget(sections: List[Dict[str, Any]], total: int) -> List[Dict[str, Any]]:
         if not sections:
-            return []
-        n = len(sections)
-        shots = max(n, int(shot_count or n))
-        weights = [max(0.2, float(s.get("weight") or 1.0)) for s in sections]
-        total_w = sum(weights) or float(n)
-        # Start with one shot per section so no story part disappears.
-        counts = [1] * n
-        remain = shots - n
-        if remain > 0:
-            raw = [remain * w / total_w for w in weights]
-            floors = [int(math.floor(x)) for x in raw]
-            counts = [1 + f for f in floors]
-            leftover = shots - sum(counts)
-            order = sorted(range(n), key=lambda i: (raw[i] - floors[i], weights[i]), reverse=True)
-            for i in order[:leftover]:
-                counts[i] += 1
-        total_sec = float(total_duration_sec or 0.0)
-        if total_sec <= 0:
-            total_sec = float(shots) * 5.0
-        result: List[Dict[str, Any]] = []
-        for i, sec in enumerate(sections):
-            item = dict(sec)
-            item["shot_count"] = int(counts[i])
-            item["duration_sec"] = round(total_sec * (weights[i] / total_w), 2)
-            result.append(item)
-        # Seconds should sum exactly to requested total after rounding.
-        delta = round(total_sec - sum(float(x["duration_sec"]) for x in result), 2)
-        if result and abs(delta) >= 0.01:
-            result[-1]["duration_sec"] = round(float(result[-1]["duration_sec"]) + delta, 2)
-        return result
+            raise RuntimeError("Blueprint returned no story_sections.")
+        sections = [dict(s) for s in sections if isinstance(s, dict)]
+        counts = [max(1, int(s.get("clip_count") or 1)) for s in sections]
+        # If too many sections for clips, keep the architecture valid by refusing.
+        if len(counts) > total:
+            raise RuntimeError(f"Blueprint created {len(counts)} sections for only {total} clips.")
+        delta = total - sum(counts)
+        if delta > 0:
+            order = list(range(1, max(1, len(counts) - 1))) or [0]
+            pos = 0
+            while delta > 0:
+                counts[order[pos % len(order)]] += 1
+                delta -= 1
+                pos += 1
+        elif delta < 0:
+            need = -delta
+            # Trim resolution first, then largest development sections; never kill a section.
+            order = [len(counts)-1] + sorted(range(max(0, len(counts)-1)), key=lambda i: (-counts[i], i))
+            while need > 0:
+                changed = False
+                for i in order:
+                    if need <= 0:
+                        break
+                    if counts[i] > 1:
+                        counts[i] -= 1
+                        need -= 1
+                        changed = True
+                if not changed:
+                    break
+            if need:
+                raise RuntimeError("Could not reconcile blueprint section budget with requested shot count.")
+        for sec, count in zip(sections, counts):
+            sec["clip_count"] = count
+        return sections
 
     @staticmethod
-    def _prompt_similarity(a: str, b: str) -> float:
-        aa = re.sub(r"[^a-z0-9 ]+", " ", str(a or "").lower())
-        bb = re.sub(r"[^a-z0-9 ]+", " ", str(b or "").lower())
-        aa = " ".join(aa.split())
-        bb = " ".join(bb.split())
-        if not aa or not bb:
-            return 0.0
-        return difflib.SequenceMatcher(None, aa, bb).ratio()
-
-    @classmethod
-    def _has_near_duplicate_prompts(cls, prompts: List[str], threshold: float = 0.82) -> bool:
-        clean = [str(x or "").strip() for x in prompts if str(x or "").strip()]
-        for i in range(len(clean)):
-            for j in range(i):
-                if cls._prompt_similarity(clean[i], clean[j]) >= threshold:
-                    return True
-        return False
-
-    @staticmethod
-    def _parse_section_shots(lines: List[str], expected_count: int, section_index: int, section_name: str) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
-        for idx, raw in enumerate(list(lines or [])[:expected_count], start=1):
-            text = re.sub(r"\s+", " ", str(raw or "").strip())
-            parts: Dict[str, str] = {}
-            for chunk in text.split(" | "):
-                if "=" in chunk:
-                    k, v = chunk.split("=", 1)
-                    parts[k.strip().upper()] = v.strip()
-            visual = parts.get("VISUAL") or parts.get("PROMPT") or text
-            out.append({
-                "index": idx,
-                "beat_index": section_index,
-                "section": section_name,
-                "purpose": parts.get("PURPOSE") or "Advance this story section with a distinct visible event.",
-                "visual": visual.strip(),
-                "change": parts.get("CHANGE") or "The situation visibly advances toward the next shot.",
-            })
+    def _slot_targets(sections: List[Dict[str, Any]], total: int) -> List[Dict[str, Any]]:
+        out = []
+        slot = 1
+        for sec_i, sec in enumerate(sections, 1):
+            count = int(sec.get("clip_count") or 0)
+            for local_i in range(1, count + 1):
+                if slot > total:
+                    break
+                out.append({
+                    "slot": slot,
+                    "section_index": sec_i,
+                    "section": str(sec.get("title") or f"Section {sec_i}"),
+                    "role": str(sec.get("role") or "development"),
+                    "purpose": str(sec.get("purpose") or ""),
+                    "must_achieve": str(sec.get("must_achieve") or ""),
+                    "section_beat": f"{local_i}/{count}",
+                })
+                slot += 1
+        if len(out) != total:
+            raise RuntimeError(f"Blueprint produced {len(out)} slot targets; expected {total}.")
         return out
 
     @staticmethod
-    def _clean_section_visuals(items: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[int]]:
-        """Validate the actual VISUAL fields before a section is accepted.
+    def _duplicate_issue(beats: List[Dict[str, Any]]) -> Optional[str]:
+        sigs = [_sig(str(b.get("beat") or "")) for b in beats]
+        for i in range(len(sigs)):
+            for j in range(i + 1, len(sigs)):
+                if not sigs[i] or not sigs[j]:
+                    continue
+                inter = len(sigs[i] & sigs[j])
+                union = len(sigs[i] | sigs[j]) or 1
+                if inter >= 5 and inter / union >= 0.72:
+                    return f"story slots {i+1} and {j+1} are near-duplicate events"
+        return None
 
-        Structured PURPOSE|VISUAL|CHANGE lines can be syntactically valid while the extracted
-        VISUAL itself still contains protocol/meta text or a truncated sentence.  Catch that here
-        so the finished movie cannot silently shrink later during T2I cleanup.
+    @staticmethod
+    def _story_section_guidance(target_duration: float, shot_count: int) -> Tuple[int, int]:
+        """Return a duration-aware *guidance* range for blueprint section count.
+
+        This deliberately does not force one fixed act template.  Longer runtimes get
+        permission to create more narrative movements so a 10- or 30-minute story is
+        not stretched across the same five sections used by a short film.
         """
-        cleaned_items: List[Dict[str, Any]] = []
-        bad_indices: List[int] = []
-        for idx, item in enumerate(list(items or [])):
-            cloned = dict(item)
-            visual = _clean_generated_list_item(str(cloned.get("visual") or ""))
-            if not visual:
-                bad_indices.append(idx)
-                cloned["visual"] = ""
-            else:
-                cloned["visual"] = visual
-            cleaned_items.append(cloned)
-        return cleaned_items, bad_indices
+        duration = max(1.0, float(target_duration or 0.0))
+        shots = max(1, int(shot_count or 1))
+        if duration <= 60:
+            lo, hi = 3, 5
+        elif duration <= 120:
+            lo, hi = 4, 6
+        elif duration <= 300:
+            lo, hi = 5, 8
+        elif duration <= 600:
+            lo, hi = 6, 10
+        elif duration <= 1200:
+            lo, hi = 8, 14
+        else:
+            lo, hi = 10, 18
+        hi = min(hi, shots)
+        lo = min(lo, hi)
+        return max(1, lo), max(1, hi)
 
-    def _repair_missing_section_visuals(
-        self,
-        *,
-        system_prompt: str,
-        section_name: str,
-        section_summary: str,
-        duration_sec: float,
-        items: List[Dict[str, Any]],
-        bad_indices: List[int],
-        style_hint: str,
-        t2i_model_hint: str,
-        director_brief: str,
-    ) -> List[Dict[str, Any]]:
-        """Ask only for invalid/missing section shots; never clone/pad existing prompts."""
-        if not bad_indices:
-            return items
-        repaired = [dict(x) for x in items]
-        valid_context = []
-        for idx, item in enumerate(repaired, start=1):
-            visual = str(item.get("visual") or "").strip()
-            if visual:
-                valid_context.append(f"Shot {idx}: {visual}")
-        missing_numbers = [i + 1 for i in bad_indices]
-        prompt = f"""
-Repair only the missing/invalid final image prompts for this ONE story section.
-
-SECTION: {section_name}
-STORY EVENT: {section_summary}
-SCREEN-TIME BUDGET: about {float(duration_sec):.2f} seconds
-TOTAL SHOTS IN SECTION: {len(repaired)}
-MISSING SHOT NUMBERS: {', '.join(str(x) for x in missing_numbers)}
-
-ALREADY ACCEPTED SHOTS (do not repeat or paraphrase them):
-{chr(10).join(valid_context) if valid_context else 'none'}
-
-Global visual style: {style_hint.strip() or 'none'}
-Target text-to-image model: {t2i_model_hint or 'none'}
-Directing approach: {director_brief}
-
-Return exactly {len(missing_numbers)} numbered lines, one for each missing shot IN THE SAME ORDER as MISSING SHOT NUMBERS.
-Each returned line must be ONLY the finished rich TEXT-TO-IMAGE prompt for that missing shot.
-Do not include PURPOSE, CHANGE, labels, explanations, the full movie premise, or markdown.
-Make each replacement a distinct chronological moment that fits between the already accepted neighboring shots.
-Do not introduce recurring characters, animals, vehicles or props unless this section actually needs them.
-Keep the global visual medium/style locked.
-""".strip()
-        replacements = self._generate_numbered_list_with_retry(
-            system_prompt=system_prompt,
-            user_prompt=prompt,
-            expected_count=len(missing_numbers),
-            temperature=0.55,
-            max_tokens=max(900, len(missing_numbers) * 240),
-            item_kind=f"replacement prompts for {section_name}",
+    def _build_blueprint(self, idea: str, style: str, shot_count: int, target_duration: float, reference_guidance: str = "", audio_context: str = "") -> Dict[str, Any]:
+        section_min, section_max = self._story_section_guidance(target_duration, shot_count)
+        blueprint_max_tokens = int(min(12000, max(4500, 2800 + (section_max * 360) + (shot_count * 8))))
+        system = (
+            "You are the senior story director inside FrameVision. Design the COMPLETE narrative architecture BEFORE any individual shots are written. "
+            "The story must use the user's actual idea as authority, not replace it with a generic interpretation. The style brief controls presentation but must not erase plot requirements. "
+            "Plan setup, development, escalation, climax and resolution across the full runtime. Do not finish early and fill remaining clips with repeated reactions, alternate camera angles, scenery, poses, or establishing shots. "
+            "A clip slot exists because something narratively changes. Camera coverage alone is never a reason for another slot. "
+            "Every explicitly named action, obstacle, set piece, location change, reveal, and ending condition in the user's idea is a story obligation unless it is physically impossible. Do not silently replace them with easier generic events. "
+            "Reference guidance constrains identity/appearance only and must not rewrite the plot. Audio/lyrics context may influence pacing but must not replace the user's story. "
+            "Return JSON only with title, story_summary, recurring_subjects, required_story_elements, and story_sections. recurring_subjects contains only characters/creatures/important recurring objects that require identity continuity. "
+            "required_story_elements is a concise list of the user's explicit plot/set-piece obligations that the later beats must cover. Each story section must contain title, role, purpose, must_achieve and clip_count."
         )
-        replacements = [_clean_generated_list_item(x) for x in replacements]
-        if len(replacements) != len(missing_numbers) or any(not x for x in replacements):
-            raise RuntimeError(f"Could not repair all missing prompts in section '{section_name}'.")
-        for bad_idx, visual in zip(bad_indices, replacements):
-            repaired[bad_idx]["visual"] = visual
-        return repaired
+        user = f"""USER IDEA (AUTHORITATIVE — preserve every explicit plot requirement):
+{idea}
 
-    def generate_project(
-        self,
-        *,
-        title: str,
-        idea: str,
-        shot_count: int,
-        include_story_outline: bool,
-        generate_t2i: bool,
-        generate_i2v: bool,
-        style_hint: str,
-        negative_hint: str,
-        use_character_bible: bool,
-        use_object_bible: bool,
-        t2i_model_hint: str,
-        i2v_model_hint: str,
-        predefined_character_bibles: Optional[List[str]] = None,
-        target_duration_sec: float = 0.0,
-    ) -> StoryProject:
-        if shot_count < 1:
-            raise ValueError("Shot count must be at least 1.")
-        if not idea.strip():
-            raise ValueError("Idea is empty.")
-        if not (generate_t2i or generate_i2v):
-            raise ValueError("Enable at least text-to-image or image-to-video.")
+STYLE / PRESENTATION BRIEF (AUTHORITATIVE — do not invent a conflicting style):
+{style or '[none]'}
 
-        story_outline: List[str] = []  # V2 compatibility: exact shot-level visual events
-        story_bible: List[str] = []
-        narrative_beats: List[str] = []
-        shot_plan: List[Dict[str, Any]] = []
-        character_bibles: List[str] = self._clean_character_bible_entries(list(predefined_character_bibles or []))
-        # Only user-authored material may authorize distinctive facial/body marks.
-        # Generated story sections/prompts are deliberately excluded from this provenance source.
-        _user_mark_source = "\n".join([str(idea or "")] + [str(x or "") for x in (predefined_character_bibles or [])])
-        character_bibles = self._filter_character_bibles_by_user_marks(character_bibles, _user_mark_source)
-        object_bibles: List[str] = []
-        t2i_prompts: List[str] = []
-        i2v_prompts: List[str] = []
+REFERENCE GUIDANCE (identity/appearance constraints only):
+{reference_guidance or '[none]'}
+
+AUDIO / LYRIC CONTEXT (pacing context only):
+{audio_context or '[none]'}
+
+TARGET: exactly {shot_count} video clips across about {target_duration:.1f} seconds.
+The sum of story_sections.clip_count MUST equal {shot_count}. The definitive resolution must occur in the final section near the end.
+For this runtime, aim for about {section_min}-{section_max} meaningful story sections when the idea supports them. This is creative guidance, not a quota: use fewer if extra sections would be filler, or more only when genuinely useful. Longer runtimes should exploit the premise with additional developments, discoveries, obstacles, reversals, location changes, decisions or mini-payoffs instead of stretching a few events across many clips.
+Before allocating sections, identify the explicit story obligations from USER IDEA and put them in required_story_elements. The beat writer will be required to cover them.
+
+Return exactly this JSON shape:
+{{
+  "title": "...",
+  "story_summary": "complete beginning-to-ending summary that preserves the user's plot",
+  "recurring_subjects": [{{"id":"char_1","name":"...","type":"character|creature|object","continuity_role":"..."}}],
+  "required_story_elements": ["explicit obligation 1", "explicit obligation 2"],
+  "story_sections": [{{"title":"...","role":"setup|development|escalation|climax|resolution","purpose":"...","must_achieve":"...","clip_count":1}}]
+}}"""
+        obj = self._json_call(system, user, "blueprint", max_tokens=blueprint_max_tokens)
+        if not isinstance(obj, dict):
+            raise RuntimeError("Blueprint response was not an object.")
+        raw_sections = obj.get("story_sections")
+        if not isinstance(raw_sections, list):
+            raise RuntimeError("Blueprint is missing story_sections.")
+        sections = []
+        for sec in raw_sections:
+            if not isinstance(sec, dict):
+                continue
+            title = _clean_line(sec.get("title"))
+            purpose = _clean_line(sec.get("purpose"))
+            must = _clean_line(sec.get("must_achieve") or purpose)
+            role = _clean_line(sec.get("role") or "development").lower()
+            try:
+                count = int(sec.get("clip_count") or 0)
+            except Exception:
+                count = 0
+            if title and purpose and count > 0:
+                sections.append({"title": title, "role": role, "purpose": purpose, "must_achieve": must, "clip_count": count})
+        sections = self._lock_section_budget(sections, shot_count)
+        severe_min = 5 if shot_count >= 10 else 1
+        if target_duration >= 600:
+            severe_min = max(severe_min, max(5, section_min - 2))
+        severe_min = min(severe_min, shot_count)
+        if len(sections) < severe_min:
+            raise RuntimeError(
+                f"Blueprint is too compressed for {target_duration:.0f}s: returned {len(sections)} sections; "
+                f"need at least {severe_min} meaningful sections before shot expansion."
+            )
+        res_start = sum(int(s["clip_count"]) for s in sections[:-1]) + 1
+        if shot_count >= 10 and res_start < int(math.floor(shot_count * 0.80)) + 1:
+            raise RuntimeError(f"Blueprint resolves too early at slot {res_start} of {shot_count}.")
+        subjects = [dict(x) for x in (obj.get("recurring_subjects") or []) if isinstance(x, dict)]
+        required = [_clean_line(x) for x in (obj.get("required_story_elements") or []) if _clean_line(x)]
+        if not required:
+            required = [idea]
+        return {"title": _clean_line(obj.get("title") or "Planner Story"), "story_summary": _clean_line(obj.get("story_summary") or idea), "recurring_subjects": subjects, "required_story_elements": required, "story_sections": sections}
+
+    def _build_beats(self, idea: str, style: str, blueprint: Dict[str, Any], shot_count: int, quality_feedback: str = "") -> List[Dict[str, Any]]:
+        """Create the locked shot list.
+
+        The built-in 2B model occasionally returns fewer list items than requested even
+        when the JSON itself is valid.  A wrong item count is therefore treated as a
+        recoverable generation error, not as a fatal workflow error.  We retry the
+        batch once, then fall back to one slot at a time while preserving the exact
+        locked blueprint.
+        """
+        targets = self._slot_targets(blueprint["story_sections"], shot_count)
+        all_beats: List[Dict[str, Any]] = []
+
+        def _one_beat(target: Dict[str, Any], previous_beats: List[Dict[str, Any]]) -> Dict[str, Any]:
+            system = (
+                "You are the story-beat writer inside FrameVision. The story architecture and this slot are LOCKED. "
+                "Write one concrete NEW chronological event for this slot only. Do not redesign the story or repeat an earlier event. "
+                "The event must create a visible or narrative state change. Return JSON only as "
+                "{\"beat\":\"...\",\"reference_ids\":[\"...\"]}."
+            )
+            user = (
+                f"USER IDEA:\n{idea}\n\nSTYLE:\n{style or '[none]'}\n\nLOCKED STORY SUMMARY:\n{blueprint['story_summary']}\n\n"
+                f"MANDATORY STORY ELEMENTS:\n{json.dumps(blueprint.get('required_story_elements') or [idea], ensure_ascii=False, indent=2)}\n\n"
+                f"LOCKED SLOT:\n{json.dumps(target, ensure_ascii=False, indent=2)}\n\n"
+                + (f"PREVIOUS BEATS — continue after these and do not repeat them:\n{json.dumps(previous_beats, ensure_ascii=False, indent=2)}\n\n" if previous_beats else "")
+                + "Return one beat object only."
+            )
+            obj = self._json_call(system, user, f"shot {target['slot']}", max_tokens=1800)
+            if isinstance(obj, dict) and isinstance(obj.get("beat"), str):
+                item = obj
+            elif isinstance(obj, dict) and isinstance(obj.get("beats"), list) and len(obj["beats"]) == 1 and isinstance(obj["beats"][0], dict):
+                item = obj["beats"][0]
+            else:
+                raise RuntimeError(f"Shot {target['slot']} did not return one beat object.")
+            beat = _clean_line(item.get("beat"))
+            if not beat:
+                raise RuntimeError(f"Shot {target['slot']} returned an empty beat.")
+            return {
+                "slot": int(target["slot"]), "section": target["section"], "role": target["role"],
+                "purpose": target["purpose"], "must_achieve": target["must_achieve"], "beat": beat,
+                "reference_ids": [str(x) for x in (item.get("reference_ids") or []) if str(x).strip()],
+            }
+
+        for start in range(1, shot_count + 1, 5):
+            end = min(shot_count, start + 4)
+            chunk_targets = targets[start-1:end]
+            next_targets = targets[end:min(shot_count, end+3)]
+            system = (
+                "You are the story-beat writer inside FrameVision. The complete story architecture is already locked. "
+                "Write exactly one concrete NEW chronological event for each supplied slot target. Do not redesign the story, rush ahead, repeat an earlier event, or create another clip merely to show the same event from a new angle. "
+                "Every beat must cause a visible or narrative state change: an action begins or completes, new information changes behavior, an obstacle alters the plan, a location transition advances the objective, or a consequence forces the next event. "
+                "If several slots belong to one section they must develop that phase through distinct cause-and-effect events. Return JSON only: {\"beats\":[{\"beat\":\"...\",\"reference_ids\":[\"...\"]}]} ."
+            )
+            base_user = (
+                f"USER IDEA:\n{idea}\n\nSTYLE:\n{style or '[none]'}\n\nLOCKED STORY SUMMARY:\n{blueprint['story_summary']}\n\n"
+                f"LOCKED RECURRING SUBJECTS:\n{json.dumps(blueprint['recurring_subjects'], ensure_ascii=False, indent=2)}\n\n"
+                f"MANDATORY STORY ELEMENTS FROM USER IDEA — the complete beat list must cover these:\n{json.dumps(blueprint.get('required_story_elements') or [idea], ensure_ascii=False, indent=2)}\n\n"
+                f"LOCKED FULL BLUEPRINT:\n{json.dumps(blueprint['story_sections'], ensure_ascii=False, indent=2)}\n\n"
+                f"EXACT TARGETS FOR SLOTS {start}-{end}:\n{json.dumps(chunk_targets, ensure_ascii=False, indent=2)}\n\n"
+                + (f"NEXT TARGETS FOR CONTEXT ONLY:\n{json.dumps(next_targets, ensure_ascii=False, indent=2)}\n\n" if next_targets else "")
+                + (f"ALL PREVIOUS BEATS — continue after these and do not retell them:\n{json.dumps(all_beats, ensure_ascii=False, indent=2)}\n\n" if all_beats else "")
+                + (f"QUALITY-GATE CORRECTION FROM PREVIOUS PASS:\n{quality_feedback}\n\n" if quality_feedback else "")
+            )
+
+            raw = None
+            for semantic_attempt in range(1, 3):
+                correction = "" if semantic_attempt == 1 else (
+                    f"\n\nCORRECTION: Your previous valid JSON had the wrong number of items. "
+                    f"Return EXACTLY {len(chunk_targets)} beat objects, one for every supplied slot, in the same order. Do not omit or merge slots."
+                )
+                try:
+                    obj = self._json_call(system, base_user + correction + f"\n\nReturn exactly {len(chunk_targets)} beat objects in chronological order.", f"shots {start}-{end}", max_tokens=4200)
+                except Exception:
+                    self._log(f"[story] Shot list batch {start}-{end} could not produce valid JSON; switching this batch to individual shots.")
+                    break
+                candidate = obj.get("beats") if isinstance(obj, dict) else None
+                if isinstance(candidate, list) and len(candidate) == len(chunk_targets) and all(isinstance(x, dict) for x in candidate):
+                    raw = candidate
+                    break
+                got = len(candidate) if isinstance(candidate, list) else 0
+                self._log(f"[story] Shot list batch {start}-{end} returned {got}/{len(chunk_targets)} items; retrying.")
+
+            if raw is None:
+                self._log(f"[story] Shot list batch {start}-{end} is incomplete; generating those slots individually.")
+                for target in chunk_targets:
+                    all_beats.append(_one_beat(target, all_beats))
+                continue
+
+            for idx, item in enumerate(raw):
+                beat = _clean_line(item.get("beat"))
+                if not beat:
+                    target = chunk_targets[idx]
+                    self._log(f"[story] Shot {target['slot']} beat was empty; regenerating that slot.")
+                    all_beats.append(_one_beat(target, all_beats))
+                    continue
+                target = chunk_targets[idx]
+                all_beats.append({
+                    "slot": int(target["slot"]), "section": target["section"], "role": target["role"],
+                    "purpose": target["purpose"], "must_achieve": target["must_achieve"], "beat": beat,
+                    "reference_ids": [str(x) for x in (item.get("reference_ids") or []) if str(x).strip()],
+                })
+        issue = self._duplicate_issue(all_beats)
+        if issue:
+            raise RuntimeError("Story quality check rejected plan: " + issue)
+        return all_beats
+
+    def _build_bibles(self, idea: str, style: str, blueprint: Dict[str, Any], beats: List[Dict[str, Any]], use_character_bible: bool, use_object_bible: bool, predefined: Optional[List[str]], predefined_entries: Optional[List[Dict[str, Any]]] = None) -> Tuple[List[str], List[str], Dict[str, Any]]:
+        """Build one continuity bible and bind it to the already-locked story.
+
+        The blueprint owns recurring-subject IDs. The LLM may describe those subjects,
+        but it is not allowed to invent a second ID namespace or a second shot-cast plan.
+        Shot bindings come from the locked beat reference_ids plus explicit subject-name
+        mentions in each beat. This makes the bible a consumer of the story rather than
+        a competing planner.
+        """
+        predefined = [_clean_line(x) for x in (predefined or []) if _clean_line(x)]
+        predefined_entries = [x for x in (predefined_entries or []) if isinstance(x, dict)]
+        recurring = [x for x in (blueprint.get("recurring_subjects") or []) if isinstance(x, dict)]
+
+        def _aliases(name: str) -> List[str]:
+            full = _clean_line(name)
+            out: List[str] = [full] if full else []
+            words = [w for w in re.findall(r"[A-Za-z0-9]+", full) if len(w) >= 4]
+            # A final role noun such as "guard" in "Night Guard" is useful because
+            # story beats often shorten the recurring subject name after introduction.
+            if len(words) >= 2:
+                out.append(words[-1])
+            return list(dict.fromkeys([x for x in out if x]))
+
+        def _predefined_character_items() -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            if predefined_entries:
+                for idx, rec in enumerate(predefined_entries, 1):
+                    prompt = _clean_line(rec.get("prompt") or "")
+                    if not prompt:
+                        continue
+                    codeword = _clean_line(rec.get("codeword") or "")
+                    out.append({
+                        "id": f"U{idx}",
+                        "display_name": codeword or f"Character {idx}",
+                        "role_tags": ([codeword] if codeword else []),
+                        "identity_anchor": prompt,
+                        "wardrobe_anchor": "",
+                        "source": "user",
+                    })
+                return out
+            for idx, line in enumerate(predefined or [], 1):
+                name = _clean_line(str(line).split(":", 1)[0]) or f"Character {idx}"
+                out.append({
+                    "id": f"U{idx}",
+                    "display_name": name,
+                    "role_tags": [name],
+                    "identity_anchor": _clean_line(line),
+                    "wardrobe_anchor": "",
+                    "source": "user",
+                })
+            return out
+
+        manual_characters = _predefined_character_items()
+        bundle: Dict[str, Any] = {
+            "characters": list(manual_characters),
+            "objects": [],
+            "shot_bindings": {},
+            "source_subjects": recurring,
+            "mode": "manual_override" if manual_characters and not use_character_bible else "automatic",
+        }
+
+        # Own Character Bible is the escape hatch/override. When normal Character Bible
+        # is OFF, do not generate a second automatic character identity set.
+        want_auto_characters = bool(use_character_bible)
+        want_auto_objects = bool(use_object_bible)
+
+        if want_auto_characters or want_auto_objects:
+            system = (
+                "You are the continuity editor inside FrameVision. The story and recurring-subject IDs are already LOCKED. "
+                "Your only job is to define a stable reusable VISUAL identity for each supplied recurring subject. "
+                "Do not invent plot events, do not invent new recurring subjects, do not rename IDs, and do not decide which shots contain which subjects. "
+                "Return JSON only with keys characters and objects. Every returned item must use the exact id supplied in RECURRING SUBJECTS and include display_name, role_tags, identity_anchor, and optional wardrobe_anchor. "
+                "Describe the visible identity appropriate to the subject itself. A person should receive stable physical and clothing details; an animal, creature, alien, vehicle, machine, prop, or other subject should receive the appropriate stable visual traits for that subject rather than human anatomy. "
+                "Make identity_anchor specific enough that an image model can reproduce the same subject across many independent images. "
+                "User-provided character bibles are authoritative and must not be replaced."
+            )
+            base_user = f"""USER IDEA:\n{idea}\n\nSTYLE:\n{style or '[none]'}\n\nLOCKED STORY SUMMARY:\n{blueprint['story_summary']}\n\nRECURRING SUBJECTS - IDs ARE IMMUTABLE:\n{json.dumps(recurring, ensure_ascii=False, indent=2)}\n\nUSER-PROVIDED CHARACTER BIBLES (authoritative):\n{json.dumps(predefined, ensure_ascii=False, indent=2)}\n\nReturn JSON only."""
+
+            parsed: Dict[str, Any] = {}
+            missing_ids: List[str] = []
+            expected_ids = {str(x.get("id") or "").strip() for x in recurring if str(x.get("id") or "").strip()}
+            for semantic_attempt in range(1, 3):
+                correction = ""
+                if missing_ids:
+                    correction = "\n\nCORRECTION: You omitted these locked recurring subject IDs: " + ", ".join(missing_ids) + ". Return them using exactly those IDs."
+                # This is the one story stage whose JSON output grows with the total
+                # clip count because it contains recurring identities plus shot bindings.
+                # Keep short jobs at the old budget, but scale long stories instead of
+                # truncating a 10-minute continuity bible at 4200 tokens.
+                _bible_subjects = len((blueprint or {}).get("recurring_subjects") or [])
+                _bible_max_tokens = int(min(16000, max(4200, 2200 + (len(beats) * 110) + (_bible_subjects * 180))))
+                obj = self._json_call(system, base_user + correction, "continuity bibles", max_tokens=_bible_max_tokens)
+                parsed = obj if isinstance(obj, dict) else {}
+                returned_ids = set()
+                for key in ("characters", "objects"):
+                    for raw in (parsed.get(key) or []) if isinstance(parsed.get(key), list) else []:
+                        if isinstance(raw, dict):
+                            rid = str(raw.get("id") or "").strip()
+                            if rid:
+                                returned_ids.add(rid)
+                # Only require locked subjects that the selected bible types intend to keep.
+                # If both are on (normal Planner mode), every recurring subject must survive.
+                if want_auto_characters and want_auto_objects:
+                    missing_ids = sorted(expected_ids - returned_ids)
+                else:
+                    missing_ids = []
+                if not missing_ids:
+                    break
+                self._log(f"[story] Continuity bible omitted {len(missing_ids)} recurring subject(s); retrying.")
+
+            recurring_by_id = {str(x.get("id") or "").strip(): x for x in recurring if str(x.get("id") or "").strip()}
+            recurring_by_name = {_name_key(x.get("name") or ""): x for x in recurring if _name_key(x.get("name") or "")}
+
+            def _normalize(raw_items: Any, source_kind: str) -> List[Dict[str, Any]]:
+                out: List[Dict[str, Any]] = []
+                seen: set[str] = set()
+                for raw in raw_items if isinstance(raw_items, list) else []:
+                    if not isinstance(raw, dict):
+                        continue
+                    rid = str(raw.get("id") or "").strip()
+                    name = _clean_line(raw.get("display_name") or raw.get("name") or "")
+                    src = recurring_by_id.get(rid)
+                    if src is None and name:
+                        src = recurring_by_name.get(_name_key(name))
+                    if src is None:
+                        # Ignore invented subjects. This is a continuity bible, not a cast creator.
+                        continue
+                    rid = str(src.get("id") or "").strip()
+                    if not rid or rid in seen:
+                        continue
+                    seen.add(rid)
+                    display_name = _clean_line(src.get("name") or name or rid)
+                    role_tags = [_clean_line(x) for x in (raw.get("role_tags") or []) if _clean_line(x)]
+                    for a in _aliases(display_name):
+                        if a not in role_tags:
+                            role_tags.append(a)
+                    identity = _clean_line(raw.get("identity_anchor") or raw.get("visual_identity") or raw.get("description") or "")
+                    wardrobe = _clean_line(raw.get("wardrobe_anchor") or raw.get("wardrobe") or "")
+                    if not identity:
+                        identity = _clean_line(src.get("continuity_role") or display_name)
+                    out.append({
+                        "id": rid,
+                        "display_name": display_name,
+                        "role_tags": role_tags,
+                        "identity_anchor": identity,
+                        "wardrobe_anchor": wardrobe,
+                        "source": "llm",
+                        "source_type": _clean_line(src.get("type") or source_kind),
+                    })
+                return out
+
+            auto_chars = _normalize(parsed.get("characters"), "character") if want_auto_characters else []
+            auto_objs = _normalize(parsed.get("objects"), "object") if want_auto_objects else []
+
+            # If a model put a recurring subject in the opposite array, preserve the
+            # identity instead of losing it. IDs/names still come from the locked blueprint.
+            normalized_all = {str(x.get("id")): x for x in auto_chars + auto_objs}
+            for src in recurring:
+                sid = str(src.get("id") or "").strip()
+                if not sid or sid in normalized_all:
+                    continue
+                # Search the opposite/raw arrays by ID or name.
+                found = None
+                for key in ("characters", "objects"):
+                    for raw in (parsed.get(key) or []) if isinstance(parsed.get(key), list) else []:
+                        if not isinstance(raw, dict):
+                            continue
+                        if str(raw.get("id") or "").strip() == sid or _name_key(raw.get("display_name") or raw.get("name") or "") == _name_key(src.get("name") or ""):
+                            found = raw
+                            break
+                    if found:
+                        break
+                if found:
+                    item = _normalize([found], "subject")
+                    if item:
+                        normalized_all[sid] = item[0]
+
+            if want_auto_characters:
+                # Character/creature-like entries returned in characters stay characters.
+                bundle["characters"] = list(manual_characters) + [x for x in normalized_all.values() if str(x.get("id")) in {str(c.get("id")) for c in auto_chars}]
+            if want_auto_objects:
+                bundle["objects"] = [x for x in normalized_all.values() if str(x.get("id")) in {str(o.get("id")) for o in auto_objs}]
+
+            # Ensure no locked recurring subject disappears just because the LLM put it
+            # into an unexpected array. Use the blueprint type only to choose storage;
+            # visual identity itself remains entirely LLM-authored.
+            have = {str(x.get("id")) for x in bundle["characters"] + bundle["objects"]}
+            for sid, item in normalized_all.items():
+                if sid in have:
+                    continue
+                src_type = _name_key(item.get("source_type") or "")
+                if src_type in {"object", "prop", "item", "vehicle", "machine", "device"}:
+                    if want_auto_objects:
+                        bundle["objects"].append(item)
+                elif want_auto_characters:
+                    bundle["characters"].append(item)
+
+        char_map = {str(c.get("id")): c for c in bundle["characters"] if isinstance(c, dict)}
+        obj_map = {str(o.get("id")): o for o in bundle["objects"] if isinstance(o, dict)}
+        source_to_kind: Dict[str, str] = {}
+        for cid in char_map:
+            source_to_kind[cid] = "character"
+        for oid in obj_map:
+            source_to_kind[oid] = "object"
+
+        # Build shot bindings from the LOCKED story, not from a second LLM cast guess.
+        for beat in beats or []:
+            slot = int(beat.get("slot") or 0)
+            beat_text = _clean_line(beat.get("beat") or "")
+            refs = [str(x).strip() for x in (beat.get("reference_ids") or []) if str(x).strip()]
+            cids: List[str] = []
+            oids: List[str] = []
+
+            def _add_subject(sid: str) -> None:
+                if sid in char_map and sid not in cids:
+                    cids.append(sid)
+                if sid in obj_map and sid not in oids:
+                    oids.append(sid)
+
+            for sid in refs:
+                _add_subject(sid)
+
+            # Beat writers occasionally omit a reference_id even while explicitly
+            # naming the subject in the beat (the museum guard case). Reconcile that
+            # omission deterministically from the locked recurring-subject names.
+            for sid, item in char_map.items():
+                aliases = [item.get("display_name"), item.get("id")] + list(item.get("role_tags") or [])
+                if _subject_present(beat_text, [str(x) for x in aliases if x], []):
+                    _add_subject(sid)
+            for sid, item in obj_map.items():
+                aliases = [item.get("display_name"), item.get("id")] + list(item.get("role_tags") or [])
+                if _subject_present(beat_text, [str(x) for x in aliases if x], []):
+                    _add_subject(sid)
+
+            # Manual override: bind only by the user's codeword/name. Do not run an
+            # automatic character detector behind the user's back.
+            if manual_characters and not use_character_bible:
+                for item in manual_characters:
+                    aliases = [item.get("display_name")] + list(item.get("role_tags") or [])
+                    if _subject_present(beat_text, [str(x) for x in aliases if x], []):
+                        uid = str(item.get("id") or "")
+                        if uid and uid not in cids:
+                            cids.append(uid)
+
+            bundle["shot_bindings"][f"S{slot:02d}"] = {"character_ids": cids, "object_ids": oids}
+
+        char_lines = _ensure_unique_identity_lines([_compose_identity_line(c, "character") for c in bundle["characters"]])
+        object_lines = _ensure_unique_identity_lines([_compose_identity_line(o, "object") for o in bundle["objects"]])
+        return char_lines, object_lines, bundle
+
+    def _build_shot_prompts(self, idea: str, style: str, blueprint: Dict[str, Any], beats: List[Dict[str, Any]], character_bibles: List[str], object_bibles: List[str], t2i_model_hint: str, i2v_model_hint: str, continuity_bundle: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Translate locked beats into image/video prompts without ever dropping a slot.
+
+        Batch generation is kept for speed, but exact item count is a hard workflow
+        invariant.  If a small model returns an incomplete batch, retry once and then
+        generate only the affected shots individually.
+        """
+        out: List[Dict[str, Any]] = []
+        total = len(beats)
+        continuity_bundle = continuity_bundle if isinstance(continuity_bundle, dict) else {}
+        character_map = {str(c.get("id")): c for c in (continuity_bundle.get("characters") or []) if isinstance(c, dict)}
+        object_map = {str(o.get("id")): o for o in (continuity_bundle.get("objects") or []) if isinstance(o, dict)}
+        shot_bindings = continuity_bundle.get("shot_bindings") if isinstance(continuity_bundle.get("shot_bindings"), dict) else {}
 
         system = (
-            "You are an offline cinematic story planner and prompt engine. "
-            "Think like a director blocking real visible events, not a prose writer decorating an idea. "
-            "Follow the requested format exactly. "
-            "Do not output chain-of-thought, thinking, explanations, JSON, markdown fences, or commentary. "
-            "Return only the requested numbered lines. "
-            "Keep the writing concrete, visual, direct, physically readable, and useful to image/video models. "
-            "Prefer visible cause -> effect -> reaction and meaningful progression over adjectives, mood repetition, or generic cinematic filler."
+            "You are the shot director inside FrameVision. Story events are LOCKED; your job is to translate each event into an image start frame and a video-motion prompt without changing or duplicating the event. "
+            "The start_frame_prompt describes the exact visible state at the BEGINNING of the clip, before the key action is already finished. It must look like an action-ready film frame, not a portrait, fashion photo, posed group shot, poster, or completed-result tableau. "
+            "The video_prompt describes what visibly changes DURING the clip and must execute the locked beat through cause and effect. Do not substitute generic camera drift, blinking, breathing, hair movement, or another angle for story action. "
+            "Identity continuity from the supplied shot cast and continuity bibles is mandatory whenever those recurring subjects are present. Use the supplied canonical identities directly instead of re-inventing the appearance. The user's style remains authoritative. "
+            "Return JSON only. Every requested locked event must get exactly one result."
         )
-        director_brief = self._director_brief(idea)
-        self._log(f"Director mode: {director_brief}")
 
-        style_hint = self._clean_style_hint(style_hint)
-        negative_hint = re.sub(r"\s+", " ", str(negative_hint or "").strip())
-        t2i_model_hint = re.sub(r"\s+", " ", str(t2i_model_hint or "").strip())
-        i2v_model_hint = re.sub(r"\s+", " ", str(i2v_model_hint or "").strip())
+        def _shot_subjects(shot_no: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+            rec = shot_bindings.get(f"S{shot_no:02d}") if isinstance(shot_bindings.get(f"S{shot_no:02d}"), dict) else {}
+            chars = [character_map[cid] for cid in (rec.get("character_ids") or []) if cid in character_map]
+            objs = [object_map[oid] for oid in (rec.get("object_ids") or []) if oid in object_map]
+            return chars, objs
 
-        self._log(f"Project: {title.strip() or 'Untitled project'}")
-        self._log(f"Idea: {idea.strip()}")
-        self._log(f"Shot count: {shot_count}")
-        self._log(f"Active style: {style_hint or 'none'}")
-        self._log(f"Negative notes: {negative_hint or 'none'}")
-        self._log(f"Text-to-image model: {t2i_model_hint or 'none'}")
-        self._log(f"Image-to-video model: {i2v_model_hint or 'none'}")
-        self._log(f"Character bible: {'on' if use_character_bible else 'off'}")
+        def _shot_cast_block(shot_no: int) -> str:
+            chars, objs = _shot_subjects(shot_no)
+            data = {
+                "present_characters": chars,
+                "present_objects": objs,
+                "continuity_requirements": _identity_prefix_for_shot(chars, objs),
+            }
+            return json.dumps(data, ensure_ascii=False, indent=2)
 
-        # V3 pipeline:
-        # 1) The user's idea is used ONLY to author the short major story sections.
-        # 2) Runtime/shot budget is distributed over those sections.
-        # 3) Each section is expanded by its own LLM call into its final connected visual prompts.
-        # There is intentionally no global "write all N shots" call and no later creative T2I rewrite.
-        story_sections: List[Dict[str, Any]] = []
-        if include_story_outline:
-            section_count = self._v3_section_count(shot_count)
-            self._log(f"V3: creating {section_count} major story sections from the user's idea...")
-            section_prompt = f"""
-Turn the user's idea into exactly {section_count} major STORY PARTS. This is the complete high-level movie structure, not individual shots.
+        def _normalize(item: Dict[str, Any], beat: Dict[str, Any], shot_no: int) -> Dict[str, Any]:
+            sf = _clean_line(item.get("start_frame_prompt"))
+            vp = _clean_line(item.get("video_prompt"))
+            if not sf or not vp:
+                raise RuntimeError(f"Shot {shot_no} is missing start_frame_prompt or video_prompt.")
+            chars, objs = _shot_subjects(shot_no)
+            sf = _inject_bound_identities(sf, chars, objs)
+            vp = _clean_line(vp)
+            return {
+                "section": beat["section"], "purpose": _clean_line(item.get("purpose") or beat["purpose"]),
+                "change": _clean_line(item.get("continuity_change") or beat["beat"]),
+                "visual": sf, "i2v": vp, "beat": beat["beat"], "reference_ids": beat.get("reference_ids") or [],
+                "present_character_ids": [str(c.get("id")) for c in chars],
+                "present_object_ids": [str(o.get("id")) for o in objs],
+            }
+        def _one_shot(beat: Dict[str, Any], shot_no: int, previous: List[Dict[str, Any]]) -> Dict[str, Any]:
+            prev_block = f"""PREVIOUS LOCKED EVENTS FOR CONTINUITY ONLY:
+{json.dumps(previous, ensure_ascii=False, indent=2)}
 
-USER IDEA:
-{idea.strip()}
+""" if previous else ""
+            event_block = f"""LOCKED EVENT FOR SHOT {shot_no}:
+{json.dumps(beat, ensure_ascii=False, indent=2)}
 
-Global visual style: {style_hint.strip() or 'none'}
-Negative notes to avoid: {negative_hint.strip() or 'none'}
-Directing approach: {director_brief}
+"""
+            user = (
+                f"""USER IDEA:
+{idea}
 
-Every line must use exactly:
-PART=<short part name> | STORY=<one short concrete description of what happens in this part> | WEIGHT=<0.5 to 3.0>
+STYLE:
+{style or '[none]'}
 
-Rules:
-- This is the ONLY stage that receives the user's original idea. Expand it into a coherent beginning-to-ending story.
-- Return exactly {section_count} parts in chronological order.
-- Treat the parts like the structural sections of a song: opening/setup, build, turns/escalations, climax, ending as appropriate. Do not force those exact labels if the story needs different ones.
-- Each STORY field must be short: one or two sentences describing the main event/change of that part, not finished image prompts.
-- Each part must lead causally into the next.
-- Give more WEIGHT to sections that deserve more screen time, such as an action chase, confrontation, discovery, or climax; give less to short transitions/openings/endings.
-- Keep the cast, important objects, geography, and chronology coherent.
-- Do not repeat the same situation in several parts with slightly different wording.
-- Do not invent decorative subplots just to fill the list.
-- Do not write camera directions or image-generation wording.
-- Return only the numbered structured lines.
-""".strip()
-            raw_sections = self._generate_numbered_list_with_retry(
-                system_prompt=system,
-                user_prompt=section_prompt,
-                expected_count=section_count,
-                temperature=0.62,
-                max_tokens=max(900, section_count * 150),
-                item_kind="major story sections",
+LOCKED STORY SUMMARY:
+{blueprint['story_summary']}
+
+CHARACTER BIBLES:
+{json.dumps(character_bibles, ensure_ascii=False, indent=2)}
+
+OBJECT BIBLES:
+{json.dumps(object_bibles, ensure_ascii=False, indent=2)}
+
+STRUCTURED CONTINUITY BIBLE:
+{json.dumps(continuity_bundle, ensure_ascii=False, indent=2)}
+
+THIS SHOT CAST REQUIREMENT:
+{_shot_cast_block(shot_no)}
+
+TARGET IMAGE MODEL: {t2i_model_hint or '[unspecified]'}
+TARGET VIDEO MODEL: {i2v_model_hint or '[unspecified]'}
+
+"""
+                + prev_block
+                + event_block
+                + 'Return exactly this JSON object: {"shot":{"purpose":"...","continuity_change":"...","start_frame_prompt":"...","video_prompt":"..."}}'
             )
-            story_sections = self._parse_story_sections(raw_sections, section_count)
-            if len(story_sections) != section_count:
-                raise RuntimeError(f"V3 story structure returned {len(story_sections)} sections; expected {section_count}.")
+            obj = self._json_call(system, user, f"shot prompts {shot_no}", max_tokens=3200)
+            item = None
+            if isinstance(obj, dict) and isinstance(obj.get("shot"), dict):
+                item = obj["shot"]
+            elif isinstance(obj, dict) and isinstance(obj.get("shots"), list) and len(obj["shots"]) == 1 and isinstance(obj["shots"][0], dict):
+                item = obj["shots"][0]
+            elif isinstance(obj, dict) and (obj.get("start_frame_prompt") or obj.get("video_prompt")):
+                item = obj
+            if not isinstance(item, dict):
+                raise RuntimeError(f"Shot {shot_no} did not return one shot object.")
+            return _normalize(item, beat, shot_no)
+        for start in range(0, total, 5):
+            chunk = beats[start:start+5]
+            previous = beats[max(0, start-2):start]
+            cast_requirements = [{
+                "shot": start + i + 1,
+                "binding": json.loads(_shot_cast_block(start + i + 1)),
+            } for i, _ in enumerate(chunk)]
+            prev_block = f"""PREVIOUS LOCKED EVENTS FOR CONTINUITY ONLY:
+{json.dumps(previous, ensure_ascii=False, indent=2)}
 
-            story_sections = self._allocate_section_shots(story_sections, shot_count, float(target_duration_sec or 0.0))
-            story_bible = [
-                f"{sec['name']}: {sec['summary']} [{sec['duration_sec']:.2f}s, {sec['shot_count']} shots]"
-                for sec in story_sections
-            ]
-            narrative_beats = [str(sec["summary"]) for sec in story_sections]
-            self._log(self._format_lines_for_log("Story sections", story_bible))
+""" if previous else ""
+            base_user = (
+                f"""USER IDEA:
+{idea}
 
-            # Build recurring identity bibles from the authored story structure, never from the raw user idea.
-            structure_text = " ".join(str(sec["summary"]) for sec in story_sections)
-            if use_character_bible and not character_bibles:
-                self._log("V3: establishing character bible from the story structure...")
-                character_bibles = self._generate_character_bibles(
-                    idea=structure_text,
-                    story_outline=narrative_beats,
-                    draft_prompts=[],
-                    shot_count=shot_count,
-                    style_hint=style_hint,
-                    t2i_model_hint=t2i_model_hint,
-                )
-                character_bibles = self._filter_character_bibles_by_user_marks(character_bibles, _user_mark_source)
-                self._log(self._format_lines_for_log("Character bible", character_bibles))
+STYLE:
+{style or '[none]'}
 
-            character_block = "\n".join(f"- {line}" for line in character_bibles) if character_bibles else "none"
-            whole_structure = "\n".join(
-                f"{i+1}. {sec['name']}: {sec['summary']}"
-                for i, sec in enumerate(story_sections)
+LOCKED STORY SUMMARY:
+{blueprint['story_summary']}
+
+CHARACTER BIBLES:
+{json.dumps(character_bibles, ensure_ascii=False, indent=2)}
+
+OBJECT BIBLES:
+{json.dumps(object_bibles, ensure_ascii=False, indent=2)}
+
+STRUCTURED CONTINUITY BIBLE:
+{json.dumps(continuity_bundle, ensure_ascii=False, indent=2)}
+
+SHOT CAST REQUIREMENTS BY SHOT:
+{json.dumps(cast_requirements, ensure_ascii=False, indent=2)}
+
+TARGET IMAGE MODEL: {t2i_model_hint or '[unspecified]'}
+TARGET VIDEO MODEL: {i2v_model_hint or '[unspecified]'}
+
+"""
+                + prev_block
+                + f"""LOCKED EVENTS TO DIRECT NOW:
+{json.dumps(chunk, ensure_ascii=False, indent=2)}
+
+"""
             )
 
-            global_index = 1
-            previous_ending = "The movie has not started yet."
-            final_visual_prompts: List[str] = []
-
-            for sec_idx, sec in enumerate(story_sections, start=1):
-                count = int(sec["shot_count"])
-                duration = float(sec["duration_sec"])
-                next_summary = story_sections[sec_idx]["summary"] if sec_idx < len(story_sections) else "This is the final story section."
-                self._log(f"V4 story-first: expanding section {sec_idx}/{len(story_sections)} '{sec['name']}' into {count} connected prompts ({duration:.2f}s)...")
-
-                # Story-first V4: earn every shot slot with a distinct chronological event before framing it.
-                event_prompt = f"""
-Expand ONE story section into exactly {count} concrete chronological STORY EVENTS. This stage is story logic only, not cinematography.
-
-COMPLETE STORY STRUCTURE:
-{whole_structure}
-
-CURRENT PART:
-Name: {sec['name']}
-Story event: {sec['summary']}
-Screen-time budget: about {duration:.2f} seconds
-Event slots required: {count}
-
-PREVIOUS PART ENDED WITH:
-{previous_ending}
-
-NEXT PART WILL BE:
-{next_summary}
-
-Established character identities:
-{character_block}
-
-Every line must use exactly:
-EVENT=<one concrete visible event> | RESULT=<what becomes different because this event happened>
-
-Rules:
-- Return exactly {count} events in chronological order.
-- Each event must materially advance the story section. A new camera angle, close-up, reaction-only portrait, alternate viewpoint, or prettier composition is NOT a new event.
-- Standing, looking, posing, walking through another location, or showing the same action from another angle does not count unless it causes a new consequence or decision.
-- Prefer actions, interactions, discoveries, obstacles, attempts, failures, consequences, decisions, arrivals/departures, object use, environmental changes, or clear cause -> effect progression.
-- Do not use camera, lens, shot-size, framing, composition, lighting, or image-generation language.
-- Do not repeat the whole project premise. Work only on the CURRENT PART.
-- Keep continuity with the previous and next parts.
-- Do not invent unrelated subplots or recurring characters merely to fill slots.
-- Event N must be meaningfully different from event N-1 and must leave the story in a changed state.
-- Return only the numbered structured lines.
-""".strip()
-                event_lines = self._generate_numbered_list_with_retry(
-                    system_prompt=system,
-                    user_prompt=event_prompt,
-                    expected_count=count,
-                    temperature=0.70,
-                    max_tokens=max(900, count * 180),
-                    item_kind=f"section {sec_idx} story events",
+            raw = None
+            for semantic_attempt in range(1, 3):
+                correction = "" if semantic_attempt == 1 else (
+                    f"\n\nCORRECTION: Your previous valid JSON had the wrong number of shots. "
+                    f"Return EXACTLY {len(chunk)} shot objects, one per locked event, in the same order. Do not omit, merge, or combine events."
                 )
-                story_events: List[Dict[str, str]] = []
-                for raw_event in event_lines:
-                    m = re.match(r"^\s*EVENT\s*=\s*(.*?)\s*\|\s*RESULT\s*=\s*(.*?)\s*$", str(raw_event or ''), flags=re.I)
-                    if not m:
-                        raise RuntimeError(f"V4 section {sec_idx} returned an invalid story event line: {raw_event}")
-                    ev = re.sub(r"\s+", " ", m.group(1)).strip(" .")
-                    result = re.sub(r"\s+", " ", m.group(2)).strip(" .")
-                    if not ev or not result:
-                        raise RuntimeError(f"V4 section {sec_idx} returned an empty story event/result.")
-                    story_events.append({"event": ev, "result": result})
-                if len(story_events) != count:
-                    raise RuntimeError(f"V4 section {sec_idx} returned {len(story_events)} story events; expected {count}.")
-                self._log(self._format_lines_for_log(
-                    f"Section {sec_idx} story events",
-                    [f"EVENT={x['event']} | RESULT={x['result']}" for x in story_events],
-                ))
-                events_block = "\n".join(
-                    f"{j+1}. EVENT={x['event']} | RESULT={x['result']}" for j, x in enumerate(story_events)
-                )
-
-                section_expand_prompt = f"""
-Create exactly {count} connected FINAL TEXT-TO-IMAGE SHOT PROMPTS for ONE story section.
-
-COMPLETE STORY STRUCTURE:
-{whole_structure}
-
-CURRENT PART:
-Name: {sec['name']}
-Story event: {sec['summary']}
-Screen-time budget: about {duration:.2f} seconds
-Shots required: {count}
-
-LOCKED STORY EVENTS — one event per image, same numbering:
-{events_block}
-
-PREVIOUS PART ENDED WITH:
-{previous_ending}
-
-NEXT PART WILL BE:
-{next_summary}
-
-Established character identities:
-{character_block}
-
-Global visual style: {style_hint.strip() or 'none'}
-Target text-to-image model: {t2i_model_hint or 'none'}
-Directing approach: {director_brief}
-
-Every line must use exactly:
-PURPOSE=<why this shot exists> | VISUAL=<the full rich generation prompt for this one image> | CHANGE=<what becomes different by the end of this shot>
-
-Rules:
-- Work ONLY on the CURRENT PART. Do not summarize or repeat the complete movie premise in each VISUAL.
-- Return exactly {count} chronological images, one for each LOCKED STORY EVENT above.
-- Image N MUST depict Event N. Do not replace an event with coverage, a reaction portrait, an alternate angle, an establishing image, or decorative B-roll.
-- The shots must belong together as one sequence and preserve the event order exactly.
-- Different framing is allowed only after the event is locked; framing never creates or substitutes for story progression.
-- Do not create paraphrases of the same event. Each VISUAL must clearly show the unique action/change specified by its matching event.
-- A protagonist does NOT need to appear in every shot. Use exterior action, pursuers, environment, vehicles, objects, reaction shots, wide geography, overhead/aerial coverage, or other subjects when the story part requires them.
-- A recurring character/animal/object may appear ONLY when that specific shot needs it. Recurring means visually consistent when present, not present everywhere.
-- VISUAL is the actual final image-generation prompt. Make it rich, concrete and immediately renderable: visible subjects, location, action, spatial relationships, relevant environment, time/weather, and useful composition/framing.
-- Keep one visual style for the entire sequence: {style_hint.strip() or 'use one coherent cinematic visual medium and never switch medium'}.
-- Do not switch between realistic, anime, cartoon, 3D animation, illustration, or other media unless the global style explicitly says to do so.
-- Preserve identities, wardrobe, vehicles, important props, locations, damage, direction of travel, time, and other continuity facts.
-- Do not introduce a new recurring animal, child, companion, important prop, or named character unless the CURRENT PART explicitly requires it.
-- No workflow wording, no labels inside VISUAL, no discussion of previous/next prompts.
-- Return only the numbered structured lines.
-""".strip()
-
-                section_lines: List[str] = []
-                parsed_section: List[Dict[str, Any]] = []
-                last_error = ""
-                for attempt in range(2):
-                    section_lines = self._generate_numbered_list_with_retry(
-                        system_prompt=system,
-                        user_prompt=section_expand_prompt + (
-                            "\n\nRETRY REQUIREMENT: The previous attempt contained near-duplicate images. Make every VISUAL materially different in event/composition/subject coverage while preserving continuity."
-                            if attempt else ""
-                        ),
-                        expected_count=count,
-                        temperature=0.66 if attempt == 0 else 0.72,
-                        max_tokens=max(900, count * 240),
-                        item_kind=f"section {sec_idx} final shot prompts",
+                try:
+                    obj = self._json_call(
+                        system,
+                        base_user + correction + f"\n\nReturn JSON as {{\"shots\":[...]}} with exactly {len(chunk)} shot objects in the same order.",
+                        f"shot prompts {start+1}-{start+len(chunk)}",
+                        max_tokens=6800,
                     )
-                    parsed_section = self._parse_section_shots(section_lines, count, sec_idx, str(sec["name"]))
-                    parsed_section, bad_visual_indices = self._clean_section_visuals(parsed_section)
-                    visuals = [str(x.get("visual") or "") for x in parsed_section]
-                    if len(parsed_section) == count and not bad_visual_indices and not self._has_near_duplicate_prompts(visuals, threshold=0.92):
-                        break
-                    if bad_visual_indices:
-                        last_error = f"section {sec_idx} had {len(bad_visual_indices)} invalid final VISUAL prompt(s)"
-                    else:
-                        last_error = f"section {sec_idx} had duplicate/near-duplicate prompts"
-                    # Retry the full small section once; unlike the old pipeline this never regenerates the whole movie.
-                    parsed_section = []
-                if len(parsed_section) != count:
-                    # If the section response structurally succeeded but a few VISUAL fields were rejected,
-                    # repair only those exact shot slots instead of padding, cloning, or aborting the movie.
-                    candidate = self._parse_section_shots(section_lines, count, sec_idx, str(sec["name"]))
-                    candidate, bad_visual_indices = self._clean_section_visuals(candidate)
-                    if len(candidate) == count and bad_visual_indices:
-                        candidate = self._repair_missing_section_visuals(
-                            system_prompt=system,
-                            section_name=str(sec["name"]),
-                            section_summary=str(sec["summary"]),
-                            duration_sec=duration,
-                            items=candidate,
-                            bad_indices=bad_visual_indices,
-                            style_hint=style_hint,
-                            t2i_model_hint=t2i_model_hint,
-                            director_brief=director_brief,
-                        )
-                        candidate, remaining_bad = self._clean_section_visuals(candidate)
-                        candidate_visuals = [str(x.get("visual") or "") for x in candidate]
-                        if not remaining_bad and not self._has_near_duplicate_prompts(candidate_visuals, threshold=0.92):
-                            parsed_section = candidate
-                    if len(parsed_section) != count:
-                        raise RuntimeError(last_error or f"V3 section {sec_idx} did not return {count} usable unique prompts.")
+                except Exception:
+                    self._log(f"[story] Prompt batch {start+1}-{start+len(chunk)} could not produce valid JSON; switching this batch to individual shots.")
+                    break
+                candidate = obj.get("shots") if isinstance(obj, dict) else None
+                if isinstance(candidate, list) and len(candidate) == len(chunk) and all(isinstance(x, dict) for x in candidate):
+                    raw = candidate
+                    break
+                got = len(candidate) if isinstance(candidate, list) else 0
+                self._log(f"[story] Prompt batch {start+1}-{start+len(chunk)} returned {got}/{len(chunk)} shots; retrying.")
 
-                per_shot_duration = float(duration) / float(max(1, count))
-                for local_idx, item in enumerate(parsed_section, start=1):
-                    locked_event = story_events[local_idx - 1]
-                    item["story_event"] = str(locked_event.get("event") or "")
-                    item["story_result"] = str(locked_event.get("result") or "")
-                    item["index"] = global_index
-                    item["duration_sec"] = round(per_shot_duration, 2)
-                    shot_plan.append(item)
-                    visual = str(item.get("visual") or "").strip()
-                    story_outline.append(visual)
-                    final_visual_prompts.append(visual)
-                    global_index += 1
-                previous_ending = str(parsed_section[-1].get("change") or parsed_section[-1].get("visual") or sec["summary"]).strip()
+            if raw is None:
+                self._log(f"[story] Prompt batch {start+1}-{start+len(chunk)} is incomplete; generating those shots individually.")
+                for i, beat in enumerate(chunk):
+                    shot_no = start + i + 1
+                    prev = beats[max(0, shot_no-3):shot_no-1]
+                    out.append(_one_shot(beat, shot_no, prev))
+                continue
 
-            if len(shot_plan) != shot_count or len(final_visual_prompts) != shot_count:
-                raise RuntimeError(f"V3 assembled {len(final_visual_prompts)} final prompts; expected {shot_count}.")
+            for i, item in enumerate(raw):
+                beat = chunk[i]
+                shot_no = start + i + 1
+                try:
+                    out.append(_normalize(item, beat, shot_no))
+                except Exception:
+                    self._log(f"[story] Prompt for shot {shot_no} is incomplete; regenerating that shot.")
+                    prev = beats[max(0, shot_no-3):shot_no-1]
+                    out.append(_one_shot(beat, shot_no, prev))
 
-            # Cross-section duplicate guard before any image generation starts.
-            if self._has_near_duplicate_prompts(final_visual_prompts, threshold=0.94):
-                raise RuntimeError(
-                    "V3 storyline planning produced near-duplicate final image prompts across story sections. "
-                    "Planning stopped before image generation."
-                )
+        if len(out) != total:
+            raise RuntimeError(f"Prompt creation produced {len(out)} shots; expected {total}.")
+        return out
 
-            if use_object_bible:
-                self._log("V3: establishing recurring object bible from the final planned shots...")
-                object_bibles = self._generate_object_bibles(
-                    idea=structure_text,
-                    story_outline=story_outline,
-                    draft_prompts=final_visual_prompts,
-                    shot_count=shot_count,
-                    style_hint=style_hint,
-                    t2i_model_hint=t2i_model_hint,
-                )
-                self._log(self._format_lines_for_log("Object bible", object_bibles))
-        else:
-            # Compatibility path only; the normal FrameVision planner enables story structure.
-            story_outline = [idea.strip()] * shot_count
-            shot_plan = [{
-                "index": i + 1,
-                "beat_index": i + 1,
-                "section": "build",
-                "purpose": "Depict the requested visual idea clearly.",
-                "visual": idea.strip(),
-                "change": "The requested visual action progresses.",
-            } for i in range(shot_count)]
-            final_visual_prompts = list(story_outline)
+    def generate_project(self, *, title: str, idea: str, shot_count: int, include_story_outline: bool = True,
+                         generate_t2i: bool = True, generate_i2v: bool = True, style_hint: str = "",
+                         negative_hint: str = "", use_character_bible: bool = True, use_object_bible: bool = True,
+                         t2i_model_hint: str = "", i2v_model_hint: str = "", predefined_character_bibles: Optional[List[str]] = None,
+                         target_duration_sec: float = 0.0, **extra: Any) -> StoryProject:
+        reference_guidance = _clean_line(extra.get("reference_guidance") or "")
+        audio_context = _clean_line(extra.get("audio_context") or "")
+        idea = _clean_line(idea)
+        style_hint = _clean_line(style_hint)
+        if not idea:
+            raise RuntimeError("Planner idea is empty.")
+        shot_count = max(1, int(shot_count))
+        target_duration_sec = float(target_duration_sec or shot_count * 5.0)
 
-        if generate_t2i:
-            # V3 section expansion already authored the real T2I prompts.
-            # Do NOT send all shots through another global creative rewrite.
-            self._log("V3: using section-authored prompts directly as text-to-image prompts...")
-            t2i_prompts = self._clean_prompt_list_items(
-                list(final_visual_prompts),
-                story_outline if story_outline else [idea.strip()] * shot_count,
-            )
-            if len(t2i_prompts) != shot_count:
-                raise RuntimeError(f"V3 retained {len(t2i_prompts)} T2I prompts; expected {shot_count}.")
+        self._log(f"[story] Story pipeline: blueprint -> shot list -> continuity bibles -> image/video prompts ({shot_count} clips)")
+        self._log("[story] Creating blueprint")
+        blueprint = None
+        last_blueprint_error = None
+        for blueprint_attempt in range(1, 3):
+            try:
+                blueprint = self._build_blueprint(idea, style_hint, shot_count, target_duration_sec, reference_guidance, audio_context)
+                break
+            except Exception as exc:
+                last_blueprint_error = exc
+                self._log(f"[story] blueprint semantic validation attempt {blueprint_attempt}/2 failed: {exc}")
+        if not isinstance(blueprint, dict):
+            raise RuntimeError(f"Blueprint failed semantic validation: {last_blueprint_error}")
+        self._log("[story] Locked blueprint: " + " | ".join(f"{s['title']}={s['clip_count']}" for s in blueprint['story_sections']))
 
-            # Existing deterministic bible injection remains a consistency safety net.
-            # It may only add identity/object anchors to matching shots; it must not creatively rewrite scenes.
-            if use_character_bible and character_bibles:
-                self._log("Injecting character bible into matching text-to-image prompts...")
-                t2i_prompts = self._inject_character_bibles_into_t2i(
-                    story_outline=story_outline,
-                    draft_prompts=t2i_prompts,
-                    character_bibles=character_bibles,
-                    shot_count=shot_count,
-                    style_hint=style_hint,
-                    negative_hint=negative_hint,
-                    t2i_model_hint=t2i_model_hint,
-                )
-                t2i_prompts = self._clean_prompt_list_items(t2i_prompts, story_outline)
-            if use_object_bible and object_bibles:
-                self._log("Injecting recurring object bible into matching text-to-image prompts...")
-                t2i_prompts = self._inject_object_bibles_into_t2i(
-                    story_outline=story_outline,
-                    draft_prompts=t2i_prompts,
-                    object_bibles=object_bibles,
-                    shot_count=shot_count,
-                    style_hint=style_hint,
-                    negative_hint=negative_hint,
-                    t2i_model_hint=t2i_model_hint,
-                )
-                t2i_prompts = self._clean_prompt_list_items(t2i_prompts, story_outline)
-            if use_character_bible and character_bibles:
-                t2i_prompts = self._expand_known_two_character_groups(t2i_prompts, character_bibles)
+        self._log("[story] Creating shot list")
+        beats = None
+        beat_feedback = ""
+        last_beat_error = None
+        for beat_attempt in range(1, 3):
+            try:
+                beats = self._build_beats(idea, style_hint, blueprint, shot_count, beat_feedback)
+                break
+            except Exception as exc:
+                last_beat_error = exc
+                beat_feedback = str(exc)
+                self._log(f"[story] beat quality attempt {beat_attempt}/2 failed: {exc}")
+        if not isinstance(beats, list) or len(beats) != shot_count:
+            raise RuntimeError(f"Beat generation failed quality validation: {last_beat_error}")
+        for b in beats:
+            self._log(f"[story] beat {b['slot']:02d} [{b['section']}]: {b['beat']}")
 
-            # Style lock is deterministic and global. No model may choose a different medium shot-to-shot.
-            t2i_prompts = self._apply_style_to_prompt_list(t2i_prompts, style_hint)
-            t2i_prompts = self._clean_prompt_list_items(t2i_prompts, story_outline)
-            if len(t2i_prompts) != shot_count:
-                raise RuntimeError(f"V3 final T2I prompt count is {len(t2i_prompts)}; expected {shot_count}.")
-            if self._has_near_duplicate_prompts(t2i_prompts, threshold=0.95):
-                raise RuntimeError("V3 final T2I prompts contain near-duplicates. Planning stopped before image generation.")
-            self._log(self._format_lines_for_log("Text-to-image prompts", t2i_prompts))
+        self._log("[story] Creating continuity bibles")
+        chars, objects, continuity_bundle = self._build_bibles(idea, style_hint, blueprint, beats, use_character_bible, use_object_bible, predefined_character_bibles, extra.get("predefined_character_entries"))
 
-        # Final hard provenance filter: generated image prompts may not re-invent face marks.
-        if t2i_prompts:
-            t2i_prompts = [self._strip_unrequested_face_marks_from_text(p, _user_mark_source) for p in t2i_prompts]
-            t2i_prompts = [p for p in t2i_prompts if p]
-            if len(t2i_prompts) != shot_count:
-                raise RuntimeError(f"Face-mark provenance filter left {len(t2i_prompts)}/{shot_count} T2I prompts; refusing silent shot loss.")
+        self._log("[story] Creating image and video prompts")
+        directed = self._build_shot_prompts(idea, style_hint, blueprint, beats, chars, objects, t2i_model_hint, i2v_model_hint, continuity_bundle)
 
-        if generate_i2v:
-            self._log("V3: generating image-to-video prompts one story section at a time...")
-            source_for_i2v = t2i_prompts if t2i_prompts else story_outline
-            if not source_for_i2v:
-                source_for_i2v = [idea.strip()] * shot_count
-
-            i2v_prompts = []
-            cursor = 0
-            if story_sections:
-                for sec_idx, sec in enumerate(story_sections, start=1):
-                    count = int(sec.get("shot_count") or 0)
-                    section_sources = source_for_i2v[cursor:cursor + count]
-                    cursor += count
-                    if len(section_sources) != count:
-                        raise RuntimeError(f"V3 I2V section {sec_idx} source count mismatch.")
-                    source_block = "\n".join(f"{i+1}. {item}" for i, item in enumerate(section_sources))
-                    i2v_prompt = f"""
-Create exactly {count} numbered IMAGE-TO-VIDEO motion prompts for this ONE already-planned story section.
-
-SECTION:
-{sec.get('name')}: {sec.get('summary')}
-
-SOURCE IMAGES / SHOT PROMPTS:
-{source_block}
-
-Target image-to-video model: {i2v_model_hint or 'none'}
-Directing approach: {director_brief}
-
-Rules:
-- Keep the exact order and meaning of the source shots.
-- Each line animates its matching source image; do not rewrite the story or introduce new subjects/locations.
-- Describe only the visible movement/action during that clip.
-- Use one dominant physical action chain plus at most one useful secondary motion.
-- Keep identities, geography, vehicle direction, objects and continuity intact.
-- Use simple camera movement only when it supports the existing action.
-- Do not repeat the same generic motion across the section.
-- Do not use workflow language such as preserve, keep the same, source image, next beat, transition, payoff, or reveal.
-- Return only the {count} numbered motion prompts.
-""".strip()
-                    part: List[str] = []
-                    for motion_attempt in range(3):
-                        motion_request = i2v_prompt + (
-                            "\n\nRETRY REQUIREMENT: The previous motion list contained an invalid, static, meta, or unusable line. "
-                            "Regenerate this small section only. Every line must describe visible motion for its matching image."
-                            if motion_attempt else ""
-                        )
-                        raw_part = self._generate_numbered_list_with_retry(
-                            system_prompt=system,
-                            user_prompt=motion_request,
-                            expected_count=count,
-                            temperature=0.62 if motion_attempt == 0 else 0.52,
-                            max_tokens=max(700, count * 150),
-                            item_kind=f"section {sec_idx} image-to-video prompts",
-                        )
-                        # Never substitute a text-to-image source description for a rejected motion prompt.
-                        # If motion cleanup loses an item, retry this small section instead.
-                        candidate_part = [self._clean_direct_i2v_prompt(p) for p in raw_part]
-                        candidate_part = self._clean_prompt_list_items(candidate_part)
-                        if len(candidate_part) == count:
-                            part = candidate_part
-                            break
-                    if len(part) != count:
-                        raise RuntimeError(f"V3 I2V section {sec_idx} returned {len(part)} usable motion prompts; expected {count} after section retries.")
-                    i2v_prompts.extend(part)
-            else:
-                # Compatibility-only fallback when story sections are disabled.
-                source_block = "\n".join(f"{i+1}. {item}" for i, item in enumerate(source_for_i2v))
-                i2v_prompt = f"""
-Create exactly {shot_count} numbered image-to-video motion prompts matching these source images in order:
-{source_block}
-Return only direct visible motion, one line per source image.
-""".strip()
-                i2v_prompts = self._generate_numbered_list_with_retry(
-                    system_prompt=system,
-                    user_prompt=i2v_prompt,
-                    expected_count=shot_count,
-                    temperature=0.62,
-                    max_tokens=max(900, shot_count * 140),
-                    item_kind="image-to-video prompts",
-                )
-                i2v_prompts = [self._clean_direct_i2v_prompt(p) for p in i2v_prompts]
-
-            if len(i2v_prompts) != shot_count:
-                raise RuntimeError(f"V3 assembled {len(i2v_prompts)} I2V prompts; expected {shot_count}.")
-            self._log(self._format_lines_for_log("Image-to-video prompts", i2v_prompts))
-
-        metadata = {
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "app": APP_NAME,
-            "runner_path": self.client.runner_path,
-            "model_path": self.client.model_path,
-            "ctx_size": self.client.ctx_size,
-            "top_p": self.client.top_p,
-            "style_hint": style_hint,
-            "negative_hint": negative_hint,
-            "include_story_outline": include_story_outline,
-            "generate_t2i": generate_t2i,
-            "generate_i2v": generate_i2v,
-            "use_character_bible": use_character_bible,
-            "use_object_bible": use_object_bible,
-            "t2i_model_hint": t2i_model_hint,
-            "i2v_model_hint": i2v_model_hint,
-            "storyline_v2": True,
-            "storyline_v3": True,
-            "target_duration_sec": float(target_duration_sec or 0.0),
-            "story_section_count": len(story_sections),
-            "narrative_beat_count": len(narrative_beats),
-            "predefined_character_bible_count": len(list(predefined_character_bibles or [])),
-        }
+        t2i = [d["visual"] for d in directed] if generate_t2i else []
+        i2v = [d["i2v"] for d in directed] if generate_i2v else []
+        outline = [b["beat"] for b in beats] if include_story_outline else []
+        story_bible = [f"{s['title']} [{s['role']}]: {s['purpose']} MUST: {s['must_achieve']}" for s in blueprint["story_sections"]]
+        shot_plan = []
+        per = target_duration_sec / max(1, shot_count)
+        for idx, d in enumerate(directed, 1):
+            shot_plan.append({
+                "shot": idx, "beat_index": idx, "section": d["section"], "purpose": d["purpose"],
+                "change": d["change"], "visual": d["visual"], "duration_sec": round(per, 3),
+                "reference_ids": d.get("reference_ids") or [],
+                "present_character_ids": d.get("present_character_ids") or [],
+                "present_object_ids": d.get("present_object_ids") or [],
+            })
 
         return StoryProject(
-            title=title.strip() or "Untitled project",
-            idea=idea.strip(),
+            title=_clean_line(blueprint.get("title") or title or "Planner Story"),
+            idea=idea,
             shot_count=shot_count,
-            story_outline=story_outline,
-            character_bibles=character_bibles,
-            object_bibles=object_bibles,
-            text_to_image_prompts=t2i_prompts,
-            image_to_video_prompts=i2v_prompts,
-            metadata=metadata,
+            story_outline=outline,
+            character_bibles=chars,
+            object_bibles=objects,
+            text_to_image_prompts=t2i,
+            image_to_video_prompts=i2v,
+            metadata={
+                "engine": "agent_story_replacement_v1",
+                "architecture": "blueprint->locked_beats->continuity_bibles->shot_prompts",
+                "style_hint": style_hint,
+                "negative_hint": negative_hint,
+                "t2i_model_hint": t2i_model_hint,
+                "i2v_model_hint": i2v_model_hint,
+                "blueprint": blueprint,
+                "reference_guidance_present": bool(reference_guidance),
+                "audio_context_present": bool(audio_context),
+                "continuity_bundle": continuity_bundle,
+                "story_scale": {
+                    "shot_count": int(shot_count),
+                    "target_duration_sec": float(target_duration_sec),
+                    "continuity_bible_max_tokens": int(min(16000, max(4200, 2200 + (len(beats) * 110) + (len((blueprint or {}).get("recurring_subjects") or []) * 180)))),
+                "story_section_guidance": list(self._story_section_guidance(target_duration_sec, shot_count)),
+                },
+            },
             story_bible=story_bible,
-            narrative_beats=narrative_beats,
+            narrative_beats=[b["beat"] for b in beats],
             shot_plan=shot_plan,
         )
-
-
-# -----------------------------
-# JSON persistence
-# -----------------------------
-def save_project_json(project: StoryProject, path: str) -> None:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with open(target, "w", encoding="utf-8") as fh:
-        json.dump(project.to_dict(), fh, indent=2, ensure_ascii=False)
-
-
-def load_project_json(path: str) -> StoryProject:
-    with open(path, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    return StoryProject(
-        title=str(data.get("title") or "Untitled project"),
-        idea=str(data.get("idea") or ""),
-        shot_count=int(data.get("shot_count") or 1),
-        story_outline=list(data.get("story_outline") or []),
-        character_bibles=list(data.get("character_bibles") or []),
-        object_bibles=list(data.get("object_bibles") or []),
-        text_to_image_prompts=list(data.get("text_to_image_prompts") or []),
-        image_to_video_prompts=list(data.get("image_to_video_prompts") or []),
-        metadata=dict(data.get("metadata") or {}),
-        story_bible=list(data.get("story_bible") or []),
-        narrative_beats=list(data.get("narrative_beats") or []),
-        shot_plan=list(data.get("shot_plan") or []),
-    )
-
-
-# -----------------------------
-# UI
-# -----------------------------
-class App(tk.Tk):
-    def __init__(self) -> None:
-        super().__init__()
-        self.title(APP_NAME)
-        self.geometry("1320x900")
-        self.minsize(1100, 760)
-
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-        self.worker_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
-        self.worker_thread: Optional[threading.Thread] = None
-        self.current_project: Optional[StoryProject] = None
-        self.settings = self._load_settings()
-
-        self._build_ui()
-        self._apply_settings_to_ui()
-        self.after(120, self._poll_worker_queue)
-
-    def _load_settings(self) -> Dict[str, Any]:
-        if SETTINGS_PATH.exists():
-            try:
-                with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-                    if isinstance(data, dict):
-                        return data
-            except Exception:
-                pass
-        return {
-            "runner_path": "",
-            "model_path": "",
-            "ctx_size": 8192,
-            "top_p": 0.9,
-            "output_dir": str(DEFAULT_OUTPUT_DIR),
-            "last_title": "",
-            "last_idea": "",
-            "last_shot_count": 8,
-            "last_style_hint": "",
-            "last_negative_hint": "",
-            "include_story_outline": True,
-            "generate_t2i": True,
-            "generate_i2v": True,
-            "use_character_bible": False,
-            "use_object_bible": False,
-            "last_t2i_model_hint": "",
-            "last_i2v_model_hint": "",
-        }
-
-    def _save_settings(self) -> None:
-        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
-            json.dump(self.settings, fh, indent=2, ensure_ascii=False)
-
-    def _build_ui(self) -> None:
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
-
-        notebook = ttk.Notebook(self)
-        notebook.grid(row=0, column=0, sticky="nsew")
-
-        self.tab_generate = ttk.Frame(notebook)
-        self.tab_output = ttk.Frame(notebook)
-        notebook.add(self.tab_generate, text="Generate")
-        notebook.add(self.tab_output, text="Output")
-
-        self.tab_generate.columnconfigure(0, weight=1)
-        self.tab_generate.rowconfigure(0, weight=1)
-        self.generate_canvas = tk.Canvas(self.tab_generate, highlightthickness=0)
-        self.generate_scrollbar = ttk.Scrollbar(self.tab_generate, orient="vertical", command=self.generate_canvas.yview)
-        self.generate_canvas.configure(yscrollcommand=self.generate_scrollbar.set)
-        self.generate_canvas.grid(row=0, column=0, sticky="nsew")
-        self.generate_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.generate_content = ttk.Frame(self.generate_canvas)
-        self.generate_canvas_window = self.generate_canvas.create_window((0, 0), window=self.generate_content, anchor="nw")
-        self.generate_content.bind("<Configure>", self._on_generate_content_configure)
-        self.generate_canvas.bind("<Configure>", self._on_generate_canvas_configure)
-        self.generate_canvas.bind_all("<MouseWheel>", self._on_generate_mousewheel, add="+")
-
-        self._build_generate_tab()
-        self._build_output_tab()
-
-    def _build_generate_tab(self) -> None:
-        tab = self.generate_content
-        for c in range(2):
-            tab.columnconfigure(c, weight=1)
-        tab.rowconfigure(3, weight=1)
-
-        cfg = ttk.LabelFrame(tab, text="Offline LLM")
-        cfg.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
-        cfg.columnconfigure(1, weight=1)
-
-        self.runner_var = tk.StringVar()
-        self.model_var = tk.StringVar()
-        self.ctx_var = tk.IntVar(value=8192)
-        self.top_p_var = tk.DoubleVar(value=0.9)
-
-        ttk.Label(cfg, text="llama-server path").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(cfg, textvariable=self.runner_var).grid(row=0, column=1, sticky="ew", padx=6, pady=6)
-        ttk.Button(cfg, text="Browse", command=self._browse_runner).grid(row=0, column=2, padx=6, pady=6)
-
-        ttk.Label(cfg, text="GGUF model path").grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(cfg, textvariable=self.model_var).grid(row=1, column=1, sticky="ew", padx=6, pady=6)
-        ttk.Button(cfg, text="Browse", command=self._browse_model).grid(row=1, column=2, padx=6, pady=6)
-
-        ttk.Label(cfg, text="Context size").grid(row=2, column=0, sticky="w", padx=6, pady=6)
-        ttk.Spinbox(cfg, from_=2048, to=65536, increment=1024, textvariable=self.ctx_var, width=12).grid(row=2, column=1, sticky="w", padx=6, pady=6)
-
-        ttk.Label(cfg, text="Top-p").grid(row=2, column=2, sticky="e", padx=6, pady=6)
-        ttk.Spinbox(cfg, from_=0.1, to=1.0, increment=0.05, textvariable=self.top_p_var, width=8).grid(row=2, column=3, sticky="w", padx=6, pady=6)
-
-        prompt = ttk.LabelFrame(tab, text="Story setup")
-        prompt.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0, 10))
-        prompt.columnconfigure(1, weight=1)
-        prompt.rowconfigure(4, weight=1)
-
-        self.title_var = tk.StringVar()
-        self.shot_count_var = tk.IntVar(value=8)
-        self.style_var = tk.StringVar()
-        self.negative_var = tk.StringVar()
-        self.t2i_model_hint_var = tk.StringVar()
-        self.i2v_model_hint_var = tk.StringVar()
-        self.include_story_var = tk.BooleanVar(value=True)
-        self.gen_t2i_var = tk.BooleanVar(value=True)
-        self.gen_i2v_var = tk.BooleanVar(value=True)
-        self.character_bible_var = tk.BooleanVar(value=False)
-        self.object_bible_var = tk.BooleanVar(value=False)
-
-        ttk.Label(prompt, text="Project title").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(prompt, textvariable=self.title_var).grid(row=0, column=1, sticky="ew", padx=6, pady=6)
-
-        ttk.Label(prompt, text="Shot count").grid(row=0, column=2, sticky="w", padx=6, pady=6)
-        ttk.Spinbox(prompt, from_=1, to=100, textvariable=self.shot_count_var, width=8).grid(row=0, column=3, sticky="w", padx=6, pady=6)
-
-        ttk.Label(prompt, text="Style hint").grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(prompt, textvariable=self.style_var).grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=6)
-
-        ttk.Label(prompt, text="Negative hint").grid(row=2, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(prompt, textvariable=self.negative_var).grid(row=2, column=1, columnspan=3, sticky="ew", padx=6, pady=6)
-
-        ttk.Label(prompt, text="Text-to-image model").grid(row=3, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(prompt, textvariable=self.t2i_model_hint_var).grid(row=3, column=1, sticky="ew", padx=6, pady=6)
-        ttk.Label(prompt, text="Image-to-video model").grid(row=3, column=2, sticky="w", padx=6, pady=6)
-        ttk.Entry(prompt, textvariable=self.i2v_model_hint_var).grid(row=3, column=3, sticky="ew", padx=6, pady=6)
-
-        checks = ttk.Frame(prompt)
-        checks.grid(row=4, column=0, columnspan=4, sticky="w", padx=6, pady=6)
-        ttk.Checkbutton(checks, text="Create story outline", variable=self.include_story_var).pack(side="left", padx=(0, 10))
-        ttk.Checkbutton(checks, text="Create text-to-image prompts", variable=self.gen_t2i_var).pack(side="left", padx=(0, 10))
-        ttk.Checkbutton(checks, text="Create image-to-video prompts", variable=self.gen_i2v_var).pack(side="left", padx=(0, 10))
-        ttk.Checkbutton(checks, text="Character bible", variable=self.character_bible_var).pack(side="left", padx=(0, 10))
-        ttk.Checkbutton(checks, text="Recurring object bible", variable=self.object_bible_var).pack(side="left", padx=(0, 10))
-
-        ttk.Label(prompt, text="Idea / story input").grid(row=5, column=0, sticky="nw", padx=6, pady=6)
-        self.idea_text = ScrolledText(prompt, height=10, wrap="word")
-        self.idea_text.grid(row=5, column=1, columnspan=3, sticky="nsew", padx=6, pady=6)
-
-        actions = ttk.Frame(tab)
-        actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
-        actions.columnconfigure(4, weight=1)
-        ttk.Button(actions, text="Test connection", command=self._test_connection).grid(row=0, column=0, padx=(0, 8))
-        self.enhance_button = ttk.Button(actions, text="Enhance story idea", command=self._start_story_enhance)
-        self.enhance_button.grid(row=0, column=1, padx=(0, 8))
-        self.generate_button = ttk.Button(actions, text="Generate storyline + prompts", command=self._start_generation)
-        self.generate_button.grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(actions, text="Load JSON", command=self._load_project_dialog).grid(row=0, column=3, padx=(0, 8))
-        ttk.Button(actions, text="Save JSON", command=self._save_project_dialog).grid(row=0, column=4, padx=(0, 8))
-        self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(actions, textvariable=self.status_var).grid(row=0, column=5, sticky="e")
-
-        logs = ttk.LabelFrame(tab, text="Log")
-        logs.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0, 10))
-        logs.columnconfigure(0, weight=1)
-        logs.rowconfigure(0, weight=1)
-        self.log_text = ScrolledText(logs, height=18, wrap="word", state="disabled")
-        self.log_text.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        self.log_menu = tk.Menu(self, tearoff=0)
-        self.log_menu.add_command(label="Copy", command=self._copy_log_selection)
-        self.log_menu.add_command(label="Clear logs", command=self._clear_logs)
-        self.log_text.bind("<Button-3>", self._show_log_context_menu)
-
-    def _on_generate_content_configure(self, _event: tk.Event) -> None:
-        self.generate_canvas.configure(scrollregion=self.generate_canvas.bbox("all"))
-
-    def _on_generate_canvas_configure(self, event: tk.Event) -> None:
-        self.generate_canvas.itemconfigure(self.generate_canvas_window, width=event.width)
-
-    def _on_generate_mousewheel(self, event: tk.Event) -> None:
-        widget = self.winfo_containing(event.x_root, event.y_root)
-        if widget is None:
-            return
-        current = widget
-        while current is not None:
-            if current is self.generate_content:
-                delta = int(-event.delta / 120) if getattr(event, "delta", 0) else 0
-                if delta:
-                    self.generate_canvas.yview_scroll(delta, "units")
-                return
-            current = getattr(current, "master", None)
-
-    def _build_output_tab(self) -> None:
-        tab = self.tab_output
-        tab.columnconfigure(0, weight=1)
-        tab.columnconfigure(1, weight=1)
-        tab.columnconfigure(2, weight=1)
-        tab.rowconfigure(1, weight=1)
-
-        top = ttk.Frame(tab)
-        top.grid(row=0, column=0, columnspan=3, sticky="ew", padx=10, pady=10)
-        top.columnconfigure(1, weight=1)
-        self.output_dir_var = tk.StringVar()
-        ttk.Label(top, text="JSON export folder").grid(row=0, column=0, sticky="w", padx=6)
-        ttk.Entry(top, textvariable=self.output_dir_var).grid(row=0, column=1, sticky="ew", padx=6)
-        ttk.Button(top, text="Browse", command=self._browse_output_dir).grid(row=0, column=2, padx=6)
-
-        self.story_box = self._make_output_box(tab, "Story outline", 0)
-        self.t2i_box = self._make_output_box(tab, "Text-to-image prompts", 1)
-        self.i2v_box = self._make_output_box(tab, "Image-to-video prompts", 2)
-
-    def _make_output_box(self, parent: ttk.Frame, title: str, column: int) -> ScrolledText:
-        frame = ttk.LabelFrame(parent, text=title)
-        frame.grid(row=1, column=column, sticky="nsew", padx=10, pady=(0, 10))
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
-        box = ScrolledText(frame, wrap="word")
-        box.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        return box
-
-    def _apply_settings_to_ui(self) -> None:
-        self.runner_var.set(str(self.settings.get("runner_path") or ""))
-        self.model_var.set(str(self.settings.get("model_path") or ""))
-        self.ctx_var.set(int(self.settings.get("ctx_size") or 8192))
-        self.top_p_var.set(float(self.settings.get("top_p") or 0.9))
-        self.output_dir_var.set(str(self.settings.get("output_dir") or DEFAULT_OUTPUT_DIR))
-        self.title_var.set(str(self.settings.get("last_title") or ""))
-        self.shot_count_var.set(int(self.settings.get("last_shot_count") or 8))
-        self.style_var.set(str(self.settings.get("last_style_hint") or ""))
-        self.negative_var.set(str(self.settings.get("last_negative_hint") or ""))
-        self.t2i_model_hint_var.set(str(self.settings.get("last_t2i_model_hint") or ""))
-        self.i2v_model_hint_var.set(str(self.settings.get("last_i2v_model_hint") or ""))
-        self.include_story_var.set(bool(self.settings.get("include_story_outline", True)))
-        self.gen_t2i_var.set(bool(self.settings.get("generate_t2i", True)))
-        self.gen_i2v_var.set(bool(self.settings.get("generate_i2v", True)))
-        self.character_bible_var.set(bool(self.settings.get("use_character_bible", False)))
-        self.object_bible_var.set(bool(self.settings.get("use_object_bible", False)))
-        self.idea_text.delete("1.0", "end")
-        self.idea_text.insert("1.0", str(self.settings.get("last_idea") or ""))
-
-    def _sync_settings_from_ui(self) -> None:
-        self.settings.update(
-            {
-                "runner_path": self.runner_var.get().strip(),
-                "model_path": self.model_var.get().strip(),
-                "ctx_size": int(self.ctx_var.get()),
-                "top_p": float(self.top_p_var.get()),
-                "output_dir": self.output_dir_var.get().strip() or str(DEFAULT_OUTPUT_DIR),
-                "last_title": self.title_var.get().strip(),
-                "last_idea": self.idea_text.get("1.0", "end").strip(),
-                "last_shot_count": int(self.shot_count_var.get()),
-                "last_style_hint": self.style_var.get().strip(),
-                "last_negative_hint": self.negative_var.get().strip(),
-                "last_t2i_model_hint": self.t2i_model_hint_var.get().strip(),
-                "last_i2v_model_hint": self.i2v_model_hint_var.get().strip(),
-                "include_story_outline": bool(self.include_story_var.get()),
-                "generate_t2i": bool(self.gen_t2i_var.get()),
-                "generate_i2v": bool(self.gen_i2v_var.get()),
-                "use_character_bible": bool(self.character_bible_var.get()),
-                "use_object_bible": bool(self.object_bible_var.get()),
-            }
-        )
-        self._save_settings()
-
-    def _browse_runner(self) -> None:
-        path = filedialog.askopenfilename(title="Select llama-server executable")
-        if path:
-            self.runner_var.set(path)
-
-    def _browse_model(self) -> None:
-        path = filedialog.askopenfilename(title="Select GGUF model", filetypes=[("GGUF", "*.gguf"), ("All files", "*.*")])
-        if path:
-            self.model_var.set(path)
-
-    def _browse_output_dir(self) -> None:
-        path = filedialog.askdirectory(title="Select export folder")
-        if path:
-            self.output_dir_var.set(path)
-
-    def _show_log_context_menu(self, event: tk.Event) -> str:
-        try:
-            self.log_text.tag_ranges("sel")
-            selected = bool(self.log_text.tag_ranges("sel"))
-        except tk.TclError:
-            selected = False
-        self.log_menu.entryconfigure("Copy", state=("normal" if selected or self.log_text.get("1.0", "end-1c").strip() else "disabled"))
-        self.log_menu.tk_popup(event.x_root, event.y_root)
-        self.log_menu.grab_release()
-        return "break"
-
-    def _copy_log_selection(self) -> None:
-        try:
-            if self.log_text.tag_ranges("sel"):
-                text = self.log_text.get("sel.first", "sel.last")
-            else:
-                text = self.log_text.get("1.0", "end-1c")
-        except tk.TclError:
-            text = self.log_text.get("1.0", "end-1c")
-        if not text:
-            return
-        self.clipboard_clear()
-        self.clipboard_append(text)
-
-    def _clear_logs(self) -> None:
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
-
-    def _log(self, text: str) -> None:
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", text.rstrip() + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
-
-    def _set_outputs(self, project: StoryProject) -> None:
-        self._fill_box(self.story_box, project.story_outline)
-        self._fill_box(self.t2i_box, project.text_to_image_prompts)
-        self._fill_box(self.i2v_box, project.image_to_video_prompts)
-
-    @staticmethod
-    def _fill_box(box: ScrolledText, lines: List[str]) -> None:
-        box.delete("1.0", "end")
-        if not lines:
-            return
-        box.insert("1.0", "\n\n".join(f"[{idx+1:02d}] {line}" for idx, line in enumerate(lines)))
-
-    def _make_client(self) -> LocalLlamaClient:
-        self._sync_settings_from_ui()
-        return LocalLlamaClient(
-            runner_path=self.runner_var.get(),
-            model_path=self.model_var.get(),
-            ctx_size=int(self.ctx_var.get()),
-            top_p=float(self.top_p_var.get()),
-        )
-
-    def _test_connection(self) -> None:
-        self._sync_settings_from_ui()
-        self.generate_button.configure(state="disabled")
-        self.status_var.set("Testing local llama-server...")
-
-        def work() -> None:
-            client = self._make_client()
-            try:
-                client.start()
-                self.worker_queue.put(("log", f"Connected. llama-server is ready on {client.base_url}"))
-                self.worker_queue.put(("status", "Connection test succeeded."))
-            except Exception as exc:
-                self.worker_queue.put(("error", str(exc)))
-            finally:
-                client.stop()
-                self.worker_queue.put(("done", None))
-
-        self.worker_thread = threading.Thread(target=work, daemon=True)
-        self.worker_thread.start()
-
-
-    def _start_story_enhance(self) -> None:
-        self._sync_settings_from_ui()
-        idea = self.idea_text.get("1.0", "end").strip()
-        if not idea:
-            messagebox.showwarning(APP_NAME, "Prompt is empty.")
-            return
-        try:
-            self.enhance_button.configure(state="disabled")
-        except Exception:
-            pass
-        try:
-            self.generate_button.configure(state="disabled")
-        except Exception:
-            pass
-        self.status_var.set("Enhancing story idea...")
-        self._log("Enhancing story idea...")
-
-        style_hint = self.style_var.get().strip()
-        extra_info = ""
-
-        def work() -> None:
-            client = self._make_client()
-            generator = StorylineGenerator(client, log_callback=lambda msg: self.worker_queue.put(("log", msg)))
-            try:
-                enhanced = generator.enhance_story_idea(
-                    idea=idea,
-                    extra_info=extra_info,
-                    style_hint=style_hint,
-                )
-                self.worker_queue.put(("enhanced_idea", enhanced))
-                self.worker_queue.put(("status", "Story idea enhanced. Push again for a different version."))
-            except Exception as exc:
-                self.worker_queue.put(("error", str(exc)))
-            finally:
-                client.stop()
-                self.worker_queue.put(("done", None))
-
-        self.worker_thread = threading.Thread(target=work, daemon=True)
-        self.worker_thread.start()
-
-    def _start_generation(self) -> None:
-        self._sync_settings_from_ui()
-        self.generate_button.configure(state="disabled")
-        self.status_var.set("Generating...")
-        self._log("Starting generation...")
-        self._log("Generated output will be printed into the log before you save any JSON.")
-
-        title = self.title_var.get().strip()
-        idea = self.idea_text.get("1.0", "end").strip()
-        shot_count = int(self.shot_count_var.get())
-        include_story = bool(self.include_story_var.get())
-        gen_t2i = bool(self.gen_t2i_var.get())
-        gen_i2v = bool(self.gen_i2v_var.get())
-        use_character_bible = bool(self.character_bible_var.get())
-        use_object_bible = bool(self.object_bible_var.get())
-        style_hint = self.style_var.get().strip()
-        negative_hint = self.negative_var.get().strip()
-        t2i_model_hint = self.t2i_model_hint_var.get().strip()
-        i2v_model_hint = self.i2v_model_hint_var.get().strip()
-
-        def work() -> None:
-            client = self._make_client()
-            generator = StorylineGenerator(client, log_callback=lambda msg: self.worker_queue.put(("log", msg)))
-            try:
-                self.worker_queue.put(("log", "Launching local llama-server..."))
-                project = generator.generate_project(
-                    title=title,
-                    idea=idea,
-                    shot_count=shot_count,
-                    include_story_outline=include_story,
-                    generate_t2i=gen_t2i,
-                    generate_i2v=gen_i2v,
-                    style_hint=style_hint,
-                    negative_hint=negative_hint,
-                    use_character_bible=use_character_bible,
-                    use_object_bible=use_object_bible,
-                    t2i_model_hint=t2i_model_hint,
-                    i2v_model_hint=i2v_model_hint,
-                )
-                self.worker_queue.put(("project", project))
-                self.worker_queue.put(("log", "Result is visible above in the log and in the output panes. Save to JSON only when you want to keep it."))
-                self.worker_queue.put(("status", "Generation finished."))
-            except Exception as exc:
-                self.worker_queue.put(("error", str(exc)))
-            finally:
-                client.stop()
-                self.worker_queue.put(("done", None))
-
-        self.worker_thread = threading.Thread(target=work, daemon=True)
-        self.worker_thread.start()
-
-    def _poll_worker_queue(self) -> None:
-        try:
-            while True:
-                kind, payload = self.worker_queue.get_nowait()
-                if kind == "log":
-                    self._log(str(payload))
-                elif kind == "status":
-                    self.status_var.set(str(payload))
-                elif kind == "project":
-                    self.current_project = payload
-                    self._set_outputs(payload)
-                    self._log("Generation completed and output panes updated.")
-                elif kind == "enhanced_idea":
-                    self.idea_text.delete("1.0", "end")
-                    self.idea_text.insert("1.0", str(payload or ""))
-                    self._log("Enhanced story idea inserted into the prompt box.")
-                    self._sync_settings_from_ui()
-                elif kind == "error":
-                    self._log(f"ERROR: {payload}")
-                    self.status_var.set("Failed.")
-                    messagebox.showerror(APP_NAME, str(payload))
-                elif kind == "done":
-                    try:
-                        self.enhance_button.configure(state="normal")
-                    except Exception:
-                        pass
-                    self.generate_button.configure(state="normal")
-        except queue.Empty:
-            pass
-        self.after(120, self._poll_worker_queue)
-
-    def _save_project_dialog(self) -> None:
-        if not self.current_project:
-            messagebox.showinfo(APP_NAME, "Nothing to save yet. Generate or load a project first.")
-            return
-        self._sync_settings_from_ui()
-        initial_dir = self.output_dir_var.get().strip() or str(DEFAULT_OUTPUT_DIR)
-        DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", self.current_project.title).strip("_") or "story_project"
-        path = filedialog.asksaveasfilename(
-            title="Save project JSON",
-            defaultextension=".json",
-            initialdir=initial_dir,
-            initialfile=f"{safe_name}.json",
-            filetypes=[("JSON", "*.json")],
-        )
-        if not path:
-            return
-        save_project_json(self.current_project, path)
-        self.status_var.set(f"Saved: {path}")
-        self._log(f"Saved JSON: {path}")
-
-    def _load_project_dialog(self) -> None:
-        path = filedialog.askopenfilename(title="Load project JSON", filetypes=[("JSON", "*.json")])
-        if not path:
-            return
-        try:
-            project = load_project_json(path)
-        except Exception as exc:
-            messagebox.showerror(APP_NAME, f"Failed to load JSON:\n{exc}")
-            return
-        self.current_project = project
-        self.title_var.set(project.title)
-        self.shot_count_var.set(project.shot_count)
-        self.idea_text.delete("1.0", "end")
-        self.idea_text.insert("1.0", project.idea)
-        self._set_outputs(project)
-        self.character_bible_var.set(bool((project.metadata or {}).get("use_character_bible", False)))
-        self.object_bible_var.set(bool((project.metadata or {}).get("use_object_bible", False)))
-        self.t2i_model_hint_var.set(str((project.metadata or {}).get("t2i_model_hint", "") or ""))
-        self.i2v_model_hint_var.set(str((project.metadata or {}).get("i2v_model_hint", "") or ""))
-        self.status_var.set(f"Loaded: {path}")
-        self._log(f"Loaded JSON: {path}")
-        if getattr(project, "character_bibles", None):
-            self._log(StorylineGenerator._format_lines_for_log("Character bible", project.character_bibles))
-        if getattr(project, "object_bibles", None):
-            self._log(StorylineGenerator._format_lines_for_log("Object bible", project.object_bibles))
-
-
-def main() -> None:
-    app = App()
-    app.mainloop()
-
-
-if __name__ == "__main__":
-    main()
