@@ -8,6 +8,19 @@
 All-in-one Sound/Image/Video Tool 
   <p align="center">     
 Create, Edit, Upscale, Play 
+
+---
+FrameVision
+
+Born from one question about PySide in August 2025.
+
+11,993 patch and bugfix files later (as on september 14th 2026)…
+
+Still adding one more feature. 
+
+Because a.i. never sleeps😄
+
+---
                               
 
 -> Small update v2.5.5 brings LTX 2.5
