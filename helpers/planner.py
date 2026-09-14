@@ -3866,6 +3866,97 @@ def _planner_native_h3_frames(frames: int, max_frames: int = 1433) -> int:
         n = 124
     return int(min(vals, key=lambda x: abs(x - n)))
 
+def _planner_fit_minimax_continuous_native_durations(shots: List[Dict[str, Any]], target_total_sec: float, max_frames: int = 1433) -> None:
+    """Snap MiniMax continuation-shot durations to H3's real frame ladder.
+
+    For a last-frame/native-continuation chain we must never ask assembly to cut
+    a source clip back to the pre-quantized story duration: the end of that clip
+    is the transition into the next one.  Choose one native H3 frame count per
+    shot and, across the whole story, bias the sum to the smallest duration that
+    is at least the requested project length.  In normal cases the overrun is
+    therefore less than one 17-frame H3 step (~0.71 s), rather than accumulating
+    one rounding error per clip.
+    """
+    if not shots:
+        return
+    try:
+        mx = max(124, min(1433, int(max_frames or 1433)))
+    except Exception:
+        mx = 1433
+    allowed = sorted(set(list(range(124, mx + 1, 17)) + ([480] if mx >= 480 else [])))
+    if not allowed:
+        return
+
+    def _nearest_idx(n: int) -> int:
+        return min(range(len(allowed)), key=lambda i: abs(int(allowed[i]) - int(n)))
+
+    idxs: List[int] = []
+    wanted: List[int] = []
+    for sh in shots:
+        try:
+            sec = max(0.0, float((sh or {}).get("duration_sec") or 0.0))
+        except Exception:
+            sec = 0.0
+        n = int(round(sec * 24.0)) if sec > 0.0 else 124
+        wanted.append(n)
+        idxs.append(_nearest_idx(n))
+
+    try:
+        target_frames = max(1, int(round(float(target_total_sec or 0.0) * 24.0)))
+    except Exception:
+        target_frames = 0
+    if target_frames <= 0:
+        target_frames = sum(allowed[i] for i in idxs)
+
+    def _total() -> int:
+        return int(sum(allowed[i] for i in idxs))
+
+    # If nearest-per-shot rounding undershoots, add native steps where doing so
+    # distorts the requested per-shot durations least.
+    guard = 0
+    while _total() < target_frames and guard < 10000:
+        guard += 1
+        choices = []
+        for j, i in enumerate(idxs):
+            if i + 1 >= len(allowed):
+                continue
+            cur = allowed[i]
+            nxt = allowed[i + 1]
+            penalty = abs(nxt - wanted[j]) - abs(cur - wanted[j])
+            choices.append((penalty, nxt - cur, j))
+        if not choices:
+            break
+        _, _, j = min(choices)
+        idxs[j] += 1
+
+    # If nearest-per-shot rounding overshoots, remove native steps only while the
+    # total remains >= target.  This makes the final duration the closest safe
+    # non-short result, so no chained transition has to be cut to hit a clock.
+    guard = 0
+    while guard < 10000:
+        guard += 1
+        cur_total = _total()
+        choices = []
+        for j, i in enumerate(idxs):
+            if i <= 0:
+                continue
+            cur = allowed[i]
+            prv = allowed[i - 1]
+            new_total = cur_total - (cur - prv)
+            if new_total < target_frames:
+                continue
+            penalty = abs(prv - wanted[j]) - abs(cur - wanted[j])
+            choices.append((penalty, cur - prv, j))
+        if not choices:
+            break
+        _, _, j = min(choices)
+        idxs[j] -= 1
+
+    for sh, i in zip(shots, idxs):
+        frames = int(allowed[i])
+        sh["duration_sec"] = round(frames / 24.0, 6)
+        sh["minimax_native_frames"] = frames
+
 def _planner_ltx25_frames(frames: int, max_frames: int = 241) -> int:
     try:
         n = max(9, min(int(max_frames or 241), int(frames)))
@@ -14871,6 +14962,21 @@ class PipelineWorker(QThread):
 
                 _fit_durations_total(out_shots, target_total, min_sec, max_sec)
 
+                # MiniMax continuation is frame-ladder based, not arbitrary seconds.
+                # Quantize the whole story together so its requested total stays as
+                # close as possible without shortening any generated transition tail.
+                try:
+                    _dur_model_key = _video_model_key((self.job.encoding or {}).get("video_model") or "")
+                    _dur_chain_on = bool(_planner_last_frame_chain_enabled(getattr(self.job, "encoding", {})))
+                    if _dur_model_key == "minimax_h3" and _dur_chain_on:
+                        _planner_fit_minimax_continuous_native_durations(
+                            out_shots,
+                            target_total,
+                            int(gen_profile.get("max_frames") or 1433),
+                        )
+                except Exception:
+                    pass
+
                 # Chunk 2: Drama curve labels + shot language rules (camera variety, meaningful close-ups, late establishing)
                 for j, _sh in enumerate(out_shots, start=1):
                     try:
@@ -22041,8 +22147,9 @@ class PipelineWorker(QThread):
                     "crf": self.job.encoding.get("crf"),
                     "bitrate_kbps": self.job.encoding.get("bitrate_kbps"),
                 },
-                # v2: MiniMax H3 source audio is preserved during normalization/concat.
-                "assembly_audio_policy": "minimax_embedded_audio_v2",
+                # v3: MiniMax continuation chains preserve complete source clips;
+                # shot durations are native-frame fitted instead of trimmed at assembly.
+                "assembly_audio_policy": "minimax_embedded_audio_v3_continuation_full_sources",
             }, sort_keys=True))
 
             _assemble_step_name = "Assemble final video (timeline → final_cut)"
@@ -22096,6 +22203,10 @@ class PipelineWorker(QThread):
                 # replace/mix this assembled audio when those features are enabled.
                 _assembly_model_key = _video_model_key((self.job.encoding or {}).get("video_model") or "")
                 _preserve_embedded_audio = bool(_assembly_model_key == "minimax_h3" and not bool(getattr(self.job, "silent", False)))
+                _minimax_continuous_chain = bool(
+                    _assembly_model_key == "minimax_h3"
+                    and _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {}))
+                )
 
                 def _run_cmd(args: List[str]) -> None:
                     if _LOGGER.enabled:
@@ -22122,6 +22233,37 @@ class PipelineWorker(QThread):
                     except Exception:
                         pass
                     return False
+
+                def _media_duration(media_path: str) -> float:
+                    try:
+                        info = _probe_json(str(media_path))
+                        # Prefer the video-stream clock: that is the transition
+                        # boundary we must preserve for a MiniMax continuation chain.
+                        for st in (info.get("streams") or []):
+                            if not isinstance(st, dict) or st.get("codec_type") != "video":
+                                continue
+                            try:
+                                d = float(st.get("duration") or 0.0)
+                                if d > 0.0:
+                                    return d
+                            except Exception:
+                                pass
+                            try:
+                                nb = int(st.get("nb_frames") or 0)
+                                rate = _parse_rate(str(st.get("avg_frame_rate") or st.get("r_frame_rate") or ""))
+                                if nb > 0 and rate > 0.0:
+                                    return float(nb) / float(rate)
+                            except Exception:
+                                pass
+                        try:
+                            d = float((info.get("format") or {}).get("duration") or 0.0)
+                            if d > 0.0:
+                                return d
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    return 0.0
 
                 def _parse_rate(s: str) -> float:
                     # "20/1" -> 20.0
@@ -22203,8 +22345,14 @@ class PipelineWorker(QThread):
                     if not src or not os.path.isfile(src):
                         raise RuntimeError(f"Missing clip for {sid}: {src}")
 
-                    # Decide desired duration
-                    desired = float(shot_durs.get(sid, 0.0) or 0.0)
+                    # Decide desired duration.  A MiniMax continuation chain is
+                    # special: its final frames are the actual transition into the
+                    # next generated clip, so assembly must preserve the complete
+                    # source clip instead of trimming it back to a story-time float.
+                    if _minimax_continuous_chain:
+                        desired = float(_media_duration(src) or 0.0)
+                    else:
+                        desired = float(shot_durs.get(sid, 0.0) or 0.0)
                     if desired <= 0.0:
                         # best-effort: use frames/fps from clip manifest, else probe duration
                         try:
@@ -22215,12 +22363,7 @@ class PipelineWorker(QThread):
                         except Exception:
                             desired = 0.0
                     if desired <= 0.0:
-                        # probe format duration
-                        info = _probe_json(src)
-                        try:
-                            desired = float((info.get("format") or {}).get("duration") or 0.0)
-                        except Exception:
-                            desired = 0.0
+                        desired = float(_media_duration(src) or 0.0)
                     desired = max(0.1, float(desired))
 
                     out_norm = os.path.join(norm_dir, f"clip_{idx:03d}_{sid}.mp4")
@@ -22232,6 +22375,14 @@ class PipelineWorker(QThread):
                         _norm_resume_ok = bool(os.path.isfile(out_norm) and os.path.getmtime(out_norm) >= os.path.getmtime(src) and os.path.getsize(out_norm) > 1024)
                         if _norm_resume_ok and _preserve_embedded_audio and not _has_audio_stream(out_norm):
                             _norm_resume_ok = False
+                        if _norm_resume_ok and _minimax_continuous_chain:
+                            # Invalidate normalized files produced by the older assembly
+                            # path if they are shorter than the full source transition.
+                            _src_d = float(_media_duration(src) or 0.0)
+                            _norm_d = float(_media_duration(out_norm) or 0.0)
+                            _tol = 1.5 / float(max(1, target_fps))
+                            if _src_d > 0.0 and (_norm_d <= 0.0 or _norm_d + _tol < _src_d):
+                                _norm_resume_ok = False
                         if _norm_resume_ok:
                             log_lines.append(f"[skip] {sid} → {os.path.basename(out_norm)} (already normalized)")
                         else:
@@ -22242,7 +22393,14 @@ class PipelineWorker(QThread):
                                 # Keep concat topology stable if an individual H3 clip happens
                                 # to contain no audio stream: create silence only for that clip.
                                 args += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
-                            args += ["-t", f"{desired:.3f}", "-vf", vf]
+                            if _minimax_continuous_chain:
+                                # No -t here: let the source video end naturally so the
+                                # continuation boundary/final transition frames survive.
+                                args += ["-vf", vf]
+                                if _preserve_embedded_audio and not _src_has_audio:
+                                    args += ["-shortest"]
+                            else:
+                                args += ["-t", f"{desired:.3f}", "-vf", vf]
                             if _preserve_embedded_audio:
                                 args += ["-map", "0:v:0", "-map", ("0:a:0" if _src_has_audio else "1:a:0")]
                             else:
@@ -22264,6 +22422,13 @@ class PipelineWorker(QThread):
 
                     if not os.path.isfile(out_norm) or os.path.getsize(out_norm) < 1024:
                         raise RuntimeError(f"Normalized clip missing/too small for {sid}: {out_norm}")
+
+                    if _minimax_continuous_chain:
+                        # Use the normalized file's real media clock in timeline.json;
+                        # do not carry the earlier arbitrary story-duration float forward.
+                        _actual_norm_duration = float(_media_duration(out_norm) or 0.0)
+                        if _actual_norm_duration > 0.0:
+                            desired = _actual_norm_duration
 
                     # Concat list requires absolute paths; quote to allow spaces.
                     _safe_path = str(out_norm).replace("'", "\\'")
