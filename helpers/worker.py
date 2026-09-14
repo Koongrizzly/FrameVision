@@ -7240,6 +7240,10 @@ def handle_job(jpath: Path):
         if t=="upscale_video": code = upscale_video(job, cfg, mani)
         elif t=="upscale_photo": code = upscale_photo(job, cfg, mani)
         elif t=='tools_ffmpeg': code = tools_ffmpeg(job, cfg, mani)
+        elif t in ('ostris_lora_train', 'ostris_train', 'lora_train'):
+            # AI Toolkit training uses the generic persistent command runner so
+            # stdout/progress/cancel handling behaves like the rest of FrameVision queue.
+            code = tools_ffmpeg(job, cfg, mani)
         elif t in ('minimax_h3_generate','minimax_h3'):
             code = minimax_h3_generate(job, cfg, mani)
         elif t in ('ltx23_generate','ltx23','ltx23_tools'):

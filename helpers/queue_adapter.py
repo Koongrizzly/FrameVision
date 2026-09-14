@@ -267,6 +267,38 @@ def enqueue_tool_job(job_type: str, input_path: str, out_dir: str, args: dict, p
     args = _fv_fix_hunyuan15_args(args or {})
     return make_job_json(job_type, input_path, out_dir, args or {}, str(d['pending']), priority=int(priority))
 
+def enqueue_ostris_lora_training(config_path: str, job_name: str, output_dir: str, priority: int = 450):
+    """Queue an Ostris AI Toolkit LoRA training run in FrameVision's main queue."""
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parents[1]
+    cfg = _P(str(config_path)).resolve()
+    repo = root / "models" / "ostris" / "ai-toolkit"
+    env = root / "environments" / ".ostris"
+    py = env / ("python.exe" if os.name == "nt" else "bin/python")
+    if not cfg.is_file():
+        raise FileNotFoundError(f"AI Toolkit config not found: {cfg}")
+    if not (repo / "run.py").is_file():
+        raise FileNotFoundError(f"AI Toolkit backend not found: {repo / 'run.py'}")
+    if not py.is_file():
+        raise FileNotFoundError(f"Ostris Python environment not found: {py}")
+    out = _P(str(output_dir)).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    safe_name = str(job_name or cfg.stem).strip() or cfg.stem
+    log_file = root / "logs" / f"ostris_queue_{safe_name}.log"
+    args = {
+        "cmd": [str(py), "run.py", str(cfg)],
+        "cwd": str(repo),
+        "log_file": str(log_file),
+        "label": f"LoRA Train - {safe_name}",
+        "title": f"LoRA Train - {safe_name}",
+        "engine": "ostris_lora",
+        "queue_family": "ostris_lora",
+        "config_path": str(cfg),
+        "job_name": safe_name,
+    }
+    return enqueue_tool_job("ostris_lora_train", str(cfg), str(out), args, priority=int(priority))
+
+
 def enqueue_musicclip_tool_job(input_path: str, out_dir: str, args: dict, priority: int = 560):
     """Queue a Music Clip Creator helper command with metadata for footer mirroring.
 

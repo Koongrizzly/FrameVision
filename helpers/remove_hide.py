@@ -57,6 +57,55 @@ class Entry:
 def build_registry() -> List[Entry]:
     return [
         Entry(
+            id="ostris_lora_trainer",
+            title="Ostris AI Toolkit / LoRA Trainer",
+            env_paths=["/environments/.ostris/"],
+            model_paths=["/models/ostris/"],
+            repo_paths=[],
+            helper_paths=[],
+            shared_helper_note=(
+                "Deletes the dedicated training environment and AI Toolkit repository/model folder. "
+                "The FrameVision LoRA Trainer helper and installer are kept so the backend can be reinstalled later."
+            ),
+        ),
+        Entry(
+            id="ltx25_fp16",
+            title="LTX 2.5 Full FP16 / BF16",
+            env_paths=["/environments/ltx25/"],
+            model_paths=["/models/ltx-2.5/"],
+            repo_paths=[],
+            helper_paths=[],
+            exclude_paths=["/models/ltx-2.5/msr/"],
+            shared_helper_note=(
+                "Deletes the native LTX 2.5 environment, repo and BF16 model files. "
+                "The Licon MSR add-on folder is preserved and can be removed separately. "
+                "The helper and unified installer are kept for reinstall."
+            ),
+        ),
+        Entry(
+            id="ltx25_convrot",
+            title="LTX 2.5 ConvRot (W4A8 / INT4)",
+            env_paths=["/environments/ltx25_convrot/"],
+            model_paths=["/models/ltx_2_5_convrot/"],
+            repo_paths=[],
+            helper_paths=[],
+            shared_helper_note=(
+                "W4A8 and INT4 share this environment/model tree and isolated ComfyUI backend. "
+                "Deleting this entry removes both ConvRot variants that are present, but keeps the LTX helper and installer."
+            ),
+        ),
+        Entry(
+            id="ltx25_msr",
+            title="LTX 2.5 Licon MSR addon",
+            env_paths=[],
+            model_paths=["/models/ltx-2.5/msr/"],
+            repo_paths=[],
+            helper_paths=[],
+            shared_helper_note=(
+                "Removes only the Licon Multiple-Subject-Reference add-on. It does not remove the base LTX 2.5 environment or models."
+            ),
+        ),
+        Entry(
             id="wan22",
             title="WAN 2.2",
             env_paths=["/.wan_venv/"],

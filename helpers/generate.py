@@ -125,9 +125,33 @@ def main():
         text_encoder_path=ns.text_encoder, video_vae_path=ns.video_vae, audio_vae_path=ns.audio_vae,
     )
     if errors:
-        print("Model validation failed before generation:")
-        for e in errors: print(" -", e)
-        return 2
+        # Experimental/hybrid MiniMax checkpoints can be perfectly loadable by the
+        # authoritative Comfy diffusion loader while the filename/metadata validator
+        # cannot classify them as stock FL2VA. Ref2VA already permits this workflow;
+        # FL2VA/continuation must do the same or a hybrid that succeeds for S01 fails
+        # immediately when S02 switches to native continuation.
+        _explicit_fl2va = Path(ns.fl2va_checkpoint).resolve() if ns.fl2va_checkpoint else None
+        _compat_errors = []
+        _hard_errors = []
+        for _err in errors:
+            _msg = str(_err or "")
+            _low = _msg.lower()
+            if (
+                ("fl2va model:" in _low or "ref2va model:" in _low)
+                and ("not a compatible" in _low or "incompatible" in _low)
+            ):
+                _compat_errors.append(_msg)
+            else:
+                _hard_errors.append(_msg)
+        if _explicit_fl2va and _explicit_fl2va.is_file() and _compat_errors and not _hard_errors:
+            diff = str(_explicit_fl2va)
+            print("[MODEL] Experimental FL2VA diffusion override: validator rejection bypassed; passing checkpoint to Comfy diffusion loader for authoritative compatibility test.", flush=True)
+            for _msg in _compat_errors:
+                print(f"[MODEL] Validator note: {_msg}", flush=True)
+        else:
+            print("Model validation failed before generation:")
+            for e in errors: print(" -", e)
+            return 2
 
     if ns.seed is None or int(ns.seed) < 0: ns.seed = int.from_bytes(os.urandom(4), "little") % 99_000_000
     else: ns.seed = int(ns.seed) % 99_000_000

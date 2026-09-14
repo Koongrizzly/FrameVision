@@ -1489,9 +1489,99 @@ def _run_mage_flow_edit_turbo(root: Path) -> Optional[Tuple[str, List[str], Path
 def _run_mage_flow_edit(root: Path) -> Optional[Tuple[str, List[str], Path]]:
     return _run_mage_models(root, "edit")
 
+def _run_ostris_lora_trainer(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    """Install/repair the Ostris AI Toolkit backend used by FrameVision's LoRA Trainer.
+
+    The installer keeps its normal GUI when launched directly. Optional Installs uses
+    --auto-install so repo/environment setup runs inside this dialog's process/log.
+    """
+    script = root / "presets" / "extra_env" / "ostris_install.py"
+    if not script.exists():
+        return None
+    py = _venv_python(root)
+    if py is None or not py.exists():
+        return None
+    return (str(py), ["-u", str(script), "--auto-install"], root)
+
+
+def _run_ltx25_action(root: Path, action: str) -> Optional[Tuple[str, List[str], Path]]:
+    """Run one action from the unified LTX 2.5 installer.
+
+    The installer owns UV bootstrap, dedicated environments, repositories, models,
+    ConvRot's isolated ComfyUI backend, and the optional Licon MSR model.
+    """
+    script = root / "presets" / "extra_env" / "ltx2_5_install.py"
+    if not script.exists():
+        return None
+    py = _venv_python(root)
+    if py is None or not py.exists():
+        return None
+    return (str(py), ["-u", str(script), "--root", str(root), "--action", str(action)], root)
+
+
+def _run_ltx25_fp16(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_ltx25_action(root, "install-fp16")
+
+
+def _run_ltx25_w4a8(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_ltx25_action(root, "install-w4a8")
+
+
+def _run_ltx25_int4(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_ltx25_action(root, "install-int4")
+
+
+def _run_ltx25_msr(root: Path) -> Optional[Tuple[str, List[str], Path]]:
+    return _run_ltx25_action(root, "install-msr")
+
+
 def _default_installs() -> List[OptionalInstall]:
     # Titles/descriptions copied from install_menu.bat "extra options" page.
     return [
+        OptionalInstall(
+            key="ostris_lora_trainer",
+            title="Ostris AI Toolkit / LoRA Trainer",
+            description=(
+                "Installs or repairs the dedicated Ostris AI Toolkit training backend used by FrameVision's LoRA Trainer. "
+                "Downloads the ai-toolkit repository into models/ostris/ai-toolkit and creates environments/.ostris."
+            ),
+            runner=_run_ostris_lora_trainer,
+        ),
+        OptionalInstall(
+            key="ltx25_fp16",
+            title="LTX 2.5 Full FP16 / BF16",
+            description=(
+                "Installs or repairs the native LTX 2.5 distilled BF16 runtime using UV. "
+                "Uses environments/ltx25 and models/ltx-2.5, including the official LTX repo and required distilled model files."
+            ),
+            runner=_run_ltx25_fp16,
+        ),
+        OptionalInstall(
+            key="ltx25_w4a8",
+            title="LTX 2.5 W4A8 ConvRot (recommended)",
+            description=(
+                "Installs or repairs the W4A8 ConvRot model, shared ConvRot UV environment and its isolated ComfyUI backend. "
+                "Uses environments/ltx25_convrot and models/ltx_2_5_convrot."
+            ),
+            runner=_run_ltx25_w4a8,
+        ),
+        OptionalInstall(
+            key="ltx25_int4",
+            title="LTX 2.5 INT4 ConvRot",
+            description=(
+                "Installs or repairs the INT4 ConvRot model in the shared ConvRot runtime/model tree and ensures the isolated ComfyUI backend is present."
+            ),
+            runner=_run_ltx25_int4,
+        ),
+        OptionalInstall(
+            key="ltx25_msr",
+            title="LTX 2.5 Licon MSR addon",
+            description=(
+                "Downloads the Licon Multiple-Subject-Reference model into models/ltx-2.5/msr. "
+                "This is an add-on for the native LTX 2.5 install and does not create another environment."
+            ),
+            runner=_run_ltx25_msr,
+        ),
         OptionalInstall(
             key="qwen3tts",
             title="Qwen3-TTS-12Hz-1.7B-CustomVoice",
@@ -2206,6 +2296,10 @@ OptionalInstall(
 # These folders are safe to delete when re-installing an optional component:
 # they contain only the Python environment, not the downloaded model weights.
 _ENV_DIR_BY_KEY = {
+    "ostris_lora_trainer": Path("environments") / ".ostris",
+    "ltx25_fp16": Path("environments") / "ltx25",
+    "ltx25_w4a8": Path("environments") / "ltx25_convrot",
+    "ltx25_int4": Path("environments") / "ltx25_convrot",
     "qwen3tts": Path("environments") / ".qwen3tts",
     "dotstts": Path("environments") / ".dots_tts",
     "whisper": Path("environments") / ".whisper",
@@ -2573,6 +2667,10 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
 
         for k in (
             "wan22_turbo",
+            "ltx25_w4a8",
+            "ltx25_int4",
+            "ltx25_fp16",
+            "ltx25_msr",
             "ltx23",
             "ltx23_fp8",
             "ltx23_sdnq_int8",
@@ -2837,6 +2935,14 @@ class OptionalInstallsDialog(QtWidgets.QDialog):
         opts_lay.addWidget(_mk_section_label("Audio models"))
 
         for k in ("qwen3tts", "qwen3tts_models", "qwen3tts_flashattn", "ace15"):
+            opt = by_key.get(k)
+            if opt:
+                _add_opt(opt, opts_lay)
+
+        # ---- AI training
+        opts_lay.addWidget(_mk_section_label("AI training"))
+
+        for k in ("ostris_lora_trainer",):
             opt = by_key.get(k)
             if opt:
                 _add_opt(opt, opts_lay)

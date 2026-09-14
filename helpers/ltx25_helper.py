@@ -32,7 +32,6 @@ DEFAULT_SETTINGS_PATH = APP_ROOT / "presets" / "setsave" / "ltx25.json"
 DEFAULT_LOGS_DIR = APP_ROOT / "logs"
 INSTALLER_DIR = APP_ROOT / "presets" / "extra_env"
 PY_INSTALLER = INSTALLER_DIR / "ltx2_5_install.py"
-FP16_INSTALLER_BAT = INSTALLER_DIR / "install_ltx_2_5_distilled.bat"
 CONVROT_WORKER = APP_ROOT / "helpers" / "ltx25_convrot_worker.py"
 CONVROT_CACHE = CONVROT_MODELS / "cache"
 DEFAULT_PROMPT = "A red sports car races along a coastal highway at sunset, cinematic tracking shot, realistic lighting, detailed reflections, fast natural motion."
@@ -2112,6 +2111,7 @@ def run_gui(parent=None, embedded=False):
             w4a8_btn = box.addButton("W4A8 (recommended)", QMessageBox.ButtonRole.AcceptRole)
             int4_btn = box.addButton("INT4", QMessageBox.ButtonRole.AcceptRole)
             fp16_btn = box.addButton("Full FP16", QMessageBox.ButtonRole.AcceptRole)
+            msr_btn = box.addButton("Licon MSR addon", QMessageBox.ButtonRole.AcceptRole)
             remove_btn = box.addButton("Remove an install", QMessageBox.ButtonRole.DestructiveRole)
             cancel_btn = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
             box.setDefaultButton(w4a8_btn)
@@ -2129,6 +2129,9 @@ def run_gui(parent=None, embedded=False):
             elif clicked is int4_btn:
                 action = "install-int4"
                 label = "INT4 ConvRot"
+            elif clicked is msr_btn:
+                action = "install-msr"
+                label = "Licon MSR addon"
             else:
                 action = "install-fp16"
                 label = "Full FP16"
@@ -2136,35 +2139,29 @@ def run_gui(parent=None, embedded=False):
             self._start_ltx25_installer(action, label)
 
         def _start_ltx25_installer(self, action: str, label: str):
-            is_fp16 = action == "install-fp16"
-            installer = FP16_INSTALLER_BAT if is_fp16 else PY_INSTALLER
+            # One authoritative Python installer now owns FP16, W4A8, INT4,
+            # the ConvRot ComfyUI backend and the Licon MSR addon.
+            installer = PY_INSTALLER
 
             if not installer.is_file():
-                kind = "BAT" if is_fp16 else "Python"
                 QMessageBox.warning(
                     self,
                     "Install LTX 2.5",
-                    f"{kind} installer was not found:\n{installer}"
+                    f"Python installer was not found:\n{installer}"
                 )
                 return
 
             self._log("=" * 72)
             self._log(f"[INSTALL] Starting {label}: {installer}")
-            if not is_fp16:
-                self._log(f"[INSTALL] Action: {action}")
+            self._log(f"[INSTALL] Action: {action}")
             self.install_btn.setEnabled(False)
             self.install_progress.setVisible(True)
 
             proc = QProcess(self)
             self.install_process = proc
             proc.setWorkingDirectory(str(APP_ROOT))
-
-            if is_fp16:
-                proc.setProgram("cmd.exe")
-                proc.setArguments(["/d", "/c", str(installer), "--no-pause"])
-            else:
-                proc.setProgram(sys.executable)
-                proc.setArguments([str(installer), "--action", action])
+            proc.setProgram(sys.executable)
+            proc.setArguments([str(installer), "--action", action])
 
             self._apply_ltx_process_environment(proc)
             proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)

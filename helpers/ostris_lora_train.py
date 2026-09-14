@@ -190,8 +190,9 @@ class MediaItemWidget(QWidget):
 
 
 class FrameVisionLoraTrainer(QMainWindow):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, parent=None, framevision_queue: bool = False) -> None:
+        super().__init__(parent)
+        self.framevision_queue = bool(framevision_queue)
         self.setWindowTitle("  LoRA Trainer")
         self.resize(1280, 850)
         self.process: Optional[QProcess] = None
@@ -251,13 +252,16 @@ class FrameVisionLoraTrainer(QMainWindow):
         self.prepare_btn.clicked.connect(self.prepare_job)
         footer.addWidget(self.prepare_btn)
 
-        self.start_btn = QPushButton("Start Training")
+        self.start_btn = QPushButton("Add to FrameVision Queue" if self.framevision_queue else "Start Training")
         self.start_btn.clicked.connect(self.start_training)
+        if self.framevision_queue:
+            self.start_btn.setToolTip("Prepare this AI Toolkit training config and add it to FrameVision's main queue.")
         footer.addWidget(self.start_btn)
 
         self.stop_btn = QPushButton("Stop Training")
         self.stop_btn.clicked.connect(self.stop_training)
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setVisible(not self.framevision_queue)
         footer.addWidget(self.stop_btn)
 
         footer.addStretch(1)
@@ -1010,6 +1014,37 @@ class FrameVisionLoraTrainer(QMainWindow):
         if filename:
             Path(filename).write_text(self.yaml_edit.toPlainText(), encoding="utf-8")
 
+    def _queue_training_job(self, config_path: Path) -> bool:
+        """Submit training to FrameVision's persistent queue instead of spawning QProcess here."""
+        try:
+            try:
+                from helpers.queue_adapter import enqueue_ostris_lora_training
+            except Exception:
+                from queue_adapter import enqueue_ostris_lora_training  # type: ignore
+            job_name = slugify(self.job_name.text())
+            preset = self.current_preset()
+            output_dir = OUTPUT_ROOT / preset.family.replace(" ", "_").lower()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            job_path = enqueue_ostris_lora_training(
+                config_path=str(config_path),
+                job_name=job_name,
+                output_dir=str(output_dir),
+            )
+            self.append_log(f"Added to FrameVision queue: {job_path}")
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+            self.tabs.setCurrentIndex(4)
+            QMessageBox.information(
+                self, "Queued",
+                f"LoRA training '{job_name}' was added to the FrameVision queue.\n\n"
+                "Progress and cancellation are handled from the Queue tab."
+            )
+            return True
+        except Exception as exc:
+            QMessageBox.critical(self, "Could not queue training", str(exc))
+            self.append_log(f"Queue error: {exc}")
+            return False
+
     def start_training(self) -> None:
         if self.process:
             return
@@ -1032,6 +1067,11 @@ class FrameVisionLoraTrainer(QMainWindow):
         CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
         config_path = CONFIG_ROOT / f"{slugify(self.job_name.text())}.yaml"
         config_path.write_text(self.yaml_edit.toPlainText(), encoding="utf-8")
+        self._save_settings()
+
+        if self.framevision_queue:
+            self._queue_training_job(config_path)
+            return
 
         self.process = QProcess(self)
         self.process.setWorkingDirectory(str(REPO_ROOT))
@@ -1128,6 +1168,20 @@ class FrameVisionLoraTrainer(QMainWindow):
     def open_path(path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(path.as_uri())
+
+
+def create_framevision_tools_widget(parent=None):
+    """Create the LoRA trainer as an embedded Tools-tab widget using FrameVision queue mode."""
+    widget = FrameVisionLoraTrainer(parent=parent, framevision_queue=True)
+    try:
+        widget.setWindowFlags(Qt.Widget)
+        widget.setMinimumHeight(720)
+        widget.setProperty("expand_min_h", 760)
+        widget.setProperty("_fv_skip_snapshot", True)
+        widget.setProperty("_fv_skip_restore", True)
+    except Exception:
+        pass
+    return widget
 
 
 if __name__ == "__main__":

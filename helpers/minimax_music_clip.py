@@ -105,6 +105,48 @@ MINIMAX_PY = MINIMAX_ENV / "python.exe"
 if not MINIMAX_PY.is_file():
     MINIMAX_PY = MINIMAX_ENV / "Scripts" / "python.exe"
 GENERATE_REF = HELPERS_DIR / "generate_ref.py"
+DIFFUSION_MODELS_DIR = ROOT / "models" / "minimax_h3" / "diffusion_models"
+LORA_MODELS_DIR = ROOT / "models" / "minimax_h3" / "loras"
+
+def _find_music_hybrid_checkpoint() -> Optional[Path]:
+    """Prefer the newer SparseRef/hybrid checkpoints for Ref2VA music jobs."""
+    if not DIFFUSION_MODELS_DIR.is_dir():
+        return None
+    candidates = [p for p in DIFFUSION_MODELS_DIR.glob("*.safetensors") if p.is_file()]
+    def score(path: Path) -> tuple[int, str]:
+        name = path.name.lower()
+        if "sparseref" in name and "hybrid" in name:
+            rank = 0
+        elif "sparseref" in name:
+            rank = 1
+        elif "hybrid" in name:
+            rank = 2
+        elif "fused" in name and "ref" in name:
+            rank = 3
+        else:
+            rank = 99
+        return rank, name
+    candidates = [p for p in candidates if score(p)[0] < 99]
+    return min(candidates, key=score).resolve() if candidates else None
+
+def _find_music_turbo_lora() -> Optional[Path]:
+    """Pick a speed/Turbo LoRA only when the project has no explicit saved LoRA."""
+    if not LORA_MODELS_DIR.is_dir():
+        return None
+    candidates = [p for p in LORA_MODELS_DIR.glob("*.safetensors") if p.is_file()]
+    def score(path: Path) -> tuple[int, str]:
+        name = path.name.lower()
+        if "turbo" in name and "ema" in name:
+            rank = 0
+        elif "turbo" in name:
+            rank = 1
+        elif "ema" in name:
+            rank = 2
+        else:
+            rank = 99
+        return rank, name
+    candidates = [p for p in candidates if score(p)[0] < 99]
+    return min(candidates, key=score).resolve() if candidates else None
 
 NORMAL_FRAME_MAX = 719
 MUSIC_FRAME_MIN = 124
@@ -542,14 +584,15 @@ class MusicProject:
     whisper_timing_enabled: bool = True
     visible_lyric_subtitles: bool = False
     job_seed: int = -1
-    steps: int = 15
+    steps: int = 10
     cfg: float = 1.0
     shift: float = 12.0
     audio_shift: float = 3.0
     ref_image_size: str = "match"
     remove_reference_backgrounds: bool = True
     sage_attention: bool = False
-    spectrum: bool = False
+    sla_attention: bool = True
+    spectrum: bool = True
     use_hybrid_model: bool = False
     hybrid_model_path: str = ""
     vram_manager_enabled: bool = True
@@ -2126,7 +2169,17 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
         if hybrid.is_file():
             hybrid_checkpoint = hybrid.resolve()
         else:
-            progress(f"__MINIMAX_HYBRID_FALLBACK__|{hybrid}")
+            hybrid_checkpoint = _find_music_hybrid_checkpoint()
+            if hybrid_checkpoint is not None:
+                progress(f"Music clip: saved hybrid path unavailable; using detected hybrid {hybrid_checkpoint.name}")
+            else:
+                progress(f"__MINIMAX_HYBRID_FALLBACK__|{hybrid}")
+    else:
+        # New SparseRef/hybrid checkpoints are valid Ref2VA music backends even though
+        # the legacy Ref2VA filename validator does not recognize them. Prefer one when present.
+        hybrid_checkpoint = _find_music_hybrid_checkpoint()
+        if hybrid_checkpoint is not None:
+            progress(f"Music clip: using detected hybrid Ref2VA checkpoint {hybrid_checkpoint.name}")
     results: List[Dict[str, Any]] = []
     targets = [s for s in project.shots if s.index in shot_indices]
     for pos, shot in enumerate(targets, start=1):
@@ -2159,7 +2212,7 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             str(MINIMAX_PY), "-u", str(GENERATE_REF),
             "--prompt", generation_prompt,
             "--width", str(width), "--height", str(height),
-            "--frames", str(shot.frames), "--steps", str(project.steps),
+            "--frames", str(shot.frames), "--steps", "10",
             "--cfg", str(project.cfg), "--seed", str(shot.seed),
             "--shift", str(project.shift), "--audio-shift", str(project.audio_shift),
             "--ref-image-size", project.ref_image_size,
@@ -2188,13 +2241,19 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             cmd += ["--vram-residency-fill" if project.vram_residency_fill else "--no-vram-residency-fill"]
         if project.sage_attention:
             cmd += ["--sage-attention"]
-        if project.spectrum:
-            cmd += ["--spectrum"]
+        # Music workflow quality preset: Turbo at 10 steps with SLA + Spectrum Forecasting.
+        cmd += ["--sla-attention", "--spectrum"]
         turbo_lora = str(project.turbo_lora_path or "").strip()
-        if turbo_lora:
-            turbo_path = Path(turbo_lora)
-            if not turbo_path.is_file():
+        turbo_path = Path(turbo_lora) if turbo_lora else None
+        if turbo_path is None or not turbo_path.is_file():
+            detected_turbo = _find_music_turbo_lora()
+            if detected_turbo is not None:
+                turbo_path = detected_turbo
+                project.turbo_lora_path = str(detected_turbo)
+                progress(f"Music clip: using detected Turbo LoRA {detected_turbo.name}")
+            elif turbo_lora:
                 raise RuntimeError(f"Turbo LoRA not found: {turbo_lora}")
+        if turbo_path is not None and turbo_path.is_file():
             cmd += ["--lora", str(turbo_path.resolve()), "--lora-strength", str(float(project.turbo_lora_strength))]
         _append_optional_music_loras(cmd, project)
         for ref in selected:
@@ -2675,6 +2734,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "check_vram_manager": "minimax_music_vram_manager",
             "check_vram_auto_bypass": "minimax_music_vram_auto_bypass",
             "check_sage": "minimax_music_sage_attention",
+            "check_sla": "minimax_music_sla_attention",
             "check_spectrum": "minimax_music_spectrum",
             "check_hypir_x1_upscale": "minimax_music_hypir_x1",
             "check_lanczos_x2_upsampling": "minimax_music_lanczos_x2",
@@ -3149,7 +3209,7 @@ class MiniMaxMusicClipWidget(QWidget):
         form.addRow("Extra context before edit:", self.spin_head)
         form.addRow("Extra context after edit:", self.spin_tail)
         form.addRow("Phrase-boundary snap tolerance:", self.spin_snap)
-        self.spin_steps = QSpinBox(gen); self.spin_steps.setRange(1, 100); self.spin_steps.setValue(15)
+        self.spin_steps = QSpinBox(gen); self.spin_steps.setRange(1, 100); self.spin_steps.setValue(10)
         self.spin_cfg = QDoubleSpinBox(gen); self.spin_cfg.setRange(0.0, 20.0); self.spin_cfg.setValue(1.0); self.spin_cfg.setDecimals(2)
         self.spin_shift = QDoubleSpinBox(gen); self.spin_shift.setRange(0.0, 30.0); self.spin_shift.setValue(12.0); self.spin_shift.setDecimals(2)
         self.spin_audio_shift = QDoubleSpinBox(gen); self.spin_audio_shift.setRange(0.0, 20.0); self.spin_audio_shift.setValue(3.0); self.spin_audio_shift.setDecimals(2)
@@ -3207,8 +3267,9 @@ class MiniMaxMusicClipWidget(QWidget):
         self.check_vram_auto_bypass = QCheckBox("Automatic bypass when job fits", gen); self.check_vram_auto_bypass.setChecked(True)
         self.check_vram_auto_bypass.setToolTip("On = MiniMax decides per stage/job whether native loading is safe. Off = VRAM Manager stays active for every job.")
         self.check_sage = QCheckBox("SageAttention", gen)
-        self.check_spectrum = QCheckBox("Spectrum", gen)
-        flags = QHBoxLayout(); flags.addWidget(self.check_vram_manager); flags.addWidget(self.check_vram_auto_bypass); flags.addWidget(self.check_sage); flags.addWidget(self.check_spectrum); flags.addStretch(1)
+        self.check_sla = QCheckBox("SLA Attention", gen); self.check_sla.setChecked(True)
+        self.check_spectrum = QCheckBox("Spectrum Forecasting", gen); self.check_spectrum.setChecked(True)
+        flags = QHBoxLayout(); flags.addWidget(self.check_vram_manager); flags.addWidget(self.check_vram_auto_bypass); flags.addWidget(self.check_sage); flags.addWidget(self.check_sla); flags.addWidget(self.check_spectrum); flags.addStretch(1)
         form.addRow("Acceleration / VRAM:", flags)
 
         post = QGroupBox("Final video upscale / restoration", body)
@@ -3278,7 +3339,9 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.head_padding = self.spin_head.value()
         self.project.tail_padding = self.spin_tail.value()
         self.project.phrase_snap_tolerance = self.spin_snap.value()
-        self.project.steps = self.spin_steps.value()
+        self.project.steps = 10
+        if self.spin_steps.value() != 10:
+            self.spin_steps.setValue(10)
         self.project.cfg = self.spin_cfg.value()
         self.project.shift = self.spin_shift.value()
         self.project.audio_shift = self.spin_audio_shift.value()
@@ -3295,7 +3358,10 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.vram_manager_enabled = self.check_vram_manager.isChecked()
         self.project.vram_auto_bypass = self.check_vram_auto_bypass.isChecked()
         self.project.sage_attention = self.check_sage.isChecked()
-        self.project.spectrum = self.check_spectrum.isChecked()
+        self.project.sla_attention = True
+        self.project.spectrum = True
+        self.check_sla.setChecked(True)
+        self.check_spectrum.setChecked(True)
         self.project.randomize_reference_characters = bool(self.check_randomize_ref_characters.isChecked())
         self.project.use_framevision_queue = bool(self.check_framevision_queue.isChecked())
         self.project.use_hypir_x1_upscale = bool(getattr(self, "check_hypir_x1_upscale", None) and self.check_hypir_x1_upscale.isChecked())
@@ -3328,7 +3394,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.spin_extra_lora2.setValue(float(getattr(p, "extra_lora2_strength", 1.0)))
         self.check_hybrid_model.setChecked(bool(getattr(p, "use_hybrid_model", False)))
         self.edit_hybrid_model.setText(str(getattr(p, "hybrid_model_path", "") or ""))
-        self.check_vram_manager.setChecked(bool(p.vram_manager_enabled)); self.check_vram_auto_bypass.setChecked(bool(p.vram_auto_bypass)); self.check_sage.setChecked(p.sage_attention); self.check_spectrum.setChecked(p.spectrum)
+        self.check_vram_manager.setChecked(bool(p.vram_manager_enabled)); self.check_vram_auto_bypass.setChecked(bool(p.vram_auto_bypass)); self.check_sage.setChecked(p.sage_attention); self.check_sla.setChecked(bool(getattr(p, "sla_attention", True))); self.check_spectrum.setChecked(p.spectrum)
         self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
         if getattr(self, "check_remove_ref_backgrounds", None) is not None:
             self.check_remove_ref_backgrounds.setChecked(bool(getattr(p, "remove_reference_backgrounds", True)))
@@ -3435,7 +3501,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "vram_offload_chunk_mb", "vram_max_resident_weights_gb", "vram_block_check_interval",
             "vram_async_streams", "vram_video_vae_reserve_gb", "vram_audio_vae_reserve_gb",
             "vram_residency_fill", "vram_residency_target_free_gb", "vram_residency_warmup_blocks",
-            "vram_residency_refill_interval", "sage_attention", "spectrum", "beat_sensitivity", "whisper_timing_enabled", "visible_lyric_subtitles",
+            "vram_residency_refill_interval", "sage_attention", "sla_attention", "spectrum", "beat_sensitivity", "whisper_timing_enabled", "visible_lyric_subtitles",
             "randomize_reference_characters",
         ):
             setattr(self.project, name, getattr(old, name))
@@ -4230,20 +4296,26 @@ class MiniMaxMusicClipWidget(QWidget):
             "helpers/generate_ref.py",
             "--prompt", generation_prompt,
             "--width", str(width), "--height", str(height),
-            "--frames", str(shot.frames), "--steps", str(self.project.steps),
+            "--frames", str(shot.frames), "--steps", "10",
             "--cfg", str(self.project.cfg), "--seed", str(shot.seed),
             "--shift", str(self.project.shift), "--audio-shift", str(self.project.audio_shift),
             "--ref-image-size", self.project.ref_image_size,
             "--ref-audio", str(audio_chunk),
             "--output", str(out_path),
         ]
+        hybrid_override: Optional[Path] = None
         if self.project.use_hybrid_model:
             hybrid = Path(str(self.project.hybrid_model_path or "").strip())
             if hybrid.is_file():
-                args += ["--ref2va-checkpoint", str(hybrid.resolve())]
+                hybrid_override = hybrid.resolve()
             else:
-                # Omit the override: generate_ref.py then uses the normal Ref2VA checkpoint.
-                self._notify_hybrid_fallback(str(hybrid))
+                hybrid_override = _find_music_hybrid_checkpoint()
+                if hybrid_override is None:
+                    self._notify_hybrid_fallback(str(hybrid))
+        else:
+            hybrid_override = _find_music_hybrid_checkpoint()
+        if hybrid_override is not None:
+            args += ["--ref2va-checkpoint", str(hybrid_override)]
         if self.project.vram_manager_enabled:
             args += ["--vram-manager-auto" if self.project.vram_auto_bypass else "--vram-manager"]
             args += [
@@ -4264,13 +4336,19 @@ class MiniMaxMusicClipWidget(QWidget):
             args += ["--vram-residency-fill" if self.project.vram_residency_fill else "--no-vram-residency-fill"]
         if self.project.sage_attention:
             args += ["--sage-attention"]
-        if self.project.spectrum:
-            args += ["--spectrum"]
+        # Music workflow quality preset: Turbo at 10 steps with SLA + Spectrum Forecasting.
+        args += ["--sla-attention", "--spectrum"]
         turbo_lora = str(self.project.turbo_lora_path or "").strip()
-        if turbo_lora:
-            turbo_path = Path(turbo_lora)
-            if not turbo_path.is_file():
+        turbo_path = Path(turbo_lora) if turbo_lora else None
+        if turbo_path is None or not turbo_path.is_file():
+            detected_turbo = _find_music_turbo_lora()
+            if detected_turbo is not None:
+                turbo_path = detected_turbo
+                self.project.turbo_lora_path = str(detected_turbo)
+                self.edit_turbo_lora.setText(str(detected_turbo))
+            elif turbo_lora:
                 raise RuntimeError(f"Turbo LoRA not found: {turbo_lora}")
+        if turbo_path is not None and turbo_path.is_file():
             args += ["--lora", str(turbo_path.resolve()), "--lora-strength", str(float(self.project.turbo_lora_strength))]
         _append_optional_music_loras(args, self.project)
         for ref in selected:
@@ -4282,7 +4360,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "output": str(out_path),
             "label": f"Music Clip Shot {shot.index}: {(self.project.title or _safe_stem(self.project.audio_path))}",
             "frames": int(shot.frames),
-            "steps": int(self.project.steps),
+            "steps": 10,
             "seed": int(shot.seed),
             "resolution": f"{width} × {height}",
             "prompt": generation_prompt,
@@ -4623,6 +4701,7 @@ class MiniMaxMusicClipWidget(QWidget):
                 self.project.use_hybrid_model = bool(data.get("use_hybrid_model", self.project.use_hybrid_model))
                 self.project.hybrid_model_path = str(data.get("hybrid_model_path") or self.project.hybrid_model_path)
                 self.project.sage_attention = bool(data.get("sage_attention", self.project.sage_attention))
+                self.project.sla_attention = bool(data.get("sla_attention", getattr(self.project, "sla_attention", True)))
                 self.project.spectrum = bool(data.get("spectrum", self.project.spectrum))
                 self.project.randomize_reference_characters = bool(data.get("randomize_reference_characters", self.project.randomize_reference_characters))
                 self.project.auto_fill_locations = bool(data.get("auto_fill_locations", getattr(self.project, "auto_fill_locations", False)))
@@ -4658,7 +4737,7 @@ class MiniMaxMusicClipWidget(QWidget):
                 "extra_lora1_path": self.project.extra_lora1_path, "extra_lora1_strength": self.project.extra_lora1_strength,
                 "extra_lora2_path": self.project.extra_lora2_path, "extra_lora2_strength": self.project.extra_lora2_strength,
                 "use_hybrid_model": self.project.use_hybrid_model, "hybrid_model_path": self.project.hybrid_model_path,
-                "sage_attention": self.project.sage_attention, "spectrum": self.project.spectrum,
+                "sage_attention": self.project.sage_attention, "sla_attention": self.project.sla_attention, "spectrum": self.project.spectrum,
                 "randomize_reference_characters": self.project.randomize_reference_characters,
                 "auto_fill_locations": bool(getattr(self.project, "auto_fill_locations", False)),
                 "auto_fill_camera": bool(getattr(self.project, "auto_fill_camera", False)),

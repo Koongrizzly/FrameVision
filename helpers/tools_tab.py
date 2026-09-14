@@ -829,6 +829,43 @@ class InstantToolsPane(QWidget):
         sec_transition_video = CollapsibleSection("Transition Video", expanded=False)
         sec_beatsyncvisuals = CollapsibleSection("Beat-synced visuals", expanded=False)
         sec_describe = CollapsibleSection("Describe anything with Qwen3 VL", expanded=False)
+        sec_lora_trainer = CollapsibleSection("LoRA Trainer", expanded=False)
+        # Lazy-load the trainer only when this dropdown is opened. The embedded
+        # trainer submits work to FrameVision's queue rather than spawning its own job.
+        _lora_wrap = QWidget()
+        _lora_layout = QVBoxLayout(_lora_wrap)
+        _lora_layout.setContentsMargins(0, 0, 0, 0)
+        _lora_placeholder = QLabel("Open this section to load the Ostris LoRA Trainer.")
+        _lora_placeholder.setWordWrap(True)
+        _lora_layout.addWidget(_lora_placeholder)
+        sec_lora_trainer.setContentLayout(_lora_layout)
+        self._lora_trainer_loaded = False
+
+        def _load_lora_trainer(on=True):
+            if not on or self._lora_trainer_loaded:
+                return
+            try:
+                from helpers.ostris_lora_train import create_framevision_tools_widget
+                trainer = create_framevision_tools_widget(sec_lora_trainer.content)
+                try:
+                    _lora_layout.removeWidget(_lora_placeholder)
+                    _lora_placeholder.deleteLater()
+                except Exception:
+                    pass
+                _lora_layout.addWidget(trainer, 1)
+                self._lora_trainer_widget = trainer
+                self._lora_trainer_loaded = True
+                try:
+                    sec_lora_trainer.content.setProperty("expand_min_h", 780)
+                    sec_lora_trainer.content.setMaximumHeight(16777215)
+                    sec_lora_trainer.content.updateGeometry()
+                    sec_lora_trainer.updateGeometry()
+                except Exception:
+                    pass
+            except Exception as exc:
+                _lora_placeholder.setText(f"LoRA Trainer failed to load: {exc}")
+
+        sec_lora_trainer.toggle.toggled.connect(_load_lora_trainer)
         self._describer_lazy_ready = False
         _desc_wrap = QWidget()
         _descl = QVBoxLayout(_desc_wrap)
@@ -1611,7 +1648,7 @@ class InstantToolsPane(QWidget):
             _bsv_layout.addWidget(_bsv_lbl)
         sec_beatsyncvisuals.setContentLayout(_bsv_layout)
 
-        default_sections = [s for s in [sec_prompt, sec_bg, sec_image_fx_lab, sec_describe, sec_qwen3tts, sec_dotstts, sec_meme, sec_music, sec_audio, sec_speed, sec_reverse, sec_upscale, sec_rife,
+        default_sections = [s for s in [sec_prompt, sec_lora_trainer, sec_bg, sec_image_fx_lab, sec_describe, sec_qwen3tts, sec_dotstts, sec_meme, sec_music, sec_audio, sec_speed, sec_reverse, sec_upscale, sec_rife,
                             sec_resize, sec_trim, sec_crop, sec_videotext, sec_transition_video, sec_beatsyncvisuals, sec_splitglue, sec_gif, sec_extract, sec_whisper, sec_rename, sec_metadata] if s is not None]
 
 # sec_musicclip,  # to re add put this back in default_sections
@@ -1658,6 +1695,7 @@ class InstantToolsPane(QWidget):
 
                 "Thumbnail / Meme Creator": sec_meme,
                 "Prompt Enhancement": sec_prompt,
+                "LoRA Trainer": sec_lora_trainer,
                 "Background Remover": sec_bg,
                 "Image FX Lab": sec_image_fx_lab,
 
@@ -1686,7 +1724,7 @@ class InstantToolsPane(QWidget):
         except Exception:
             pass
         # Build default whitelist (all except Trim and Audio)
-        default_whitelist = [k for k in self._sections_map.keys() if k not in ("Trim Lab","Sound Lab","Background Remover")]
+        default_whitelist = [k for k in self._sections_map.keys() if k not in ("Trim Lab","Sound Lab","Background Remover","LoRA Trainer")]
         try:
             import json as _json
             wl_txt = self._qs.value("ToolsPane/remember_whitelist_json", "", type=str) or ""
