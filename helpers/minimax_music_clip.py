@@ -35,6 +35,8 @@ import threading
 import sys
 import tempfile
 import urllib.request
+import urllib.error
+import socket
 import zipfile
 import time
 import wave
@@ -316,6 +318,27 @@ def _fmt_time(seconds: float) -> str:
     return f"{minutes:02d}:{sec:05.2f}"
 
 
+def _read_text_tolerant(path) -> str:
+    """Read user/generated text without crashing on non-UTF-8 bytes.
+
+    Prefer UTF-8/UTF-8-BOM, then Windows-1252 for legacy Windows text,
+    and finally replace only undecodable bytes instead of aborting the workflow.
+    """
+    p = Path(path)
+    raw = p.read_bytes()
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    return raw.decode("utf-8", errors="replace")
+
+
+def _subprocess_text_kwargs() -> dict:
+    """Never let odd console glyphs/legacy bytes crash subprocess capture."""
+    return {"text": True, "encoding": "utf-8", "errors": "replace"}
+
+
 def _existing_executable(candidates: Iterable[Path | str]) -> str:
     for candidate in candidates:
         text = str(candidate)
@@ -359,7 +382,7 @@ def probe_duration(path: str) -> float:
     cp = subprocess.run(
         [probe, "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     try:
@@ -476,6 +499,15 @@ class MusicShot:
     output_path: str = ""
     status: str = "Planned"
     seed: int = -1
+    # Planner-style music-direction fields. These are deliberately separate from the
+    # final H3 prompt so the creative plan can be inspected/rebuilt without asking
+    # the LLM to know MiniMax prompt syntax.
+    director_action: str = ""
+    director_location: str = ""
+    director_camera: str = ""
+    director_section: str = ""
+    director_performance_mode: str = ""
+    director_reference_names: List[str] = field(default_factory=list)
 
     @property
     def edit_duration(self) -> float:
@@ -498,6 +530,8 @@ class MusicProject:
     characters_subjects: str = ""
     locations_world: str = ""
     camera_choreography: str = ""
+    auto_fill_locations: bool = False
+    auto_fill_camera: bool = False
     resolution: str = "832 × 480"
     aspect: str = "16:9"
     max_frames: int = MUSIC_FRAME_DEFAULT_MAX
@@ -554,6 +588,44 @@ class MusicProject:
     shots: List[MusicShot] = field(default_factory=list)
 
 
+# ---------------------- planner-style music direction ----------------------
+#
+# The creative/LLM director is deliberately isolated in minimax_music_director.py.
+# Both the FrameVision-imported widget and the standalone MiniMax music creator can
+# import the same director module. Future creative-planner changes therefore live in
+# one file instead of requiring duplicate edits to both applications.
+try:
+    from .minimax_music_director import (
+        music_director_safe_task as _shared_music_director_safe_task,
+        apply_music_director_result as _shared_apply_music_director_result,
+        assign_music_shot_references as _shared_assign_music_shot_references,
+    )
+except ImportError:
+    from minimax_music_director import (
+        music_director_safe_task as _shared_music_director_safe_task,
+        apply_music_director_result as _shared_apply_music_director_result,
+        assign_music_shot_references as _shared_assign_music_shot_references,
+    )
+
+
+def _music_director_safe_task(progress, project: MusicProject) -> Dict[str, Any]:
+    return _shared_music_director_safe_task(
+        progress, project, root=ROOT,
+        clean_lyric=_clean_whisper_lyric_text,
+        normalize_ref_kind=_normalise_reference_kind,
+    )
+
+
+def _apply_music_director_result(project: MusicProject, result: Dict[str, Any]) -> bool:
+    return _shared_apply_music_director_result(project, result)
+
+
+def _assign_music_shot_references(project: MusicProject, shot: MusicShot) -> List[str]:
+    return _shared_assign_music_shot_references(
+        project, shot, normalize_ref_kind=_normalise_reference_kind,
+        fallback_assign=auto_assign_references,
+    )
+
 # ------------------------- lightweight music analysis -------------------------
 
 
@@ -568,7 +640,7 @@ def analyze_music(audio_path: str, sensitivity: int = 10) -> AnalysisResult:
         cp = subprocess.run(
             [ffmpeg, "-y", "-i", audio_path, "-vn", "-ac", "1", "-ar", "44100", "-acodec", "pcm_s16le", str(wav_path)],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if cp.returncode != 0 or not wav_path.is_file():
@@ -1242,7 +1314,7 @@ def build_h3_reference_prompt(
         )
     elif bool(getattr(project, "visible_lyric_subtitles", False)):
         sections.append(
-            "Visible lyric subtitles are enabled. The current lyric phrase from <Audio 1> may appear as synchronized readable subtitle/lyric text. "
+            "Visible lyric subtitles are enabled. The current lyric phrase from the supplied song may appear as synchronized readable subtitle/lyric text. "
             "Do not invent unrelated captions, title cards, logos, lower-thirds or other text. Text explicitly requested as a physical part of the scene may also remain visible."
         )
     else:
@@ -1251,9 +1323,14 @@ def build_h3_reference_prompt(
             "Only text explicitly requested as a physical part of a scene, object, poster, sign, monitor or interface may be visible. Do not turn spoken or sung words into on-screen text."
         )
 
-    # 2) summary. Creative-brief lists are option pools, not a checklist for one clip.
-    story_focus, story_pool_count = _creative_pool_choice(project.main_idea, shot.index, allow_commas=False)
-    story = re.sub(r"\s+", " ", story_focus.strip()) if story_focus.strip() else "the current music-video story"
+    # 2) summary. Planner-directed action wins; old creative-pool behavior remains
+    # as a fully compatible fallback when no local LLM is configured.
+    if str(getattr(shot, "director_action", "") or "").strip():
+        story_focus = str(shot.director_action).strip()
+        story_pool_count = 1
+    else:
+        story_focus, story_pool_count = _creative_pool_choice(project.main_idea, shot.index, allow_commas=False)
+    story = re.sub(r"\s+", " ", story_focus.strip()) if story_focus.strip() else "the current music-video performance"
     summary_bits = [f"[reference generation + audio reuse] Create a music-video shot for {story}."]
     if story_pool_count > 1:
         summary_bits.append("This is one selected story beat from the larger project idea; keep the other listed story beats for other clips instead of combining them here.")
@@ -1274,9 +1351,9 @@ def build_h3_reference_prompt(
         picture_summary = ", ".join(f"<Picture {picture_no}>" for _subject_no, picture_no, _ref in picture_anchors)
         summary_bits.append(f"Use {picture_summary} as concrete composition/shot-planning anchors rather than as character identities.")
     if has_lyrics:
-        summary_bits.append("Reuse <Audio 1> as the continuous authoritative song/performance source for this shot.")
+        summary_bits.append("Reuse the supplied audio as the continuous authoritative song/performance source for this shot.")
     else:
-        summary_bits.append("Reuse <Audio 1> as the continuous authoritative instrumental audio source for this shot; the visible character performs silent story action while the music continues unchanged.")
+        summary_bits.append("Reuse the supplied instrumental audio as the continuous authoritative audio source for this shot; the visible character performs silent story action while the music continues unchanged.")
     sections.append("summary:")
     sections.append(" ".join(summary_bits))
 
@@ -1315,17 +1392,21 @@ def build_h3_reference_prompt(
         )
     if has_lyrics:
         sections.append(
-            "<Audio 1>: fully_copy - keep the supplied song segment continuous as the target performance track; preserve its existing vocals, lyrics, instrumental passages, rhythm and timing instead of inventing replacement vocals or music."
+            "Supplied audio: fully_copy - keep the supplied song segment continuous as the target performance track; preserve its existing vocals, lyrics, instrumental passages, rhythm and timing instead of inventing replacement vocals or music."
         )
     else:
         sections.append(
-            "<Audio 1>: fully_copy - keep the supplied instrumental audio unchanged as the complete sound for this shot. Do not add any extra voice, speech, singing, humming, mumbling, narration or replacement music. Preserve its rhythm, beat, timing, continuity and musical energy."
+            "Supplied audio: fully_copy - keep the supplied instrumental audio unchanged as the complete sound for this shot. Do not add any extra voice, speech, singing, humming, mumbling, narration or replacement music. Preserve its rhythm, beat, timing, continuity and musical energy."
         )
 
     # 4) detailed_description
     sections.append("detailed_description:")
     style = re.sub(r"\s+", " ", project.style_theme.strip()) if project.style_theme.strip() else "cinematic music-video"
-    location, location_pool_count = _creative_pool_choice(project.locations_world, shot.index, allow_commas=True)
+    directed_location = str(getattr(shot, "director_location", "") or "").strip()
+    if directed_location:
+        location, location_pool_count = directed_location, 1
+    else:
+        location, location_pool_count = _creative_pool_choice(project.locations_world, shot.index, allow_commas=True)
     location = re.sub(r"\s+", " ", location.strip())
     if location:
         # Avoid awkward output such as "set in in the basement" when the user already
@@ -1354,17 +1435,29 @@ def build_h3_reference_prompt(
         shot1.append(f"Use {first_pictures} for the specified composition/framing purpose.")
     if story_focus.strip():
         shot1.append(re.sub(r"\s+", " ", story_focus.strip()) + ".")
-    shot1.append(f"This is the {shot.section or 'current'} section of the music video.")
-    camera_choice, camera_pool_count = _creative_pool_choice(project.camera_choreography, shot.index, allow_commas=True)
+    section_name = str(getattr(shot, "director_section", "") or shot.section or "current").strip()
+    shot1.append(f"This is the {section_name} section of the music video.")
+    directed_camera = str(getattr(shot, "director_camera", "") or "").strip()
+    if directed_camera:
+        camera_choice, camera_pool_count = directed_camera, 1
+    else:
+        camera_choice, camera_pool_count = _creative_pool_choice(project.camera_choreography, shot.index, allow_commas=True)
     if camera_choice.strip():
         shot1.append("Primary camera concept: " + re.sub(r"\s+", " ", camera_choice.strip()) + ".")
         if camera_pool_count > 1:
             shot1.append("Use this one selected camera concept as the dominant camera language for the clip. Do not stack the other camera moves from the Creative brief into this shot; they are reserved for later clips.")
+    performance_mode = re.sub(r"\s+", " ", str(getattr(shot, "director_performance_mode", "") or "").strip())
+    if performance_mode:
+        shot1.append(f"Performance mode: {performance_mode}.")
+    shot1.append(
+        "Music-video priority: keep the visible performers physically engaged with the music from the opening moment. "
+        "Use convincing rhythmic full-body action, choreography, vocal performance, band performance or beat-driven interaction appropriate to this shot; avoid passive standing, blank posing or merely staring at the camera unless a brief deliberate visual break is explicitly directed."
+    )
     if has_lyrics:
-        shot1.append("<Audio 1> begins immediately and remains continuous and synchronized with the visible vocal performance.")
+        shot1.append("The supplied song begins immediately and remains continuous and synchronized with the visible vocal performance.")
     else:
         shot1.append(
-            "<Audio 1> begins immediately as an instrumental-only passage and remains continuous. "
+            "The supplied instrumental audio begins immediately and remains continuous. "
             "Every visible character remains completely silent. Use expressive body movement, arm movement, eye movement and silent facial acting to communicate the story and react to the beat. "
             "Mouth movement stays minimal, natural and non-speaking, with no lip-sync, no sung articulation and no speech-like mouth shapes."
         )
@@ -1376,11 +1469,11 @@ def build_h3_reference_prompt(
             performer = f"<Subject {characters[0][0]}>"
             if visible_subtitles:
                 shot1.append(
-                    f"Lyric performance: <d>[Original language] {lyric}</d>. {performer} is the singer/performer and lip-syncs/sings these words in time with <Audio 1>. Visible lyric subtitles are enabled, so the current phrase may also appear as synchronized readable subtitle text."
+                    f"Lyric performance: <d>[Original language] {lyric}</d>. {performer} is the singer/performer and lip-syncs/sings these words in time with the supplied song. Visible lyric subtitles are enabled, so the current phrase may also appear as synchronized readable subtitle text."
                 )
             else:
                 shot1.append(
-                    f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. {performer} is the singer/performer and lip-syncs/sings these words in time with <Audio 1>. These lyric words are heard and lip-synced only; do not display them anywhere in the image."
+                    f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. {performer} is the singer/performer and lip-syncs/sings these words in time with the supplied song. These lyric words are heard and lip-synced only; do not display them anywhere in the image."
                 )
         elif len(characters) > 1:
             suffix = " Visible lyric subtitles are enabled for this phrase." if visible_subtitles else " The lyric words are audio-only and must not be displayed visually."
@@ -1390,15 +1483,15 @@ def build_h3_reference_prompt(
         else:
             if visible_subtitles:
                 shot1.append(
-                    f"Lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to <Audio 1>. Visible lyric subtitles are enabled and may show the current phrase."
+                    f"Lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to the supplied song. Visible lyric subtitles are enabled and may show the current phrase."
                 )
             else:
                 shot1.append(
-                    f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to <Audio 1>. These words are heard only and must not appear visually."
+                    f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to the supplied song. These words are heard only and must not appear visually."
                 )
     else:
         shot1.append(
-            "Instrumental interval: <Audio 1> contains the complete intended sound for this section. "
+            "Instrumental interval: the supplied audio contains the complete intended sound for this section. "
             "Translate every story idea into visible physical action rather than spoken or sung content. Characters may dance, gesture, react, work, move through the environment and interact with props, but they do not talk, sing, narrate, hum, mumble or mouth words. "
             "Do not interpret phrases such as asks, tells, explains, argues, jokes, calls, sings or says as permission to create audible speech; express the intended meaning silently through action and reaction instead."
         )
@@ -1410,9 +1503,9 @@ def build_h3_reference_prompt(
         ss = rel - mm * 60
         timestamp = f"{mm:02d}:{ss:06.3f}"
         if has_lyrics:
-            continuity = "<Audio 1> continues seamlessly across the cut with unchanged musical timing and vocal continuity."
+            continuity = "The supplied song continues seamlessly across the cut with unchanged musical timing and vocal continuity."
         else:
-            continuity = "<Audio 1> continues seamlessly across the cut as the same instrumental passage; every character remains completely silent with minimal natural non-speaking mouth movement and communicates only through visible action and reaction."
+            continuity = "The supplied instrumental audio continues seamlessly across the cut; every character remains completely silent with minimal natural non-speaking mouth movement and communicates only through visible action and reaction."
         sections.append(
             f"[Shot {cut_no}] At {timestamp}, the camera cuts to a complementary new angle or visual beat within the same established scene. "
             "Keep the same character identities, performer roles, props and background/location roles. " + continuity
@@ -1430,17 +1523,17 @@ def build_h3_reference_prompt(
     sections.append("overall_soundscape:")
     if has_lyrics:
         sections.append(
-            "Natural physical ambience and incidental scene sounds may be subtle and secondary. Keep <Audio 1> dominant, continuous and clearly synchronized with the vocal performance."
+            "Natural physical ambience and incidental scene sounds may be subtle and secondary. Keep the supplied song dominant, continuous and clearly synchronized with the vocal performance."
         )
     else:
         sections.append(
-            "<Audio 1> is the complete instrumental soundtrack for this interval. Natural physical ambience may be subtle and secondary, but must not replace, interrupt or compete with the supplied instrumental audio. Every visible character remains a silent visual participant rather than a speaker or singer."
+            "The supplied instrumental audio is the complete soundtrack for this interval. Natural physical ambience may be subtle and secondary, but must not replace, interrupt or compete with it. Every visible character remains a silent visual participant rather than a speaker or singer."
         )
     sections.append("non_diegetic_music:")
     if has_lyrics:
-        sections.append("<Audio 1> is directly reused as the complete music track for this shot. Do not add a separate score or replacement music.")
+        sections.append("The supplied audio is directly reused as the complete music track for this shot. Do not add a separate score or replacement music.")
     else:
-        sections.append("<Audio 1> is directly reused as the complete music track for this shot. Do not add a separate score, voice, vocalization or replacement music.")
+        sections.append("The supplied audio is directly reused as the complete music track for this shot. Do not add a separate score, voice, vocalization or replacement music.")
 
     return "\n".join(x.strip() for x in sections if x and x.strip())
 
@@ -1900,7 +1993,7 @@ def _whisper_task(progress, audio_path: str) -> List[LyricSegment]:
     try:
         cp = subprocess.run(
             [ffmpeg, "-y", "-i", audio_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav_path)],
-            capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if cp.returncode != 0 or not wav_path.is_file():
             raise RuntimeError("Could not prepare audio for Whisper.cpp:\n" + (cp.stderr or cp.stdout or ""))
@@ -1911,14 +2004,14 @@ def _whisper_task(progress, audio_path: str) -> List[LyricSegment]:
             "-l", "auto", "-t", str(threads), "-oj", "-of", str(result_prefix), "-np",
         ]
         cp = subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
             cwd=str(cli.parent), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if cp.returncode != 0:
             raise RuntimeError("Whisper.cpp transcription failed:\n" + (cp.stderr or cp.stdout or ""))
         if not result_json.is_file():
             raise RuntimeError("Whisper.cpp completed but did not create its JSON result.")
-        data = json.loads(result_json.read_text(encoding="utf-8-sig"))
+        data = json.loads(_read_text_tolerant(result_json))
         raw_lyrics = _parse_whisper_json_segments(data)
         lyrics = _whisper_phrase_cleanup(raw_lyrics)
         language = ""
@@ -1955,7 +2048,7 @@ def _extract_audio_slice(audio: str, out_path: Path, start: float, duration: flo
         "-t", f"{max(0.10, duration):.6f}", "-vn", "-ac", "2", "-ar", "32000",
         "-c:a", "pcm_s16le", str(out_path),
     ]
-    cp = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if cp.returncode != 0 or not out_path.is_file():
         raise RuntimeError("Could not create Ref2VA audio slice:\n" + (cp.stderr or cp.stdout or ""))
 
@@ -2154,7 +2247,7 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
                     env=os.environ.copy(),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                     bufsize=1,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
@@ -2270,7 +2363,7 @@ def _assembly_task(progress, project: MusicProject) -> str:
             ffmpeg, "-y", "-i", shot.output_path, "-an", "-vf", vf,
             "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(target),
         ]
-        cp = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if cp.returncode != 0 or not target.is_file():
             raise RuntimeError(f"Could not trim shot {shot.index}:\n" + (cp.stderr or cp.stdout or ""))
         trimmed.append(target)
@@ -2282,7 +2375,7 @@ def _assembly_task(progress, project: MusicProject) -> str:
     cp = subprocess.run(
         [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(video_only)],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if cp.returncode != 0:
@@ -2290,7 +2383,7 @@ def _assembly_task(progress, project: MusicProject) -> str:
         cp = subprocess.run(
             [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-an", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(video_only)],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     if cp.returncode != 0 or not video_only.is_file():
@@ -2306,7 +2399,7 @@ def _assembly_task(progress, project: MusicProject) -> str:
     if song_duration > 0:
         cmd += ["-t", f"{song_duration:.6f}"]
     cmd += [str(final)]
-    cp = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if cp.returncode != 0 or not final.is_file():
         raise RuntimeError("Final mux failed:\n" + (cp.stderr or cp.stdout or ""))
 
@@ -2363,7 +2456,17 @@ class MiniMaxMusicClipWidget(QWidget):
         self._assistant_remote_chat_id = ""
         self._assistant_run = False
         self._one_click_assemble_after_generation = False
-        self._assistant_handoff_mtime_ns = 0
+        # Treat any handoff file that already existed before this visible widget
+        # started as already consumed.  Only handoffs created/updated after startup
+        # are eligible for live import.  This prevents stale assistant projects from
+        # being resurrected on every FrameVision launch.
+        try:
+            self._assistant_handoff_mtime_ns = (
+                ASSISTANT_HANDOFF_PATH.stat().st_mtime_ns
+                if ASSISTANT_HANDOFF_PATH.is_file() else 0
+            )
+        except Exception:
+            self._assistant_handoff_mtime_ns = 0
         self._assistant_output_monitor = QTimer(self)
         self._assistant_output_monitor.setInterval(1500)
         self._assistant_output_monitor.timeout.connect(self._assistant_poll_outputs)
@@ -2519,7 +2622,7 @@ class MiniMaxMusicClipWidget(QWidget):
             stat = ASSISTANT_HANDOFF_PATH.stat()
             if stat.st_mtime_ns <= int(getattr(self, "_assistant_handoff_mtime_ns", 0) or 0):
                 return
-            data = json.loads(ASSISTANT_HANDOFF_PATH.read_text(encoding="utf-8"))
+            data = json.loads(_read_text_tolerant(ASSISTANT_HANDOFF_PATH))
             project_data = data.get("project") if isinstance(data, dict) else None
             if not isinstance(project_data, dict):
                 return
@@ -2544,6 +2647,8 @@ class MiniMaxMusicClipWidget(QWidget):
             "edit_subjects": "minimax_music_reference_details",
             "edit_world": "minimax_music_locations_world",
             "edit_camera": "minimax_music_camera_choreography",
+            "check_auto_fill_locations": "minimax_music_auto_fill_locations",
+            "check_auto_fill_camera": "minimax_music_auto_fill_camera",
             "check_randomize_ref_characters": "minimax_music_randomize_ref_characters",
             "spin_sensitivity": "minimax_music_beat_sensitivity",
             "check_whisper_timing": "minimax_music_whisper_timing",
@@ -2808,15 +2913,21 @@ class MiniMaxMusicClipWidget(QWidget):
         self.edit_subjects = QPlainTextEdit(brief); self.edit_subjects.setMaximumHeight(90)
         self.edit_world = QLineEdit(brief)
         self.edit_camera = QLineEdit(brief)
+        self.check_auto_fill_locations = QCheckBox("Auto Fill locations with LLM", brief)
+        self.check_auto_fill_camera = QCheckBox("Auto Fill camera / effects with LLM", brief)
         self.edit_subjects.setToolTip("Optional continuity details for named reference images. Example: Erica is the blue-haired woman in her reference, keeps that outfit, and is always the drummer when the drum kit is present. Leave blank when MiniMax may invent role, outfit or props.")
-        self.edit_idea.setToolTip("Write one continuous story, or put alternative story beats on separate lines / separated by semicolons. Alternative beats are distributed across clips instead of being crammed into every clip.")
-        self.edit_world.setToolTip("Enter one location, or a list separated by commas, semicolons or new lines. One primary location is assigned per clip and the list rotates before reuse.")
-        self.edit_camera.setToolTip("Enter one camera concept, or a list separated by commas, semicolons or new lines. One primary camera concept is assigned per clip and the list rotates before reuse. Connected instructions such as 'whip pan then rack focus' stay together.")
+        self.edit_idea.setToolTip("The Music Director treats this as the creative authority for the complete song. A short idea is enough: the LLM expands it into music-driven clip actions instead of repeating the same sentence in every prompt.")
+        self.edit_world.setToolTip("Optional location material. With Auto Fill OFF, these locations are distributed without inventing unrelated worlds. With Auto Fill ON, the LLM expands them into a coherent section-by-section location plan.")
+        self.edit_camera.setToolTip("Optional camera/choreography material. With Auto Fill OFF, supplied ideas are distributed across clips. With Auto Fill ON, the LLM invents varied music-video camera positions, moves and effects for individual prompts while respecting your ideas.")
+        self.check_auto_fill_locations.setToolTip("When enabled, the Planner-style Music Director creates a suitable primary location for each detected musical section. If you supplied locations, they remain mandatory creative ingredients and the LLM expands around them.")
+        self.check_auto_fill_camera.setToolTip("When enabled, the Music Director creates varied camera positions, movements and music-video effects for individual clips, matched to the action and song energy. User-supplied camera ideas remain preferred ingredients.")
         bf.addRow("Main idea / story:", self.edit_idea)
         bf.addRow("Style / theme:", self.edit_style)
         bf.addRow("Ref image purpose details:", self.edit_subjects)
         bf.addRow("Locations / world:", self.edit_world)
+        bf.addRow("", self.check_auto_fill_locations)
         bf.addRow("Camera choreography:", self.edit_camera)
+        bf.addRow("", self.check_auto_fill_camera)
         lay.addWidget(brief)
 
         actions = QHBoxLayout()
@@ -3156,6 +3267,8 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.characters_subjects = self.edit_subjects.toPlainText().strip()
         self.project.locations_world = self.edit_world.text().strip()
         self.project.camera_choreography = self.edit_camera.text().strip()
+        self.project.auto_fill_locations = bool(getattr(self, "check_auto_fill_locations", None) and self.check_auto_fill_locations.isChecked())
+        self.project.auto_fill_camera = bool(getattr(self, "check_auto_fill_camera", None) and self.check_auto_fill_camera.isChecked())
         self.project.beat_sensitivity = self.spin_sensitivity.value()
         self.project.whisper_timing_enabled = self.check_whisper_timing.isChecked()
         self.project.visible_lyric_subtitles = self.check_visible_lyric_subtitles.isChecked()
@@ -3193,6 +3306,10 @@ class MiniMaxMusicClipWidget(QWidget):
         p = self.project
         self.edit_audio.setText(p.audio_path); self.edit_output.setText(p.output_dir or str(OUTPUT_ROOT)); self.edit_title.setText(p.title)
         self.edit_idea.setPlainText(p.main_idea); self.edit_style.setText(p.style_theme); self.edit_subjects.setPlainText(p.characters_subjects); self.edit_world.setText(p.locations_world); self.edit_camera.setText(p.camera_choreography)
+        if getattr(self, "check_auto_fill_locations", None) is not None:
+            self.check_auto_fill_locations.setChecked(bool(getattr(p, "auto_fill_locations", False)))
+        if getattr(self, "check_auto_fill_camera", None) is not None:
+            self.check_auto_fill_camera.setChecked(bool(getattr(p, "auto_fill_camera", False)))
         self.spin_sensitivity.setValue(p.beat_sensitivity)
         self.check_whisper_timing.setChecked(bool(getattr(p, "whisper_timing_enabled", True)))
         self.check_visible_lyric_subtitles.setChecked(bool(getattr(p, "visible_lyric_subtitles", False)))
@@ -3269,7 +3386,7 @@ class MiniMaxMusicClipWidget(QWidget):
             marker = candidate / marker_name
             try:
                 if marker.is_file():
-                    data = json.loads(marker.read_text(encoding="utf-8"))
+                    data = json.loads(_read_text_tolerant(marker))
                     if str(data.get("identity") or "") == identity:
                         break
                 elif not any(candidate.iterdir()):
@@ -3323,6 +3440,17 @@ class MiniMaxMusicClipWidget(QWidget):
         ):
             setattr(self.project, name, getattr(old, name))
         self.project_path = ""
+        # A deliberate New Project must not be immediately replaced by a stale
+        # assistant handoff on the next 1-second poll.  Mark the current handoff
+        # snapshot as already seen; a genuinely new assistant update will have a
+        # newer mtime and will still import normally.
+        try:
+            self._assistant_handoff_mtime_ns = (
+                ASSISTANT_HANDOFF_PATH.stat().st_mtime_ns
+                if ASSISTANT_HANDOFF_PATH.is_file() else 0
+            )
+        except Exception:
+            pass
         _cleanup_music_clip_temp_artifacts()
         self._sync_ui_from_project()
         self.status.setText("New project.")
@@ -3369,7 +3497,7 @@ class MiniMaxMusicClipWidget(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "Open MiniMax music project", "", "JSON (*.json)")
         if not path: return
         try:
-            data = json.loads(Path(path).read_text(encoding="utf-8")); self.project = self._project_from_dict(data); self.project_path = path; self._sync_ui_from_project(); self.status.setText(f"Opened: {path}")
+            data = json.loads(_read_text_tolerant(Path(path))); self.project = self._project_from_dict(data); self.project_path = path; self._sync_ui_from_project(); self.status.setText(f"Opened: {path}")
             self._write_autosave(force=True)
         except Exception as exc:
             QMessageBox.critical(self, "Open project failed", str(exc))
@@ -3534,7 +3662,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self._one_click_build_plan_and_queue()
 
     def _one_click_build_plan_and_queue(self) -> None:
-        self._emit_music_clip_event("progress", message="Building the music-video shot plan...")
+        self._emit_music_clip_event("progress", message="Building the locked MiniMax timing plan...")
         self.tabs.setCurrentIndex(3)
         self._pull_ui()
         self._ensure_project_output_folder(reset_generated_state=True)
@@ -3543,16 +3671,9 @@ class MiniMaxMusicClipWidget(QWidget):
         try:
             self.project.shots = build_shot_plan(self.project)
             self.project.reference_random_seed = self._next_job_seed() if self.project.randomize_reference_characters else -1
-            for shot in self.project.shots:
-                shot.reference_names = auto_assign_references(self.project, shot)
-                shot.prompt = build_default_prompt(self.project, shot)
-            self._populate_shots()
-            self._populate_review()
-            self._write_autosave(force=True)
-            self._write_assistant_handoff()
         except Exception as exc:
             self._one_click_active = False
-            self._set_ready("Video clip planning failed.")
+            self._set_ready("Video clip timing plan failed.")
             QMessageBox.critical(self, "Video clip planning failed", str(exc))
             return
 
@@ -3562,6 +3683,29 @@ class MiniMaxMusicClipWidget(QWidget):
             QMessageBox.warning(self, "No shots", "The Director did not create any shots for this track.")
             return
 
+        self._emit_music_clip_event("progress", message="MiniMax timing is locked. The Music Director is planning the complete video...")
+        self._set_busy("Music Director: creating whole-video concept and clip directions...")
+        self._one_click_start_worker_when_idle(_music_director_safe_task, self._one_click_music_director_done, self.project)
+
+    def _one_click_music_director_done(self, result: Dict[str, Any]) -> None:
+        used_llm = _apply_music_director_result(self.project, result)
+        for shot in self.project.shots:
+            shot.reference_names = _assign_music_shot_references(self.project, shot)
+            shot.prompt = build_default_prompt(self.project, shot)
+        self._populate_shots()
+        self._populate_review()
+        self._write_autosave(force=True)
+        self._write_assistant_handoff()
+        if used_llm:
+            self._emit_music_clip_event("progress", message="Music Director finished. Building the MiniMax H3 generation queue...")
+        else:
+            warning = str((result or {}).get("warning") or "local LLM unavailable")
+            self._emit_music_clip_event("progress", message=f"Music Director fallback used: {warning}. Building the MiniMax queue with deterministic prompts.")
+        # FunctionWorker emits succeeded immediately before the QThread reports
+        # finished. Queue/direct-generation startup must wait for that handoff.
+        QTimer.singleShot(80, self._one_click_finish_plan_and_queue)
+
+    def _one_click_finish_plan_and_queue(self) -> None:
         self.tabs.setCurrentIndex(4)
         self._sync_existing_generated_outputs()
         missing = [
@@ -3575,8 +3719,6 @@ class MiniMaxMusicClipWidget(QWidget):
             out_dir = Path(self.project.output_dir or OUTPUT_ROOT / _safe_stem(self.project.audio_path)).resolve()
             final_path = out_dir / f"{_safe_stem(self.project.title or self.project.audio_path)}_minimax_music_video.mp4"
             if bool(getattr(self, "_assistant_run", False)):
-                # Assistant jobs are monitored across queue workers.  Wait for all
-                # physical clips to exist before submitting the final assembly item.
                 self._assistant_queue_assembly_when_ready = bool(missing)
                 self._assistant_assembly_queued = False
                 if not missing:
@@ -3584,7 +3726,6 @@ class MiniMaxMusicClipWidget(QWidget):
                     self._assistant_assembly_queued = True
                 self._assistant_start_output_monitor(str(final_path))
             else:
-                # Interactive desktop behavior remains unchanged.
                 self._queue_assembly()
             self._emit_music_clip_event(
                 "progress",
@@ -3600,8 +3741,6 @@ class MiniMaxMusicClipWidget(QWidget):
             )
             return
 
-        # Direct fallback. Interactive users can still generate shots manually, but
-        # an assistant-launched one-click run must finish the complete deliverable.
         self._one_click_active = False
         if missing:
             self._one_click_assemble_after_generation = bool(getattr(self, "_assistant_run", False))
@@ -3732,25 +3871,45 @@ class MiniMaxMusicClipWidget(QWidget):
     # ---- director ----
     def _create_plan(self) -> None:
         audio = self._require_audio()
-        if not audio: return
+        if not audio:
+            return
         self._pull_ui()
         self._ensure_project_output_folder(reset_generated_state=True)
         if self.project.analysis.duration <= 0:
             self.project.analysis.duration = probe_duration(audio)
         try:
             self.project.shots = build_shot_plan(self.project)
-            for shot in self.project.shots:
-                shot.reference_names = auto_assign_references(self.project, shot); shot.prompt = build_default_prompt(self.project, shot)
-            self._populate_shots(); self._populate_review(); self.status.setText(f"Created {len(self.project.shots)} MiniMax shots.")
+            self.project.reference_random_seed = self._next_job_seed() if self.project.randomize_reference_characters else -1
         except Exception as exc:
             QMessageBox.critical(self, "Planning failed", str(exc))
+            return
+        self._set_busy("Music Director: creating whole-video concept and clip directions...")
+        self._run_worker(_music_director_safe_task, self._music_director_done, self.project)
+
+    def _music_director_done(self, result: Dict[str, Any]) -> None:
+        used_llm = _apply_music_director_result(self.project, result)
+        for shot in self.project.shots:
+            shot.reference_names = _assign_music_shot_references(self.project, shot)
+            shot.prompt = build_default_prompt(self.project, shot)
+        self._populate_shots()
+        self._populate_review()
+        self._write_autosave(force=True)
+        if used_llm:
+            concept = str((result or {}).get("concept_summary") or "").strip()
+            suffix = f" Director concept: {concept}" if concept else ""
+            self._set_ready(f"Created {len(self.project.shots)} Planner-directed MiniMax shots.{suffix}")
+        else:
+            warning = str((result or {}).get("warning") or "local LLM unavailable")
+            self._set_ready(f"Created {len(self.project.shots)} MiniMax shots with deterministic fallback. Music Director: {warning}.")
 
     def _rebuild_prompts(self) -> None:
         self._pull_ui()
         self.project.reference_random_seed = self._next_job_seed() if self.project.randomize_reference_characters else -1
         for shot in self.project.shots:
-            shot.reference_names = auto_assign_references(self.project, shot); shot.prompt = build_default_prompt(self.project, shot)
-        self._populate_shots(); self.status.setText("MiniMax-H3 Ref2VA prompts and reference suggestions rebuilt.")
+            shot.reference_names = _assign_music_shot_references(self.project, shot)
+            shot.prompt = build_default_prompt(self.project, shot)
+        self._populate_shots()
+        self.status.setText("MiniMax-H3 prompts rebuilt from the locked Music Director plan; no new LLM plan was requested.")
 
     def _populate_shots(self) -> None:
         selected_index = None
@@ -4376,7 +4535,7 @@ class MiniMaxMusicClipWidget(QWidget):
         try:
             if not AUTOSAVE_PATH.is_file():
                 return False
-            data = json.loads(AUTOSAVE_PATH.read_text(encoding="utf-8"))
+            data = json.loads(_read_text_tolerant(AUTOSAVE_PATH))
             if not isinstance(data, dict):
                 return False
             # Current format wraps the project so we can also remember the explicit
@@ -4432,7 +4591,7 @@ class MiniMaxMusicClipWidget(QWidget):
     def _load_settings(self) -> None:
         try:
             if SETTINGS_PATH.is_file():
-                data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+                data = json.loads(_read_text_tolerant(SETTINGS_PATH))
                 self.project.output_dir = str(data.get("output_dir") or self.project.output_dir)
                 self.project.resolution = str(data.get("resolution") or self.project.resolution)
                 self.project.aspect = str(data.get("aspect") or self.project.aspect)
@@ -4466,6 +4625,8 @@ class MiniMaxMusicClipWidget(QWidget):
                 self.project.sage_attention = bool(data.get("sage_attention", self.project.sage_attention))
                 self.project.spectrum = bool(data.get("spectrum", self.project.spectrum))
                 self.project.randomize_reference_characters = bool(data.get("randomize_reference_characters", self.project.randomize_reference_characters))
+                self.project.auto_fill_locations = bool(data.get("auto_fill_locations", getattr(self.project, "auto_fill_locations", False)))
+                self.project.auto_fill_camera = bool(data.get("auto_fill_camera", getattr(self.project, "auto_fill_camera", False)))
                 self.project.use_framevision_queue = bool(data.get("use_framevision_queue", getattr(self.project, "use_framevision_queue", False)))
                 self.project.use_hypir_x1_upscale = bool(data.get("use_hypir_x1_upscale", getattr(self.project, "use_hypir_x1_upscale", False)))
                 self.project.use_lanczos_x2_upsampling = bool(data.get("use_lanczos_x2_upsampling", getattr(self.project, "use_lanczos_x2_upsampling", False)))
@@ -4499,6 +4660,8 @@ class MiniMaxMusicClipWidget(QWidget):
                 "use_hybrid_model": self.project.use_hybrid_model, "hybrid_model_path": self.project.hybrid_model_path,
                 "sage_attention": self.project.sage_attention, "spectrum": self.project.spectrum,
                 "randomize_reference_characters": self.project.randomize_reference_characters,
+                "auto_fill_locations": bool(getattr(self.project, "auto_fill_locations", False)),
+                "auto_fill_camera": bool(getattr(self.project, "auto_fill_camera", False)),
                 "use_framevision_queue": bool(getattr(self.project, "use_framevision_queue", False)),
                 "use_hypir_x1_upscale": bool(getattr(self.project, "use_hypir_x1_upscale", False)),
                 "use_lanczos_x2_upsampling": bool(getattr(self.project, "use_lanczos_x2_upsampling", False)),
@@ -4533,7 +4696,7 @@ def _queue_cli_main(argv: Sequence[str]) -> Optional[int]:
     try:
         pos = list(argv).index("--queue-assemble")
         project_path = Path(argv[pos + 1]).resolve()
-        data = json.loads(project_path.read_text(encoding="utf-8"))
+        data = json.loads(_read_text_tolerant(project_path))
         project = MiniMaxMusicClipWidget._project_from_dict(data)
         result = _assembly_task(lambda text: print(text, flush=True), project)
         print(f"Saved final music video: {result}", flush=True)

@@ -32,11 +32,11 @@ def main():
 
     ap = argparse.ArgumentParser(description="MiniMax-H3 W4A8 ConvRot standalone generator")
     ap.add_argument("--prompt", default="A cinematic red sports car races through rain-soaked neon streets at night, dynamic tracking camera, realistic reflections and natural engine sound.")
-    ap.add_argument("--width", type=int, default=832); ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--frames", type=int, default=362); ap.add_argument("--experimental-long-duration", action="store_true", help="Allow H3 native-grid research durations beyond the normal 719-frame range, up to 2385 frames"); ap.add_argument("--steps", type=int, default=15)
+    ap.add_argument("--width", type=int, default=832); ap.add_argument("--height", type=int, default=448)
+    ap.add_argument("--frames", type=int, default=124); ap.add_argument("--experimental-long-duration", action="store_true", help="Allow H3 native-grid research durations beyond the normal 719-frame range, up to 2385 frames"); ap.add_argument("--steps", type=int, default=15)
     ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
     ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0)
-    ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="beta")
+    ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="simple")
     ap.add_argument("--first-frame"); ap.add_argument("--last-frame"); ap.add_argument("--continue-video"); ap.add_argument("--continue-context-frames", type=int, default=39); ap.add_argument("--continue-audio-memory", action="store_true", help="Experimental: use source clip audio as continuation memory/context"); ap.add_argument("--glue-source"); ap.add_argument("--output")
     ap.add_argument("--fl2va-checkpoint"); ap.add_argument("--ref2va-checkpoint"); ap.add_argument("--text-encoder"); ap.add_argument("--video-vae"); ap.add_argument("--audio-vae")
     ap.add_argument("--lora", action="append", default=[]); ap.add_argument("--lora-strength", action="append", type=float, default=[])
@@ -49,6 +49,7 @@ def main():
     ap.add_argument("--spectrum", action="store_true", help="Enable experimental bundled MiniMax H3 Spectrum feature forecasting")
     ap.add_argument("--sage-attention", action="store_true", help="Use SageAttention for the sampling worker")
     ap.add_argument("--sol-attention", action="store_true", help="Use vendored Sol-Attn for eligible MiniMax H3 attention; falls back to existing attention otherwise")
+    ap.add_argument("--sla-attention", action="store_true", help="Enable MiniMax H3 SLA block-sparse attention with the tested 0.85 preset")
     ap.add_argument("--disable-comfy-kitchen", action="store_true", help="Disable Comfy Kitchen quantized W4A8 / ConvRot acceleration for worker processes")
     ap.add_argument("--vram-residency-engine", choices=["static", "dynamic"], default="static")
     ap.add_argument("--vram-runtime-free-gb", type=float, default=0.5)
@@ -66,6 +67,18 @@ def main():
     ap.add_argument("--vram-residency-refill-interval", type=int, default=1)
     ap.add_argument("--vram-keep-text-encoder", action="store_true")
     ns = ap.parse_args()
+    # SLA and the standalone Sol attention override both own the same H3 attention path.
+    # When both are selected, SLA owns this job so Sol cannot intercept it first.
+    if ns.sla_attention and ns.sol_attention:
+        ns.sol_attention = False
+        print("[SLA] Sol-Attn suppressed for this job because SLA Attention is enabled.", flush=True)
+    if ns.sla_attention:
+        if ns.disable_comfy_kitchen:
+            print("[SLA] ERROR: SLA requires Comfy Kitchen; turn Comfy Kitchen on.", flush=True)
+            return 2
+        from runtime.sla_backend import ensure_comfy_kitchen_sla_backend
+        if not ensure_comfy_kitchen_sla_backend(auto_upgrade=True):
+            return 2
     # Sol-Attn is read by the vendored H3 model inside the isolated sampling
     # worker. Keep it process-local so VAE/text helper workers are unaffected.
     if ns.sol_attention:
@@ -143,6 +156,7 @@ def main():
         stage_plan = decide_vram_stages(
             width, height, ns.frames, "fl2va",
             text_encoder_path=te, video_vae_path=vv, audio_vae_path=av,
+            diffusion_model_path=diff,
             reference_needed=reference_needed, reference_frames=reference_frames,
             reference_audio=bool(ns.continue_video and ns.continue_audio_memory),
         )
@@ -284,6 +298,7 @@ def main():
         sample_cmd = [py, "-m", "runtime.sample_worker", "--diffusion", str(diff), "--text-encoder", str(te), "--prompt", ns.prompt, "--width", str(width), "--height", str(height), "--frames", str(ns.frames), "--steps", str(ns.steps), "--cfg", str(ns.cfg), "--seed", str(ns.seed), "--shift", str(ns.shift), "--audio-shift", str(ns.audio_shift), "--sampler", ns.sampler, "--scheduler", ns.scheduler, "--out", str(lat)]
         if ns.experimental_long_duration: sample_cmd += ["--experimental-long-duration"]
         if ns.spectrum: sample_cmd += ["--spectrum"]
+        if ns.sla_attention: sample_cmd += ["--sla-attention"]
         sample_env = os.environ.copy()
         comfy_args = []
         if ns.sage_attention:

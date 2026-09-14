@@ -819,7 +819,7 @@ def run_gui(parent=None, embedded=False):
     ensure_pyside6()
 
     from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QUrl, Signal, QTimer
-    from PySide6.QtGui import QDesktopServices, QPixmap
+    from PySide6.QtGui import QDesktopServices, QPixmap, QValidator
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
         QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -860,6 +860,43 @@ def run_gui(parent=None, embedded=False):
 
     class SafeSpinBox(WheelGuardMixin, QSpinBox):
         pass
+
+    class LTXFramesSpinBox(SafeSpinBox):
+        """Spin box restricted to LTX-valid frame counts: frames % 8 == 1."""
+        @staticmethod
+        def _nearest_valid(value: int) -> int:
+            value = int(value)
+            lower = value - ((value - 1) % 8)
+            upper = lower + 8
+            return lower if (value - lower) <= (upper - value) else upper
+
+        def setValue(self, value):
+            value = self._nearest_valid(int(value))
+            value = max(self.minimum(), min(self.maximum(), value))
+            super().setValue(value)
+
+        def validate(self, text, pos):
+            stripped = text.strip()
+            if not stripped:
+                return (QValidator.State.Intermediate, text, pos)
+            try:
+                value = int(stripped)
+            except ValueError:
+                return (QValidator.State.Invalid, text, pos)
+            if value < self.minimum() or value > self.maximum():
+                return (QValidator.State.Intermediate, text, pos)
+            if value % 8 == 1:
+                return (QValidator.State.Acceptable, text, pos)
+            return (QValidator.State.Intermediate, text, pos)
+
+        def fixup(self, text):
+            try:
+                value = int(text.strip())
+            except Exception:
+                value = self.value()
+            value = self._nearest_valid(value)
+            value = max(self.minimum(), min(self.maximum(), value))
+            return str(value)
 
     class SafeDoubleSpinBox(WheelGuardMixin, QDoubleSpinBox):
         pass
@@ -1001,10 +1038,11 @@ def run_gui(parent=None, embedded=False):
             self.height_spin.setSingleStep(64)
             self.height_spin.setValue(512)
 
-            self.frames_spin = SafeSpinBox()
+            self.frames_spin = LTXFramesSpinBox()
             self.frames_spin.setRange(9, 2001)
             self.frames_spin.setSingleStep(8)
             self.frames_spin.setValue(121)
+            self.frames_spin.setToolTip("LTX requires frame counts of 8n+1 (9, 17, 25, ... 121, 241, 481). Invalid typed values are snapped to the nearest valid count.")
 
             self.fps_spin = SafeDoubleSpinBox()
             self.fps_spin.setRange(1.0, 120.0)

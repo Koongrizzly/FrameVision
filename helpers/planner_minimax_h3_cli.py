@@ -56,6 +56,17 @@ def main()->int:
     ap.add_argument("--continue-video",default="")
     ap.add_argument("--lora",action="append",default=[])
     ap.add_argument("--lora-strength",action="append",type=float,default=[])
+    # Planner-side MiniMax generation overrides. Keep this wrapper transparent:
+    # it accepts the same switches the Planner emits and forwards them to the
+    # real standalone generate.py / generate_ref.py backend.
+    ap.add_argument("--steps",type=int,default=None)
+    ap.add_argument("--scheduler",default=None)
+    ap.add_argument("--spectrum",action="store_true")
+    ap.add_argument("--sla-attention",action="store_true")
+    ap.add_argument("--sage-attention",action="store_true")
+    ap.add_argument("--sol-attention",action="store_true")
+    ap.add_argument("--fl2va-checkpoint",default="")
+    ap.add_argument("--ref2va-checkpoint",default="")
     ns=ap.parse_args()
     if len(ns.lora) != len(ns.lora_strength):
         raise SystemExit("Each --lora needs one matching --lora-strength")
@@ -84,12 +95,23 @@ def main()->int:
     if not script.is_file(): raise SystemExit(f"MiniMax H3 generator not found: {script}")
     out=Path(ns.output).resolve(); out.parent.mkdir(parents=True,exist_ok=True)
     turbo_lora=find_turbo_lora()
-    steps=4 if turbo_lora else 15
+    # Explicit Planner values win. This is required for the current EMA preset
+    # (10 steps) while preserving the old wrapper defaults for older callers.
+    steps=int(ns.steps) if ns.steps is not None else (4 if turbo_lora else 15)
+    scheduler=str(ns.scheduler or "beta")
     _native_frames=native_frames(ns.frames)
     cmd=[str(PYTHON),str(script),"--width",str(ns.width),"--height",str(ns.height),"--frames",str(_native_frames),
          "--steps",str(steps),"--cfg","1.0","--shift","12","--audio-shift","3","--seed",str(ns.seed),
-         "--sampler","euler","--scheduler","beta","--prompt",ns.prompt,"--output",str(out),
+         "--sampler","euler","--scheduler",scheduler,"--prompt",ns.prompt,"--output",str(out),
          "--vram-manager-auto","--video-vae-tile-size","256","--video-vae-tile-overlap","64"]
+    if ns.spectrum:
+        cmd += ["--spectrum"]
+    if ns.sla_attention:
+        cmd += ["--sla-attention"]
+    if ns.sage_attention:
+        cmd += ["--sage-attention"]
+    if ns.sol_attention:
+        cmd += ["--sol-attention"]
     if _native_frames > 719:
         cmd += ["--experimental-long-duration"]
     _active_lora_paths=set()
@@ -97,7 +119,7 @@ def main()->int:
         cmd += ["--lora",turbo_lora,"--lora-strength","1.0"]
         _active_lora_paths.add(os.path.normcase(str(Path(turbo_lora).resolve())))
         print(f"[minimax-planner] 4-step Turbo LoRA default: {turbo_lora}",flush=True)
-        print("[minimax-planner] sampling steps: 4",flush=True)
+        print(f"[minimax-planner] sampling steps: {steps}",flush=True)
     else:
         print(f"[minimax-planner] no Turbo LoRA found under {MODEL_ROOT / 'loras'}; sampling steps: 15",flush=True)
     _added_extra=0
@@ -118,15 +140,28 @@ def main()->int:
     elif use_refs:
         cmd += ["--ref-image-size","match"]
         for p in refs: cmd += ["--ref-image",p]
-    hybrid=find_hybrid()
-    if hybrid:
-        # Same preference as the GUI: one hybrid checkpoint supplies either generation mode.
-        cmd += ["--fl2va-checkpoint",hybrid,"--ref2va-checkpoint",hybrid]
-        print(f"[minimax-planner] hybrid default: {hybrid}",flush=True)
-    elif use_refs:
-        print("[minimax-planner] no hybrid found; Ref2VA default",flush=True)
+    explicit_fl2va=str(ns.fl2va_checkpoint or "").strip()
+    explicit_ref2va=str(ns.ref2va_checkpoint or "").strip()
+    if explicit_fl2va or explicit_ref2va:
+        if explicit_fl2va:
+            _p=Path(explicit_fl2va).resolve()
+            if not _p.is_file(): raise SystemExit(f"MiniMax H3 FL2VA override not found: {_p}")
+            cmd += ["--fl2va-checkpoint",str(_p)]
+        if explicit_ref2va:
+            _p=Path(explicit_ref2va).resolve()
+            if not _p.is_file(): raise SystemExit(f"MiniMax H3 Ref2VA override not found: {_p}")
+            cmd += ["--ref2va-checkpoint",str(_p)]
+        print(f"[minimax-planner] explicit model override: FL2VA={explicit_fl2va or '<automatic>'} | Ref2VA={explicit_ref2va or '<automatic>'}",flush=True)
     else:
-        print("[minimax-planner] no hybrid and no refs; FL2VA text-to-video default",flush=True)
+        hybrid=find_hybrid()
+        if hybrid:
+            # Same preference as the GUI: one hybrid checkpoint supplies either generation mode.
+            cmd += ["--fl2va-checkpoint",hybrid,"--ref2va-checkpoint",hybrid]
+            print(f"[minimax-planner] hybrid default: {hybrid}",flush=True)
+        elif use_refs:
+            print("[minimax-planner] no hybrid found; Ref2VA default",flush=True)
+        else:
+            print("[minimax-planner] no hybrid and no refs; FL2VA text-to-video default",flush=True)
     env=os.environ.copy(); env["PYTHONUTF8"]="1"; env["PYTHONIOENCODING"]="utf-8"
     rc=subprocess.call(cmd,cwd=str(ROOT),env=env)
     if rc not in (0,3): return int(rc)

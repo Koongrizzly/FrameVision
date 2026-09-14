@@ -2406,6 +2406,11 @@ class MainWindow(QMainWindow):
         self.sol_attention_enabled.setToolTip("Sparse BF16 attention for eligible long MiniMax H3 sequences. Keeps packed conditioning KV exact and falls back to SageAttention/Comfy attention when Sol is unavailable. Default: Off.")
         v.addWidget(self.sol_attention_enabled)
 
+        self.sla_attention_enabled = QCheckBox("Enable H3 SLA Attention")
+        self.sla_attention_enabled.setChecked(False)
+        self.sla_attention_enabled.setToolTip("MiniMax H3 SLA block-sparse attention. Uses the tested screenshot preset: sparsity 0.85, block 32, min sequence 12288, dense last step 1, dense step 1, audio protection On, reference protection Off, Comfy Kitchen dense backend and sparse engine. Default: Off.")
+        v.addWidget(self.sla_attention_enabled)
+
         self.comfy_kitchen_enabled = QCheckBox("Enable Comfy Kitchen W4A8 acceleration")
         self.comfy_kitchen_enabled.setChecked(True)
         self.comfy_kitchen_enabled.setToolTip("Uses Comfy Kitchen CUDA kernels for supported quantized W4A8 / ConvRot operations. This is separate from SageAttention and both may be enabled together. Default: On.")
@@ -2466,6 +2471,12 @@ class MainWindow(QMainWindow):
             "When enabled, the app ignores the separate FL2VA and Ref2VA checkpoint overrides and scans the MiniMax H3 model folders recursively for a .safetensors file with 'hybrid' in its filename. The same hybrid checkpoint is then used for T2VA/FL2VA and Ref2VA jobs."
         )
         mf.addRow(self.use_hybrid_model)
+        self.hybrid_model = ModelPathRow("Blank = auto-scan for a filename containing hybrid")
+        self.hybrid_model.setToolTip(
+            "Optional explicit hybrid checkpoint override. Select the exact .safetensors hybrid model you want to use, or a folder to scan. "
+            "When this field is set it takes priority over automatic hybrid discovery. The selected checkpoint is used for both FL2VA/T2VA and Ref2VA jobs."
+        )
+        mf.addRow("Hybrid checkpoint", self.hybrid_model)
         self.fl2va_model = ModelPathRow("Blank = auto-scan diffusion_models for FL2VA")
         self.ref2va_model = ModelPathRow("Blank = auto-scan diffusion_models for Ref2VA")
         self.text_encoder_model = ModelPathRow("Blank = auto-scan text_encoders")
@@ -2924,8 +2935,10 @@ class MainWindow(QMainWindow):
             "spectrum_enabled": self.spectrum_enabled.isChecked(),
             "sage_attention_enabled": self.sage_attention_enabled.isChecked(),
             "sol_attention_enabled": self.sol_attention_enabled.isChecked(),
+            "sla_attention_enabled": self.sla_attention_enabled.isChecked(),
             "comfy_kitchen_enabled": self.comfy_kitchen_enabled.isChecked(),
             "use_hybrid_model": self.use_hybrid_model.isChecked(),
+            "hybrid_model": self.hybrid_model.path(),
             "vram_manager_enabled": self.vram_manager_enabled.isChecked(), "vram_manager_auto_bypass": self.vram_manager_auto_bypass.isChecked(), "vram_residency_engine": self.vram_residency_engine.currentData(), "vram_runtime_free_gb": self.vram_runtime_free.value(),
             "vram_text_headroom_gb": self.vram_text_headroom.value(), "vram_diffusion_headroom_gb": self.vram_diffusion_headroom.value(),
             "vram_offload_chunk_mb": self.vram_offload_chunk.value(), "vram_max_resident_weights_gb": self.vram_max_weights.value(),
@@ -2985,8 +2998,10 @@ class MainWindow(QMainWindow):
             self.spectrum_enabled.setChecked(bool(d.get("spectrum_enabled", False)))
             self.sage_attention_enabled.setChecked(bool(d.get("sage_attention_enabled", False)))
             self.sol_attention_enabled.setChecked(bool(d.get("sol_attention_enabled", False)))
+            self.sla_attention_enabled.setChecked(bool(d.get("sla_attention_enabled", False)))
             self.comfy_kitchen_enabled.setChecked(bool(d.get("comfy_kitchen_enabled", True)))
             self.use_hybrid_model.setChecked(bool(d.get("use_hybrid_model", False)))
+            self.hybrid_model.edit.setText(d.get("hybrid_model", ""))
             self._sync_hybrid_model_controls(self.use_hybrid_model.isChecked())
             self._set_system_hud_visible(False if self._embedded else self.system_hud_toggle.isChecked())
             self._set_framevision_queue_mode(self._framevision_queue_mode())
@@ -3029,6 +3044,7 @@ class MainWindow(QMainWindow):
         # and application restart just like the dedicated LoRA state does.
         self.sage_attention_enabled.toggled.connect(self.save_last)
         self.sol_attention_enabled.toggled.connect(self.save_last)
+        self.sla_attention_enabled.toggled.connect(self.save_last)
         self.comfy_kitchen_enabled.toggled.connect(self.save_last)
 
     def load_last(self):
@@ -3104,9 +3120,26 @@ class MainWindow(QMainWindow):
         # while the single hybrid diffusion checkpoint is active.
         self.fl2va_model.setEnabled(not bool(enabled))
         self.ref2va_model.setEnabled(not bool(enabled))
+        self.hybrid_model.setEnabled(bool(enabled))
 
     def _find_hybrid_checkpoint(self):
-        """Return the preferred MiniMax H3 hybrid .safetensors checkpoint, or an empty string."""
+        """Return an explicit hybrid override first, otherwise auto-discover one."""
+        explicit = self.hybrid_model.path().strip()
+        if explicit:
+            candidate = Path(explicit).expanduser()
+            if candidate.is_file():
+                if candidate.suffix.lower() == ".safetensors":
+                    return str(candidate.resolve())
+                return ""
+            if candidate.is_dir():
+                matches = sorted(
+                    (p for p in candidate.rglob("*.safetensors") if "hybrid" in p.name.lower()),
+                    key=lambda p: (len(p.parts), p.name.lower(), str(p).lower()),
+                )
+                if matches:
+                    return str(matches[0].resolve())
+                return ""
+
         roots = []
 
         # Custom diffusion locations already entered by the user are valid search roots.
@@ -3668,7 +3701,7 @@ print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
                 QMessageBox.critical(
                     self,
                     "Hybrid model not found",
-                    "Use hybrid model is enabled, but no .safetensors checkpoint with 'hybrid' in its filename was found in the MiniMax H3 model folders.\n\nPlace the hybrid checkpoint under models\\minimax_h3 (normally diffusion_models), or point one of the FL2VA/Ref2VA checkpoint fields at the folder containing it before enabling hybrid mode."
+                    "Use hybrid model is enabled, but no usable hybrid .safetensors checkpoint was found.\n\nSelect the exact file in Hybrid checkpoint, or leave that field blank to use automatic hybrid discovery under models\\minimax_h3."
                 )
                 return
         w,h=RESOLUTION_PRESETS[self.res_class.currentText()][self.aspect.currentText()]; frames=self._frame_count()
@@ -3757,6 +3790,7 @@ print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
         if self.spectrum_enabled.isChecked(): args += ["--spectrum"]
         if self.sage_attention_enabled.isChecked(): args += ["--sage-attention"]
         if self.sol_attention_enabled.isChecked(): args += ["--sol-attention"]
+        if self.sla_attention_enabled.isChecked(): args += ["--sla-attention"]
         if not self.comfy_kitchen_enabled.isChecked(): args += ["--disable-comfy-kitchen"]
         # Video-VAE tiling is independent from sampling-side VRAM Manager activation.
         # Keep the proven 256/128 defaults unless the user deliberately changes them for testing.

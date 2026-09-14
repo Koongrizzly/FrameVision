@@ -43,6 +43,7 @@ def main():
     ap.add_argument("--spectrum", action="store_true", help="Enable experimental bundled MiniMax H3 Spectrum feature forecasting")
     ap.add_argument("--sage-attention", action="store_true", help="Use SageAttention for the sampling worker")
     ap.add_argument("--sol-attention", action="store_true", help="Use vendored Sol-Attn for eligible MiniMax H3 attention; falls back to existing attention otherwise")
+    ap.add_argument("--sla-attention", action="store_true", help="Enable MiniMax H3 SLA block-sparse attention with the screenshot preset")
     ap.add_argument("--disable-comfy-kitchen", action="store_true", help="Disable Comfy Kitchen quantized W4A8 / ConvRot acceleration for worker processes")
     ap.add_argument("--vram-residency-engine", choices=["static", "dynamic"], default="static")
     ap.add_argument("--vram-runtime-free-gb", type=float, default=0.5)
@@ -104,6 +105,36 @@ def main():
         fl2va_path=ns.fl2va_checkpoint, ref2va_path=ns.ref2va_checkpoint,
         text_encoder_path=ns.text_encoder, video_vae_path=ns.video_vae, audio_vae_path=ns.audio_vae,
     )
+    # Explicit experimental ConvRot/hybrid diffusion overrides are allowed to reach
+    # Comfy's real diffusion loader.  validate_models.py was written around the
+    # stock W4A8 checkpoint signatures and can reject newer INT8/hybrid layouts
+    # before comfy.sd.load_diffusion_model() gets a chance to inspect them.
+    # Keep every non-diffusion validation error intact; this bypass applies only
+    # to a user-selected .safetensors diffusion checkpoint with a recognized
+    # experimental/quantized filename.
+    override_raw = ns.ref2va_checkpoint
+    override_path = Path(override_raw).expanduser() if override_raw else None
+    override_name = override_path.name.lower() if override_path else ""
+    allow_loader_probe = bool(
+        override_path
+        and override_path.is_file()
+        and override_path.suffix.lower() == ".safetensors"
+        and any(tag in override_name for tag in ("int8", "hybrid", "convrot", "partial"))
+    )
+    if errors and allow_loader_probe:
+        diffusion_errors = [e for e in errors if str(e).startswith("Ref2VA model:")]
+        other_errors = [e for e in errors if not str(e).startswith("Ref2VA model:")]
+        if diffusion_errors and not other_errors:
+            print(
+                "[MODEL] Experimental diffusion override: validator rejection bypassed; "
+                "passing checkpoint to Comfy diffusion loader for authoritative compatibility test.",
+                flush=True,
+            )
+            for e in diffusion_errors:
+                print("[MODEL] Validator note:", e, flush=True)
+            ref = override_path
+            errors = []
+
     if errors:
         print("Model validation failed before generation:")
         for e in errors: print(" -", e)
@@ -146,6 +177,7 @@ def main():
         cmd = [py, "-m", "runtime.sample_worker_ref", "--diffusion", str(ref), "--text-encoder", str(te), "--video-vae", str(vv), "--audio-vae", str(av), "--prompt", ns.prompt, "--width", str(ns.width), "--height", str(ns.height), "--frames", str(ns.frames), "--steps", str(ns.steps), "--cfg", str(ns.cfg), "--seed", str(ns.seed), "--shift", str(ns.shift), "--audio-shift", str(ns.audio_shift), "--sampler", ns.sampler, "--scheduler", ns.scheduler, "--ref-image-size", ns.ref_image_size, "--out", str(lat)]
         if ns.experimental_long_duration: cmd += ["--experimental-long-duration"]
         if ns.spectrum: cmd += ["--spectrum"]
+        if ns.sla_attention: cmd += ["--sla-attention"]
         sample_env = os.environ.copy()
         comfy_args = []
         if ns.sage_attention:

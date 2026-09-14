@@ -3825,13 +3825,13 @@ _LTX25_PRESETS = {
     # Planner quality controls resolution only for now; runtime defaults come from ltx25_helper.py.
     "low": {"model":"ltx25", "engine":"framevision_ltx25", "quality":"low", "res":"832x448",
             "res_landscape":"832x448", "res_portrait":"448x832", "res_square":"448x448",
-            "fps":24, "min_sec":3.0, "max_sec":10.0, "max_frames":241, "label":"480p"},
+            "fps":24, "min_sec":3.0, "max_sec":15.0, "max_frames":361, "label":"480p"},
     "medium": {"model":"ltx25", "engine":"framevision_ltx25", "quality":"medium", "res":"1280x704",
             "res_landscape":"1280x704", "res_portrait":"704x1280", "res_square":"704x704",
-            "fps":24, "min_sec":3.0, "max_sec":10.0, "max_frames":241, "label":"704p"},
+            "fps":24, "min_sec":3.0, "max_sec":15.0, "max_frames":361, "label":"704p"},
     "high": {"model":"ltx25", "engine":"framevision_ltx25", "quality":"high", "res":"1920x1088",
             "res_landscape":"1920x1088", "res_portrait":"1088x1920", "res_square":"1088x1088",
-            "fps":24, "min_sec":3.0, "max_sec":10.0, "max_frames":241, "label":"1088p"},
+            "fps":24, "min_sec":3.0, "max_sec":15.0, "max_frames":361, "label":"1088p"},
 }
 
 _MINIMAX_H3_PRESETS = {
@@ -8486,7 +8486,24 @@ def _resolve_generation_profile(video_model_label: str, gen_quality_label: str, 
     if mk == "ltx25":
         if gk not in _LTX25_PRESETS:
             gk = "medium"
-        return dict(_LTX25_PRESETS[gk])
+        prof = dict(_LTX25_PRESETS[gk])
+        try:
+            src = planner_upscale_settings if isinstance(planner_upscale_settings, dict) else {}
+            override = src.get("ltx25_clip_length_sec", None)
+            if override is not None:
+                sec = float(override)
+                min_sec = float(prof.get("min_sec") or 3.0)
+                hard_max_sec = float(_LTX25_PRESETS.get(gk, {}).get("max_sec") or 15.0)
+                sec = max(min_sec, min(hard_max_sec, sec))
+                fps = max(1, int(prof.get("fps") or 24))
+                hard_max_frames = int(_LTX25_PRESETS.get(gk, {}).get("max_frames") or 361)
+                native_frames = _planner_ltx25_frames(int(round(sec * fps)) + 1, hard_max_frames)
+                prof["max_sec"] = float(sec)
+                prof["max_frames"] = int(native_frames)
+                prof["video_length"] = int(native_frames)
+        except Exception:
+            pass
+        return prof
     if mk == "minimax_h3":
         if gk not in _MINIMAX_H3_PRESETS:
             gk = "default"
@@ -8560,8 +8577,13 @@ def _planner_preferred_clip_seconds(gen_profile: Optional[Dict[str, Any]]) -> fl
         max_sec = 5.0
     avg_sec = (float(min_sec) + float(max_sec)) / 2.0
     model_key = str(prof.get("model") or prof.get("model_key") or '').strip().lower()
-    if model_key == "ltx23":
-        # Prefer the upper end of the LTX range so short jobs stay compact.
+    if model_key == "ltx25":
+        # LTX 2.5: the user-selected clip length is a planning target as well as a hard cap.
+        # This prevents the midpoint rule (3..15s -> ~9s) from over-splitting stories.
+        # Example: a 60s project with a 15s clip limit now naturally targets 4 shots.
+        avg_sec = float(max_sec)
+    elif model_key == "ltx23":
+        # Prefer the upper end of the LTX 2.3 range so short jobs stay compact.
         avg_sec = max(avg_sec, min(max_sec, max(min_sec, max_sec * 0.85)))
     return max(float(min_sec), min(float(max_sec), float(avg_sec)))
 
@@ -8721,6 +8743,76 @@ def _planner_minimax_h3_append_extra_lora_args(args: List[str], enc: Optional[Di
             raise RuntimeError(f"Selected MiniMax H3 extra LoRA was not found: {path}")
         args += ["--lora", path, "--lora-strength", str(float(item.get("strength") or 0.0))]
     return selected
+
+def _planner_minimax_h3_custom_model_args(args: List[str], enc: Optional[Dict[str, Any]]) -> str:
+    """Apply the Planner's optional one-file MiniMax model override.
+
+    Hybrid/experimental checkpoints are intentionally sent to both FL2VA and Ref2VA.
+    The MiniMax backend performs the authoritative compatibility test for the active mode.
+    """
+    src = enc if isinstance(enc, dict) else {}
+    if not bool(src.get("minimax_h3_use_own_model_variant", False)):
+        return ""
+    path = str(src.get("minimax_h3_own_model_variant_path") or "").strip()
+    if not path:
+        raise RuntimeError("MiniMax H3 'Use own model variant' is enabled but no model file is selected.")
+    try:
+        path = str(Path(path).resolve())
+    except Exception:
+        pass
+    if not os.path.isfile(path):
+        raise RuntimeError(f"Selected MiniMax H3 model variant was not found: {path}")
+    args += ["--fl2va-checkpoint", path, "--ref2va-checkpoint", path]
+    return path
+
+def _planner_minimax_h3_is_4step_ema_lora_name(path_or_name: str) -> bool:
+    try:
+        name = Path(str(path_or_name or "")).name.lower()
+    except Exception:
+        name = str(path_or_name or "").lower()
+    if not name or "ema" not in name:
+        return False
+    # Covers 4step / 4-step / 4_step / v4_step600 style names used by H3 speed LoRAs.
+    return bool(re.search(r"(?:^|[^0-9])4[ _-]*steps?(?:[^0-9]|$)", name) or re.search(r"v4[ _-]*step", name) or "4step" in name)
+
+def _planner_minimax_h3_find_4step_ema_lora() -> str:
+    """Find the automatic H3 EMA four-step speed LoRA, if installed."""
+    roots = [
+        _root() / "models" / "minimax_h3" / "loras",
+        _root() / "models" / "loras" / "minimax_h3",
+    ]
+    found: List[Path] = []
+    for base in roots:
+        try:
+            if not base.exists():
+                continue
+            for cand in base.rglob("*.safetensors"):
+                if cand.is_file() and _planner_minimax_h3_is_4step_ema_lora_name(cand.name):
+                    found.append(cand)
+        except Exception:
+            continue
+    if not found:
+        return ""
+    # Prefer explicitly turbo-named files, then newest file.
+    try:
+        found.sort(key=lambda q: (("turbo" in q.name.lower()), q.stat().st_mtime), reverse=True)
+    except Exception:
+        found.sort(key=lambda q: q.name.lower())
+    return str(found[0].resolve())
+
+def _planner_minimax_h3_append_ema_speed_defaults(args: List[str], enc: Optional[Dict[str, Any]]) -> str:
+    """Use the new Planner defaults when the automatic 4-step EMA LoRA is available.
+
+    The speed LoRA itself remains selected/loaded by the existing MiniMax CLI. Planner only
+    locks the matching generation defaults here: 10 steps, SLA + Spectrum ON, Sage/Sol OFF.
+    """
+    ema_lora = _planner_minimax_h3_find_4step_ema_lora()
+    if not ema_lora:
+        return ""
+    # argparse store_true flags have no explicit OFF counterpart for Sage/Sol, so simply do
+    # not pass those flags. These explicit values override older CLI defaults where applicable.
+    args += ["--steps", "10", "--scheduler", "beta", "--spectrum", "--sla-attention"]
+    return ema_lora
 
 from PySide6.QtCore import Qt, QObject, Signal, Slot, QThread, QSize, QTimer, qInstallMessageHandler, QtMsgType
 from PySide6.QtGui import QFont, QAction, QPixmap, QIcon, QStandardItemModel, QStandardItem, QColor, QPainter, QBrush
@@ -10772,6 +10864,8 @@ class PipelineWorker(QThread):
             args = [sys.executable, str(cli), "--prompt", str(prompt or ""), "--output", str(out_file),
                     "--width", str(int(_mm_w)), "--height", str(int(_mm_h)),
                     "--frames", str(int(frames)), "--seed", str(int(seed if seed is not None else -1))]
+            _mm_recreate_custom_model = _planner_minimax_h3_custom_model_args(args, self.job.encoding or {})
+            _mm_recreate_ema_lora = _planner_minimax_h3_append_ema_speed_defaults(args, self.job.encoding or {})
             _mm_recreate_extra_loras = _planner_minimax_h3_append_extra_lora_args(args, self.job.encoding or {})
             if _continue_video:
                 args += ["--continue-video", _continue_video]
@@ -10781,7 +10875,9 @@ class PipelineWorker(QThread):
 
             _ref_names = ", ".join(Path(x).name for x in _mm_refs) if _mm_refs else "none"
             _regen_lora_note = ", ".join(f"{Path(str(x.get('path') or '')).name}@{float(x.get('strength') or 0):.2f}" for x in (_mm_recreate_extra_loras or [])) or "none"
-            self.signals.log.emit(f"[minimax-h3] recreate {sid}: {_mm_w}x{_mm_h}, {frames} frames @ 24fps, refs={len(_mm_refs)} [{_ref_names}], continuation={bool(_continue_video)}, extra_loras=[{_regen_lora_note}]")
+            _regen_model_note = Path(_mm_recreate_custom_model).name if _mm_recreate_custom_model else "automatic hybrid preference"
+            _regen_speed_note = (f"EMA 4-step defaults steps=10 SLA=ON Spectrum=ON Sage=OFF Sol=OFF ({Path(_mm_recreate_ema_lora).name})" if _mm_recreate_ema_lora else "standard MiniMax defaults")
+            self.signals.log.emit(f"[minimax-h3] recreate {sid}: {_mm_w}x{_mm_h}, {frames} frames @ 24fps, refs={len(_mm_refs)} [{_ref_names}], continuation={bool(_continue_video)}, model={_regen_model_note}, {_regen_speed_note}, extra_loras=[{_regen_lora_note}]")
             subprocess.run(args, cwd=str(_root()), check=True)
             rec["reference_images"] = list(_mm_refs)
             rec["video_model"] = "minimax_h3"
@@ -19270,6 +19366,93 @@ class PipelineWorker(QThread):
                 shot_map = manifest.get("shots") if isinstance(manifest.get("shots"), dict) else {}
                 clips_out=[]; cli=(_root()/"helpers"/"planner_ltx25_cli.py").resolve()
                 if not cli.is_file(): raise RuntimeError(f"Missing LTX 2.5 planner CLI: {cli}")
+
+                # Resume must preserve completed LTX 2.5 clips.  Older code reset
+                # clips_out to [] and immediately rendered S01 again, even when a
+                # cancelled project already had many valid clips on disk.
+                _ltx25_resume_run = bool((self.job.encoding or {}).get("planner_resume_run"))
+                _ltx25_existing_by_id: Dict[str, Dict[str, Any]] = {}
+
+                def _remember_ltx25_existing(_sid: Any, _file: Any, _meta: Optional[Dict[str, Any]] = None) -> None:
+                    _sid_s = str(_sid or "").strip()
+                    _file_s = str(_file or "").strip()
+                    if not _sid_s or not _file_s:
+                        return
+                    try:
+                        if not os.path.isfile(_file_s) or os.path.getsize(_file_s) < 1024:
+                            return
+                    except Exception:
+                        return
+                    _item = dict(_meta) if isinstance(_meta, dict) else {}
+                    _item["id"] = _sid_s
+                    _item["file"] = _file_s
+                    _ltx25_existing_by_id.setdefault(_sid_s, _item)
+
+                if _ltx25_resume_run:
+                    # 1) Main project manifest: authoritative when present.
+                    try:
+                        _saved = ((manifest.get("paths") or {}).get("clips") or [])
+                        if isinstance(_saved, list):
+                            for _it in _saved:
+                                if isinstance(_it, dict):
+                                    _remember_ltx25_existing(_it.get("id"), _it.get("file"), _it)
+                    except Exception:
+                        pass
+
+                    # 2) Per-shot clip_file survives some review/recreate paths even
+                    # when paths.clips was only partially written.
+                    try:
+                        if isinstance(shot_map, dict):
+                            for _sid0, _rec0 in shot_map.items():
+                                if isinstance(_rec0, dict):
+                                    _remember_ltx25_existing(_sid0, _rec0.get("clip_file"), {"id": str(_sid0), "file": _rec0.get("clip_file"), "seed": _rec0.get("clip_seed")})
+                    except Exception:
+                        pass
+
+                    # 3) Partial clip manifest is updated after every completed LTX
+                    # clip, specifically so cancellation can resume safely.
+                    try:
+                        _cm = _safe_read_json(clips_manifest_path) or {}
+                        _cm_clips = _cm.get("clips") if isinstance(_cm, dict) else []
+                        if isinstance(_cm_clips, list):
+                            for _it in _cm_clips:
+                                if isinstance(_it, dict):
+                                    _remember_ltx25_existing(_it.get("id"), _it.get("file"), _it)
+                    except Exception:
+                        pass
+
+                    # 4) Filesystem fallback for older manifests.  Prefer the exact
+                    # current job filename, then canonical/legacy SID forms.  This is
+                    # deliberately only active during Resume.
+                    try:
+                        for _idx0, _sh0 in enumerate(shots, start=1):
+                            _sid0 = str((_sh0 or {}).get("id") or f"S{_idx0:02d}").strip()
+                            if _sid0 in _ltx25_existing_by_id:
+                                continue
+                            _cands = [
+                                os.path.join(clips_dir, f"{self.job.job_id}_{_sid0}.mp4"),
+                                os.path.join(clips_dir, f"{_sid0}.mp4"),
+                            ]
+                            for _alias0 in _planner_sid_aliases(_sid0):
+                                _cands.append(os.path.join(clips_dir, f"{_alias0}.mp4"))
+                                try:
+                                    _cands.extend(str(x) for x in sorted(Path(clips_dir).glob(f"*_{_alias0}.mp4"), key=lambda q: q.stat().st_mtime, reverse=True))
+                                except Exception:
+                                    pass
+                            _seen_cands = set()
+                            for _cand0 in _cands:
+                                if not _cand0 or _cand0 in _seen_cands:
+                                    continue
+                                _seen_cands.add(_cand0)
+                                try:
+                                    if os.path.isfile(_cand0) and os.path.getsize(_cand0) >= 1024:
+                                        _remember_ltx25_existing(_sid0, _cand0, {"id": _sid0, "file": _cand0})
+                                        break
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+
                 id_to_img={}
                 for it in ((manifest.get("paths") or {}).get("images") or []):
                     if isinstance(it,dict) and it.get("id") and it.get("file"): id_to_img[str(it["id"])]=str(it["file"])
@@ -19288,7 +19471,72 @@ class PipelineWorker(QThread):
                     dsec=max(float(prof.get("min_sec") or 3.0),min(float(prof.get("max_sec") or 10.0),dsec))
                     frames=_planner_ltx25_frames(int(round(dsec*fps))+1,max_frames); seed=_planner_direct_video_seed(sid,rec)
                     out_file=os.path.join(clips_dir,f"{self.job.job_id}_{sid}.mp4")
+
+                    # Resume: re-register a valid completed clip and move straight
+                    # on to the next shot.  Do this before image validation/model
+                    # launch so S01..Sxx are not needlessly touched again.
+                    _existing = _ltx25_existing_by_id.get(sid) if _ltx25_resume_run else None
+                    _existing_file = str((_existing or {}).get("file") or "").strip() if isinstance(_existing, dict) else ""
+                    if _existing_file and os.path.isfile(_existing_file) and os.path.getsize(_existing_file) >= 1024:
+                        _reuse_item = dict(_existing) if isinstance(_existing, dict) else {}
+                        _reuse_item.update({
+                            "id": sid,
+                            "file": _existing_file,
+                            "frames": int(_reuse_item.get("frames") or frames),
+                            "fps": int(_reuse_item.get("fps") or fps),
+                            "duration_sec": float(_reuse_item.get("duration_sec") or round(frames/fps,2)),
+                            "seed": _reuse_item.get("seed", seed),
+                            "resolution": str(_reuse_item.get("resolution") or f"{w}x{h}"),
+                            "model_key": "ltx25",
+                            "video_model": "ltx25",
+                        })
+                        clips_out.append(_reuse_item)
+                        rec.update({
+                            "clip_file": _existing_file,
+                            "clip_seed": _reuse_item.get("seed", seed),
+                            "video_model": "ltx25",
+                            "model_key": "ltx25",
+                        })
+                        shot_map[sid] = rec
+                        manifest.setdefault("paths", {})["clips"] = clips_out
+                        manifest["paths"]["clips_dir"] = clips_dir
+                        manifest["shots"] = shot_map
+                        manifest.setdefault("settings", {})["video_engine"] = "ltx25"
+                        manifest["settings"]["video_model"] = "ltx25"
+                        manifest["settings"]["video_profile"] = prof
+                        _safe_write_json(manifest_path, manifest)
+                        _safe_write_json(clips_manifest_path, {"clips": clips_out, "profile": prof, "engine": "ltx25"})
+                        self.signals.stage.emit(f"Clips (LTX 2.5) — {sid} (skip {i}/{len(shots)})")
+                        self.signals.log.emit(f"[ltx25] {sid}: resume found valid completed clip; skipping regeneration")
+                        self.signals.progress.emit(min(99, 72 + int((i - 1) * (25 / max(1, len(shots))))))
+                        continue
+
                     args=[sys.executable,str(cli),"--prompt",prompt,"--output",out_file,"--width",str(w),"--height",str(h),"--frames",str(frames),"--fps",str(fps),"--seed",str(seed)]
+
+                    # LTX 2.5 has its own direct clip loop, so it must explicitly honor
+                    # Planner's last-frame -> next-start-image chain.  Previously this
+                    # loop only looked up the pre-generated Planner image for each SID,
+                    # which meant S02+ ignored the completed previous clip and started
+                    # from an unrelated/generated still even though chain mode was ON.
+                    if _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {})) and i > 1:
+                        _image_records = list((manifest.get("paths") or {}).get("images") or [])
+                        _chain_img = _planner_force_chain_image_for_shot(
+                            shots=shots,
+                            shot_index=i,
+                            images_dir=images_dir,
+                            shot_map=shot_map,
+                            image_records=_image_records,
+                            manifest=manifest,
+                            manifest_path=manifest_path,
+                            id_to_img=id_to_img,
+                            log_emit=self.signals.log.emit,
+                            chain_frames_dir=os.path.join(self.out_dir, "chain_frames"),
+                            force_refresh=True,
+                        )
+                        if not _chain_img or not os.path.isfile(_chain_img):
+                            raise RuntimeError(f"[CHAIN] {sid}: could not derive LTX 2.5 start image from previous clip.")
+                        id_to_img[sid] = _chain_img
+
                     img=id_to_img.get(sid,'')
                     _ltx_image = img
                     _normalized_image = ''
@@ -19387,6 +19635,30 @@ class PipelineWorker(QThread):
                     try: self.signals.asset_created.emit(out_file)
                     except Exception: pass
 
+                    # Materialize the next chained start image immediately after a
+                    # successful LTX 2.5 clip.  Besides making the next iteration use
+                    # the correct frame, this leaves a valid chain frame on disk when
+                    # the user cancels after the current clip and later resumes.
+                    if _planner_last_frame_chain_enabled(getattr(self.job, "encoding", {})) and i < len(shots):
+                        _next_sid = str((shots[i] or {}).get("id") or f"S{i + 1:02d}")
+                        _image_records = list((manifest.get("paths") or {}).get("images") or [])
+                        _derived = _planner_overwrite_next_image_from_clip(
+                            current_sid=sid,
+                            next_sid=_next_sid,
+                            clip_path=out_file,
+                            images_dir=images_dir,
+                            shot_map=shot_map,
+                            image_records=_image_records,
+                            manifest=manifest,
+                            manifest_path=manifest_path,
+                            id_to_img=id_to_img,
+                            log_emit=self.signals.log.emit,
+                            target_path=_planner_chain_frame_path(self.out_dir, _next_sid),
+                            mirror_to_images_dir=True,
+                        )
+                        if not _derived:
+                            raise RuntimeError(f"[CHAIN] {sid} -> {_next_sid}: could not extract LTX 2.5 last frame.")
+
                     if _cancel_after_current or self._external_cancel_requested() or self._stop_requested:
                         raise RuntimeError("Cancelled by user.")
                 _safe_write_json(clips_manifest_path,{"clips":clips_out,"profile":prof,"engine":"ltx25"})
@@ -19475,7 +19747,10 @@ class PipelineWorker(QThread):
                     frames=_planner_native_h3_frames(int(round(dsec*fps)),max_frames); seed=_planner_direct_video_seed(sid,rec)
                     out_file=os.path.join(clips_dir,f"{self.job.job_id}_{sid}.mp4")
                     args=[sys.executable,str(cli),"--prompt",prompt,"--output",out_file,"--width",str(w),"--height",str(h),"--frames",str(frames),"--seed",str(seed)]
-                    _mm_extra_loras = _planner_minimax_h3_append_extra_lora_args(args, self.job.encoding if isinstance(getattr(self.job, "encoding", None), dict) else {})
+                    _mm_enc = self.job.encoding if isinstance(getattr(self.job, "encoding", None), dict) else {}
+                    _mm_custom_model = _planner_minimax_h3_custom_model_args(args, _mm_enc)
+                    _mm_ema_lora = _planner_minimax_h3_append_ema_speed_defaults(args, _mm_enc)
+                    _mm_extra_loras = _planner_minimax_h3_append_extra_lora_args(args, _mm_enc)
 
                     # Map <Subject N> to the Nth loaded MiniMax reference. This keeps
                     # each Ref2VA shot at 1-2 refs in normal use and never above 3.
@@ -19684,7 +19959,9 @@ class PipelineWorker(QThread):
                     _mode_note="FL2VA native continuation" if native_continue else ("Ref2VA + previous last frame" if continuity_frame else "Ref2VA")
                     _ref_names=", ".join(Path(x).name for x in shot_refs) if shot_refs else "none"
                     _lora_note = ", ".join(f"{Path(str(x.get('path') or '')).name}@{float(x.get('strength') or 0):.2f}" for x in (_mm_extra_loras or [])) or "none"
-                    self.signals.log.emit(f"[minimax-h3] {sid}: {w}x{h}, {frames} frames @ 24fps, refs={len(shot_refs)} [{_ref_names}]; {_mode_note}; extra_loras=[{_lora_note}]; hybrid preferred automatically")
+                    _model_note = Path(_mm_custom_model).name if _mm_custom_model else "automatic hybrid preference"
+                    _speed_note = (f"EMA 4-step defaults: steps=10 SLA=ON Spectrum=ON Sage=OFF Sol=OFF ({Path(_mm_ema_lora).name})" if _mm_ema_lora else "standard MiniMax defaults")
+                    self.signals.log.emit(f"[minimax-h3] {sid}: {w}x{h}, {frames} frames @ 24fps, refs={len(shot_refs)} [{_ref_names}]; {_mode_note}; model={_model_note}; {_speed_note}; extra_loras=[{_lora_note}]")
                     subprocess.run(args,cwd=str(_root()),check=True)
                     if not os.path.isfile(out_file) or os.path.getsize(out_file)<1024: raise RuntimeError(f"MiniMax H3 output missing/too small: {out_file}")
                     seen_subjects.update(used_subjects)
@@ -28258,7 +28535,8 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             "MiniMax H3",
             "More later",
         ])
-        self.cmb_video_model.setCurrentIndex(0)
+        # First-use/default Planner video model: LTX 2.5.
+        self.cmb_video_model.setCurrentIndex(4)
         grid.addWidget(self.cmb_video_model, 1, 1)
 
         grid.addWidget(QLabel("Generation quality"), 2, 0)
@@ -28490,7 +28768,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         grid.addWidget(self.lbl_ltx23_extra_lora2, 6, 0)
         grid.addWidget(self.row_ltx23_extra_lora2, 6, 1)
 
-        self.lbl_ltx23_clip_length = QLabel("LTX clip length")
+        self.lbl_ltx23_clip_length = QLabel("LTX maximum clip length")
         self.ltx23_clip_length_row = QWidget()
         _ltx_clip_row = QHBoxLayout(self.ltx23_clip_length_row)
         _ltx_clip_row.setContentsMargins(0, 0, 0, 0)
@@ -28505,7 +28783,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             pass
         self.lbl_ltx23_clip_length_value = QLabel("20 sec")
         try:
-            _ltx_clip_tip = "LTX only. Sets the target maximum clip length in seconds for each shot. Range follows the active quality preset. Public FrameVision LTX is capped at 10 seconds / 241 frames for now."
+            _ltx_clip_tip = "LTX only. Sets the target maximum clip length in seconds for each shot. LTX 2.3 follows its supported range; LTX 2.5 supports up to 15 seconds / 361 frames."
             self.lbl_ltx23_clip_length.setToolTip(_ltx_clip_tip)
             self.sld_ltx23_clip_length.setToolTip(_ltx_clip_tip)
             self.lbl_ltx23_clip_length_value.setToolTip(_ltx_clip_tip)
@@ -28608,6 +28886,49 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         grid.addWidget(self.row_minimax_h3_extra_lora1, 5, 1)
         grid.addWidget(self.lbl_minimax_h3_extra_lora2, 6, 0)
         grid.addWidget(self.row_minimax_h3_extra_lora2, 6, 1)
+
+        # MiniMax-only model override. Row 7 is shared with the LTX clip-length row,
+        # which is hidden whenever MiniMax is selected.
+        self.lbl_minimax_h3_own_model_variant = QLabel("Use own model variant")
+        self.minimax_h3_own_model_variant_row = QWidget()
+        _mm_model_row = QHBoxLayout(self.minimax_h3_own_model_variant_row)
+        _mm_model_row.setContentsMargins(0, 0, 0, 0)
+        _mm_model_row.setSpacing(6)
+        self.chk_minimax_h3_use_own_model_variant = QCheckBox("Enabled")
+        self.edit_minimax_h3_own_model_variant = QLineEdit()
+        self.edit_minimax_h3_own_model_variant.setReadOnly(True)
+        self.edit_minimax_h3_own_model_variant.setPlaceholderText("Select MiniMax H3 / hybrid checkpoint (.safetensors)")
+        self.btn_minimax_h3_own_model_variant = QPushButton("Browse…")
+        self.btn_minimax_h3_own_model_variant_clear = QPushButton("Clear")
+        _mm_model_tip = (
+            "MiniMax H3 only. Overrides automatic diffusion-model selection with one custom checkpoint, "
+            "usually a hybrid model. The same file is offered to both FL2VA and Ref2VA and is remembered after restart."
+        )
+        for _w in (self.lbl_minimax_h3_own_model_variant, self.minimax_h3_own_model_variant_row,
+                   self.chk_minimax_h3_use_own_model_variant, self.edit_minimax_h3_own_model_variant,
+                   self.btn_minimax_h3_own_model_variant, self.btn_minimax_h3_own_model_variant_clear):
+            try: _w.setToolTip(_mm_model_tip)
+            except Exception: pass
+        try:
+            _mm_saved = _load_planner_settings() or {}
+        except Exception:
+            _mm_saved = {}
+        _mm_saved_path = str(_mm_saved.get("minimax_h3_own_model_variant_path") or "").strip()
+        self.chk_minimax_h3_use_own_model_variant.setChecked(bool(_mm_saved.get("minimax_h3_use_own_model_variant", False)))
+        if _mm_saved_path:
+            self.edit_minimax_h3_own_model_variant.setText(_mm_saved_path)
+            self.edit_minimax_h3_own_model_variant.setToolTip(_mm_saved_path)
+        self.chk_minimax_h3_use_own_model_variant.toggled.connect(self._on_minimax_h3_own_model_variant_changed)
+        self.btn_minimax_h3_own_model_variant.clicked.connect(self._browse_minimax_h3_own_model_variant)
+        self.btn_minimax_h3_own_model_variant_clear.clicked.connect(self._clear_minimax_h3_own_model_variant)
+        _mm_model_row.addWidget(self.chk_minimax_h3_use_own_model_variant, 0)
+        _mm_model_row.addWidget(self.edit_minimax_h3_own_model_variant, 1)
+        _mm_model_row.addWidget(self.btn_minimax_h3_own_model_variant, 0)
+        _mm_model_row.addWidget(self.btn_minimax_h3_own_model_variant_clear, 0)
+        grid.addWidget(self.lbl_minimax_h3_own_model_variant, 7, 0)
+        grid.addWidget(self.minimax_h3_own_model_variant_row, 7, 1)
+        self._sync_minimax_h3_own_model_variant_enabled()
+
         try:
             self._refresh_minimax_h3_clip_length_slider()
             self._sync_minimax_h3_controls_visibility()
@@ -28646,8 +28967,11 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             self.cmb_videoclip_clip_order.currentIndexChanged.connect(self._on_videoclip_creator_clip_order_changed)
         except Exception:
             pass
-        grid.addWidget(self.lbl_videoclip_clip_order, 7, 0)
-        grid.addWidget(self.cmb_videoclip_clip_order, 7, 1)
+        # Keep Clip order on its own row. Row 7 is reserved for the LTX maximum clip length slider.
+        # Sharing row 7 caused the LTX slider to be covered whenever last-frame chaining forced
+        # Clip order visible.
+        grid.addWidget(self.lbl_videoclip_clip_order, 12, 0)
+        grid.addWidget(self.cmb_videoclip_clip_order, 12, 1)
 
         # Safeguard: Videoclip Creator presets are not compatible with Narration.
         self.lbl_videoclip_preset_hint = QLabel("Disable narration to have more presets")
@@ -29434,6 +29758,8 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             if bool(self._is_ltx23_video_model_selected()) and hasattr(self, "sld_ltx23_clip_length") and self.sld_ltx23_clip_length is not None:
                 payload["ltx23_clip_length_sec"] = int(self.sld_ltx23_clip_length.value())
                 payload[f"ltx23_clip_length_sec_{self._ltx23_quality_key_ui()}"] = int(self.sld_ltx23_clip_length.value())
+            elif bool(self._is_ltx25_video_model_selected()) and hasattr(self, "sld_ltx23_clip_length") and self.sld_ltx23_clip_length is not None:
+                payload["ltx25_clip_length_sec"] = int(self.sld_ltx23_clip_length.value())
         except Exception:
             pass
 
@@ -31891,6 +32217,21 @@ These prompts override the normal reused Own Storymode prompts for the video sta
                     self.lbl_videoclip_preset_hint.setVisible(True)
             except Exception:
                 pass
+            # Keep duration and per-model clip-length sliders visible while the chain workflow is enabled.
+            # Only the external preset/order choices should be locked by this mode.
+            try:
+                if hasattr(self, "duration_row") and self.duration_row is not None:
+                    self.duration_row.setVisible(True)
+            except Exception:
+                pass
+            try:
+                self._sync_ltx23_only_controls_visibility()
+            except Exception:
+                pass
+            try:
+                self._sync_minimax_h3_controls_visibility()
+            except Exception:
+                pass
             return
 
         try:
@@ -31910,6 +32251,21 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             pass
         try:
             self._sync_videoclip_creator_external_options_visibility()
+        except Exception:
+            pass
+        # When chain mode is turned back off, still keep the general duration row visible
+        # and restore model-specific clip-length controls according to the selected backend.
+        try:
+            if hasattr(self, "duration_row") and self.duration_row is not None:
+                self.duration_row.setVisible(True)
+        except Exception:
+            pass
+        try:
+            self._sync_ltx23_only_controls_visibility()
+        except Exception:
+            pass
+        try:
+            self._sync_minimax_h3_controls_visibility()
         except Exception:
             pass
 
@@ -32519,6 +32875,13 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         vm = vm.strip().lower()
         return ("ltx" in vm) and ("2.3" in vm)
 
+    def _is_ltx25_video_model_selected(self) -> bool:
+        try:
+            vm = str(self._current_video_model_label() if hasattr(self, "_current_video_model_label") else "")
+        except Exception:
+            vm = ""
+        return _video_model_key(vm) == "ltx25"
+
     def _is_ltx23_wangp_video_model_selected(self) -> bool:
         """True only for the old hidden Wan2GP LTX slot, not public FrameVision LTX."""
         try:
@@ -33039,6 +33402,10 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         except Exception:
             visible = False
         try:
+            clip_visible = bool(visible or self._is_ltx25_video_model_selected())
+        except Exception:
+            clip_visible = bool(visible)
+        try:
             lora_visible = bool(self._is_ltx23_wangp_video_model_selected())
         except Exception:
             lora_visible = False
@@ -33061,12 +33428,12 @@ These prompts override the normal reused Own Storymode prompts for the video sta
                 pass
         try:
             if hasattr(self, "lbl_ltx23_clip_length") and self.lbl_ltx23_clip_length is not None:
-                self.lbl_ltx23_clip_length.setVisible(bool(visible))
+                self.lbl_ltx23_clip_length.setVisible(bool(clip_visible))
         except Exception:
             pass
         try:
             if hasattr(self, "ltx23_clip_length_row") and self.ltx23_clip_length_row is not None:
-                self.ltx23_clip_length_row.setVisible(bool(visible))
+                self.ltx23_clip_length_row.setVisible(bool(clip_visible))
         except Exception:
             pass
         try:
@@ -33088,28 +33455,50 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         return gk if gk in _LTX23_PRESETS else "medium"
 
     def _refresh_ltx23_clip_length_slider(self) -> None:
+        is_ltx25 = False
         try:
-            gk = self._ltx23_quality_key_ui()
+            is_ltx25 = bool(self._is_ltx25_video_model_selected())
         except Exception:
-            gk = "medium"
-        preset = dict(_LTX23_PRESETS.get(gk) or _LTX23_PRESETS.get("medium") or {})
-        try:
-            min_sec = int(round(float(preset.get("min_sec") or 4.0)))
-        except Exception:
-            min_sec = 4
-        try:
-            max_sec = int(round(float(preset.get("max_sec") or 20.0)))
-        except Exception:
-            max_sec = 20
-        try:
-            saved = _load_planner_settings() or {}
-        except Exception:
-            saved = {}
-        raw_val = saved.get(f"ltx23_clip_length_sec_{gk}", saved.get("ltx23_clip_length_sec", max_sec))
+            is_ltx25 = False
+        if is_ltx25:
+            try:
+                gq = str(self.cmb_gen_quality.currentText() or '').strip()
+            except Exception:
+                gq = ""
+            gk = _normalize_key(gq)
+            if gk not in _LTX25_PRESETS:
+                gk = "medium"
+            preset = dict(_LTX25_PRESETS.get(gk) or _LTX25_PRESETS.get("medium") or {})
+            min_sec = int(round(float(preset.get("min_sec") or 3.0)))
+            max_sec = 15
+            try:
+                saved = _load_planner_settings() or {}
+            except Exception:
+                saved = {}
+            raw_val = saved.get("ltx25_clip_length_sec", 10)
+        else:
+            try:
+                gk = self._ltx23_quality_key_ui()
+            except Exception:
+                gk = "medium"
+            preset = dict(_LTX23_PRESETS.get(gk) or _LTX23_PRESETS.get("medium") or {})
+            try:
+                min_sec = int(round(float(preset.get("min_sec") or 4.0)))
+            except Exception:
+                min_sec = 4
+            try:
+                max_sec = int(round(float(preset.get("max_sec") or 20.0)))
+            except Exception:
+                max_sec = 20
+            try:
+                saved = _load_planner_settings() or {}
+            except Exception:
+                saved = {}
+            raw_val = saved.get(f"ltx23_clip_length_sec_{gk}", saved.get("ltx23_clip_length_sec", max_sec))
         try:
             cur = int(round(float(raw_val)))
         except Exception:
-            cur = int(max_sec)
+            cur = 10 if is_ltx25 else int(max_sec)
         cur = max(min_sec, min(max_sec, cur))
         try:
             if hasattr(self, "sld_ltx23_clip_length") and self.sld_ltx23_clip_length is not None:
@@ -33128,16 +33517,24 @@ These prompts override the normal reused Own Storymode prompts for the video sta
 
     def _on_ltx23_clip_length_changed(self, value: int) -> None:
         try:
-            gk = self._ltx23_quality_key_ui()
+            is_ltx25 = bool(self._is_ltx25_video_model_selected())
         except Exception:
-            gk = "medium"
-        try:
-            preset = dict(_LTX23_PRESETS.get(gk) or _LTX23_PRESETS.get("medium") or {})
-            min_sec = int(round(float(preset.get("min_sec") or 4.0)))
-            max_sec = int(round(float(preset.get("max_sec") or 20.0)))
-        except Exception:
-            min_sec, max_sec = 4, 20
-        cur = max(int(min_sec), min(int(max_sec), int(value or max_sec)))
+            is_ltx25 = False
+        if is_ltx25:
+            min_sec, max_sec = 3, 15
+            cur = max(min_sec, min(max_sec, int(value or 10)))
+        else:
+            try:
+                gk = self._ltx23_quality_key_ui()
+            except Exception:
+                gk = "medium"
+            try:
+                preset = dict(_LTX23_PRESETS.get(gk) or _LTX23_PRESETS.get("medium") or {})
+                min_sec = int(round(float(preset.get("min_sec") or 4.0)))
+                max_sec = int(round(float(preset.get("max_sec") or 20.0)))
+            except Exception:
+                min_sec, max_sec = 4, 20
+            cur = max(int(min_sec), min(int(max_sec), int(value or max_sec)))
         try:
             if hasattr(self, "lbl_ltx23_clip_length_value") and self.lbl_ltx23_clip_length_value is not None:
                 self.lbl_ltx23_clip_length_value.setText(f"{int(cur)} sec")
@@ -33145,8 +33542,11 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             pass
         try:
             s = _load_planner_settings()
-            s[f"ltx23_clip_length_sec_{gk}"] = int(cur)
-            s["ltx23_clip_length_sec"] = int(cur)
+            if is_ltx25:
+                s["ltx25_clip_length_sec"] = int(cur)
+            else:
+                s[f"ltx23_clip_length_sec_{gk}"] = int(cur)
+                s["ltx23_clip_length_sec"] = int(cur)
             _save_planner_settings(s)
         except Exception:
             pass
@@ -33165,6 +33565,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             "lbl_minimax_h3_clip_length", "minimax_h3_clip_length_row",
             "lbl_minimax_h3_extra_lora1", "row_minimax_h3_extra_lora1",
             "lbl_minimax_h3_extra_lora2", "row_minimax_h3_extra_lora2",
+            "lbl_minimax_h3_own_model_variant", "minimax_h3_own_model_variant_row",
         ):
             try:
                 _w = getattr(self, _name, None)
@@ -34394,6 +34795,74 @@ These prompts override the normal reused Own Storymode prompts for the video sta
                 out[f"ltx23_extra_lora{slot}_multiplier"] = 1.0
         return out
 
+    def _sync_minimax_h3_own_model_variant_enabled(self) -> None:
+        try:
+            enabled = bool(self.chk_minimax_h3_use_own_model_variant.isChecked())
+        except Exception:
+            enabled = False
+        for _name in ("edit_minimax_h3_own_model_variant", "btn_minimax_h3_own_model_variant", "btn_minimax_h3_own_model_variant_clear"):
+            try:
+                _w = getattr(self, _name, None)
+                if _w is not None:
+                    _w.setEnabled(bool(enabled))
+            except Exception:
+                pass
+
+    def _save_minimax_h3_own_model_variant(self) -> None:
+        try:
+            s = _load_planner_settings() or {}
+            s["minimax_h3_use_own_model_variant"] = bool(self.chk_minimax_h3_use_own_model_variant.isChecked())
+            s["minimax_h3_own_model_variant_path"] = str(self.edit_minimax_h3_own_model_variant.text() or "").strip()
+            _save_planner_settings(s)
+        except Exception:
+            pass
+
+    def _on_minimax_h3_own_model_variant_changed(self, _checked: bool) -> None:
+        self._sync_minimax_h3_own_model_variant_enabled()
+        self._save_minimax_h3_own_model_variant()
+
+    def _browse_minimax_h3_own_model_variant(self) -> None:
+        try:
+            current = str(self.edit_minimax_h3_own_model_variant.text() or "").strip()
+            if current and os.path.isfile(current):
+                start = str(Path(current).parent)
+            else:
+                start = str((_root() / "models" / "minimax_h3" / "diffusion_models").resolve())
+                if not os.path.isdir(start):
+                    start = str((_root() / "models" / "minimax_h3").resolve())
+            fn, _ = QFileDialog.getOpenFileName(self, "Select MiniMax H3 model variant", start, "MiniMax checkpoints (*.safetensors);;All files (*.*)")
+        except Exception:
+            fn = ""
+        if not fn:
+            return
+        try:
+            self.edit_minimax_h3_own_model_variant.setText(str(fn))
+            self.edit_minimax_h3_own_model_variant.setToolTip(str(fn))
+            self.chk_minimax_h3_use_own_model_variant.setChecked(True)
+        except Exception:
+            pass
+        self._save_minimax_h3_own_model_variant()
+
+    def _clear_minimax_h3_own_model_variant(self) -> None:
+        try:
+            self.edit_minimax_h3_own_model_variant.clear()
+            self.edit_minimax_h3_own_model_variant.setToolTip(
+                "MiniMax H3 only. Overrides automatic diffusion-model selection with one custom checkpoint, usually a hybrid model."
+            )
+            self.chk_minimax_h3_use_own_model_variant.setChecked(False)
+        except Exception:
+            pass
+        self._save_minimax_h3_own_model_variant()
+
+    def _collect_minimax_h3_model_variant_settings(self) -> Dict[str, Any]:
+        try:
+            return {
+                "minimax_h3_use_own_model_variant": bool(self.chk_minimax_h3_use_own_model_variant.isChecked()),
+                "minimax_h3_own_model_variant_path": str(self.edit_minimax_h3_own_model_variant.text() or "").strip(),
+            }
+        except Exception:
+            return {"minimax_h3_use_own_model_variant": False, "minimax_h3_own_model_variant_path": ""}
+
     def _minimax_h3_extra_lora_widgets(self, slot: int):
         return (
             getattr(self, f"chk_minimax_h3_extra_lora{slot}", None),
@@ -34732,6 +35201,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             "use_20_camera_effects": bool(getattr(self, "chk_use_20_camera_effects", None) and self.chk_use_20_camera_effects.isChecked()),
             "use_transition_lora": bool(getattr(self, "chk_use_transition_lora", None) and self.chk_use_transition_lora.isChecked() and self._is_ltx23_wangp_video_model_selected()),
             "ltx23_clip_length_sec": int((getattr(self, "sld_ltx23_clip_length", None).value() if (getattr(self, "sld_ltx23_clip_length", None) is not None and self._is_ltx23_video_model_selected()) else 0) or 0),
+            "ltx25_clip_length_sec": int((getattr(self, "sld_ltx23_clip_length", None).value() if (getattr(self, "sld_ltx23_clip_length", None) is not None and self._is_ltx25_video_model_selected()) else 0) or 0),
             "minimax_h3_clip_length_sec": int((getattr(self, "sld_minimax_h3_clip_length", None).value() if (getattr(self, "sld_minimax_h3_clip_length", None) is not None and self._is_minimax_h3_video_model_selected()) else 0) or 0),
             "use_end_images_as_last_frames": bool(getattr(self, "chk_use_end_images_as_last_frames", None) and self.chk_use_end_images_as_last_frames.isChecked()),
             "use_last_frame_as_next_image": bool(getattr(self, "chk_use_last_frame_as_next_image", None) and self.chk_use_last_frame_as_next_image.isChecked()),
@@ -34758,11 +35228,14 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         try:
             if self._is_minimax_h3_video_model_selected():
                 enc.update(self._collect_minimax_h3_extra_lora_settings())
+                enc.update(self._collect_minimax_h3_model_variant_settings())
             else:
                 for _slot in (1, 2):
                     enc[f"minimax_h3_extra_lora{_slot}_enabled"] = False
                     enc[f"minimax_h3_extra_lora{_slot}_path"] = ""
                     enc[f"minimax_h3_extra_lora{_slot}_strength"] = 1.0
+                enc["minimax_h3_use_own_model_variant"] = False
+                enc["minimax_h3_own_model_variant_path"] = ""
         except Exception:
             pass
 
@@ -34969,6 +35442,11 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             try:
                 if int(enc.get("ltx23_clip_length_sec") or 0) > 0:
                     _pu["ltx23_clip_length_sec"] = int(enc.get("ltx23_clip_length_sec") or 0)
+            except Exception:
+                pass
+            try:
+                if int(enc.get("ltx25_clip_length_sec") or 0) > 0:
+                    _pu["ltx25_clip_length_sec"] = int(enc.get("ltx25_clip_length_sec") or 0)
             except Exception:
                 pass
             try:

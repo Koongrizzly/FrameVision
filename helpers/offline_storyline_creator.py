@@ -488,26 +488,39 @@ class StorylineGenerator:
 
     @staticmethod
     def _story_section_guidance(target_duration: float, shot_count: int) -> Tuple[int, int]:
-        """Return a duration-aware *guidance* range for blueprint section count.
+        """Return duration-aware *creative guidance* for blueprint section count.
 
-        This deliberately does not force one fixed act template.  Longer runtimes get
-        permission to create more narrative movements so a 10- or 30-minute story is
-        not stretched across the same five sections used by a short film.
+        These values express the usual amount of narrative movement expected for the
+        selected runtime. They are deliberately guidance rather than a hard act count:
+        the blueprint may use fewer sections when another section would only be filler,
+        or more when the premise genuinely benefits from it. The purpose is to stop a
+        longer story from stretching a small number of story phases across too many clips.
         """
         duration = max(1.0, float(target_duration or 0.0))
         shots = max(1, int(shot_count or 1))
-        if duration <= 60:
-            lo, hi = 3, 5
-        elif duration <= 120:
-            lo, hi = 4, 6
-        elif duration <= 300:
-            lo, hi = 5, 8
-        elif duration <= 600:
-            lo, hi = 6, 10
-        elif duration <= 1200:
-            lo, hi = 8, 14
-        else:
-            lo, hi = 10, 18
+
+        # Typical section depth by runtime. Keep short stories compact, then add
+        # narrative movements gradually as more runtime becomes available.
+        if duration < 120:          # below 2 minutes
+            lo, hi = 5, 5
+        elif duration < 180:        # 2:00 up to 3:00
+            lo, hi = 6, 6
+        elif duration < 300:        # 3:00 up to 5:00
+            lo, hi = 7, 7
+        elif duration < 480:        # 5:00 up to 8:00
+            lo, hi = 8, 8
+        elif duration < 720:        # 8:00 up to 12:00
+            lo, hi = 9, 9
+        elif duration < 900:        # 12:00 up to 15:00
+            lo, hi = 10, 10
+        elif duration < 1200:       # 15:00 up to 20:00
+            lo, hi = 11, 11
+        elif duration < 1500:       # 20:00 up to 25:00
+            lo, hi = 12, 12
+        else:                        # 25 minutes and above
+            lo, hi = 13, 15
+
+        # Never guide the model toward more sections than available clip slots.
         hi = min(hi, shots)
         lo = min(lo, hi)
         return max(1, lo), max(1, hi)
