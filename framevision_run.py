@@ -321,11 +321,32 @@ def _apply_framevision_app_icon(app, win=None):
         pass
 
 
+def _set_framevision_windows_app_id():
+    """Give the Python-hosted GUI its own Windows taskbar identity."""
+    try:
+        import os as _os
+        if _os.name != "nt":
+            return
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "GetGoingFast.FrameVision"
+        )
+    except Exception:
+        pass
+
+
 def main():
     _fv_profile_mark("main() entered")
 
+    # Must be set before QApplication/window creation. FrameVision ultimately runs
+    # inside python.exe even when start.bat was launched by FrameVision.exe, so
+    # Windows otherwise keeps the generic Python taskbar identity/icon.
+    _set_framevision_windows_app_id()
+
     with _fv_profile_section("QApplication creation"):
         app = QApplication(sys.argv)
+        app.setApplicationName("FrameVision")
+        app.setApplicationDisplayName("FrameVision")
         _apply_framevision_app_icon(app)
 
     with _fv_profile_section("MainWindow construction"):
