@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -68,6 +69,80 @@ def env_python() -> Path:
 
 def quote_cmd(parts: list[str]) -> str:
     return subprocess.list2cmdline([str(p) for p in parts])
+
+
+def auto_install(update_repo: bool = True, install_ui_deps: bool = False) -> int:
+    """Non-GUI install/repair path used by FrameVision Optional Installs."""
+    conda = conda_executable()
+    if not conda:
+        print("[ERROR] Conda could not be found. Install/configure Conda before installing Ostris AI Toolkit.", flush=True)
+        return 2
+
+    git = shutil.which("git")
+    if not git:
+        print("[ERROR] Git is required to download AI Toolkit.", flush=True)
+        return 2
+
+    MODEL_ROOT.mkdir(parents=True, exist_ok=True)
+    LOG_ROOT.mkdir(parents=True, exist_ok=True)
+
+    commands: list[tuple[str, list[str], Path]] = []
+    if not (REPO_ROOT / ".git").exists():
+        commands.append(("Clone AI Toolkit", [git, "clone", REPO_URL, str(REPO_ROOT)], APP_ROOT))
+    elif update_repo:
+        commands.append(("Update AI Toolkit", [git, "-C", str(REPO_ROOT), "pull", "--ff-only"], APP_ROOT))
+
+    commands.append((
+        "Initialize repository submodules",
+        [git, "-C", str(REPO_ROOT), "submodule", "update", "--init", "--recursive"],
+        APP_ROOT,
+    ))
+
+    if not env_python().exists():
+        commands.append((
+            "Create Python 3.12 Conda environment",
+            [conda, "create", "-y", "-p", str(ENV_ROOT), "python=3.12", "pip"],
+            APP_ROOT,
+        ))
+
+    # These use the path that will exist after the environment-creation command.
+    py = str(env_python())
+    commands.extend([
+        ("Upgrade packaging tools", [py, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], APP_ROOT),
+        ("Install CUDA PyTorch", [py, "-m", "pip", "install", "--no-cache-dir", *TORCH_PACKAGES, "--index-url", TORCH_INDEX], APP_ROOT),
+        ("Install AI Toolkit requirements", [py, "-m", "pip", "install", "-r", str(REPO_ROOT / "requirements.txt")], REPO_ROOT),
+        ("Install helper dependencies", [py, "-m", "pip", "install", "PySide6", "PyYAML", "Pillow"], REPO_ROOT),
+    ])
+
+    if install_ui_deps:
+        npm = shutil.which("npm")
+        if npm:
+            commands.append(("Install original web UI packages", [npm, "install"], REPO_ROOT / "ui"))
+        else:
+            print("[WARN] npm was not found; original web UI dependencies will be skipped.", flush=True)
+
+    print("=== Ostris AI Toolkit / LoRA Trainer installation started ===", flush=True)
+    print(f"Repository: {REPO_ROOT}", flush=True)
+    print(f"Environment: {ENV_ROOT}", flush=True)
+
+    for label, command, cwd in commands:
+        print(f"\n--- {label} ---", flush=True)
+        print(quote_cmd(command), flush=True)
+        try:
+            result = subprocess.run(command, cwd=cwd)
+        except Exception as exc:
+            print(f"[ERROR] Could not run command: {exc}", flush=True)
+            return 1
+        if result.returncode != 0:
+            print(f"[ERROR] {label} failed with exit code {result.returncode}", flush=True)
+            return int(result.returncode or 1)
+
+    if not env_python().exists() or not (REPO_ROOT / "run.py").exists():
+        print("[ERROR] Installation finished but the environment or AI Toolkit run.py is missing.", flush=True)
+        return 1
+
+    print("\n=== Ostris AI Toolkit installation completed ===", flush=True)
+    return 0
 
 
 class OstrisInstaller(QMainWindow):
@@ -393,6 +468,15 @@ class OstrisInstaller(QMainWindow):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--auto-install", action="store_true", help="Install/repair without opening the GUI.")
+    parser.add_argument("--no-update-repo", action="store_true", help="Do not git pull an existing AI Toolkit checkout.")
+    parser.add_argument("--install-ui-deps", action="store_true", help="Also install Ostris original web UI npm packages.")
+    args = parser.parse_args()
+
+    if args.auto_install:
+        raise SystemExit(auto_install(update_repo=not args.no_update_repo, install_ui_deps=args.install_ui_deps))
+
     app = QApplication(sys.argv)
     window = OstrisInstaller()
     window.show()
