@@ -60,6 +60,10 @@ SETTINGS_PATH = PROJECT_ROOT / "presets" / "setsave" / "yue2.json"
 LOG_DIR = PROJECT_ROOT / "logs"
 OUTPUT_DIR = PROJECT_ROOT / "output" / "yue2"
 TEMP_DIR = PROJECT_ROOT / "temp"
+SHEETSAGE_ENV = PROJECT_ROOT / "environments" / ".yue2_sheetsage2"
+SHEETSAGE_MODEL_DIR = MODEL_DIR / "SheetSage2"
+SHEETSAGE_PYTHON = SHEETSAGE_ENV / "Scripts" / "python.exe" if os.name == "nt" else SHEETSAGE_ENV / "bin" / "python"
+SHEETSAGE_INFER = SHEETSAGE_MODEL_DIR / "infer.py"
 
 GITHUB_REPO = "0xShug0/audio.cpp"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}"
@@ -81,6 +85,7 @@ DEFAULTS = {
     "backend": "cuda",
     "output_dir": str(OUTPUT_DIR),
     "last_abc": "",
+    "cover_source_audio": "",
     "last_style": DEFAULT_STYLE,
     "last_lyrics": DEFAULT_LYRICS,
     "log_cli": True,
@@ -218,7 +223,7 @@ def _trim_wav_exact(path: Path, seconds: int) -> tuple[bool, str]:
 
 
 def _ensure_dirs() -> None:
-    for path in (AUDIOCPP_DIR, MODEL_DIR, SETTINGS_PATH.parent, LOG_DIR, OUTPUT_DIR, TEMP_DIR):
+    for path in (AUDIOCPP_DIR, MODEL_DIR, SETTINGS_PATH.parent, LOG_DIR, OUTPUT_DIR, TEMP_DIR, SHEETSAGE_ENV.parent):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -379,6 +384,141 @@ class SafeSpinBox(QSpinBox):
 class SafeDoubleSpinBox(QDoubleSpinBox):
     def wheelEvent(self, event):  # noqa: N802
         event.ignore()
+
+
+
+def _find_uv() -> Optional[Path]:
+    candidates = [
+        PROJECT_ROOT / "presets" / "bin" / "uv.exe",
+        PROJECT_ROOT / "presets" / "bin" / "uv" / "uv.exe",
+        PROJECT_ROOT / "uv.exe",
+    ]
+    found = shutil.which("uv")
+    if found:
+        candidates.insert(0, Path(found))
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _sheetsage_ready() -> bool:
+    return SHEETSAGE_PYTHON.is_file() and SHEETSAGE_INFER.is_file()
+
+
+class SheetSageInstallThread(QThread):
+    message = Signal(str)
+    finished_ok = Signal(bool, str)
+
+    def _run(self, args: list[str], cwd: Optional[Path] = None) -> None:
+        self.message.emit("[SheetSage2] " + " ".join(map(str, args)))
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        proc = subprocess.Popen(
+            [str(x) for x in args], cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace", creationflags=flags,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                self.message.emit(line)
+        code = proc.wait()
+        if code != 0:
+            raise RuntimeError(f"Command failed with exit code {code}: {' '.join(map(str, args))}")
+
+    def run(self) -> None:
+        try:
+            SHEETSAGE_ENV.parent.mkdir(parents=True, exist_ok=True)
+            SHEETSAGE_MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
+            if not SHEETSAGE_PYTHON.is_file():
+                uv = _find_uv()
+                if uv:
+                    self.message.emit("[SheetSage2] Creating isolated Python 3.11 environment with UV...")
+                    self._run([str(uv), "venv", str(SHEETSAGE_ENV), "--python", "3.11"])
+                elif os.name == "nt" and shutil.which("py"):
+                    self.message.emit("[SheetSage2] UV not found; using Windows Python launcher for Python 3.11...")
+                    self._run(["py", "-3.11", "-m", "venv", str(SHEETSAGE_ENV)])
+                else:
+                    raise RuntimeError(
+                        "Python 3.11 is required for SheetSage2. Install UV or Python 3.11, then retry."
+                    )
+            py = str(SHEETSAGE_PYTHON)
+            self._run([py, "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"])
+            self._run([py, "-m", "pip", "install", "huggingface-hub==0.36.0", "hf_transfer"])
+            if not SHEETSAGE_INFER.is_file():
+                self.message.emit("[SheetSage2] Downloading official m-a-p/SheetSage2 model snapshot...")
+                code = (
+                    "from huggingface_hub import snapshot_download; "
+                    f"snapshot_download('m-a-p/SheetSage2', local_dir=r'{str(SHEETSAGE_MODEL_DIR)}')"
+                )
+                env = os.environ.copy()
+                env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+                flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                proc = subprocess.Popen([py, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True, encoding="utf-8", errors="replace", env=env, creationflags=flags)
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    if line.strip(): self.message.emit(line.rstrip())
+                if proc.wait() != 0:
+                    raise RuntimeError("SheetSage2 model download failed")
+            self.message.emit("[SheetSage2] Installing the official CUDA 12.6 PyTorch stack...")
+            self._run([py, "-m", "pip", "install", "torch==2.8.0", "torchaudio==2.8.0", "--index-url", "https://download.pytorch.org/whl/cu126"])
+            req = SHEETSAGE_MODEL_DIR / "requirements.txt"
+            if not req.is_file():
+                raise RuntimeError(f"Missing SheetSage2 requirements file: {req}")
+            self._run([py, "-m", "pip", "install", "-r", str(req)])
+            if not _sheetsage_ready():
+                raise RuntimeError("SheetSage2 installation finished but infer.py or the isolated Python environment is missing")
+            self.finished_ok.emit(True, "SheetSage2 is installed and ready for audio-to-ABC transcription.")
+        except Exception as exc:
+            self.finished_ok.emit(False, str(exc))
+
+
+class SheetSageTranscribeThread(QThread):
+    message = Signal(str)
+    finished_ok = Signal(bool, str, str)
+
+    def __init__(self, source_audio: str, output_dir: str, parent=None):
+        super().__init__(parent)
+        self.source_audio = source_audio
+        self.output_dir = output_dir
+
+    def run(self) -> None:
+        try:
+            if not _sheetsage_ready():
+                raise RuntimeError("SheetSage2 is not installed yet")
+            source = Path(self.source_audio)
+            if not source.is_file():
+                raise RuntimeError(f"Source audio not found: {source}")
+            out = Path(self.output_dir)
+            if out.exists():
+                shutil.rmtree(out, ignore_errors=True)
+            out.mkdir(parents=True, exist_ok=True)
+            args = [str(SHEETSAGE_PYTHON), str(SHEETSAGE_INFER), str(source), "--output", str(out), "--melody-only"]
+            env = os.environ.copy()
+            env["PYTHONUTF8"] = "1"
+            ffmpeg = _find_ffmpeg()
+            if ffmpeg:
+                env["PATH"] = str(ffmpeg.parent) + os.pathsep + env.get("PATH", "")
+            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            self.message.emit("[SheetSage2] Transcribing source audio to melody-only ABC...")
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    encoding="utf-8", errors="replace", env=env, creationflags=flags)
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line=line.rstrip()
+                if line: self.message.emit(line)
+            code=proc.wait()
+            score = out / "score.abc"
+            if code != 0 or not score.is_file():
+                raise RuntimeError(f"SheetSage2 transcription failed (exit code {code}); no usable score.abc was produced")
+            abc = score.read_text(encoding="utf-8", errors="replace")
+            if not abc.strip():
+                raise RuntimeError("SheetSage2 produced an empty ABC score")
+            self.finished_ok.emit(True, str(score), abc)
+        except Exception as exc:
+            self.finished_ok.emit(False, str(exc), "")
 
 
 class RuntimeInstallerThread(QThread):
@@ -689,6 +829,9 @@ class YuE2Window(QMainWindow):
         self.resize(1040, 820)
         self._log_file = LOG_DIR / f"yue2_{_timestamp()}.log"
         self._installer: Optional[RuntimeInstallerThread] = None
+        self._sheetsage_installer: Optional[SheetSageInstallThread] = None
+        self._sheetsage_transcriber: Optional[SheetSageTranscribeThread] = None
+        self._pending_cover_after_transcribe = False
         self._pending_duration_target: Optional[tuple[str, int]] = None
         self._process = GenerationProcess(self)
         self._process.line.connect(self.log)
@@ -778,15 +921,20 @@ class YuE2Window(QMainWindow):
         check = QCheckBox("Instrumental — no vocals / no singing")
         check.setChecked(bool(self.settings.get(settings_key, False)))
         check.setToolTip(
-            "Allow a completely empty Lyrics field. YuE2 receives no lyric text and the helper "
-            "adds instrumental / no vocals / no singing to the style request for this run."
+            "YuE2/audio.cpp still requires a non-empty lyrics channel for instrumental music. "
+            "Leave this box enabled and optionally enter bracketed instrumental directions such as "
+            "[slow orchestral buildup with strings and drums]. If left empty the helper supplies safe "
+            "instrumental tags automatically."
         )
 
         def _apply(enabled: bool) -> None:
-            lyrics_widget.setEnabled(not enabled)
+            # Keep the field editable in instrumental mode because YuE2's intended workflow
+            # uses bracketed performance/arrangement directions in the lyrics channel.
+            lyrics_widget.setEnabled(True)
             if enabled:
-                lyrics_widget.clear()
-                lyrics_widget.setPlaceholderText("Instrumental mode: lyrics intentionally blank")
+                lyrics_widget.setPlaceholderText(
+                    "Optional instrumental directions, e.g. [steady buildup of staccato strings and ethnic drums]"
+                )
             else:
                 lyrics_widget.setPlaceholderText("Use section tags such as [Verse] [Chorus] [Bridge]...")
 
@@ -828,28 +976,60 @@ class YuE2Window(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         info = QLabel(
-            "Melody-conditioned cover generation uses an ABC melody file (cot=melody). "
-            "YuE2 keeps the supplied melody as conditioning while creating a new arrangement/style."
+            "YuE2 cover workflow: load the original song, transcribe it with SheetSage2 into a chord-free melody score, "
+            "review/edit that ABC, then generate with cot=melody. YuE2 itself does not take reference audio directly."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        box = QGroupBox("Melody-conditioned cover")
+        source_box = QGroupBox("1. Source recording → melody score")
+        source_form = QFormLayout(source_box)
+        self.cover_audio = QLineEdit()
+        self.cover_audio.setPlaceholderText("Original song or audio reference (.wav .mp3 .flac .m4a .aac .ogg)")
+        audio_row = QWidget(); audio_layout = QHBoxLayout(audio_row); audio_layout.setContentsMargins(0,0,0,0)
+        audio_layout.addWidget(self.cover_audio, 1)
+        audio_browse = QPushButton("Browse...")
+        audio_browse.clicked.connect(self._browse_cover_audio)
+        audio_layout.addWidget(audio_browse)
+        source_form.addRow("Source audio", audio_row)
+
+        self.sheetsage_status = QLabel()
+        self.sheetsage_status.setWordWrap(True)
+        self.sheetsage_install_button = QPushButton("Install / Repair SheetSage2")
+        self.sheetsage_install_button.clicked.connect(self.install_sheetsage2)
+        ss_row = QWidget(); ss_layout = QHBoxLayout(ss_row); ss_layout.setContentsMargins(0,0,0,0)
+        ss_layout.addWidget(self.sheetsage_status, 1); ss_layout.addWidget(self.sheetsage_install_button)
+        source_form.addRow("Transcriber", ss_row)
+
+        transcribe_row = QHBoxLayout()
+        self.cover_transcribe_button = QPushButton("Transcribe Audio to ABC")
+        self.cover_transcribe_button.clicked.connect(lambda: self._start_cover_transcription(False))
+        transcribe_row.addStretch(1); transcribe_row.addWidget(self.cover_transcribe_button)
+        source_form.addRow("", transcribe_row)
+        layout.addWidget(source_box)
+
+        score_box = QGroupBox("2. Review / edit melody ABC")
+        score_layout = QVBoxLayout(score_box)
+        self.cover_abc = QLineEdit()
+        abc_row = QWidget(); abc_layout = QHBoxLayout(abc_row); abc_layout.setContentsMargins(0,0,0,0)
+        abc_layout.addWidget(self.cover_abc, 1)
+        browse = QPushButton("Load ABC..."); browse.clicked.connect(lambda: self._browse_abc_into_editor(self.cover_abc, self.cover_abc_editor))
+        save = QPushButton("Save ABC..."); save.clicked.connect(lambda: self._save_abc_editor(self.cover_abc_editor, self.cover_abc))
+        abc_layout.addWidget(browse); abc_layout.addWidget(save)
+        score_layout.addWidget(abc_row)
+        self.cover_abc_editor = QPlainTextEdit()
+        self.cover_abc_editor.setPlaceholderText("SheetSage2 melody-only ABC appears here. Review or edit it before creating the cover.")
+        self.cover_abc_editor.setMinimumHeight(230)
+        score_layout.addWidget(self.cover_abc_editor)
+        layout.addWidget(score_box)
+
+        box = QGroupBox("3. Generate cover from the melody score")
         form = QFormLayout(box)
         self.cover_lyrics, self.cover_style, self.cover_steps, self.cover_seed, self.cover_duration, self.cover_name = self._common_song_widgets("yue2_cover")
         self.cover_instrumental = self._make_instrumental_checkbox(self.cover_lyrics, "instrumental_cover")
-        self.cover_abc = QLineEdit()
-        abc_row = QWidget()
-        abc_layout = QHBoxLayout(abc_row)
-        abc_layout.setContentsMargins(0, 0, 0, 0)
-        abc_layout.addWidget(self.cover_abc, 1)
-        browse = QPushButton("Browse...")
-        browse.clicked.connect(lambda: self._browse_abc(self.cover_abc))
-        abc_layout.addWidget(browse)
-        form.addRow("ABC melody file", abc_row)
         form.addRow("Instrumental", self.cover_instrumental)
         form.addRow("Lyrics", self.cover_lyrics)
-        form.addRow("Style", self.cover_style)
+        form.addRow("Target style", self.cover_style)
         form.addRow("NAR ODE steps", self.cover_steps)
         form.addRow("Seed", self.cover_seed)
         form.addRow("Duration", self.cover_duration)
@@ -858,36 +1038,42 @@ class YuE2Window(QMainWindow):
 
         row = QHBoxLayout()
         self.cover_button = QPushButton("Create Cover")
+        self.cover_button.setToolTip("If source audio is loaded but no ABC has been created yet, this automatically transcribes the audio first and then starts YuE2 cover generation.")
         self.cover_button.clicked.connect(lambda: self._run_mode("cover"))
-        row.addStretch(1)
-        row.addWidget(self.cover_button)
+        row.addStretch(1); row.addWidget(self.cover_button)
         layout.addLayout(row)
         layout.addStretch(1)
+        self._refresh_sheetsage_status()
         return self._scroll_tab(page)
 
     def _build_score_tab(self) -> QScrollArea:
         page = QWidget()
         layout = QVBoxLayout(page)
         info = QLabel(
-            "Full score conditioning uses an ABC score together with full planning (cot=full). "
-            "Use this when the musical structure/notes should be conditioned by a complete score rather than only a melody line."
+            "Full score conditioning uses cot=full. Load a complete ABC score, inspect or edit it here, then render a new YuE2 recording from that score."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
+
+        abc_box = QGroupBox("Editable ABC score")
+        abc_v = QVBoxLayout(abc_box)
+        self.score_abc = QLineEdit()
+        abc_row = QWidget(); abc_layout = QHBoxLayout(abc_row); abc_layout.setContentsMargins(0,0,0,0)
+        abc_layout.addWidget(self.score_abc, 1)
+        browse = QPushButton("Load ABC..."); browse.clicked.connect(lambda: self._browse_abc_into_editor(self.score_abc, self.score_abc_editor))
+        save = QPushButton("Save ABC..."); save.clicked.connect(lambda: self._save_abc_editor(self.score_abc_editor, self.score_abc))
+        abc_layout.addWidget(browse); abc_layout.addWidget(save)
+        abc_v.addWidget(abc_row)
+        self.score_abc_editor = QPlainTextEdit()
+        self.score_abc_editor.setPlaceholderText("Load a full YuE2-compatible ABC score here. Chord symbols are preserved in cot=full mode.")
+        self.score_abc_editor.setMinimumHeight(230)
+        abc_v.addWidget(self.score_abc_editor)
+        layout.addWidget(abc_box)
 
         box = QGroupBox("Full score-conditioned generation")
         form = QFormLayout(box)
         self.score_lyrics, self.score_style, self.score_steps, self.score_seed, self.score_duration, self.score_name = self._common_song_widgets("yue2_score")
         self.score_instrumental = self._make_instrumental_checkbox(self.score_lyrics, "instrumental_score")
-        self.score_abc = QLineEdit()
-        abc_row = QWidget()
-        abc_layout = QHBoxLayout(abc_row)
-        abc_layout.setContentsMargins(0, 0, 0, 0)
-        abc_layout.addWidget(self.score_abc, 1)
-        browse = QPushButton("Browse...")
-        browse.clicked.connect(lambda: self._browse_abc(self.score_abc))
-        abc_layout.addWidget(browse)
-        form.addRow("ABC score file", abc_row)
         form.addRow("Instrumental", self.score_instrumental)
         form.addRow("Lyrics", self.score_lyrics)
         form.addRow("Style", self.score_style)
@@ -900,8 +1086,7 @@ class YuE2Window(QMainWindow):
         row = QHBoxLayout()
         self.score_button = QPushButton("Generate From Score")
         self.score_button.clicked.connect(lambda: self._run_mode("score"))
-        row.addStretch(1)
-        row.addWidget(self.score_button)
+        row.addStretch(1); row.addWidget(self.score_button)
         layout.addLayout(row)
         layout.addStretch(1)
         return self._scroll_tab(page)
@@ -1136,8 +1321,17 @@ class YuE2Window(QMainWindow):
             widget.setPlainText(lyrics)
         for widget in (self.gen_style, self.cover_style, self.score_style):
             widget.setPlainText(style)
+        self.cover_audio.setText(str(self.settings.get("cover_source_audio", "")))
         self.cover_abc.setText(abc)
         self.score_abc.setText(abc)
+        if abc and Path(abc).is_file():
+            try:
+                abc_text = Path(abc).read_text(encoding="utf-8", errors="replace")
+                self.cover_abc_editor.setPlainText(abc_text)
+                self.score_abc_editor.setPlainText(abc_text)
+            except Exception:
+                pass
+        self._refresh_sheetsage_status()
 
     def save_settings(self, quiet: bool = False) -> None:
         source_lyrics = self.gen_lyrics.toPlainText().strip()
@@ -1155,6 +1349,7 @@ class YuE2Window(QMainWindow):
             "backend": self.backend_combo.currentText(),
             "output_dir": self.output_edit.text().strip() or str(OUTPUT_DIR),
             "last_abc": self.cover_abc.text().strip() or self.score_abc.text().strip(),
+            "cover_source_audio": self.cover_audio.text().strip(),
             "last_style": source_style,
             "last_lyrics": source_lyrics,
             "log_cli": self.cli_log_check.isChecked(),
@@ -1172,8 +1367,8 @@ class YuE2Window(QMainWindow):
             "semantic_top_k": self.semantic_top_k_spin.value(),
             "semantic_repetition_penalty": self.semantic_rep_spin.value(),
             "semantic_penalty_window": self.semantic_window_spin.value(),
-            "semantic_min_tokens": duration_tokens,
-            "semantic_max_tokens": duration_tokens,
+            "semantic_min_tokens": self.semantic_min_tokens_spin.value(),
+            "semantic_max_tokens": self.semantic_max_tokens_spin.value(),
             "weight_type": self.weight_type_combo.currentText(),
             "model_weight_type": self.model_weight_type_combo.currentText(),
             "vae_weight_type": self.vae_weight_type_combo.currentText(),
@@ -1268,6 +1463,140 @@ class YuE2Window(QMainWindow):
         if filename:
             edit.setText(filename)
 
+    def _browse_cover_audio(self) -> None:
+        start = self.cover_audio.text().strip() or str(PROJECT_ROOT)
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Select source song for YuE2 cover", start,
+            "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg *.wma);;All files (*.*)"
+        )
+        if filename:
+            self.cover_audio.setText(filename)
+            self.settings["cover_source_audio"] = filename
+
+    def _browse_abc_into_editor(self, edit: QLineEdit, editor: QPlainTextEdit) -> None:
+        self._browse_abc(edit)
+        filename = edit.text().strip()
+        if filename and Path(filename).is_file():
+            try:
+                editor.setPlainText(Path(filename).read_text(encoding="utf-8", errors="replace"))
+            except Exception as exc:
+                QMessageBox.warning(self, "YuE2 ABC", f"Could not read ABC file:\n{exc}")
+
+    def _save_abc_editor(self, editor: QPlainTextEdit, edit: QLineEdit) -> None:
+        text = editor.toPlainText().strip()
+        if not text:
+            QMessageBox.warning(self, "YuE2 ABC", "There is no ABC text to save.")
+            return
+        start = edit.text().strip() or str(OUTPUT_DIR / "score.abc")
+        filename, _ = QFileDialog.getSaveFileName(self, "Save ABC notation", start, "ABC notation (*.abc);;All files (*.*)")
+        if not filename:
+            return
+        if not filename.lower().endswith(".abc"):
+            filename += ".abc"
+        try:
+            path = Path(filename)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text + "\n", encoding="utf-8")
+            edit.setText(str(path))
+            self.log(f"[ABC] Saved edited score: {path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "YuE2 ABC", f"Could not save ABC file:\n{exc}")
+
+    def _materialize_editor_abc(self, mode: str) -> str:
+        if mode == "cover":
+            editor, edit = self.cover_abc_editor, self.cover_abc
+        else:
+            editor, edit = self.score_abc_editor, self.score_abc
+        text = editor.toPlainText().strip()
+        if not text:
+            return edit.text().strip()
+        work = TEMP_DIR / f"yue2_{mode}_working.abc"
+        work.parent.mkdir(parents=True, exist_ok=True)
+        work.write_text(text + "\n", encoding="utf-8")
+        return str(work)
+
+    def _refresh_sheetsage_status(self) -> None:
+        if not hasattr(self, "sheetsage_status"):
+            return
+        if _sheetsage_ready():
+            self.sheetsage_status.setText(f"READY — {SHEETSAGE_MODEL_DIR}")
+            self.sheetsage_status.setStyleSheet("color: #58d68d;")
+            self.sheetsage_install_button.setText("Repair SheetSage2")
+        else:
+            self.sheetsage_status.setText("NOT INSTALLED — required only for audio-to-cover transcription")
+            self.sheetsage_status.setStyleSheet("color: #f5b041;")
+            self.sheetsage_install_button.setText("Install SheetSage2")
+
+    def install_sheetsage2(self) -> None:
+        if self._sheetsage_installer and self._sheetsage_installer.isRunning():
+            return
+        self.sheetsage_install_button.setEnabled(False)
+        self.sheetsage_install_button.setText("Installing...")
+        self.cover_transcribe_button.setEnabled(False)
+        self._sheetsage_installer = SheetSageInstallThread(self)
+        self._sheetsage_installer.message.connect(self.log)
+        self._sheetsage_installer.finished_ok.connect(self._sheetsage_install_done)
+        self._sheetsage_installer.start()
+
+    def _sheetsage_install_done(self, ok: bool, message: str) -> None:
+        self.log(f"[SheetSage2] {message}")
+        self.sheetsage_install_button.setEnabled(True)
+        self.cover_transcribe_button.setEnabled(True)
+        self._refresh_sheetsage_status()
+        if ok:
+            if self._pending_cover_after_transcribe and self.cover_audio.text().strip():
+                QTimer.singleShot(0, lambda: self._start_cover_transcription(True))
+            else:
+                QMessageBox.information(self, "SheetSage2", message)
+        else:
+            self._pending_cover_after_transcribe = False
+            QMessageBox.warning(self, "SheetSage2 installation", message)
+
+    def _start_cover_transcription(self, auto_generate: bool = False) -> None:
+        if self._sheetsage_transcriber and self._sheetsage_transcriber.isRunning():
+            return
+        source = self.cover_audio.text().strip()
+        if not source or not Path(source).is_file():
+            QMessageBox.warning(self, "YuE2 cover", "Choose the original audio/song first.")
+            return
+        if not _sheetsage_ready():
+            self._pending_cover_after_transcribe = bool(auto_generate)
+            self.install_sheetsage2()
+            QMessageBox.information(self, "YuE2 cover", "SheetSage2 is required for audio covers. Its isolated installer has started; the cover transcription will continue automatically when installation finishes.")
+            return
+        self._pending_cover_after_transcribe = bool(auto_generate)
+        out_dir = TEMP_DIR / "yue2_cover_transcription"
+        self.cover_transcribe_button.setEnabled(False)
+        self.cover_button.setEnabled(False)
+        self.sheetsage_status.setText("Transcribing source audio...")
+        self.sheetsage_status.setStyleSheet("color: #5dade2;")
+        self._sheetsage_transcriber = SheetSageTranscribeThread(source, str(out_dir), self)
+        self._sheetsage_transcriber.message.connect(self.log)
+        self._sheetsage_transcriber.finished_ok.connect(self._cover_transcription_done)
+        self._sheetsage_transcriber.start()
+
+    def _cover_transcription_done(self, ok: bool, detail: str, abc: str) -> None:
+        self.cover_transcribe_button.setEnabled(True)
+        self.cover_button.setEnabled(True)
+        self._refresh_sheetsage_status()
+        if not ok:
+            self.log(f"[SheetSage2] ERROR: {detail}")
+            QMessageBox.critical(self, "YuE2 cover transcription", detail)
+            self._pending_cover_after_transcribe = False
+            return
+        self.cover_abc.setText(detail)
+        self.cover_abc_editor.setPlainText(abc)
+        self.settings["last_abc"] = detail
+        self.settings["cover_source_audio"] = self.cover_audio.text().strip()
+        try:
+            _write_json_atomic(SETTINGS_PATH, self.settings)
+        except Exception:
+            pass
+        self.log(f"[SheetSage2] Melody-only cover score ready: {detail}")
+        if self._pending_cover_after_transcribe:
+            self._pending_cover_after_transcribe = False
+            QTimer.singleShot(0, lambda: self._run_mode("cover"))
+
     # -------------------------- generation ------------------------------
 
     def _run_mode(self, mode: str) -> None:
@@ -1313,7 +1642,12 @@ class YuE2Window(QMainWindow):
             seed = self.cover_seed.value()
             duration_seconds = self.cover_duration.value()
             cot = "melody"
-            abc_file = self.cover_abc.text().strip()
+            # Intended YuE2 cover workflow: source recording -> SheetSage2 melody-only ABC -> cot=melody.
+            # If the user loaded source audio but has not transcribed it yet, Create Cover performs that stage first.
+            if self.cover_audio.text().strip() and not self.cover_abc_editor.toPlainText().strip() and not self.cover_abc.text().strip():
+                self._start_cover_transcription(True)
+                return
+            abc_file = self._materialize_editor_abc("cover")
             requested_name = self.cover_name.text().strip()
             instrumental = self.cover_instrumental.isChecked()
             label = "yue2_cover"
@@ -1324,16 +1658,20 @@ class YuE2Window(QMainWindow):
             seed = self.score_seed.value()
             duration_seconds = self.score_duration.value()
             cot = "full"
-            abc_file = self.score_abc.text().strip()
+            abc_file = self._materialize_editor_abc("score")
             requested_name = self.score_name.text().strip()
             instrumental = self.score_instrumental.isChecked()
             label = "yue2_score"
 
         if not lyrics and not instrumental:
-            QMessageBox.warning(self, "YuE2", "Lyrics cannot be empty unless Instrumental mode is enabled.")
+            QMessageBox.warning(self, "YuE2", "Lyrics cannot be empty. For instrumental music enable Instrumental mode; the helper will then supply YuE2-compatible bracketed instrumental directions automatically.")
             return
         if instrumental:
-            lyrics = ""
+            # audio.cpp/YuE2 rejects an empty --lyrics value even for instrumental output.
+            # The intended YuE2 workflow uses bracketed musical directions in the lyrics
+            # channel, so preserve user-entered directions or provide safe defaults.
+            if not lyrics:
+                lyrics = "[Instrumental]\n[No vocals]"
             style_lower = style.lower()
             instrumental_tags = []
             if "instrumental" not in style_lower:
@@ -1348,7 +1686,7 @@ class YuE2Window(QMainWindow):
             QMessageBox.warning(self, "YuE2", "Style cannot be empty.")
             return
         if instrumental:
-            self.log("[RUN] Instrumental mode enabled: sending empty lyrics and no-vocal style guidance.")
+            self.log("[RUN] Instrumental mode enabled: sending YuE2-compatible bracketed instrumental directions plus no-vocal style guidance.")
         if abc_file and not Path(abc_file).is_file():
             QMessageBox.warning(self, "YuE2", "The selected ABC file does not exist.")
             return
@@ -1451,6 +1789,7 @@ class YuE2Window(QMainWindow):
             "backend": self.backend_combo.currentText(),
             "output_dir": str(output_dir),
             "last_abc": abc_file,
+            "cover_source_audio": self.cover_audio.text().strip(),
             "last_style": style,
             "last_lyrics": lyrics,
             "log_cli": self.cli_log_check.isChecked(),

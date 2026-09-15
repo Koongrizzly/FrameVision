@@ -621,6 +621,7 @@ class MusicProject:
     extra_lora2_path: str = ""
     extra_lora2_strength: float = 1.0
     randomize_reference_characters: bool = False
+    unlimited_random_references: bool = False
     use_framevision_queue: bool = False
     use_hypir_x1_upscale: bool = False
     use_lanczos_x2_upsampling: bool = False
@@ -1644,12 +1645,13 @@ def build_generation_prompt(project: MusicProject, shot: MusicShot, selected_ref
 
 
 def _randomized_character_reference_names(project: MusicProject, shot: MusicShot, enabled: Sequence[ReferenceAsset]) -> List[str]:
-    """Return a stable per-shot random character subset when the feature is enabled.
+    """Return a stable per-shot random Character subset.
 
-    Only enabled Character references participate. One or two characters are selected
-    per shot (or fewer when fewer are available). The project-level seed is refreshed
-    when the plan/prompts are rebuilt, then saved with the project so retries keep the
-    same shot-to-reference mapping.
+    Normal random mode keeps the established one-or-two random picks.  Unlimited
+    random mode treats the full Character pool as a shuffled deck: references are
+    consumed across clips without repetition until every item has been used, then a
+    new deterministic shuffled round begins.  The saved project seed makes rebuilds
+    and retries reproduce the exact same assignment.
     """
     if not bool(getattr(project, "randomize_reference_characters", False)):
         return []
@@ -1667,13 +1669,44 @@ def _randomized_character_reference_names(project: MusicProject, shot: MusicShot
             project.reference_random_seed = int(base_seed)
         except Exception:
             pass
-    rng = random.Random(f"{base_seed}:{int(getattr(shot, 'index', 0) or 0)}:{len(chars)}")
-    count = rng.randint(1, max_count)
+
+    try:
+        shot_index = max(1, int(getattr(shot, "index", 1) or 1))
+    except Exception:
+        shot_index = 1
+
+    # Existing random behavior for the normal <=9-reference mode.
+    if not bool(getattr(project, "unlimited_random_references", False)):
+        rng = random.Random(f"{base_seed}:{shot_index}:{len(chars)}")
+        count = rng.randint(1, max_count)
+        names = [r.name for r in chars]
+        if count >= len(names):
+            rng.shuffle(names)
+            return names
+        return list(rng.sample(names, count))
+
     names = [r.name for r in chars]
-    if count >= len(names):
-        rng.shuffle(names)
-        return names
-    return list(rng.sample(names, count))
+
+    # Determine how many cards all earlier clips consumed.  Counts are generated from
+    # per-shot deterministic RNGs so requesting shot N never depends on call order.
+    def count_for(index: int) -> int:
+        if len(names) <= 1:
+            return 1
+        return random.Random(f"{base_seed}:count:{index}:{len(names)}").randint(1, 2)
+
+    offset = sum(count_for(i) for i in range(1, shot_index))
+    count = count_for(shot_index)
+
+    # Build only the rounds needed for this shot.  Each round contains every ref once.
+    needed = offset + count
+    stream: List[str] = []
+    round_no = 0
+    while len(stream) < needed:
+        deck = list(names)
+        random.Random(f"{base_seed}:round:{round_no}:{len(names)}").shuffle(deck)
+        stream.extend(deck)
+        round_no += 1
+    return stream[offset:offset + count]
 
 
 def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
@@ -1684,7 +1717,9 @@ def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
     enabled, one or two Character references are chosen per shot while non-character
     context (background/style plus explicitly named props/anchors) stays stable.
     """
-    enabled = [r for r in project.references if r.enabled and Path(r.path).is_file()]
+    unlimited_pool = bool(getattr(project, "randomize_reference_characters", False) and getattr(project, "unlimited_random_references", False))
+    source_refs = project.references if unlimited_pool else project.references[:9]
+    enabled = [r for r in source_refs if r.enabled and Path(r.path).is_file()]
     randomize_chars = bool(getattr(project, "randomize_reference_characters", False))
     blob = " ".join((shot.prompt, shot.lyrics, project.characters_subjects, project.main_idea)).lower()
     chosen: List[str] = []
@@ -2710,6 +2745,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "check_auto_fill_locations": "minimax_music_auto_fill_locations",
             "check_auto_fill_camera": "minimax_music_auto_fill_camera",
             "check_randomize_ref_characters": "minimax_music_randomize_ref_characters",
+            "check_unlimited_random_refs": "minimax_music_unlimited_random_refs",
             "spin_sensitivity": "minimax_music_beat_sensitivity",
             "check_whisper_timing": "minimax_music_whisper_timing",
             "check_visible_lyric_subtitles": "minimax_music_visible_lyrics",
@@ -3025,6 +3061,16 @@ class MiniMaxMusicClipWidget(QWidget):
         )
 
         lay.addWidget(self.check_randomize_ref_characters)
+        self.check_unlimited_random_refs = QCheckBox("Unlimited random refs", body)
+        self.check_unlimited_random_refs.setToolTip(
+            "Only available while random reference characters are enabled. Removes the 9-image project-pool limit, "
+            "allows loading a whole folder, and cycles through the complete enabled Character pool without repeats "
+            "before starting a newly shuffled round. Each individual MiniMax shot still receives only 1 or 2 random Character refs."
+        )
+        self.check_unlimited_random_refs.setVisible(False)
+        lay.addWidget(self.check_unlimited_random_refs)
+        self.check_randomize_ref_characters.toggled.connect(self._update_unlimited_random_ref_controls)
+        self.check_unlimited_random_refs.toggled.connect(self._update_unlimited_random_ref_controls)
         self.check_remove_ref_backgrounds = QCheckBox("Remove backgrounds from Character and Object / Prop references", body)
         self.check_remove_ref_backgrounds.setChecked(True)
         self.check_remove_ref_backgrounds.setToolTip(
@@ -3055,10 +3101,14 @@ class MiniMaxMusicClipWidget(QWidget):
         lay.addWidget(self.refs_table, 1)
         row = QHBoxLayout()
         self.btn_add_ref = QPushButton("Add reference image...", self.page_refs)
+        self.btn_add_ref_folder = QPushButton("Add reference folder...", self.page_refs)
+        self.btn_add_ref_folder.setToolTip("Add every supported image in a folder to the unlimited random Character reference pool.")
+        self.btn_add_ref_folder.setVisible(False)
         self.btn_remove_ref = QPushButton("Remove selected", self.page_refs)
-        row.addWidget(self.btn_add_ref); row.addWidget(self.btn_remove_ref); row.addStretch(1)
+        row.addWidget(self.btn_add_ref); row.addWidget(self.btn_add_ref_folder); row.addWidget(self.btn_remove_ref); row.addStretch(1)
         outer.addLayout(row)
         self.btn_add_ref.clicked.connect(self._add_reference)
+        self.btn_add_ref_folder.clicked.connect(self._add_reference_folder)
         self.btn_remove_ref.clicked.connect(self._remove_reference)
 
     def _build_analysis_tab(self) -> None:
@@ -3364,6 +3414,7 @@ class MiniMaxMusicClipWidget(QWidget):
         self.check_sla.setChecked(True)
         self.check_spectrum.setChecked(True)
         self.project.randomize_reference_characters = bool(self.check_randomize_ref_characters.isChecked())
+        self.project.unlimited_random_references = bool(self.project.randomize_reference_characters and self.check_unlimited_random_refs.isChecked())
         self.project.use_framevision_queue = bool(self.check_framevision_queue.isChecked())
         self.project.use_hypir_x1_upscale = bool(getattr(self, "check_hypir_x1_upscale", None) and self.check_hypir_x1_upscale.isChecked())
         self.project.use_lanczos_x2_upsampling = bool(getattr(self, "check_lanczos_x2_upsampling", None) and self.check_lanczos_x2_upsampling.isChecked())
@@ -3397,6 +3448,8 @@ class MiniMaxMusicClipWidget(QWidget):
         self.edit_hybrid_model.setText(str(getattr(p, "hybrid_model_path", "") or ""))
         self.check_vram_manager.setChecked(bool(p.vram_manager_enabled)); self.check_vram_auto_bypass.setChecked(bool(p.vram_auto_bypass)); self.check_sage.setChecked(p.sage_attention); self.check_sla.setChecked(bool(getattr(p, "sla_attention", True))); self.check_spectrum.setChecked(p.spectrum)
         self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
+        self.check_unlimited_random_refs.setChecked(bool(getattr(p, "unlimited_random_references", False)))
+        self._update_unlimited_random_ref_controls()
         if getattr(self, "check_remove_ref_backgrounds", None) is not None:
             self.check_remove_ref_backgrounds.setChecked(bool(getattr(p, "remove_reference_backgrounds", True)))
         self.check_framevision_queue.setChecked(bool(getattr(p, "use_framevision_queue", False)))
@@ -3503,7 +3556,7 @@ class MiniMaxMusicClipWidget(QWidget):
             "vram_async_streams", "vram_video_vae_reserve_gb", "vram_audio_vae_reserve_gb",
             "vram_residency_fill", "vram_residency_target_free_gb", "vram_residency_warmup_blocks",
             "vram_residency_refill_interval", "sage_attention", "sla_attention", "spectrum", "beat_sensitivity", "whisper_timing_enabled", "visible_lyric_subtitles",
-            "randomize_reference_characters",
+            "randomize_reference_characters", "unlimited_random_references",
         ):
             setattr(self.project, name, getattr(old, name))
         self.project_path = ""
@@ -3570,15 +3623,67 @@ class MiniMaxMusicClipWidget(QWidget):
             QMessageBox.critical(self, "Open project failed", str(exc))
 
     # ---- refs ----
+    def _unlimited_random_refs_enabled(self) -> bool:
+        return bool(
+            getattr(self, "check_randomize_ref_characters", None)
+            and self.check_randomize_ref_characters.isChecked()
+            and getattr(self, "check_unlimited_random_refs", None)
+            and self.check_unlimited_random_refs.isChecked()
+        )
+
+    def _update_unlimited_random_ref_controls(self, *_args) -> None:
+        random_on = bool(getattr(self, "check_randomize_ref_characters", None) and self.check_randomize_ref_characters.isChecked())
+        unlimited_on = bool(random_on and getattr(self, "check_unlimited_random_refs", None) and self.check_unlimited_random_refs.isChecked())
+        if getattr(self, "check_unlimited_random_refs", None) is not None:
+            self.check_unlimited_random_refs.setVisible(random_on)
+        if getattr(self, "btn_add_ref_folder", None) is not None:
+            self.btn_add_ref_folder.setVisible(unlimited_on)
+
+    @staticmethod
+    def _supported_reference_image(path: str | Path) -> bool:
+        return Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+    def _append_reference_paths(self, paths: Sequence[str]) -> None:
+        current = self._refs_from_table()
+        unlimited = self._unlimited_random_refs_enabled()
+        existing = {os.path.normcase(os.path.abspath(r.path)) for r in current if r.path}
+        added = 0
+        for path in paths:
+            if not unlimited and len(current) >= 9:
+                break
+            if not self._supported_reference_image(path):
+                continue
+            norm = os.path.normcase(os.path.abspath(path))
+            if norm in existing:
+                continue
+            current.append(ReferenceAsset(name=Path(path).stem, kind="Character", path=str(path)))
+            existing.add(norm)
+            added += 1
+        self.project.references = current
+        self._populate_refs()
+        if paths and not unlimited and len(current) >= 9:
+            self.status.setText("Reference pool is limited to 9. Enable Randomize reference characters and Unlimited random refs to load more.")
+        elif added:
+            self.status.setText(f"Added {added} reference image{'s' if added != 1 else ''}.")
+
     def _add_reference(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Add MiniMax reference images", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*.*)")
-        if not paths: return
-        current = self._refs_from_table()
-        for path in paths:
-            if len(current) >= 9: break
-            if any(os.path.normcase(r.path) == os.path.normcase(path) for r in current): continue
-            current.append(ReferenceAsset(name=Path(path).stem, kind="Character", path=path))
-        self.project.references = current; self._populate_refs()
+        if not paths:
+            return
+        self._append_reference_paths(paths)
+
+    def _add_reference_folder(self) -> None:
+        if not self._unlimited_random_refs_enabled():
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Add random reference folder", "")
+        if not folder:
+            return
+        root = Path(folder)
+        paths = [str(p) for p in sorted(root.iterdir(), key=lambda x: x.name.lower()) if p.is_file() and self._supported_reference_image(p)]
+        if not paths:
+            QMessageBox.information(self, "No reference images", "That folder contains no supported image files.")
+            return
+        self._append_reference_paths(paths)
 
     def _remove_reference(self) -> None:
         rows = sorted({i.row() for i in self.refs_table.selectedIndexes()}, reverse=True)
@@ -3587,7 +3692,7 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _populate_refs(self) -> None:
         self.refs_table.blockSignals(True); self.refs_table.setRowCount(0)
-        for ref in self.project.references[:9]:
+        for ref in self.project.references:
             row = self.refs_table.rowCount(); self.refs_table.insertRow(row); self.refs_table.setRowHeight(row, 92)
             use = QTableWidgetItem(""); use.setFlags(use.flags() | Qt.ItemIsUserCheckable); use.setCheckState(Qt.Checked if ref.enabled else Qt.Unchecked); self.refs_table.setItem(row, 0, use)
             preview = QLabel(self.refs_table); preview.setAlignment(Qt.AlignCenter); preview.setMinimumSize(112, 78); preview.setMaximumSize(112, 78)
@@ -3621,7 +3726,7 @@ class MiniMaxMusicClipWidget(QWidget):
             role_widget = self.refs_table.cellWidget(row, 2)
             kind = _normalise_reference_kind(role_widget.currentText() if isinstance(role_widget, QComboBox) else txt(2))
             refs.append(ReferenceAsset(name=txt(4) or Path(txt(5)).stem, kind=kind, path=txt(5), description=txt(3), enabled=bool(self.refs_table.item(row,0) and self.refs_table.item(row,0).checkState() == Qt.Checked)))
-        return refs[:9]
+        return refs
 
     # ---- one-click video clip workflow ----
     def create_video_clip(self) -> None:

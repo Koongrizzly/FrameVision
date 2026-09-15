@@ -63,6 +63,7 @@ class ModelPreset:
     fps: int = 24
     quantize: bool = True
     qtype: str = "qfloat8"
+    qtype_te: str = "qfloat8"
     notes: str = ""
 
 
@@ -85,6 +86,16 @@ PRESETS: list[ModelPreset] = [
     ModelPreset(
         "SDXL — Character or Style", "SDXL", "image", "sdxl",
         "stabilityai/stable-diffusion-xl-base-1.0", 1024, 32, 2000, 0.0001,
+    ),
+    ModelPreset(
+        "MiniMax-H3 — Image or Video LoRA", "MiniMax", "video", "minimax_h3",
+        "Comfy-Org/MiniMax-H3", 768, 16, 3000, 0.0001, frames=39, fps=24,
+        qtype="convrot8", qtype_te="nvfp4",
+        notes=(
+            "Official AI Toolkit MiniMax-H3 training path. Supports image datasets (single-frame appearance/identity) "
+            "and video datasets with joint audio. Uses the recommended training adapter plus contrastive guidance by default. "
+            "MiniMax video training is fixed at 24 fps and uses the 17n+5 frame grid."
+        )
     ),
     ModelPreset(
         "LTX 2.3 — Image or Video LoRA", "LTX", "video", "ltx2.3",
@@ -601,7 +612,7 @@ class FrameVisionLoraTrainer(QMainWindow):
         self.fps.setValue(p.fps)
         self.quantize.setChecked(p.quantize)
         self.notes.setText(p.notes or "Review generated YAML before training.")
-        if p.family == "LTX":
+        if p.family in {"LTX", "MiniMax"}:
             self.dataset_type.setEnabled(True)
             self.dataset_type.setCurrentIndex(0)
         else:
@@ -610,6 +621,19 @@ class FrameVisionLoraTrainer(QMainWindow):
         video = self.effective_media_type() == "video"
         self.frames.setEnabled(video)
         self.fps.setEnabled(video)
+        if p.family == "MiniMax":
+            self.frames.setRange(5, 719)
+            self.frames.setSingleStep(17)
+            self.frames.setToolTip(
+                "MiniMax-H3 video frame count. Values are normalized to the valid 17n+5 grid "
+                "when the YAML is generated (5, 22, 39, 56, ...)."
+            )
+            self.fps.setValue(24)
+            self.fps.setEnabled(False)
+        else:
+            self.frames.setRange(1, 721)
+            self.frames.setSingleStep(8)
+            self.frames.setToolTip("Video frame count used by compatible video trainers.")
         self.clear_media()
         self._update_dataset_summary()
 
@@ -636,7 +660,7 @@ class FrameVisionLoraTrainer(QMainWindow):
 
     def effective_media_type(self) -> str:
         p = self.current_preset()
-        if p.family == "LTX":
+        if p.family in {"LTX", "MiniMax"}:
             return "image" if self.dataset_type.currentIndex() == 0 else "video"
         return p.media
 
@@ -644,11 +668,11 @@ class FrameVisionLoraTrainer(QMainWindow):
         if not hasattr(self, "dataset_type"):
             return
         p = self.current_preset()
-        is_ltx = p.family == "LTX"
-        self.dataset_type.setEnabled(is_ltx)
+        selectable_media = p.family in {"LTX", "MiniMax"}
+        self.dataset_type.setEnabled(selectable_media)
         video = self.effective_media_type() == "video"
         self.frames.setEnabled(video)
-        self.fps.setEnabled(video)
+        self.fps.setEnabled(video and p.family != "MiniMax")
         self.clear_media()
         self._update_dataset_summary()
 
@@ -828,7 +852,7 @@ class FrameVisionLoraTrainer(QMainWindow):
             if key in data:
                 widget.setChecked(bool(data[key]))
         self.sample_prompts.setPlainText(data.get("sample_prompts", ""))
-        if self.current_preset().family == "LTX":
+        if self.current_preset().family in {"LTX", "MiniMax"}:
             self.dataset_type.setCurrentText(data.get("dataset_type", "Images"))
         self.media_paths = [Path(p) for p in data.get("media_paths", []) if Path(p).exists()]
         self._refresh_media_list()
@@ -852,6 +876,12 @@ class FrameVisionLoraTrainer(QMainWindow):
                 target_cap.touch()
         self.current_dataset_dir = dataset_dir
         return dataset_dir
+
+    @staticmethod
+    def _minimax_frame_count(value: int) -> int:
+        """Snap down to MiniMax-H3's valid 17n+5 frame grid."""
+        value = max(5, int(value))
+        return 5 + 17 * ((value - 5) // 17)
 
     def build_config(self, dataset_dir: Path) -> dict[str, Any]:
         p = self.current_preset()
@@ -915,7 +945,7 @@ class FrameVisionLoraTrainer(QMainWindow):
                 "quantize": self.quantize.isChecked(),
                 "qtype": p.qtype,
                 "quantize_te": self.quantize.isChecked(),
-                "qtype_te": "qfloat8",
+                "qtype_te": p.qtype_te,
                 "arch": self.arch.text().strip() or None,
                 "low_vram": self.low_vram.isChecked(),
                 "model_kwargs": {},
@@ -938,6 +968,26 @@ class FrameVisionLoraTrainer(QMainWindow):
             "logging": {"log_every": 1, "use_ui_logger": True},
         }
 
+        if p.family == "MiniMax":
+            # Match AI Toolkit's first-party MiniMax-H3 defaults. H3 is guidance-distilled;
+            # the training adapter + contrastive guidance preserve that behavior during LoRA training.
+            process["network"]["network_kwargs"]["ignore_if_contains"] = ["adaln_proj"]
+            process["train"].update({
+                "timestep_type": "shift",
+                "do_guidance_loss": True,
+                "guidance_loss_target": 3.5,
+                "audio_loss_multiplier": 1.0,
+                "cache_text_embeddings": True,
+            })
+            process["model"]["assistant_lora_path"] = (
+                "ostris/minimax_h3_training_adapter/minimax_h3_training_adapter_v1.safetensors"
+            )
+            process["sample"].update({
+                "guidance_scale": 1,
+                "sample_steps": 28,
+                "fps": 24,
+            })
+
         if p.media == "video":
             ds = process["datasets"][0]
             if dataset_media == "image":
@@ -947,14 +997,25 @@ class FrameVisionLoraTrainer(QMainWindow):
                     "auto_frame_count": False,
                     "do_i2v": False,
                 })
+                if p.family == "MiniMax":
+                    ds["do_audio"] = False
+                    process["sample"]["num_frames"] = 1
             else:
+                frame_count = self.frames.value()
+                fps = self.fps.value()
+                if p.family == "MiniMax":
+                    frame_count = self._minimax_frame_count(frame_count)
+                    fps = 24
+                    process["sample"]["num_frames"] = frame_count
                 ds.update({
                     "shrink_video_to_frames": True,
-                    "num_frames": self.frames.value(),
-                    "auto_frame_count": False,
+                    "num_frames": frame_count,
+                    "auto_frame_count": p.family == "MiniMax",
                     "do_i2v": "I2V" in p.label,
-                    "fps": self.fps.value(),
+                    "fps": fps,
                 })
+                if p.family == "MiniMax":
+                    ds["do_audio"] = True
             if os.name == "nt":
                 process["train"]["num_dataloader_workers"] = 0
         elif p.media == "audio":
