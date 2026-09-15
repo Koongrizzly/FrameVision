@@ -994,6 +994,14 @@ class MainWindow(QMainWindow):
         self.ref_videos = RefList("Reference videos (max 3; soundtrack extracted when present)", "Video (*.mp4 *.mov *.mkv *.webm *.avi)", 3)
         self.ref_audios = RefList("Voice / standalone reference audio (max 3)", "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg)", 3)
         rfl.addWidget(self.ref_images); rfl.addWidget(self.ref_videos); rfl.addWidget(self.ref_audios)
+        self.lock_source_audio = QCheckBox("Use first standalone audio as exact source / output")
+        self.lock_source_audio.setChecked(False)
+        self.lock_source_audio.setToolTip(
+            "OFF: normal Ref2VA behavior; audio is a reference and H3 generates new audio (use this for voice cloning/reference sound). "
+            "ON: standalone Audio slot 1 is encoded into H3's target audio latent and locked during denoising; the untouched source file is muxed into the final video. "
+            "Use this for exact music, speech, rhythm and lyric timing."
+        )
+        rfl.addWidget(self.lock_source_audio)
 
         # Standalone audio can be ordinary sound/music reference, or it can be tied
         # to a specific H3 subject as a persistent voice-timbre reference.  Keep
@@ -2923,6 +2931,7 @@ class MainWindow(QMainWindow):
             "glue_results": self.glue_results.isChecked(), "continue_last_result": self.continue_last_result.isChecked(),
             "continue_audio_memory": self.continue_audio_memory.isChecked(),
             "ref_size": self.ref_size.currentText(), "ref_remove_backgrounds": self.ref_remove_backgrounds.isChecked(), "ref_images": self.ref_images.paths(), "ref_videos": self.ref_videos.paths(), "ref_audios": self.ref_audios.paths(),
+            "lock_source_audio": self.lock_source_audio.isChecked(),
             "ref_audio_subjects": [int(combo.currentData() or 0) for combo in self.ref_audio_subjects],
             "cfg": self.cfg.value(), "shift": self.shift.value(), "audio_shift": self.audio_shift.value(), "sampler": self.sampler.currentText(), "scheduler": self.scheduler.currentText(),
             "output_folder": self.output_folder.path(), "output_name": self.output_name.text().strip(), "extended_logging": self.extended_logging.isChecked(), "tile_debugging": self.tile_debugging.isChecked(),
@@ -2967,6 +2976,7 @@ class MainWindow(QMainWindow):
             ctx=int(d.get("continue_context_frames",39)); idx=self.continue_context.findData(ctx); self.continue_context.setCurrentIndex(idx if idx >= 0 else 1)
             self.glue_results.setChecked(bool(d.get("glue_results", False))); self.continue_last_result.setChecked(bool(d.get("continue_last_result", False))); self.continue_audio_memory.setChecked(bool(d.get("continue_audio_memory", False))); self._sync_continue_video_options()
             self.ref_size.setCurrentText(d.get("ref_size", "match")); self.ref_remove_backgrounds.setChecked(bool(d.get("ref_remove_backgrounds", True))); self.ref_images.set_paths(d.get("ref_images", [])); self.ref_videos.set_paths(d.get("ref_videos", [])); self.ref_audios.set_paths(d.get("ref_audios", []))
+            self.lock_source_audio.setChecked(bool(d.get("lock_source_audio", False)))
             saved_voice_subjects = d.get("ref_audio_subjects", []) or []
             for i, combo in enumerate(self.ref_audio_subjects):
                 subject_n = int(saved_voice_subjects[i]) if i < len(saved_voice_subjects) else 0
@@ -3769,6 +3779,10 @@ print("FRAMEVISION_MINIMAX_ALL_DOWNLOADS_COMPLETE", flush=True)
                 args += ["--ref-audio", pth]
                 subject_n = int(self.ref_audio_subjects[i].currentData() or 0) if i < len(self.ref_audio_subjects) else 0
                 args += ["--ref-audio-subject", str(subject_n)]
+            if self.lock_source_audio.isChecked():
+                if not self.ref_audios.paths():
+                    QMessageBox.warning(self, "Source audio required", "Use exact source/output needs at least one standalone audio file in Audio slot 1."); return
+                args += ["--lock-source-audio-index", "1"]
         args += self.model_override_args()
         args += self.lora_args()
         if self.vram_manager_enabled.isChecked():

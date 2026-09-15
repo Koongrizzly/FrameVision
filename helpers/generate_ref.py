@@ -31,7 +31,7 @@ def main():
     ap.add_argument("--prompt", required=True); ap.add_argument("--width", type=int, default=832); ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--frames", type=int, default=362); ap.add_argument("--experimental-long-duration", action="store_true", help="Allow H3 native-grid research durations beyond the normal 719-frame range, up to 2385 frames"); ap.add_argument("--steps", type=int, default=15); ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
     ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0); ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="beta")
-    ap.add_argument("--ref-image-size", choices=["match", "max"], default="match"); ap.add_argument("--ref-image", action="append", default=[]); ap.add_argument("--ref-video", action="append", default=[]); ap.add_argument("--ref-audio", action="append", default=[]); ap.add_argument("--ref-audio-subject", action="append", type=int, default=[], help="Optional H3 Subject number (1-9) for each standalone --ref-audio; 0 keeps it generic."); ap.add_argument("--output")
+    ap.add_argument("--ref-image-size", choices=["match", "max"], default="match"); ap.add_argument("--ref-image", action="append", default=[]); ap.add_argument("--ref-video", action="append", default=[]); ap.add_argument("--ref-audio", action="append", default=[]); ap.add_argument("--ref-audio-subject", action="append", type=int, default=[], help="Optional H3 Subject number (1-9) for each standalone --ref-audio; 0 keeps it generic."); ap.add_argument("--lock-source-audio-index", type=int, default=0, help="1-based standalone ref-audio slot to lock as the target H3 audio and mux unchanged to the result"); ap.add_argument("--output")
     ap.add_argument("--fl2va-checkpoint"); ap.add_argument("--ref2va-checkpoint"); ap.add_argument("--text-encoder"); ap.add_argument("--video-vae"); ap.add_argument("--audio-vae")
     ap.add_argument("--lora", action="append", default=[]); ap.add_argument("--lora-strength", action="append", type=float, default=[])
     ap.add_argument("--extended-logging", action="store_true")
@@ -233,6 +233,11 @@ def main():
             cmd += ["--ref-audio", str(Path(p).resolve())]
             subject_n = ns.ref_audio_subject[i] if i < len(ns.ref_audio_subject) else 0
             cmd += ["--ref-audio-subject", str(subject_n)]
+        if ns.lock_source_audio_index:
+            if not (1 <= ns.lock_source_audio_index <= min(3, len(ns.ref_audio))):
+                raise ValueError(f"--lock-source-audio-index {ns.lock_source_audio_index} does not refer to a supplied --ref-audio")
+            cmd += ["--lock-source-audio-index", str(ns.lock_source_audio_index)]
+            print(f"Source-audio lock requested: standalone audio slot {ns.lock_source_audio_index}", flush=True)
         subprocess.check_call(cmd, cwd=ROOT, env=sample_env)
         print("Sampling process exited completely. Starting VAE with clean memory...", flush=True)
 
@@ -269,11 +274,18 @@ def main():
             ae["H3_COMFY_ARGS"] = f"--novram --reserve-vram {max(0.1, ns.vram_audio_vae_reserve_gb):g}"
             if ns.vram_manager_auto: print("[VRAM-AUTO] audio VAE decode launching MANAGED (--novram)", flush=True)
         try:
-            audio_cmd = [py, "-m", "runtime.audio_decode_worker", "--latents", str(lat), "--vae", str(av), "--wav", str(wav)]
-            if ns.extended_logging: audio_cmd += ["--extended-logging"]
-            subprocess.check_call(audio_cmd, cwd=ROOT, env=ae)
-            print('Muxing video and audio...', flush=True)
-            tmp = td / "mux.mp4"; subprocess.check_call([ff, "-y", "-framerate", "24", "-i", str(frames_dir / "frame_%06d.png"), "-i", str(wav), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac", "-b:a", "256k", "-shortest", str(tmp)])
+            if ns.lock_source_audio_index:
+                # The source waveform is authoritative. H3 already saw its encoded latent
+                # during sampling; mux the untouched source file instead of a VAE round-trip.
+                mux_audio = str(Path(ns.ref_audio[ns.lock_source_audio_index - 1]).resolve())
+                print(f'Muxing video with untouched locked source audio: {mux_audio}', flush=True)
+            else:
+                audio_cmd = [py, "-m", "runtime.audio_decode_worker", "--latents", str(lat), "--vae", str(av), "--wav", str(wav)]
+                if ns.extended_logging: audio_cmd += ["--extended-logging"]
+                subprocess.check_call(audio_cmd, cwd=ROOT, env=ae)
+                mux_audio = str(wav)
+                print('Muxing video and generated audio...', flush=True)
+            tmp = td / "mux.mp4"; subprocess.check_call([ff, "-y", "-framerate", "24", "-i", str(frames_dir / "frame_%06d.png"), "-i", mux_audio, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac", "-b:a", "256k", "-shortest", str(tmp)])
             if out.exists(): out.unlink()
             shutil.move(str(tmp), str(out)); audio_ok = True
         except subprocess.CalledProcessError:
