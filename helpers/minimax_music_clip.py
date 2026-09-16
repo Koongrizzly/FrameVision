@@ -1495,7 +1495,8 @@ def build_h3_reference_prompt(
         shot1.append(f"Performance mode: {performance_mode}.")
     shot1.append(
         "Music-video priority: keep the visible performers physically engaged with the music from the opening moment. "
-        "Use convincing rhythmic full-body action, choreography, vocal performance, band performance or beat-driven interaction appropriate to this shot; avoid passive standing, blank posing or merely staring at the camera unless a brief deliberate visual break is explicitly directed."
+        "Use convincing rhythmic full-body action, choreography, vocal performance or other role-appropriate beat-driven interaction; avoid passive standing, blank posing or merely staring at the camera unless a brief deliberate visual break is explicitly directed. "
+        "Do not invent musical instruments or make any performer play an instrument unless the user-defined role, story direction or selected reference explicitly requires that instrument performance. Rappers and vocalists perform with voice, lip-sync, gestures, body movement and choreography rather than being turned into guitarists or drummers."
     )
     if has_lyrics:
         shot1.append("The supplied song begins immediately and remains continuous and synchronized with the visible vocal performance.")
@@ -2431,6 +2432,58 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
     return results
 
 
+def _probe_video_frame_count(path: str) -> int:
+    """Return decoded video-frame count, or 0 when ffprobe cannot provide it."""
+    probe = ffprobe_path()
+    if not probe:
+        return 0
+    cp = subprocess.run(
+        [probe, "-v", "error", "-select_streams", "v:0", "-count_frames",
+         "-show_entries", "stream=nb_read_frames", "-of", "default=nw=1:nk=1", path],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        return max(0, int((cp.stdout or "").strip()))
+    except Exception:
+        return 0
+
+
+def _assembly_frame_plan(project: MusicProject) -> List[Tuple[Shot, int]]:
+    """Build one authoritative 24-fps edit timeline for the whole song.
+
+    The old assembler converted every floating-point shot duration independently.
+    FFmpeg necessarily rounded each of those durations to whole frames, so a long
+    edit could gain roughly one frame at many cuts.  The plan below quantizes the
+    *shared absolute boundaries* once.  Adjacent shots therefore share the same
+    boundary and rounding cannot accumulate across the song.
+    """
+    if not project.shots:
+        return []
+    ordered = list(project.shots)
+    plan: List[Tuple[Shot, int]] = []
+    previous_boundary = int(round(float(ordered[0].edit_start) * FPS))
+    for pos, shot in enumerate(ordered):
+        start_boundary = int(round(float(shot.edit_start) * FPS))
+        # A MiniMax music plan is contiguous.  Reject a genuinely broken plan
+        # instead of hiding a timeline gap/overlap during assembly.
+        if pos and abs(start_boundary - previous_boundary) > 1:
+            raise RuntimeError(
+                f"Shot timeline is not contiguous at shot {shot.index}: "
+                f"previous boundary={previous_boundary}, start={start_boundary} frames."
+            )
+        end_boundary = int(round(float(shot.edit_end) * FPS))
+        target_frames = end_boundary - previous_boundary
+        if target_frames <= 0:
+            raise RuntimeError(
+                f"Shot {shot.index} has an invalid edit range "
+                f"({shot.edit_start:.6f} -> {shot.edit_end:.6f})."
+            )
+        plan.append((shot, target_frames))
+        previous_boundary = end_boundary
+    return plan
+
+
 def _assembly_task(progress, project: MusicProject) -> str:
     ffmpeg = ffmpeg_path()
     if not ffmpeg:
@@ -2441,60 +2494,98 @@ def _assembly_task(progress, project: MusicProject) -> str:
     if missing:
         raise RuntimeError("Missing generated clips for shots: " + ", ".join(map(str, missing)))
 
+    # One frame plan for the complete song is the key sync invariant.  Do not
+    # independently round shot.edit_duration values.
+    frame_plan = _assembly_frame_plan(project)
+    expected_total_frames = sum(frame_count for _shot, frame_count in frame_plan)
+
     out_dir = Path(project.output_dir or OUTPUT_ROOT / _safe_stem(project.audio_path)).resolve()
     temp_dir = out_dir / "_assembly"
     temp_dir.mkdir(parents=True, exist_ok=True)
     trimmed: List[Path] = []
-    for i, shot in enumerate(project.shots, start=1):
-        progress(f"Trimming shot {shot.index} ({i}/{len(project.shots)})...")
+    for i, (shot, target_frames) in enumerate(frame_plan, start=1):
+        progress(
+            f"Trimming shot {shot.index} ({i}/{len(frame_plan)}) - "
+            f"{target_frames} frames @ {FPS} fps..."
+        )
         target = temp_dir / f"trim_{shot.index:03d}.mp4"
-        # tpad makes tiny source-duration mismatches non-fatal; trim then enforces the edit slot.
+
+        # Preserve the existing, already-tested MiniMax audio-context cut point
+        # (shot.trim_in).  After that cut, reset timestamps, normalize to the
+        # native 24-fps edit clock, and take an exact integer number of frames.
+        # This removes the root cause of cumulative drift without changing clip
+        # playback speed or retiming the completed music video.
         vf = (
-            f"tpad=stop_mode=clone:stop_duration=1.0,"
-            f"trim=start={shot.trim_in:.6f}:duration={shot.edit_duration:.6f},"
+            "tpad=stop_mode=clone:stop_duration=1.0,"
+            f"trim=start={shot.trim_in:.6f},"
+            "setpts=PTS-STARTPTS,"
+            f"fps={FPS},"
+            f"trim=start_frame=0:end_frame={target_frames},"
             "setpts=PTS-STARTPTS"
         )
         cmd = [
             ffmpeg, "-y", "-i", shot.output_path, "-an", "-vf", vf,
+            "-r", str(FPS), "-fps_mode", "cfr",
             "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(target),
         ]
-        cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        cp = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
         if cp.returncode != 0 or not target.is_file():
             raise RuntimeError(f"Could not trim shot {shot.index}:\n" + (cp.stderr or cp.stdout or ""))
+        actual_frames = _probe_video_frame_count(str(target))
+        if actual_frames and actual_frames != target_frames:
+            raise RuntimeError(
+                f"Shot {shot.index} trim produced {actual_frames} frames; "
+                f"the timeline requires {target_frames}. Assembly stopped rather than hiding sync drift."
+            )
         trimmed.append(target)
 
     concat_file = temp_dir / "concat.txt"
-    concat_file.write_text("\n".join("file '" + str(p).replace("'", "'\\''") + "'" for p in trimmed), encoding="utf-8")
+    concat_file.write_text(
+        "\n".join("file '" + str(p).replace("'", "'\\''") + "'" for p in trimmed),
+        encoding="utf-8",
+    )
     video_only = temp_dir / "video_only.mp4"
-    progress("Concatenating trimmed shots...")
+    progress("Concatenating frame-locked shots...")
+
+    # Match the robust LTX strategy: re-encode the stitch instead of packet-copying
+    # dozens of independently encoded MP4 timelines.  Because every input is now
+    # exact CFR 24 fps, this is normalization, not a speed/duration correction.
     cp = subprocess.run(
-        [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(video_only)],
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
+        [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file),
+         "-an", "-r", str(FPS), "-fps_mode", "cfr",
+         "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(video_only)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    if cp.returncode != 0:
-        # Codec-copy concat can fail with odd source headers. Re-encode fallback.
-        cp = subprocess.run(
-            [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-an", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(video_only)],
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
     if cp.returncode != 0 or not video_only.is_file():
         raise RuntimeError("Could not concatenate clips:\n" + (cp.stderr or cp.stdout or ""))
 
+    actual_total_frames = _probe_video_frame_count(str(video_only))
+    if actual_total_frames and actual_total_frames != expected_total_frames:
+        raise RuntimeError(
+            f"Assembled timeline produced {actual_total_frames} frames; expected "
+            f"{expected_total_frames}. Assembly stopped rather than stretching the video or masking drift."
+        )
+
+    expected_duration = expected_total_frames / float(FPS)
+    progress(
+        f"Timeline verified: {expected_total_frames} frames @ {FPS} fps "
+        f"({expected_duration:.3f}s). Muxing the untouched master song..."
+    )
     final = out_dir / f"{_safe_stem(project.title or project.audio_path)}_minimax_music_video.mp4"
-    song_duration = project.analysis.duration or probe_duration(project.audio_path)
-    progress("Muxing the original master song...")
     cmd = [
         ffmpeg, "-y", "-i", str(video_only), "-i", project.audio_path,
-        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "256k",
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "256k",
+        str(final),
     ]
-    if song_duration > 0:
-        cmd += ["-t", f"{song_duration:.6f}"]
-    cmd += [str(final)]
-    cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    cp = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
     if cp.returncode != 0 or not final.is_file():
         raise RuntimeError("Final mux failed:\n" + (cp.stderr or cp.stdout or ""))
 
@@ -3915,9 +4006,12 @@ class MiniMaxMusicClipWidget(QWidget):
 
         self._one_click_active = False
         if missing:
-            self._one_click_assemble_after_generation = bool(getattr(self, "_assistant_run", False))
+            # A normal GUI "Create a video clip" run is a complete workflow, not
+            # generation-only.  Arm final assembly for both GUI and assistant runs.
+            self._one_click_assemble_after_generation = True
             self._generate_indices(missing)
         else:
+            self._one_click_assemble_after_generation = False
             self._assemble()
 
     # ---- analysis ----
@@ -3978,6 +4072,9 @@ class MiniMaxMusicClipWidget(QWidget):
         self.status.setText(text)
 
     def _worker_failed(self, message: str) -> None:
+        # Never let a failed/cancelled one-click generation leave an armed
+        # assembly flag that can fire on a later unrelated job.
+        self._one_click_assemble_after_generation = False
         if hasattr(self, "btn_stop_generation"):
             self.btn_stop_generation.setEnabled(False)
         self._set_ready("Failed.")
@@ -4630,11 +4727,13 @@ class MiniMaxMusicClipWidget(QWidget):
         self.btn_stop_generation.setEnabled(False)
         self._populate_review()
         if cancelled or _GENERATION_CANCEL.is_set():
+            self._one_click_assemble_after_generation = False
             self._set_ready("Generation stopped. Finished clips were kept; unfinished clips remain planned.")
         else:
             self._set_ready("Generation finished." if not failures else f"Generation finished with {len(failures)} failed shot(s).")
         self._write_assistant_handoff()
         if failures:
+            self._one_click_assemble_after_generation = False
             self._emit_music_clip_event("error", message=f"Music Clip generation finished with {len(failures)} failed shot(s); final assembly was not started.")
             if self.isVisible():
                 QMessageBox.warning(self, "Some shots failed", "\n\n".join(failures[:5]))

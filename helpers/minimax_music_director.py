@@ -560,7 +560,8 @@ WHISPER LYRIC CONTEXT:
 
     system = (
         "You are the music-video planner inside FrameVision. The song timing and clip count are already locked. "
-        "Music performance is the priority: favor convincing dancing, singing/lip-sync when lyrics exist, band performance, rhythmic body movement, prop interaction or other beat-driven physical action. "
+        "Music performance is the priority: favor convincing dancing, singing/lip-sync when lyrics exist, role-appropriate rhythmic body movement, choreography, formation changes, environment interaction or other beat-driven physical action. "
+        "Never invent musical instruments or make a performer play an instrument unless the user brief, subject rules, or an explicit reference role clearly requires that instrument performance. Rappers and vocalists should rap/sing, gesture, move, dance and perform to camera rather than being turned into guitarists, drummers or other instrumentalists. "
         "Do not fill clips with passive people staring at the camera. User instructions are authoritative. Expand sparse input intelligently without replacing a detailed user idea. "
         "Lyrics are semantic inspiration, not mandatory literal illustration. Repeated choruses may intentionally reuse a signature location, choreography motif or framing with escalation. "
         "Camera text must describe camera geometry/motion only. Never name, reference, follow, approach, reveal, switch to, or introduce a person, character, performer, dancer, subject, prop, or new scene event inside the camera field. "
@@ -680,7 +681,7 @@ PREVIOUS LOCKED SHOTS FOR CONTINUITY / VARIETY:
 LOCKED TARGET:
 {json.dumps(target, ensure_ascii=False, indent=2)}
 
-Write ONE concrete music-video event/action for this clip. It must begin visibly and provide a real performance/staging change, not generic 'moves to the music'. Respect the section location and performance goal. Use only exact available reference names genuinely present.
+Write ONE concrete music-video event/action for this clip. It must begin visibly and provide a real performance/staging change, not generic 'moves to the music'. Respect the section location and performance goal. Use only exact available reference names genuinely present. Keep every performer in a role appropriate to the brief. Do not invent guitars, drums, microphones-as-instruments, keyboards or any other musical instrument unless the user brief, subject rules, or an explicit reference role clearly requires instrument-playing.
 Return JSON only: {{"beat":{{"shot":{int(target['shot'])},"beat":"...","performance_mode":"...","reference_names":["..."]}}}}
 """
             obj = session.generate_json(system, user, max_tokens=1200, temperature=0.28)
@@ -705,7 +706,7 @@ LOCKED TARGETS TO WRITE NOW:
 NEXT TARGETS FOR CONTEXT ONLY (do not return them):
 {json.dumps(next_targets, ensure_ascii=False, indent=2) if next_targets else '[end of song]'}
 
-Write exactly one concrete NEW music-video beat for every target. Each beat must create visible performance/staging progression. Favor dancing, singing/lip-sync when lyrics exist, band performance, rhythmic movement, prop interaction, formation changes, environment interaction or other beat-driven physical action. Do not merely change camera angle or describe passive posing. Repeated chorus motifs are allowed when intentionally escalated.
+Write exactly one concrete NEW music-video beat for every target. Each beat must create visible performance/staging progression. Favor dancing, singing/lip-sync when lyrics exist, role-appropriate rhythmic movement, choreography, formation changes, environment interaction or other beat-driven physical action. Never invent musical instruments or instrument-playing unless the user brief, subject rules, or an explicit reference role clearly asks for it. Do not merely change camera angle or describe passive posing. Repeated chorus motifs are allowed when intentionally escalated.
 
 STRICT OUTPUT CONTRACT:
 Fill the string/list values in this exact skeleton. Do not add, remove, reorder, duplicate or renumber entries. Keep every shot number exactly as shown.
