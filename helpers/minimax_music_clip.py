@@ -3981,15 +3981,17 @@ class MiniMaxMusicClipWidget(QWidget):
                 self._queue_shots(missing)
             out_dir = Path(self.project.output_dir or OUTPUT_ROOT / _safe_stem(self.project.audio_path)).resolve()
             final_path = out_dir / f"{_safe_stem(self.project.title or self.project.audio_path)}_minimax_music_video.mp4"
-            if bool(getattr(self, "_assistant_run", False)):
-                self._assistant_queue_assembly_when_ready = bool(missing)
-                self._assistant_assembly_queued = False
-                if not missing:
-                    self._queue_assembly()
-                    self._assistant_assembly_queued = True
-                self._assistant_start_output_monitor(str(final_path))
-            else:
+            # Never enqueue assembly ahead of unfinished clip jobs.  This used to
+            # be protected only for assistant/Telegram runs; normal GUI one-click
+            # runs queued assembly immediately, which is unsafe on queue backends
+            # that do not guarantee strict child-job ordering.  Use the same
+            # output-ready gate for every one-click run.
+            self._assistant_queue_assembly_when_ready = bool(missing)
+            self._assistant_assembly_queued = False
+            if not missing:
                 self._queue_assembly()
+                self._assistant_assembly_queued = True
+            self._assistant_start_output_monitor(str(final_path))
             self._emit_music_clip_event(
                 "progress",
                 message=(f"Queued {len(missing)} clip{'s' if len(missing) != 1 else ''}. I will send each clip here as soon as it finishes, then assemble the final video." if missing else "All clips already exist. Final assembly is queued."),
@@ -4740,7 +4742,20 @@ class MiniMaxMusicClipWidget(QWidget):
         elif bool(getattr(self, "_one_click_assemble_after_generation", False)) and not cancelled and not _GENERATION_CANCEL.is_set():
             self._one_click_assemble_after_generation = False
             self._emit_music_clip_event("progress", message="All clips are ready. Assembling the final music video...")
-            QTimer.singleShot(0, self._assemble)
+            # FunctionWorker emits succeeded before its QThread has fully stopped.
+            # Calling _assemble() immediately here can therefore hit _run_worker()'s
+            # "Busy" guard and silently leave a one-click job unassembled.  Wait
+            # until the generation worker is genuinely idle before starting assembly.
+            self._one_click_assemble_when_idle()
+
+    def _one_click_assemble_when_idle(self) -> None:
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            QTimer.singleShot(60, self._one_click_assemble_when_idle)
+            return
+        if _GENERATION_CANCEL.is_set():
+            return
+        self._assemble()
 
     def _assemble(self) -> None:
         if not self.project.shots: QMessageBox.warning(self, "No plan", "Create and generate the shot plan first."); return
