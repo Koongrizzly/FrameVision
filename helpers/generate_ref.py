@@ -1,9 +1,48 @@
 from __future__ import annotations
 import argparse, os, sys, tempfile, subprocess, shutil, time
+from contextlib import contextmanager
 from pathlib import Path
 
 # This launcher lives in helpers/, while runtime/ remains in the standalone root.
 _APP_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _remove_isolated_workdir(path: Path, attempts: int = 8, delay: float = 0.25) -> bool:
+    """Best-effort removal of a Ref2VA isolated work directory.
+
+    Windows can keep freshly-closed frame/latent files locked for a brief moment.
+    Retry instead of leaving an h3_ref_isolated_* directory behind.
+    """
+    path = Path(path)
+    if not path.exists():
+        return True
+    last_error = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            shutil.rmtree(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(delay * (attempt + 1))
+    print(f"[CLEANUP] Warning: could not remove temporary Ref2VA work folder {path}: {last_error}", flush=True)
+    return False
+
+
+@contextmanager
+def _isolated_workdir(parent: Path):
+    """Create a per-job Ref2VA work folder and always clean it on exit."""
+    parent = Path(parent)
+    parent.mkdir(parents=True, exist_ok=True)
+    workdir = Path(tempfile.mkdtemp(prefix="h3_ref_isolated_", dir=str(parent)))
+    try:
+        yield workdir
+    finally:
+        if _remove_isolated_workdir(workdir):
+            print(f"[CLEANUP] Removed temporary Ref2VA work folder: {workdir.name}", flush=True)
+
 if str(_APP_ROOT) not in sys.path:
     sys.path.insert(0, str(_APP_ROOT))
 
@@ -149,6 +188,16 @@ def main():
     print(f"Using audio VAE: {Path(av).name}", flush=True)
     py = sys.executable
 
+    # Backend fail-safe: older presets/CLI jobs can still carry the old 0.50 GB
+    # runtime floor.  Hybrid/SparseRef/Fused checkpoints get at least 1.50 GB
+    # before the worker starts so Comfy's initial reserve is safe too.
+    _diff_name = Path(ref).name.lower() if ref else ""
+    _hybrid_checkpoint = any(token in _diff_name for token in ("hybrid", "sparseref", "fused"))
+    if bool(ns.vram_manager or ns.vram_manager_auto) and _hybrid_checkpoint and float(ns.vram_runtime_free_gb) < 1.50:
+        print(f"[VRAM-MGR] Hybrid checkpoint detected; raising runtime minimum free {ns.vram_runtime_free_gb:g} -> 1.5 GB", flush=True)
+        ns.vram_runtime_free_gb = 1.50
+        ns.vram_residency_target_free_gb = max(float(ns.vram_residency_target_free_gb), 1.50)
+
     use_vram_manager = bool(ns.vram_manager)
     stage_plan = None
     managed_sample_stages = ["reference", "text", "diffusion"] if use_vram_manager else []
@@ -166,14 +215,15 @@ def main():
             ref_video_count=len(ns.ref_video),
             ref_audio_count=len(ns.ref_audio),
             ref_image_size=ns.ref_image_size,
+            diffusion_model_path=ref,
         )
         print_vram_stage_decisions(stage_plan, ns.width, ns.height, ns.frames)
         managed_sample_stages = [x for x in ("reference", "text", "diffusion") if stage_plan["stages"][x]["use_manager"]]
         use_vram_manager = bool(managed_sample_stages)
 
 
-    with tempfile.TemporaryDirectory(prefix="h3_ref_isolated_", dir=str(ROOT / "output")) as td:
-        td = Path(td); lat = td / "latents.pt"; frames_dir = td / "frames"; wav = td / "audio.wav"
+    with _isolated_workdir(ROOT / "output") as td:
+        lat = td / "latents.pt"; frames_dir = td / "frames"; wav = td / "audio.wav"
         cmd = [py, "-m", "runtime.sample_worker_ref", "--diffusion", str(ref), "--text-encoder", str(te), "--video-vae", str(vv), "--audio-vae", str(av), "--prompt", ns.prompt, "--width", str(ns.width), "--height", str(ns.height), "--frames", str(ns.frames), "--steps", str(ns.steps), "--cfg", str(ns.cfg), "--seed", str(ns.seed), "--shift", str(ns.shift), "--audio-shift", str(ns.audio_shift), "--sampler", ns.sampler, "--scheduler", ns.scheduler, "--ref-image-size", ns.ref_image_size, "--out", str(lat)]
         if ns.experimental_long_duration: cmd += ["--experimental-long-duration"]
         if ns.spectrum: cmd += ["--spectrum"]

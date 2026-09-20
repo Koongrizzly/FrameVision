@@ -76,6 +76,145 @@ def _qwen_model_dir() -> str:
     return str((_root() / "models" / "describe" / "default" / "qwen3vl2b").resolve())
 
 
+def _h3_prompt_builder_app_js_path() -> Path:
+    """Shared source of truth for MiniMax H3 visual-style presets."""
+    return (_root() / "h3_prompt_builder" / "public" / "local" / "app.js").resolve()
+
+
+def _h3_prompt_builder_index_path() -> Path:
+    return (_root() / "h3_prompt_builder" / "public" / "local" / "index.html").resolve()
+
+
+def _load_h3_prompt_builder_style_profiles() -> Dict[str, str]:
+    """Read STYLE_PROFILES directly from the root-level H3 Prompt Builder.
+
+    Planner intentionally does not keep a second copy of these descriptions: changing
+    the Prompt Builder preset text automatically changes the Planner's hard style lock.
+    """
+    path = _h3_prompt_builder_app_js_path()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"const\s+STYLE_PROFILES\s*=\s*\{([\s\S]*?)\n\};", text)
+        if not m:
+            return {}
+        body = m.group(1)
+        out: Dict[str, str] = {}
+        for mm in re.finditer(r'"((?:\\.|[^"\\])+)"\s*:\s*"((?:\\.|[^"\\])*)"\s*,?', body):
+            try:
+                name = json.loads('"' + mm.group(1) + '"')
+                value = json.loads('"' + mm.group(2) + '"')
+            except Exception:
+                name = mm.group(1)
+                value = mm.group(2)
+            if str(name).strip() and str(value).strip():
+                out[str(name).strip()] = str(value).strip()
+        return out
+    except Exception:
+        return {}
+
+
+def _load_h3_prompt_builder_preset_groups() -> List[Tuple[str, List[str]]]:
+    """Read the Prompt Builder's visible optgroups so the Planner popup stays in sync."""
+    profiles = _load_h3_prompt_builder_style_profiles()
+    path = _h3_prompt_builder_index_path()
+    groups: List[Tuple[str, List[str]]] = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for gm in re.finditer(r'<optgroup\s+label="([^"]+)"[^>]*>([\s\S]*?)</optgroup>', text, re.I):
+            label = re.sub(r"\s+", " ", gm.group(1)).strip()
+            names = [re.sub(r"<[^>]+>", "", x).strip() for x in re.findall(r'<option[^>]*>([\s\S]*?)</option>', gm.group(2), re.I)]
+            names = [x for x in names if x in profiles]
+            if names:
+                groups.append((label, names))
+    except Exception:
+        groups = []
+    if groups:
+        return groups
+    return [("H3 Prompt Builder presets", list(profiles.keys()))] if profiles else []
+
+
+def _h3_genre_story_guidance(style_name: str) -> str:
+    """Small narrative grammar only; never feed the large visual lock to story-writing calls."""
+    name = str(style_name or "").strip()
+    low = name.lower()
+    if not name:
+        return ""
+    if name in ("Action blockbuster", "Disaster spectacle", "Pulp adventure"):
+        return "Favor active decisions, escalating physical obstacles, readable cause-and-effect set pieces, meaningful setbacks and a decisive climax; keep the resolution short and avoid passive filler."
+    if name in ("Psychological thriller", "Neo-noir crime", "Supernatural mystery"):
+        return "Build uncertainty through concrete evidence, reversals and escalating risk; each scene should change what the characters know or must do, with reveals earned rather than repeated suspense poses."
+    if name in ("Visceral cinematic horror", "Cosmic horror", "Gothic whimsy", "Dark fairy tale"):
+        return "Escalate threat and consequence progressively, alternate anticipation with irreversible events, and make each scene change safety, knowledge or options instead of repeating atmospheric scares."
+    if name in ("Stand-up comedy", "TV comedy", "Sitcom", "Slapstick comedy", "Sketch comedy", "Dark comedy", "Parody", "Surreal comedy"):
+        return "Build clear setup, complication, escalation and payoff; every scene needs a new comic turn or consequence and must not repeat the same gag or reaction merely from another angle."
+    if name == "Romantic fantasy":
+        return "Let relationship choices and emotional reversals cause visible changes in the situation; build toward a meaningful decision or sacrifice instead of a sequence of decorative romantic moments."
+    if name in ("Dystopian future", "Retro science fiction", "Game cinematic", "Gameplay / first-person"):
+        return "Use the world as pressure on character goals: introduce concrete obstacles, choices and consequences, escalating toward a changed situation rather than relying on worldbuilding shots alone."
+    return f"Use '{name}' as the selected story/genre tone while preserving a causal story: concrete goals, obstacles, decisions, consequences and a real ending; do not turn the story into a sequence of style-only showcase shots."
+
+
+def _h3_automatic_camera_lock(style_name: str) -> str:
+    """Mirror the Prompt Builder's automaticCamera() style branches."""
+    name = str(style_name or "").strip()
+    if name in ("Action blockbuster", "Disaster spectacle", "Pulp adventure"):
+        return "Use action-motivated camera positions that alternate wide geography, low tracking, close impact detail, point of view and reaction shots. Preserve screen direction and spatial continuity while increasing speed and scale."
+    if name in ("Psychological thriller", "Neo-noir crime", "Supernatural mystery"):
+        return "Begin with controlled observational framing, then move progressively closer through slow push-ins, obstructed angles, reflections and subjective reaction shots as certainty erodes."
+    if name in ("Visceral cinematic horror", "Cosmic horror", "Gothic whimsy", "Dark fairy tale"):
+        return "Use negative space, withheld point of view, unsettling detail inserts and reaction shots to imply the threat before a carefully staged reveal; contrast creeping movement with abrupt stillness."
+    if name == "Stand-up comedy":
+        return "Anchor the comedian to the stage and microphone. Favor medium and close performer coverage with occasional wider room views and selective audience reactions, preserving stage direction and allowing pauses and delivery timing to register."
+    if name in ("Sitcom", "TV comedy"):
+        return "Use clean conversational coverage: readable two-shots and medium shots, doorway or entrance angles when motivated, restrained close-ups for key lines, and listener reaction cuts. Preserve eyelines, room geography and who is speaking at every moment."
+    if name == "Slapstick comedy":
+        return "Keep the main physical gag readable in wider framing, then cut to impact or prop details and clear reactions. Preserve cause and effect, screen direction and body geography as the physical complication escalates."
+    if name == "Sketch comedy":
+        return "Use concise setup, escalation and punchline coverage with clearly differentiated angles. Cut only when the gag advances, favor reaction shots at turning points and hold long enough for the final punchline to land."
+    if name == "Dark comedy":
+        return "Use restrained, grounded coverage with controlled compositions, dry reaction close-ups and deliberate pauses. Let the serious visual treatment contrast with the absurd or uncomfortable situation rather than signaling the joke with exaggerated camera work."
+    if name == "Parody":
+        return "Adopt the camera grammar of the genre being spoofed and execute it convincingly, then heighten selected conventions for comic payoff. Preserve readable geography and reaction timing so the parody remains specific rather than random."
+    if name == "Surreal comedy":
+        return "Frame impossible events with calm, coherent camera logic. Preserve subject identity and geography, use composed reactions and motivated reveals, and let each absurd escalation remain visually understandable."
+    return "Begin with a strong establishing composition, vary shot scale as the story develops, move closer for the decisive action and hold long enough for the final emotional reaction to land."
+
+
+def _h3_selected_visual_style_lock(style_name: str) -> str:
+    profiles = _load_h3_prompt_builder_style_profiles()
+    name = str(style_name or "").strip()
+    profile = str(profiles.get(name) or "").strip()
+    if not name or not profile:
+        return ""
+    return f"SELECTED VISUAL STYLE LOCK — {name}: {profile} Maintain this exact medium and art direction throughout; do not silently substitute a different visual medium or genre."
+
+
+def _h3_final_quality_lock(style_name: str, *, silent: bool = False) -> str:
+    name = str(style_name or "").strip()
+    if not name:
+        return ""
+    camera = _h3_automatic_camera_lock(name)
+    audio = "complete silence" if bool(silent) else "native stereo ambience, tactile close-up effects and reactions synchronized exactly to their visible source"
+    return (
+        f"FINAL QUALITY LOCK: {camera} Preserve subject identity, wardrobe, environment geography, screen direction, lighting logic and story progression throughout the entire clip. "
+        f"Use believable weight, inertia, contact, occlusion and cause-and-effect motion. Sound treatment: {audio}. "
+        "No continuity jumps, duplicated anatomy, accidental extra subjects, unreadable action or generic filler imagery."
+    )
+
+
+def _h3_wrap_with_selected_style_lock(prompt: str, style_name: str, *, silent: bool = False) -> str:
+    """Deterministically wrap a finished H3 prompt; no LLM is allowed to rewrite the locks."""
+    body = str(prompt or "").strip()
+    prefix = _h3_selected_visual_style_lock(style_name)
+    suffix = _h3_final_quality_lock(style_name, silent=silent)
+    if not prefix or not suffix:
+        return body
+    # Avoid stacking the same selected lock if a resumed/reprocessed job passes here twice.
+    body = re.sub(r'^SELECTED VISUAL STYLE LOCK\s*—[^\n]*\n+', '', body, flags=re.I).strip()
+    body = re.sub(r'\n*FINAL QUALITY LOCK:\s*[\s\S]*$', '', body, flags=re.I).strip()
+    return "\n\n".join(x for x in (prefix, body, suffix) if x).strip()
+
+
 _ADVISED_LLAMA_REPO_ID = "DavidAU/Llama-3.2-8X3B-MOE-Dark-Champion-Instruct-uncensored-abliterated-18.4B-GGUF"
 _ADVISED_LLAMA_FILENAME = "L3.2-8X3B-MOE-Dark-Champion-Inst-18.4B-uncen-ablit_D_AU-Q4_k_m.gguf"
 _ADVISED_LLAMA_FOLDER = "L3.2-8X3B-MOE-Dark-Champion-Inst-18.4B-uncen-ablit_D_AU-Q4_k_m"
@@ -13568,6 +13707,10 @@ class PipelineWorker(QThread):
                         target_duration_sec=float(max(1.0, float(getattr(self.job, "approx_duration_sec", 0) or 0.0))),
                         reference_guidance=str(_refs_guidance_excerpt or ""),
                         audio_context=(str(_transcript_excerpt or "") if _lyrics_mode == "lyrics" else ""),
+                        genre_preset=str((self.job.encoding or {}).get("minimax_story_genre_preset") or ""),
+                        genre_story_guidance=str((self.job.encoding or {}).get("minimax_story_genre_guidance") or ""),
+                        genre_video_prefix=str((self.job.encoding or {}).get("minimax_story_genre_prefix") or ""),
+                        genre_video_suffix=str((self.job.encoding or {}).get("minimax_story_genre_suffix") or ""),
                     )
                 finally:
                     try:
@@ -18678,10 +18821,12 @@ class PipelineWorker(QThread):
                                 pass
                         return None
 
-                    _project_style = str(((manifest.get("settings") or {}).get("minimax_prompt_builder_style") or "")).strip()
+                    _selected_genre = str((enc0 or {}).get("minimax_story_genre_preset") or "").strip()
+                    _project_style = _selected_genre or str(((manifest.get("settings") or {}).get("minimax_prompt_builder_style") or "")).strip()
                     if not _project_style:
                         _project_style = _mm_infer_project_style(str(self.job.prompt or ""))
                     manifest.setdefault("settings", {})["minimax_prompt_builder_style"] = _project_style
+                    manifest.setdefault("settings", {})["minimax_story_genre_preset"] = _selected_genre
                     manifest.setdefault("settings", {})["minimax_prompt_conversion"] = "h3_prompt_builder_deterministic_v3"
 
                     _debug = []
@@ -18799,6 +18944,15 @@ class PipelineWorker(QThread):
                             sound_enabled=True,
                         )
                         _cp = str((_built or {}).get("prompt") or _beat)
+                        # The selected H3 Prompt Builder preset is a hard wrapper, not an
+                        # LLM suggestion. Apply it after deterministic prompt construction
+                        # so every final MiniMax clip starts and ends with the same lock.
+                        if _selected_genre:
+                            _cp = _h3_wrap_with_selected_style_lock(
+                                _cp,
+                                _selected_genre,
+                                silent=bool(getattr(self.job, "silent", False)),
+                            )
                         _it["prompt"] = _cp
                         _it["minimax_ref_indices"] = list(_ref_nums)
                         _it["schema"] = {
@@ -27602,6 +27756,20 @@ class PlannerPane(QWidget):
         self.btn_enhance_story_idea.setToolTip("Turns a simple idea into a stronger story seed. Push again for a different random version.")
         self.btn_enhance_story_idea.clicked.connect(self._enhance_story_idea_clicked)
         enhance_row.addWidget(self.btn_enhance_story_idea)
+
+        # MiniMax H3 only: select a shared visual/genre preset from the root-level
+        # h3_prompt_builder.  The selected lock is stored separately from Extra info
+        # so Prompt Enhance and story-writing LLMs cannot paraphrase or discard it.
+        self._minimax_story_genre_preset = ""
+        self.btn_minimax_story_genre = QPushButton("Genre preset…")
+        self.btn_minimax_story_genre.setToolTip(
+            "MiniMax H3 only. Select a visual/genre preset from h3_prompt_builder. "
+            "Storymode receives only a compact narrative hint; the exact H3 visual-style "
+            "and final-quality locks are added deterministically to every final MiniMax prompt."
+        )
+        self.btn_minimax_story_genre.clicked.connect(self._choose_minimax_story_genre_preset)
+        self.btn_minimax_story_genre.setVisible(False)
+        enhance_row.addWidget(self.btn_minimax_story_genre)
         enhance_row.addStretch(1)
         lay.addLayout(enhance_row)
 
@@ -27925,6 +28093,93 @@ class PlannerPane(QWidget):
         except Exception:
             pass
         QMessageBox.warning(self, "Enhance story idea failed", str(error or "Unknown error."))
+
+    def _update_minimax_story_genre_button(self) -> None:
+        btn = getattr(self, "btn_minimax_story_genre", None)
+        if btn is None:
+            return
+        name = str(getattr(self, "_minimax_story_genre_preset", "") or "").strip()
+        btn.setText(f"Genre: {name}" if name else "Genre preset…")
+
+    def _sync_minimax_story_genre_visibility(self) -> None:
+        try:
+            visible = bool(self._is_minimax_h3_video_model_selected())
+        except Exception:
+            visible = False
+        try:
+            self.btn_minimax_story_genre.setVisible(visible)
+            self._update_minimax_story_genre_button()
+        except Exception:
+            pass
+
+    def _choose_minimax_story_genre_preset(self) -> None:
+        groups = _load_h3_prompt_builder_preset_groups()
+        if not groups:
+            QMessageBox.warning(
+                self,
+                "MiniMax genre presets",
+                "Could not read presets from h3_prompt_builder/public/local/app.js.\n\n"
+                f"Expected: {_h3_prompt_builder_app_js_path()}",
+            )
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("MiniMax H3 genre / visual preset")
+        dlg.resize(520, 560)
+        outer = QVBoxLayout(dlg)
+        note = QLabel(
+            "Choose the H3 Prompt Builder preset for this Storymode project. "
+            "It guides story grammar lightly and hard-locks every final MiniMax prompt."
+        )
+        note.setWordWrap(True)
+        outer.addWidget(note)
+        lst = QListWidget()
+        current = str(getattr(self, "_minimax_story_genre_preset", "") or "").strip()
+
+        none_item = QListWidgetItem("No preset")
+        none_item.setData(Qt.UserRole, "")
+        lst.addItem(none_item)
+        if not current:
+            lst.setCurrentItem(none_item)
+
+        for label, names in groups:
+            header = QListWidgetItem(str(label))
+            header.setFlags(Qt.NoItemFlags)
+            font = header.font()
+            font.setBold(True)
+            header.setFont(font)
+            lst.addItem(header)
+            for name in names:
+                item = QListWidgetItem(f"  {name}")
+                item.setData(Qt.UserRole, str(name))
+                lst.addItem(item)
+                if str(name) == current:
+                    lst.setCurrentItem(item)
+        outer.addWidget(lst, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        select = QPushButton("Select")
+        row.addWidget(cancel)
+        row.addWidget(select)
+        outer.addLayout(row)
+        cancel.clicked.connect(dlg.reject)
+        select.clicked.connect(dlg.accept)
+        lst.itemDoubleClicked.connect(lambda _item: dlg.accept())
+        if dlg.exec() != QDialog.Accepted:
+            return
+        item = lst.currentItem()
+        if item is None or not (item.flags() & Qt.ItemIsSelectable):
+            return
+        self._minimax_story_genre_preset = str(item.data(Qt.UserRole) or "").strip()
+        self._update_minimax_story_genre_button()
+        try:
+            if self._minimax_story_genre_preset:
+                self._append_log(f"[MiniMax H3] Genre preset selected: {self._minimax_story_genre_preset}")
+            else:
+                self._append_log("[MiniMax H3] Genre preset cleared")
+        except Exception:
+            pass
 
     def _build_optional_group(self) -> QGroupBox:
         box = QGroupBox()  # title removed
@@ -29097,6 +29352,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
         try:
             self._refresh_minimax_h3_clip_length_slider()
             self._sync_minimax_h3_controls_visibility()
+            self._sync_minimax_story_genre_visibility()
         except Exception:
             pass
 
@@ -33078,6 +33334,7 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             self._sync_minimax_h3_controls_visibility()
             self._refresh_minimax_h3_clip_length_slider()
             self._sync_minimax_image_model_ui()
+            self._sync_minimax_story_genre_visibility()
         except Exception:
             pass
         try:
@@ -35408,6 +35665,23 @@ These prompts override the normal reused Own Storymode prompts for the video sta
             enc.update(self._own_llama_ui_payload())
         except Exception:
             pass
+
+        # Shared H3 Prompt Builder genre/visual preset. Keep the large lock text out
+        # of Extra info and out of the story-writing prompts. Store both the selected
+        # name and deterministic wrappers in the job so resume/queue runs are stable.
+        try:
+            _genre_name = str(getattr(self, "_minimax_story_genre_preset", "") or "").strip()
+            if _video_model_key(enc.get("video_model", "")) != "minimax_h3":
+                _genre_name = ""
+            enc["minimax_story_genre_preset"] = _genre_name
+            enc["minimax_story_genre_guidance"] = _h3_genre_story_guidance(_genre_name) if _genre_name else ""
+            enc["minimax_story_genre_prefix"] = _h3_selected_visual_style_lock(_genre_name) if _genre_name else ""
+            enc["minimax_story_genre_suffix"] = _h3_final_quality_lock(_genre_name, silent=bool(silent)) if _genre_name else ""
+        except Exception:
+            enc["minimax_story_genre_preset"] = ""
+            enc["minimax_story_genre_guidance"] = ""
+            enc["minimax_story_genre_prefix"] = ""
+            enc["minimax_story_genre_suffix"] = ""
 
         # Store selected videoclip preset id (if it came from JSON) for robust matching later.
         try:

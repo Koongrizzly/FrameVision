@@ -525,43 +525,45 @@ class StorylineGenerator:
         lo = min(lo, hi)
         return max(1, lo), max(1, hi)
 
-    def _build_blueprint(self, idea: str, style: str, shot_count: int, target_duration: float, reference_guidance: str = "", audio_context: str = "") -> Dict[str, Any]:
+    def _build_blueprint(self, idea: str, style: str, shot_count: int, target_duration: float, reference_guidance: str = "", audio_context: str = "", genre_preset: str = "", genre_story_guidance: str = "") -> Dict[str, Any]:
         section_min, section_max = self._story_section_guidance(target_duration, shot_count)
-        blueprint_max_tokens = int(min(12000, max(4500, 2800 + (section_max * 360) + (shot_count * 8))))
+        blueprint_max_tokens = int(min(10000, max(4200, 2600 + (section_max * 320))))
         system = (
-            "You are the senior story director inside FrameVision. Design the COMPLETE narrative architecture BEFORE any individual shots are written. "
-            "The story must use the user's actual idea as authority, not replace it with a generic interpretation. The style brief controls presentation but must not erase plot requirements. "
-            "Plan setup, development, escalation, climax and resolution across the full runtime. Do not finish early and fill remaining clips with repeated reactions, alternate camera angles, scenery, poses, or establishing shots. "
-            "A clip slot exists because something narratively changes. Camera coverage alone is never a reason for another slot. "
-            "Every explicitly named action, obstacle, set piece, location change, reveal, and ending condition in the user's idea is a story obligation unless it is physically impossible. Do not silently replace them with easier generic events. "
-            "Reference guidance constrains identity/appearance only and must not rewrite the plot. Audio/lyrics context may influence pacing but must not replace the user's story. "
-            "Return JSON only with title, story_summary, recurring_subjects, required_story_elements, and story_sections. recurring_subjects contains only characters/creatures/important recurring objects that require identity continuity. "
-            "required_story_elements is a concise list of the user's explicit plot/set-piece obligations that the later beats must cover. Each story section must contain title, role, purpose, must_achieve and clip_count."
+            "You are the senior story architect inside FrameVision. Write the STORY structure only. "
+            "Do not write camera directions, image prompts, shot lists, or video-generation prompts. "
+            "The user's idea is authoritative. Preserve explicit plot obligations, but turn them into a causal beginning-to-ending story. "
+            "Each section is a narrative scene/phase in which something changes. Avoid filler endings, repeated reactions, alternate views, or scenery-only sections. "
+            "Return JSON only with title, story_summary, recurring_subjects, required_story_elements and story_sections. "
+            "Each story section contains title, role, purpose, must_achieve and coverage_weight. coverage_weight is only relative complexity from 1 to 3; it is NOT a clip count."
         )
-        user = f"""USER IDEA (AUTHORITATIVE — preserve every explicit plot requirement):
+        user = f"""AUTHORITATIVE IDEA:
 {idea}
 
-STYLE / PRESENTATION BRIEF (AUTHORITATIVE — do not invent a conflicting style):
+STYLE / PRESENTATION:
 {style or '[none]'}
 
-REFERENCE GUIDANCE (identity/appearance constraints only):
+STORY GENRE / FORMAT LOCK:
+{genre_preset or '[none]'}
+
+NARRATIVE GRAMMAR FOR THAT GENRE:
+{genre_story_guidance or '[none]'}
+
+REFERENCE GUIDANCE (identity only):
 {reference_guidance or '[none]'}
 
-AUDIO / LYRIC CONTEXT (pacing context only):
+AUDIO / LYRIC CONTEXT (pacing only):
 {audio_context or '[none]'}
 
-TARGET: exactly {shot_count} video clips across about {target_duration:.1f} seconds.
-The sum of story_sections.clip_count MUST equal {shot_count}. The definitive resolution must occur in the final section near the end.
-For this runtime, aim for about {section_min}-{section_max} meaningful story sections when the idea supports them. This is creative guidance, not a quota: use fewer if extra sections would be filler, or more only when genuinely useful. Longer runtimes should exploit the premise with additional developments, discoveries, obstacles, reversals, location changes, decisions or mini-payoffs instead of stretching a few events across many clips.
-Before allocating sections, identify the explicit story obligations from USER IDEA and put them in required_story_elements. The beat writer will be required to cover them.
+Approximate finished runtime: {target_duration:.1f} seconds. FrameVision can render about {shot_count} clips later, but DO NOT design one story event per clip. Build the story first.
+For this runtime, aim for roughly {section_min}-{section_max} meaningful narrative sections when useful. Use fewer if more would be filler. The resolution belongs at the end.
 
-Return exactly this JSON shape:
+Return exactly:
 {{
   "title": "...",
-  "story_summary": "complete beginning-to-ending summary that preserves the user's plot",
+  "story_summary": "complete causal beginning-to-ending summary",
   "recurring_subjects": [{{"id":"char_1","name":"...","type":"character|creature|object","continuity_role":"..."}}],
-  "required_story_elements": ["explicit obligation 1", "explicit obligation 2"],
-  "story_sections": [{{"title":"...","role":"setup|development|escalation|climax|resolution","purpose":"...","must_achieve":"...","clip_count":1}}]
+  "required_story_elements": ["..."],
+  "story_sections": [{{"title":"...","role":"setup|development|escalation|climax|resolution","purpose":"...","must_achieve":"...","coverage_weight":2}}]
 }}"""
         obj = self._json_call(system, user, "blueprint", max_tokens=blueprint_max_tokens)
         if not isinstance(obj, dict):
@@ -569,7 +571,7 @@ Return exactly this JSON shape:
         raw_sections = obj.get("story_sections")
         if not isinstance(raw_sections, list):
             raise RuntimeError("Blueprint is missing story_sections.")
-        sections = []
+        sections: List[Dict[str, Any]] = []
         for sec in raw_sections:
             if not isinstance(sec, dict):
                 continue
@@ -578,29 +580,167 @@ Return exactly this JSON shape:
             must = _clean_line(sec.get("must_achieve") or purpose)
             role = _clean_line(sec.get("role") or "development").lower()
             try:
-                count = int(sec.get("clip_count") or 0)
+                weight = int(sec.get("coverage_weight") or sec.get("clip_count") or 1)
             except Exception:
-                count = 0
-            if title and purpose and count > 0:
-                sections.append({"title": title, "role": role, "purpose": purpose, "must_achieve": must, "clip_count": count})
-        sections = self._lock_section_budget(sections, shot_count)
-        severe_min = 5 if shot_count >= 10 else 1
-        if target_duration >= 600:
-            severe_min = max(severe_min, max(5, section_min - 2))
-        severe_min = min(severe_min, shot_count)
-        if len(sections) < severe_min:
-            raise RuntimeError(
-                f"Blueprint is too compressed for {target_duration:.0f}s: returned {len(sections)} sections; "
-                f"need at least {severe_min} meaningful sections before shot expansion."
-            )
-        res_start = sum(int(s["clip_count"]) for s in sections[:-1]) + 1
-        if shot_count >= 10 and res_start < int(math.floor(shot_count * 0.80)) + 1:
-            raise RuntimeError(f"Blueprint resolves too early at slot {res_start} of {shot_count}.")
+                weight = 1
+            weight = max(1, min(3, weight))
+            if title and purpose:
+                sections.append({"title": title, "role": role, "purpose": purpose, "must_achieve": must, "coverage_weight": weight})
+        if not sections:
+            raise RuntimeError("Blueprint returned no usable story sections.")
+        if len(sections) > shot_count:
+            raise RuntimeError(f"Blueprint created {len(sections)} story sections for only {shot_count} available clips.")
+
+        # Convert relative scene complexity into the exact clip budget in Python. The
+        # story architect never has to reason about exact clip numbering/allocation.
+        counts = [1 for _ in sections]
+        remaining = shot_count - len(sections)
+        weights = [max(1, int(x.get("coverage_weight") or 1)) for x in sections]
+        while remaining > 0:
+            best = max(range(len(sections)), key=lambda i: (weights[i] / max(1, counts[i]), -i))
+            counts[best] += 1
+            remaining -= 1
+        for sec, count in zip(sections, counts):
+            sec["clip_count"] = int(count)
+
         subjects = [dict(x) for x in (obj.get("recurring_subjects") or []) if isinstance(x, dict)]
         required = [_clean_line(x) for x in (obj.get("required_story_elements") or []) if _clean_line(x)]
         if not required:
             required = [idea]
-        return {"title": _clean_line(obj.get("title") or "Planner Story"), "story_summary": _clean_line(obj.get("story_summary") or idea), "recurring_subjects": subjects, "required_story_elements": required, "story_sections": sections}
+        return {
+            "title": _clean_line(obj.get("title") or "Planner Story"),
+            "story_summary": _clean_line(obj.get("story_summary") or idea),
+            "recurring_subjects": subjects,
+            "required_story_elements": required,
+            "story_sections": sections,
+        }
+
+    def _build_scenes(self, style: str, blueprint: Dict[str, Any], genre_preset: str = "", genre_story_guidance: str = "") -> List[Dict[str, Any]]:
+        """Expand each story section into a screenplay-like scene using fresh, narrow calls."""
+        scenes: List[Dict[str, Any]] = []
+        sections = list(blueprint.get("story_sections") or [])
+        previous_exit = ""
+        for idx, sec in enumerate(sections, 1):
+            next_sec = sections[idx] if idx < len(sections) else None
+            system = (
+                "You are the scene writer inside FrameVision. Expand ONE locked story section into a complete visible scene. "
+                "Do not write camera angles, shot numbers, image prompts, or model instructions. Write action, blocking, dialogue/reactions only when story-relevant, and cause-and-effect progression. "
+                "The scene must begin from entry_state and end in a materially changed exit_state. Break the scene into ordered action_units; each action unit must advance what happens rather than describe another view of the same moment. Return JSON only."
+            )
+            user = f"""LOCKED STORY SUMMARY:
+{blueprint.get('story_summary','')}
+
+CURRENT SECTION:
+{json.dumps(sec, ensure_ascii=False, indent=2)}
+
+STYLE (presentation only):
+{style or '[none]'}
+
+STORY GENRE / FORMAT LOCK:
+{genre_preset or '[none]'}
+
+GENRE STORY GUIDANCE:
+{genre_story_guidance or '[none]'}
+
+PREVIOUS SCENE EXIT STATE:
+{previous_exit or '[story beginning]'}
+
+NEXT SECTION PURPOSE (destination only; do not write it yet):
+{json.dumps(next_sec, ensure_ascii=False, indent=2) if next_sec else '[final section]'}
+
+Return exactly:
+{{"scene":{{"title":"...","entry_state":"...","scene_text":"...","action_units":["event 1","event 2"],"exit_state":"..."}}}}"""
+            obj = self._json_call(system, user, f"scene {idx}", max_tokens=3600)
+            raw = obj.get("scene") if isinstance(obj, dict) and isinstance(obj.get("scene"), dict) else obj
+            if not isinstance(raw, dict):
+                raise RuntimeError(f"Scene {idx} did not return a scene object.")
+            units = [_clean_line(x) for x in (raw.get("action_units") or []) if _clean_line(x)]
+            scene_text = _clean_line(raw.get("scene_text"))
+            entry = _clean_line(raw.get("entry_state") or previous_exit or sec.get("purpose"))
+            exit_state = _clean_line(raw.get("exit_state") or sec.get("must_achieve"))
+            if not scene_text or not units or not exit_state:
+                raise RuntimeError(f"Scene {idx} is missing scene_text, action_units or exit_state.")
+            scene = {
+                "scene_index": idx,
+                "title": _clean_line(raw.get("title") or sec.get("title") or f"Scene {idx}"),
+                "role": _clean_line(sec.get("role") or "development"),
+                "purpose": _clean_line(sec.get("purpose") or ""),
+                "must_achieve": _clean_line(sec.get("must_achieve") or ""),
+                "entry_state": entry,
+                "scene_text": scene_text,
+                "action_units": units,
+                "exit_state": exit_state,
+                "clip_count": int(sec.get("clip_count") or 1),
+            }
+            scenes.append(scene)
+            previous_exit = exit_state
+        return scenes
+
+    def _build_coverage(self, blueprint: Dict[str, Any], scenes: List[Dict[str, Any]], shot_count: int) -> List[Dict[str, Any]]:
+        """Break each complete scene into renderable clips. Story content is already locked."""
+        out: List[Dict[str, Any]] = []
+        slot = 1
+        for scene in scenes:
+            count = max(1, int(scene.get("clip_count") or 1))
+            system = (
+                "You are the shot-coverage planner inside FrameVision. The scene is LOCKED. Break its action into the requested number of chronological video clips. "
+                "Do not invent new plot, repeat one event from multiple angles, or use reaction/scenery shots merely to fill the quota. Every significant action unit must be covered once across the clips. "
+                "Each clip needs a concrete before_state, event, and after_state. after_state of one clip should naturally lead into the next. Return JSON only."
+            )
+            user = f"""LOCKED SCENE:
+{json.dumps(scene, ensure_ascii=False, indent=2)}
+
+REQUIRED CLIPS FOR THIS SCENE: {count}
+
+LOCKED RECURRING SUBJECT IDS/NAMES:
+{json.dumps(blueprint.get('recurring_subjects') or [], ensure_ascii=False, indent=2)}
+
+Return exactly {count} items:
+{{"shots":[{{"before_state":"...","event":"...","after_state":"...","reference_ids":["..."]}}]}}"""
+            obj = self._json_call(system, user, f"coverage scene {scene['scene_index']}", max_tokens=max(2600, count * 900))
+            shots = obj.get("shots") if isinstance(obj, dict) else None
+            if not isinstance(shots, list) or len(shots) != count or not all(isinstance(x, dict) for x in shots):
+                # Deterministic fallback: partition the locked action units instead of
+                # asking the same LLM prompt over and over.
+                units = list(scene.get("action_units") or [])
+                if not units:
+                    raise RuntimeError(f"Coverage for scene {scene['scene_index']} returned the wrong number of shots.")
+                groups: List[List[str]] = [[] for _ in range(count)]
+                for i, unit in enumerate(units):
+                    groups[min(count - 1, int(i * count / max(1, len(units))))].append(unit)
+                shots = []
+                state = _clean_line(scene.get("entry_state"))
+                for i, group in enumerate(groups):
+                    event = _clean_line(" Then ".join(group) or scene.get("scene_text"))
+                    after = _clean_line(scene.get("exit_state") if i == count - 1 else event)
+                    shots.append({"before_state": state, "event": event, "after_state": after, "reference_ids": []})
+                    state = after
+
+            for local_i, item in enumerate(shots, 1):
+                event = _clean_line(item.get("event"))
+                before = _clean_line(item.get("before_state") or (scene.get("entry_state") if local_i == 1 else out[-1].get("after_state")))
+                after = _clean_line(item.get("after_state") or (scene.get("exit_state") if local_i == count else event))
+                if not event:
+                    raise RuntimeError(f"Coverage scene {scene['scene_index']} shot {local_i} returned an empty event.")
+                out.append({
+                    "slot": slot,
+                    "scene_index": int(scene["scene_index"]),
+                    "section": scene["title"],
+                    "role": scene["role"],
+                    "purpose": scene["purpose"],
+                    "must_achieve": scene["must_achieve"],
+                    "before_state": before,
+                    "beat": event,
+                    "after_state": after,
+                    "reference_ids": [str(x) for x in (item.get("reference_ids") or []) if str(x).strip()],
+                })
+                slot += 1
+        if len(out) != shot_count:
+            raise RuntimeError(f"Scene coverage produced {len(out)} clips; expected {shot_count}.")
+        issue = self._duplicate_issue(out)
+        if issue:
+            self._log(f"[story] Warning: {issue}. Keeping locked coverage instead of restarting the entire story.")
+        return out
 
     def _build_beats(self, idea: str, style: str, blueprint: Dict[str, Any], shot_count: int, quality_feedback: str = "") -> List[Dict[str, Any]]:
         """Create the locked shot list.
@@ -958,194 +1098,82 @@ Return exactly this JSON shape:
         return char_lines, object_lines, bundle
 
     def _build_shot_prompts(self, idea: str, style: str, blueprint: Dict[str, Any], beats: List[Dict[str, Any]], character_bibles: List[str], object_bibles: List[str], t2i_model_hint: str, i2v_model_hint: str, continuity_bundle: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """Translate locked beats into image/video prompts without ever dropping a slot.
-
-        Batch generation is kept for speed, but exact item count is a hard workflow
-        invariant.  If a small model returns an incomplete batch, retry once and then
-        generate only the affected shots individually.
-        """
-        out: List[Dict[str, Any]] = []
-        total = len(beats)
-        continuity_bundle = continuity_bundle if isinstance(continuity_bundle, dict) else {}
-        character_map = {str(c.get("id")): c for c in (continuity_bundle.get("characters") or []) if isinstance(c, dict)}
-        object_map = {str(o.get("id")): o for o in (continuity_bundle.get("objects") or []) if isinstance(o, dict)}
+        """Direct each locked coverage clip with one fresh, narrow LLM call."""
+        continuity_bundle = continuity_bundle or {}
+        character_map = {str(x.get("id")): x for x in (continuity_bundle.get("characters") or []) if isinstance(x, dict) and x.get("id")}
+        object_map = {str(x.get("id")): x for x in (continuity_bundle.get("objects") or []) if isinstance(x, dict) and x.get("id")}
         shot_bindings = continuity_bundle.get("shot_bindings") if isinstance(continuity_bundle.get("shot_bindings"), dict) else {}
+        out: List[Dict[str, Any]] = []
 
-        system = (
-            "You are the shot director inside FrameVision. Story events are LOCKED; your job is to translate each event into an image start frame and a video-motion prompt without changing or duplicating the event. "
-            "The start_frame_prompt describes the exact visible state at the BEGINNING of the clip, before the key action is already finished. It must look like an action-ready film frame, not a portrait, fashion photo, posed group shot, poster, or completed-result tableau. "
-            "The video_prompt describes what visibly changes DURING the clip and must execute the locked beat through cause and effect. Do not substitute generic camera drift, blinking, breathing, hair movement, or another angle for story action. "
-            "Identity continuity from the supplied shot cast and continuity bibles is mandatory whenever those recurring subjects are present. Use the supplied canonical identities directly instead of re-inventing the appearance. The user's style remains authoritative. "
-            "Return JSON only. Every requested locked event must get exactly one result."
-        )
-
-        def _shot_subjects(shot_no: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        def _subjects(shot_no: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
             rec = shot_bindings.get(f"S{shot_no:02d}") if isinstance(shot_bindings.get(f"S{shot_no:02d}"), dict) else {}
             chars = [character_map[cid] for cid in (rec.get("character_ids") or []) if cid in character_map]
             objs = [object_map[oid] for oid in (rec.get("object_ids") or []) if oid in object_map]
             return chars, objs
 
-        def _shot_cast_block(shot_no: int) -> str:
-            chars, objs = _shot_subjects(shot_no)
-            data = {
-                "present_characters": chars,
-                "present_objects": objs,
-                "continuity_requirements": _identity_prefix_for_shot(chars, objs),
-            }
-            return json.dumps(data, ensure_ascii=False, indent=2)
+        system = (
+            "You are the final shot director inside FrameVision. You do NOT write or alter story. Direct ONE already-locked clip. "
+            "The start_frame_prompt must depict the supplied before_state immediately before the event happens. The video_prompt must execute the supplied event and visibly reach the after_state. "
+            "Do not repeat the original story idea, do not import actions from other clips, and do not replace the event with generic camera motion, posing, scenery, blinking, breathing, or another angle. "
+            "Use only the supplied visible-subject identities. Camera language may support the action but may not become the action. Return JSON only."
+        )
 
-        def _normalize(item: Dict[str, Any], beat: Dict[str, Any], shot_no: int) -> Dict[str, Any]:
+        for idx, beat in enumerate(beats, 1):
+            chars, objs = _subjects(idx)
+            cast = {
+                "characters": chars,
+                "objects": objs,
+                "continuity_line": _identity_prefix_for_shot(chars, objs),
+            }
+            previous_after = _clean_line(beats[idx-2].get("after_state")) if idx > 1 else ""
+            next_event = _clean_line(beats[idx].get("beat")) if idx < len(beats) else ""
+            user = f"""STYLE / LOOK:
+{style or '[none]'}
+
+LOCKED CLIP {idx}:
+{json.dumps({
+                'before_state': beat.get('before_state'),
+                'event': beat.get('beat'),
+                'after_state': beat.get('after_state'),
+                'scene': beat.get('section'),
+            }, ensure_ascii=False, indent=2)}
+
+VISIBLE SUBJECT IDENTITIES FOR THIS CLIP ONLY:
+{json.dumps(cast, ensure_ascii=False, indent=2)}
+
+PREVIOUS CLIP END (continuity only):
+{previous_after or '[none]'}
+
+NEXT CLIP EVENT (do not perform it yet):
+{next_event or '[none]'}
+
+TARGET IMAGE MODEL: {t2i_model_hint or '[unspecified]'}
+TARGET VIDEO MODEL: {i2v_model_hint or '[unspecified]'}
+
+Return exactly:
+{{"shot":{{"purpose":"...","continuity_change":"...","start_frame_prompt":"...","video_prompt":"..."}}}}"""
+            obj = self._json_call(system, user, f"direct shot {idx}", max_tokens=2600)
+            item = obj.get("shot") if isinstance(obj, dict) and isinstance(obj.get("shot"), dict) else obj
+            if not isinstance(item, dict):
+                raise RuntimeError(f"Shot {idx} did not return a shot object.")
             sf = _clean_line(item.get("start_frame_prompt"))
             vp = _clean_line(item.get("video_prompt"))
             if not sf or not vp:
-                raise RuntimeError(f"Shot {shot_no} is missing start_frame_prompt or video_prompt.")
-            chars, objs = _shot_subjects(shot_no)
+                raise RuntimeError(f"Shot {idx} is missing start_frame_prompt or video_prompt.")
             sf = _inject_bound_identities(sf, chars, objs)
-            vp = _clean_line(vp)
-            return {
-                "section": beat["section"], "purpose": _clean_line(item.get("purpose") or beat["purpose"]),
-                "change": _clean_line(item.get("continuity_change") or beat["beat"]),
-                "visual": sf, "i2v": vp, "beat": beat["beat"], "reference_ids": beat.get("reference_ids") or [],
+            out.append({
+                "section": beat["section"],
+                "purpose": _clean_line(item.get("purpose") or beat.get("purpose")),
+                "change": _clean_line(item.get("continuity_change") or beat.get("after_state") or beat.get("beat")),
+                "visual": sf,
+                "i2v": vp,
+                "beat": beat["beat"],
+                "before_state": beat.get("before_state") or "",
+                "after_state": beat.get("after_state") or "",
+                "reference_ids": beat.get("reference_ids") or [],
                 "present_character_ids": [str(c.get("id")) for c in chars],
                 "present_object_ids": [str(o.get("id")) for o in objs],
-            }
-        def _one_shot(beat: Dict[str, Any], shot_no: int, previous: List[Dict[str, Any]]) -> Dict[str, Any]:
-            prev_block = f"""PREVIOUS LOCKED EVENTS FOR CONTINUITY ONLY:
-{json.dumps(previous, ensure_ascii=False, indent=2)}
-
-""" if previous else ""
-            event_block = f"""LOCKED EVENT FOR SHOT {shot_no}:
-{json.dumps(beat, ensure_ascii=False, indent=2)}
-
-"""
-            user = (
-                f"""USER IDEA:
-{idea}
-
-STYLE:
-{style or '[none]'}
-
-LOCKED STORY SUMMARY:
-{blueprint['story_summary']}
-
-CHARACTER BIBLES:
-{json.dumps(character_bibles, ensure_ascii=False, indent=2)}
-
-OBJECT BIBLES:
-{json.dumps(object_bibles, ensure_ascii=False, indent=2)}
-
-STRUCTURED CONTINUITY BIBLE:
-{json.dumps(continuity_bundle, ensure_ascii=False, indent=2)}
-
-THIS SHOT CAST REQUIREMENT:
-{_shot_cast_block(shot_no)}
-
-TARGET IMAGE MODEL: {t2i_model_hint or '[unspecified]'}
-TARGET VIDEO MODEL: {i2v_model_hint or '[unspecified]'}
-
-"""
-                + prev_block
-                + event_block
-                + 'Return exactly this JSON object: {"shot":{"purpose":"...","continuity_change":"...","start_frame_prompt":"...","video_prompt":"..."}}'
-            )
-            obj = self._json_call(system, user, f"shot prompts {shot_no}", max_tokens=3200)
-            item = None
-            if isinstance(obj, dict) and isinstance(obj.get("shot"), dict):
-                item = obj["shot"]
-            elif isinstance(obj, dict) and isinstance(obj.get("shots"), list) and len(obj["shots"]) == 1 and isinstance(obj["shots"][0], dict):
-                item = obj["shots"][0]
-            elif isinstance(obj, dict) and (obj.get("start_frame_prompt") or obj.get("video_prompt")):
-                item = obj
-            if not isinstance(item, dict):
-                raise RuntimeError(f"Shot {shot_no} did not return one shot object.")
-            return _normalize(item, beat, shot_no)
-        for start in range(0, total, 5):
-            chunk = beats[start:start+5]
-            previous = beats[max(0, start-2):start]
-            cast_requirements = [{
-                "shot": start + i + 1,
-                "binding": json.loads(_shot_cast_block(start + i + 1)),
-            } for i, _ in enumerate(chunk)]
-            prev_block = f"""PREVIOUS LOCKED EVENTS FOR CONTINUITY ONLY:
-{json.dumps(previous, ensure_ascii=False, indent=2)}
-
-""" if previous else ""
-            base_user = (
-                f"""USER IDEA:
-{idea}
-
-STYLE:
-{style or '[none]'}
-
-LOCKED STORY SUMMARY:
-{blueprint['story_summary']}
-
-CHARACTER BIBLES:
-{json.dumps(character_bibles, ensure_ascii=False, indent=2)}
-
-OBJECT BIBLES:
-{json.dumps(object_bibles, ensure_ascii=False, indent=2)}
-
-STRUCTURED CONTINUITY BIBLE:
-{json.dumps(continuity_bundle, ensure_ascii=False, indent=2)}
-
-SHOT CAST REQUIREMENTS BY SHOT:
-{json.dumps(cast_requirements, ensure_ascii=False, indent=2)}
-
-TARGET IMAGE MODEL: {t2i_model_hint or '[unspecified]'}
-TARGET VIDEO MODEL: {i2v_model_hint or '[unspecified]'}
-
-"""
-                + prev_block
-                + f"""LOCKED EVENTS TO DIRECT NOW:
-{json.dumps(chunk, ensure_ascii=False, indent=2)}
-
-"""
-            )
-
-            raw = None
-            for semantic_attempt in range(1, 3):
-                correction = "" if semantic_attempt == 1 else (
-                    f"\n\nCORRECTION: Your previous valid JSON had the wrong number of shots. "
-                    f"Return EXACTLY {len(chunk)} shot objects, one per locked event, in the same order. Do not omit, merge, or combine events."
-                )
-                try:
-                    obj = self._json_call(
-                        system,
-                        base_user + correction + f"\n\nReturn JSON as {{\"shots\":[...]}} with exactly {len(chunk)} shot objects in the same order.",
-                        f"shot prompts {start+1}-{start+len(chunk)}",
-                        max_tokens=6800,
-                    )
-                except Exception:
-                    self._log(f"[story] Prompt batch {start+1}-{start+len(chunk)} could not produce valid JSON; switching this batch to individual shots.")
-                    break
-                candidate = obj.get("shots") if isinstance(obj, dict) else None
-                if isinstance(candidate, list) and len(candidate) == len(chunk) and all(isinstance(x, dict) for x in candidate):
-                    raw = candidate
-                    break
-                got = len(candidate) if isinstance(candidate, list) else 0
-                self._log(f"[story] Prompt batch {start+1}-{start+len(chunk)} returned {got}/{len(chunk)} shots; retrying.")
-
-            if raw is None:
-                self._log(f"[story] Prompt batch {start+1}-{start+len(chunk)} is incomplete; generating those shots individually.")
-                for i, beat in enumerate(chunk):
-                    shot_no = start + i + 1
-                    prev = beats[max(0, shot_no-3):shot_no-1]
-                    out.append(_one_shot(beat, shot_no, prev))
-                continue
-
-            for i, item in enumerate(raw):
-                beat = chunk[i]
-                shot_no = start + i + 1
-                try:
-                    out.append(_normalize(item, beat, shot_no))
-                except Exception:
-                    self._log(f"[story] Prompt for shot {shot_no} is incomplete; regenerating that shot.")
-                    prev = beats[max(0, shot_no-3):shot_no-1]
-                    out.append(_one_shot(beat, shot_no, prev))
-
-        if len(out) != total:
-            raise RuntimeError(f"Prompt creation produced {len(out)} shots; expected {total}.")
+            })
         return out
 
     def generate_project(self, *, title: str, idea: str, shot_count: int, include_story_outline: bool = True,
@@ -1155,6 +1183,10 @@ TARGET VIDEO MODEL: {i2v_model_hint or '[unspecified]'}
                          target_duration_sec: float = 0.0, **extra: Any) -> StoryProject:
         reference_guidance = _clean_line(extra.get("reference_guidance") or "")
         audio_context = _clean_line(extra.get("audio_context") or "")
+        genre_preset = _clean_line(extra.get("genre_preset") or "")
+        genre_story_guidance = _clean_line(extra.get("genre_story_guidance") or "")
+        genre_video_prefix = str(extra.get("genre_video_prefix") or "").strip()
+        genre_video_suffix = str(extra.get("genre_video_suffix") or "").strip()
         idea = _clean_line(idea)
         style_hint = _clean_line(style_hint)
         if not idea:
@@ -1162,54 +1194,53 @@ TARGET VIDEO MODEL: {i2v_model_hint or '[unspecified]'}
         shot_count = max(1, int(shot_count))
         target_duration_sec = float(target_duration_sec or shot_count * 5.0)
 
-        self._log(f"[story] Story pipeline: blueprint -> shot list -> continuity bibles -> image/video prompts ({shot_count} clips)")
-        self._log("[story] Creating blueprint")
-        blueprint = None
-        last_blueprint_error = None
-        for blueprint_attempt in range(1, 3):
-            try:
-                blueprint = self._build_blueprint(idea, style_hint, shot_count, target_duration_sec, reference_guidance, audio_context)
-                break
-            except Exception as exc:
-                last_blueprint_error = exc
-                self._log(f"[story] blueprint semantic validation attempt {blueprint_attempt}/2 failed: {exc}")
-        if not isinstance(blueprint, dict):
-            raise RuntimeError(f"Blueprint failed semantic validation: {last_blueprint_error}")
-        self._log("[story] Locked blueprint: " + " | ".join(f"{s['title']}={s['clip_count']}" for s in blueprint['story_sections']))
+        self._log(f"[story] Story pipeline v1.5-style: story -> scenes -> coverage -> continuity -> model prompts ({shot_count} clips)")
+        self._log("[story] Stage 1/5: creating story architecture")
+        blueprint = self._build_blueprint(idea, style_hint, shot_count, target_duration_sec, reference_guidance, audio_context, genre_preset, genre_story_guidance)
+        self._log("[story] Story sections: " + " | ".join(f"{s['title']}->{s['clip_count']} clip(s)" for s in blueprint['story_sections']))
 
-        self._log("[story] Creating shot list")
-        beats = None
-        beat_feedback = ""
-        last_beat_error = None
-        for beat_attempt in range(1, 3):
-            try:
-                beats = self._build_beats(idea, style_hint, blueprint, shot_count, beat_feedback)
-                break
-            except Exception as exc:
-                last_beat_error = exc
-                beat_feedback = str(exc)
-                self._log(f"[story] beat quality attempt {beat_attempt}/2 failed: {exc}")
-        if not isinstance(beats, list) or len(beats) != shot_count:
-            raise RuntimeError(f"Beat generation failed quality validation: {last_beat_error}")
+        self._log("[story] Stage 2/5: expanding story sections into complete scenes")
+        scenes = self._build_scenes(style_hint, blueprint, genre_preset, genre_story_guidance)
+        for sc in scenes:
+            self._log(f"[story] scene {sc['scene_index']:02d}: {sc['title']} | {sc['entry_state']} -> {sc['exit_state']}")
+
+        self._log("[story] Stage 3/5: breaking scenes into chronological clip coverage")
+        beats = self._build_coverage(blueprint, scenes, shot_count)
         for b in beats:
-            self._log(f"[story] beat {b['slot']:02d} [{b['section']}]: {b['beat']}")
+            self._log(f"[story] clip {b['slot']:02d} [{b['section']}]: {b['beat']}")
 
-        self._log("[story] Creating continuity bibles")
-        chars, objects, continuity_bundle = self._build_bibles(idea, style_hint, blueprint, beats, use_character_bible, use_object_bible, predefined_character_bibles, extra.get("predefined_character_entries"))
+        self._log("[story] Stage 4/5: creating continuity bibles")
+        # The continuity stage consumes the already-locked coverage. It does not write story.
+        chars, objects, continuity_bundle = self._build_bibles("", style_hint, blueprint, beats, use_character_bible, use_object_bible, predefined_character_bibles, extra.get("predefined_character_entries"))
 
-        self._log("[story] Creating image and video prompts")
-        directed = self._build_shot_prompts(idea, style_hint, blueprint, beats, chars, objects, t2i_model_hint, i2v_model_hint, continuity_bundle)
+        self._log("[story] Stage 5/5: directing each locked clip for the selected models")
+        directed = self._build_shot_prompts("", style_hint, blueprint, beats, chars, objects, t2i_model_hint, i2v_model_hint, continuity_bundle)
 
         t2i = [d["visual"] for d in directed] if generate_t2i else []
-        i2v = [d["i2v"] for d in directed] if generate_i2v else []
+        if generate_i2v:
+            i2v = []
+            for d in directed:
+                body = str(d["i2v"] or "").strip()
+                if genre_video_prefix and genre_video_suffix:
+                    # Hard wrapper is applied after the LLM finishes. The LLM never sees
+                    # or rewrites these Prompt Builder locks.
+                    body = "\n\n".join(x for x in (genre_video_prefix, body, genre_video_suffix) if str(x or "").strip()).strip()
+                i2v.append(body)
+        else:
+            i2v = []
         outline = [b["beat"] for b in beats] if include_story_outline else []
         story_bible = [f"{s['title']} [{s['role']}]: {s['purpose']} MUST: {s['must_achieve']}" for s in blueprint["story_sections"]]
         shot_plan = []
         per = target_duration_sec / max(1, shot_count)
         for idx, d in enumerate(directed, 1):
             shot_plan.append({
-                "shot": idx, "beat_index": idx, "section": d["section"], "purpose": d["purpose"],
-                "change": d["change"], "visual": d["visual"], "duration_sec": round(per, 3),
+                "shot": idx,
+                "beat_index": idx,
+                "section": d["section"],
+                "purpose": d["purpose"],
+                "change": d["change"],
+                "visual": d["visual"],
+                "duration_sec": round(per, 3),
                 "reference_ids": d.get("reference_ids") or [],
                 "present_character_ids": d.get("present_character_ids") or [],
                 "present_object_ids": d.get("present_object_ids") or [],
@@ -1225,24 +1256,28 @@ TARGET VIDEO MODEL: {i2v_model_hint or '[unspecified]'}
             text_to_image_prompts=t2i,
             image_to_video_prompts=i2v,
             metadata={
-                "engine": "agent_story_replacement_v1",
-                "architecture": "blueprint->locked_beats->continuity_bibles->shot_prompts",
+                "engine": "agent_story_replacement_v15",
+                "architecture": "story->scenes->coverage->continuity->model_prompts",
                 "style_hint": style_hint,
+                "genre_preset": genre_preset,
+                "genre_story_guidance": genre_story_guidance,
+                "genre_video_lock_applied": bool(genre_video_prefix and genre_video_suffix),
                 "negative_hint": negative_hint,
                 "t2i_model_hint": t2i_model_hint,
                 "i2v_model_hint": i2v_model_hint,
                 "blueprint": blueprint,
+                "scenes": scenes,
                 "reference_guidance_present": bool(reference_guidance),
                 "audio_context_present": bool(audio_context),
                 "continuity_bundle": continuity_bundle,
                 "story_scale": {
                     "shot_count": int(shot_count),
                     "target_duration_sec": float(target_duration_sec),
-                    "continuity_bible_max_tokens": int(min(16000, max(4200, 2200 + (len(beats) * 110) + (len((blueprint or {}).get("recurring_subjects") or []) * 180)))),
-                "story_section_guidance": list(self._story_section_guidance(target_duration_sec, shot_count)),
+                    "story_section_guidance": list(self._story_section_guidance(target_duration_sec, shot_count)),
                 },
             },
             story_bible=story_bible,
             narrative_beats=[b["beat"] for b in beats],
             shot_plan=shot_plan,
         )
+

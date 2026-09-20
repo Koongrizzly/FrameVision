@@ -37,7 +37,7 @@ def main():
     ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
     ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0)
     ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="simple")
-    ap.add_argument("--first-frame"); ap.add_argument("--last-frame"); ap.add_argument("--continue-video"); ap.add_argument("--continue-context-frames", type=int, default=39); ap.add_argument("--continue-audio-memory", action="store_true", help="Experimental: use source clip audio as continuation memory/context"); ap.add_argument("--glue-source"); ap.add_argument("--output")
+    ap.add_argument("--first-frame"); ap.add_argument("--last-frame"); ap.add_argument("--continue-video"); ap.add_argument("--continue-context-frames", type=int, default=39); ap.add_argument("--continue-audio-memory", action="store_true", help="Experimental: use source clip audio as continuation memory/context"); ap.add_argument("--latent-continuation", action="store_true", help="Prefer the saved native H3 latent sidecar for continuation history; fall back to video history if unavailable/incompatible"); ap.add_argument("--glue-source"); ap.add_argument("--output")
     ap.add_argument("--fl2va-checkpoint"); ap.add_argument("--ref2va-checkpoint"); ap.add_argument("--text-encoder"); ap.add_argument("--video-vae"); ap.add_argument("--audio-vae")
     ap.add_argument("--lora", action="append", default=[]); ap.add_argument("--lora-strength", action="append", type=float, default=[])
     ap.add_argument("--extended-logging", action="store_true")
@@ -169,6 +169,16 @@ def main():
     print(f"Using video VAE: {Path(vv).name}", flush=True)
     print(f"Using audio VAE: {Path(av).name}", flush=True)
     py = sys.executable
+
+    # Backend fail-safe: older presets/CLI jobs can still carry the old 0.50 GB
+    # runtime floor.  Hybrid/SparseRef/Fused checkpoints get at least 1.50 GB
+    # before the worker starts so Comfy's initial reserve is safe too.
+    _diff_name = Path(diff).name.lower()
+    _hybrid_checkpoint = any(token in _diff_name for token in ("hybrid", "sparseref", "fused"))
+    if bool(ns.vram_manager or ns.vram_manager_auto) and _hybrid_checkpoint and float(ns.vram_runtime_free_gb) < 1.50:
+        print(f"[VRAM-MGR] Hybrid checkpoint detected; raising runtime minimum free {ns.vram_runtime_free_gb:g} -> 1.5 GB", flush=True)
+        ns.vram_runtime_free_gb = 1.50
+        ns.vram_residency_target_free_gb = max(float(ns.vram_residency_target_free_gb), 1.50)
 
     use_vram_manager = bool(ns.vram_manager)
     stage_plan = None
@@ -377,7 +387,15 @@ def main():
             if ns.first_frame: sample_cmd += ["--first-frame", str(Path(ns.first_frame).resolve())]
             if ns.last_frame: sample_cmd += ["--last-frame", str(Path(ns.last_frame).resolve())]
             if ns.continue_video:
-                sample_cmd += ["--continue-video", str(Path(ns.continue_video).resolve()), "--continue-context-frames", str(ns.continue_context_frames)]
+                continue_path = Path(ns.continue_video).resolve()
+                sample_cmd += ["--continue-video", str(continue_path), "--continue-context-frames", str(ns.continue_context_frames)]
+                if ns.latent_continuation:
+                    latent_sidecar = continue_path.with_suffix(".h3latent.pt")
+                    if latent_sidecar.is_file():
+                        sample_cmd += ["--continue-latent", str(latent_sidecar)]
+                        print(f"Latent continuation: using saved H3 state {latent_sidecar.name}", flush=True)
+                    else:
+                        print(f"Latent continuation requested, but no sidecar was found at {latent_sidecar.name}; falling back to decoded-video history.", flush=True)
                 if ns.continue_audio_memory:
                     sample_cmd += ["--continue-audio-memory", "--audio-vae", str(av)]
         subprocess.check_call(sample_cmd, cwd=ROOT, env=sample_env)
@@ -468,6 +486,15 @@ def main():
             except Exception as exc:
                 print(f"ERROR: Glue results failed: {type(exc).__name__}: {exc}", flush=True)
                 return 2
+        # Keep the raw MiniMax H3 A/V latent beside every successful rendered result.
+        # It is intentionally a sidecar, so normal MP4 workflows remain unchanged and
+        # manual/external videos simply fall back to the existing decoded-video path.
+        latent_sidecar = out.with_suffix(".h3latent.pt")
+        try:
+            shutil.copy2(lat, latent_sidecar)
+            print(f"Saved H3 latent sidecar: {latent_sidecar}", flush=True)
+        except Exception as exc:
+            print(f"WARNING: video completed but H3 latent sidecar could not be saved ({type(exc).__name__}: {exc})", flush=True)
         if audio_ok:
             print("Saved with audio:", out, flush=True); return 0
         print("Saved FULL video-only fallback:", out, flush=True); return 3
