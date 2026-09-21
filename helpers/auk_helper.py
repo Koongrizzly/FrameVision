@@ -738,7 +738,7 @@ class AuKHelperWidget(QWidget):
 
     def _duration_spin(self, default=6.0) -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
-        spin.setRange(0.5, 120.0)
+        spin.setRange(0.5, 600.0)
         spin.setDecimals(1)
         spin.setSingleStep(0.5)
         spin.setSuffix(" s")
@@ -774,7 +774,7 @@ class AuKHelperWidget(QWidget):
         seconds += len(re.findall(r"[.!?]+", text)) * 0.34
         seconds += len(re.findall(r"\n+", text)) * 0.22
         seconds += 0.35
-        return max(0.8, min(120.0, seconds))
+        return max(0.8, min(600.0, seconds))
 
     def _toggle_auto_duration(self, prefix: str, enabled: bool):
         spin = getattr(self, f"{prefix}_duration")

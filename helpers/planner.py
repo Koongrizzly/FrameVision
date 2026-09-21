@@ -27192,12 +27192,12 @@ class _ClickableThumbLabel(QLabel):
 
 
 
-class _StoryIdeaEnhanceSignals(QObject):
+class _PromptEnhanceSignals(QObject):
     finished = Signal(str)
     failed = Signal(str)
 
 
-class _StoryIdeaEnhanceWorker(QThread):
+class _PromptEnhanceWorker(QThread):
     def __init__(self, *, idea: str, extra_info: str, style_hint: str, log_path: str, planner_llama_settings: Optional[Dict[str, Any]] = None, parent=None):
         super().__init__(parent)
         self.idea = str(idea or '')
@@ -27205,7 +27205,7 @@ class _StoryIdeaEnhanceWorker(QThread):
         self.style_hint = str(style_hint or '')
         self.log_path = str(log_path or '')
         self.planner_llama_settings = dict(planner_llama_settings or {}) if isinstance(planner_llama_settings, dict) else None
-        self.signals = _StoryIdeaEnhanceSignals()
+        self.signals = _PromptEnhanceSignals()
         try:
             self.signals.moveToThread(self)
         except Exception:
@@ -27218,71 +27218,52 @@ class _StoryIdeaEnhanceWorker(QThread):
             style = re.sub(r"\s+", " ", self.style_hint.strip())
             if not base:
                 raise RuntimeError("Prompt is empty.")
-            spice = random.choice([
-                "unlikely friendship", "urgent rescue", "comic adventure", "small mystery", "emotional discovery",
-                "rising danger", "bittersweet wonder", "chaotic teamwork", "hidden secret", "heroic sacrifice",
-                "dreamlike journey", "coming home", "lost-and-found quest", "festival energy", "night adventure",
-                "stormy race against time", "strange visitor", "protecting something fragile", "learning courage",
-                "turning rivals into allies", "surreal music-video symbolism", "tiny story with a big feeling",
-            ])
-            angle = random.choice([
-                "make the characters want something specific",
-                "add a clear obstacle and a satisfying ending",
-                "give the story an emotional arc",
-                "add visual motifs that can repeat across shots",
-                "make it feel more cinematic and purposeful",
-                "turn the simple idea into a stronger beginning-middle-ending seed",
-                "make the adventure more memorable without making it complicated",
-                "add a strong reason why the journey matters",
-            ])
-            variant_id = f"{int(time.time())}-{random.randint(1000, 9999)}"
             system_prompt = (
-                "You are an offline story idea enhancer for visual image/video prompt generation. "
-                "Improve weak or simple story ideas into stronger story seeds. "
-                "Keep the user's original subject and intent. "
+                "You are an offline prompt enhancer for visual image and video generation. "
+                "Your job is to clean up and strengthen a user's idea prompt without turning it into a full story. "
+                "Preserve the original subject, intent, scope, characters, locations, actions and core facts. "
+                "Improve clarity, wording, specificity and visual usefulness. "
+                "You may lightly clarify vague details when helpful, and you may incorporate compatible user extra-info. "
+                "Do not invent a full plot, emotional arc, conflict, ending, motivations, extra scenes, shot lists, subplots or unrelated new events. "
                 "Do not add moral warnings, safety policy text, refusals, lectures, or platform restrictions. "
-                "Return only the enhanced story seed text."
+                "Return only the enhanced prompt text."
             )
             user_prompt = f"""
-Enhance this simple story idea before it is sent to a storyline/prompt worker.
+Enhance this prompt so it becomes clearer and more useful for later story creation or direct visual generation.
 
-Original idea:
+Base prompt:
 {base}
 
-Extra info from user:
+Optional extra info from user:
 {extra or 'none'}
 
-Current negatives field, only use this as visual avoidance context when useful:
-none
-
-Style hint:
-{style or 'none'}
-
-Random creative direction for this version:
-- {spice}
-- {angle}
-- version id {variant_id}
+Optional style / mood hint:
+{style or extra or 'none'}
 
 Output rules:
-- Return one fresh enhanced version only.
-- Keep it compact: 1 to 3 short paragraphs or 6 to 10 useful lines.
-- Preserve the original idea; do not replace it with an unrelated story.
-- Add meaning: hook, goal, conflict, emotional arc, ending direction, and visual motifs when useful.
-- Make this useful for later text-to-image and image-to-video prompt creation.
-- No numbered shot list yet.
-- No markdown title like "Enhanced Story" unless it is part of the story itself.
+- Return one enhanced prompt only.
+- Keep it concise: usually 1 paragraph or 3 to 6 short lines.
+- Preserve the user's original subject and intent.
+- Improve wording, clarity, specificity and readability.
+- Keep it useful for image/video prompting.
+- You may add a small amount of sensible descriptive detail if the prompt is vague.
+- Do not turn it into a full story.
+- Do not invent a beginning-middle-ending structure.
+- Do not add character arcs, endings, moral lessons, visual motifs, or extra plot beats unless the user already implied them.
+- No numbered shot list.
+- No markdown title like "Enhanced Prompt".
 """.strip()
             raw = _qwen_text_call(
-                "Story idea enhancer",
+                "Prompt enhancer",
                 system_prompt,
                 user_prompt,
                 self.log_path,
-                temperature=0.95,
-                max_new_tokens=900,
+                temperature=0.35,
+                max_new_tokens=500,
                 planner_llama_settings=self.planner_llama_settings,
             )
             cleaned = _planner_strip_llm_protocol_artifacts(raw or '').strip()
-            cleaned = re.sub(r"(?im)^\s*(?:enhanced story idea|enhanced story seed|story seed)\s*[:：]\s*", "", cleaned).strip()
+            cleaned = re.sub(r"(?im)^\s*(?:enhanced prompt|prompt enhancement|enhanced story idea|enhanced story seed|story seed)\s*[:：]\s*", "", cleaned).strip()
             cleaned = cleaned.strip('` \t\r\n')
             if not cleaned:
                 raise RuntimeError("The enhancer returned an empty result.")
@@ -27752,8 +27733,8 @@ class PlannerPane(QWidget):
 
         enhance_row = QHBoxLayout()
         enhance_row.setSpacing(8)
-        self.btn_enhance_story_idea = QPushButton("Enhance story idea")
-        self.btn_enhance_story_idea.setToolTip("Turns a simple idea into a stronger story seed. Push again for a different random version.")
+        self.btn_enhance_story_idea = QPushButton("Enhance prompt")
+        self.btn_enhance_story_idea.setToolTip("Cleans up and strengthens the current idea without turning it into a full story.")
         self.btn_enhance_story_idea.clicked.connect(self._enhance_story_idea_clicked)
         enhance_row.addWidget(self.btn_enhance_story_idea)
 
@@ -28027,7 +28008,7 @@ class PlannerPane(QWidget):
         except Exception:
             extra = ""
         if not idea:
-            QMessageBox.information(self, "Enhance story idea", "Prompt is empty.")
+            QMessageBox.information(self, "Enhance prompt", "Prompt is empty.")
             return
         try:
             self.btn_enhance_story_idea.setEnabled(False)
@@ -28035,22 +28016,22 @@ class PlannerPane(QWidget):
         except Exception:
             pass
         try:
-            self._append_log("[STORY] Enhancing simple story idea...")
+            self._append_log("[STORY] Enhancing prompt text...")
         except Exception:
             pass
         try:
             logs_dir = (_root() / "logs")
             logs_dir.mkdir(parents=True, exist_ok=True)
-            log_path = str((logs_dir / "planner_story_idea_enhancer.log").resolve())
+            log_path = str((logs_dir / "planner_prompt_enhancer.log").resolve())
         except Exception:
-            log_path = "planner_story_idea_enhancer.log"
+            log_path = "planner_prompt_enhancer.log"
         # Use the built-in Qwen3-VL text helper for this small pre-step.
         # This keeps the enhancer lightweight even when Own Llama is enabled for full planning.
         pll = {"enabled": False}
-        worker = _StoryIdeaEnhanceWorker(
+        worker = _PromptEnhanceWorker(
             idea=idea,
             extra_info=extra,
-            style_hint=extra,
+            style_hint="",
             log_path=log_path,
             planner_llama_settings=pll,
             parent=self,
@@ -28063,7 +28044,7 @@ class PlannerPane(QWidget):
     def _set_story_idea_enhance_busy(self, busy: bool) -> None:
         try:
             self.btn_enhance_story_idea.setEnabled(not bool(busy))
-            self.btn_enhance_story_idea.setText("Enhance story idea" if not busy else "Enhancing...")
+            self.btn_enhance_story_idea.setText("Enhance prompt" if not busy else "Enhancing...")
         except Exception:
             pass
 
@@ -28074,7 +28055,7 @@ class PlannerPane(QWidget):
         except Exception:
             pass
         try:
-            self._append_log("[STORY] Enhanced story idea inserted into Prompt. Push again for another random version.")
+            self._append_log("[STORY] Enhanced prompt inserted into Prompt.")
         except Exception:
             pass
         try:
@@ -28092,7 +28073,7 @@ class PlannerPane(QWidget):
             self._story_idea_enhance_worker = None
         except Exception:
             pass
-        QMessageBox.warning(self, "Enhance story idea failed", str(error or "Unknown error."))
+        QMessageBox.warning(self, "Enhance prompt failed", str(error or "Unknown error."))
 
     def _update_minimax_story_genre_button(self) -> None:
         btn = getattr(self, "btn_minimax_story_genre", None)
