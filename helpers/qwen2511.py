@@ -179,6 +179,27 @@ def _load_mage_edit_ui_class():
             return None
 
 
+_LAST_QWEN_IMAGE_21_IMPORT_ERROR = ""
+
+def _load_qwen_image_21_ui_class():
+    """Load the standalone Qwen Image 2.1 widget for embedding as an outer tab."""
+    global _LAST_QWEN_IMAGE_21_IMPORT_ERROR
+    _LAST_QWEN_IMAGE_21_IMPORT_ERROR = ""
+    errors = []
+    try:
+        from helpers.qwen_image_2_1_sd_cpp_gui import QwenImage21Widget  # type: ignore
+        return QwenImage21Widget
+    except Exception as exc:
+        errors.append("helpers.qwen_image_2_1_sd_cpp_gui: " + "".join(traceback.format_exception_only(type(exc), exc)).strip())
+    try:
+        from qwen_image_2_1_sd_cpp_gui import QwenImage21Widget  # type: ignore
+        return QwenImage21Widget
+    except Exception as exc:
+        errors.append("qwen_image_2_1_sd_cpp_gui: " + "".join(traceback.format_exception_only(type(exc), exc)).strip())
+    _LAST_QWEN_IMAGE_21_IMPORT_ERROR = "\n".join(errors)
+    return None
+
+
 class ClickableLabel(QtWidgets.QLabel):
     """Tiny clickable thumbnail label."""
     clicked = QtCore.Signal()
@@ -2289,6 +2310,16 @@ class Qwen2511Pane(QtWidgets.QWidget):
         self.tabs.addTab(self.qwen_host_page, "Qwen Edit")
         self._refresh_qwen_backend_visibility()
 
+        # Qwen Image 2.1 is a separate create/edit backend. Keep it lazy so the
+        # existing Qwen Edit 2511 startup path stays as fast and stable as before.
+        self.tabs.addTab(
+            self._make_lazy_placeholder(
+                "Qwen Image 2.1",
+                "Qwen Image 2.1 is not loaded yet. It will import when this tab is opened.",
+            ),
+            "Qwen Image 2.1",
+        )
+
         # --- Optional tool pages ---
         # Flux Klein and FireRed can stay lazy. HiDream must be eager-loaded:
         # the embedded HiDream tab is used by FrameVision workflows and the
@@ -2701,7 +2732,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
         try:
             if self._find_tab_index_by_title(title) >= 0:
                 return
-            order = ["Qwen Edit", "Flux Klein", "HiDream Image Edit", "Mage Edit", "Firered 1.1"]
+            order = ["Qwen Edit", "Qwen Image 2.1", "Flux Klein", "HiDream Image Edit", "Mage Edit", "Firered 1.1"]
             wanted_pos = order.index(title) if title in order else len(order)
             insert_at = self.tabs.count()
             for i in range(self.tabs.count()):
@@ -2828,7 +2859,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
                 if hasattr(self, "tabs") and self.tabs is not None:
                     idx = int(self.tabs.currentIndex())
                     title = str(self.tabs.tabText(idx)).strip() if 0 <= idx < self.tabs.count() else ""
-                    if title in {"Flux Klein", "Firered 1.1"} and title not in getattr(self, "_lazy_tab_loaded", set()):
+                    if title in {"Qwen Image 2.1", "Flux Klein", "Firered 1.1"} and title not in getattr(self, "_lazy_tab_loaded", set()):
                         self._set_lazy_placeholder_message(
                             idx,
                             title,
@@ -2859,7 +2890,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
                 return
             idx = int(self.tabs.currentIndex())
             title = str(self.tabs.tabText(idx)).strip() if 0 <= idx < self.tabs.count() else ""
-            if title not in {"Flux Klein", "Firered 1.1"}:
+            if title not in {"Qwen Image 2.1", "Flux Klein", "Firered 1.1"}:
                 self._lazy_deferred_auto_load_done = True
                 return
             if title in getattr(self, "_lazy_tab_loaded", set()):
@@ -3023,6 +3054,26 @@ class Qwen2511Pane(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _build_qwen_image_21_tab(self) -> QtWidgets.QWidget:
+        cls = _load_qwen_image_21_ui_class()
+        if cls is None:
+            self.qwen_image_21_pane = None
+            detail = globals().get("_LAST_QWEN_IMAGE_21_IMPORT_ERROR", "") or "No Python exception was reported."
+            return self._make_tool_error_page(
+                "Qwen Image 2.1",
+                "qwen_image_2_1_sd_cpp_gui.py could not be imported.\n\nReason:\n" + str(detail),
+            )
+        try:
+            self.qwen_image_21_pane = cls(self)
+            try:
+                self.qwen_image_21_pane.setWindowTitle("")
+            except Exception:
+                pass
+            return self.qwen_image_21_pane
+        except Exception as exc:
+            self.qwen_image_21_pane = None
+            return self._make_tool_error_page("Qwen Image 2.1", str(exc))
+
     def _build_flux_tab(self) -> QtWidgets.QWidget:
         if _flux_klein_hidden_by_remove_hide():
             # Safety guard: the tab should not be added when both Flux Klein
@@ -3122,6 +3173,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
                 return
             title = str(self.tabs.tabText(idx)).strip()
             builders = {
+                "Qwen Image 2.1": self._build_qwen_image_21_tab,
                 "Flux Klein": self._build_flux_tab,
                 "Firered 1.1": self._build_firered_tab,
             }
@@ -3163,7 +3215,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
             if idx < 0 or idx >= self.tabs.count():
                 return
             title = str(self.tabs.tabText(idx)).strip()
-            if title not in {"Flux Klein", "Firered 1.1"}:
+            if title not in {"Qwen Image 2.1", "Flux Klein", "Firered 1.1"}:
                 return
             if title in getattr(self, "_lazy_tab_loaded", set()):
                 return
@@ -3192,7 +3244,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
                 tab_text = ""
 
             if (
-                tab_text in {"Flux Klein", "Firered 1.1"}
+                tab_text in {"Qwen Image 2.1", "Flux Klein", "Firered 1.1"}
                 and tab_text not in getattr(self, "_lazy_tab_loaded", set())
                 and False
             ):
@@ -3207,6 +3259,7 @@ class Qwen2511Pane(QtWidgets.QWidget):
                 return
 
             banner_map = {
+                "Qwen Image 2.1": "Qwen Image 2.1 (stable-diffusion.cpp)",
                 "Flux Klein": "FLUX Klein 2 Create + Edit (4B & 9B gguf loader)",
                 "HiDream Image Edit": "HiDream Image Edit (BF16 Base / Dev)",
                 "Mage Edit": "Mage Flow Edit",
