@@ -16,11 +16,13 @@ Design rules:
 - The original full song is muxed back at final assembly; generated clip audio is not used
   as the final soundtrack.
 
-This standalone helper keeps each real job as a persistent reopenable project and calls the
-existing helpers/generate_ref.py backend.
+This helper intentionally does not import the old LTX Music Clip Creator. Each MiniMax job
+now owns a complete persistent project manifest in its output folder and calls the existing
+helpers/generate_ref.py backend.
 """
 
 import json
+import importlib.util
 import hashlib
 import concurrent.futures
 import math
@@ -34,18 +36,20 @@ import threading
 import sys
 import tempfile
 import urllib.request
+import urllib.error
+import socket
 import zipfile
 import time
 import uuid
-import wave
 from datetime import datetime, timezone
+import wave
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
-    from PySide6.QtCore import QThread, Qt, Signal, QUrl, QTimer
-    from PySide6.QtGui import QDesktopServices, QPixmap
+    from PySide6.QtCore import QThread, Qt, Signal, QUrl, QTimer, QEvent
+    from PySide6.QtGui import QDesktopServices, QPixmap, QPalette
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -90,72 +94,10 @@ def _detect_project_root() -> Path:
 
 ROOT = _detect_project_root()
 HELPERS_DIR = ROOT / "helpers"
-OUTPUT_ROOT = ROOT / "output" / "minimax_music_clips"
+OUTPUT_ROOT = ROOT / "output" / "videoclips" / "minimaxh3"
 SETTINGS_PATH = ROOT / "presets" / "minimax_music_clip_settings.json"
-MAIN_GUI_SETTINGS_PATH = ROOT / "presets" / "setsave" / "minimax_h3_gui_last.json"
 AUTOSAVE_PATH = ROOT / "presets" / "setsave" / "minimax_music_clip.json"
-FILE_DIALOG_HISTORY = ROOT / "presets" / "setsave" / "minimax_file_dialog_history.json"
-
-
-def _dialog_start_dir(key: str, preferred: str | Path | None = None, fallback: str | Path | None = None) -> str:
-    for candidate in (preferred,):
-        if candidate:
-            try:
-                q = Path(str(candidate)).expanduser()
-                if q.is_file():
-                    q = q.parent
-                if q.is_dir():
-                    return str(q)
-            except Exception:
-                pass
-    try:
-        if FILE_DIALOG_HISTORY.is_file():
-            data = json.loads(_read_text_tolerant(FILE_DIALOG_HISTORY))
-            folders = data.get("folders", {}) if isinstance(data, dict) else {}
-            for candidate in (folders.get(key), data.get("last_folder")):
-                if candidate and Path(candidate).is_dir():
-                    return str(Path(candidate))
-    except Exception:
-        pass
-    try:
-        q = Path(str(fallback or ROOT)).expanduser()
-        if q.is_file():
-            q = q.parent
-        if q.is_dir():
-            return str(q)
-    except Exception:
-        pass
-    return str(ROOT)
-
-
-def _remember_dialog_folder(key: str, selected: str | Path) -> None:
-    if not selected:
-        return
-    try:
-        q = Path(str(selected)).expanduser()
-        folder = q if q.is_dir() else q.parent
-        if not folder.is_dir():
-            return
-        data = {}
-        if FILE_DIALOG_HISTORY.is_file():
-            try:
-                data = json.loads(_read_text_tolerant(FILE_DIALOG_HISTORY))
-            except Exception:
-                data = {}
-        if not isinstance(data, dict):
-            data = {}
-        folders = data.get("folders")
-        if not isinstance(folders, dict):
-            folders = {}
-        folders[key] = str(folder)
-        data["folders"] = folders
-        data["last_folder"] = str(folder)
-        FILE_DIALOG_HISTORY.parent.mkdir(parents=True, exist_ok=True)
-        tmp = FILE_DIALOG_HISTORY.with_suffix(FILE_DIALOG_HISTORY.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        tmp.replace(FILE_DIALOG_HISTORY)
-    except Exception:
-        pass
+ASSISTANT_HANDOFF_PATH = ROOT / "presets" / "setsave" / "minimax_music_clip_assistant_handoff.json"
 PROJECT_MANIFEST_NAME = "minimax_music_project.json"
 PROJECT_MARKER_NAME = ".minimax_music_project.json"
 PROJECT_ASSETS_DIRNAME = "project_assets"
@@ -170,12 +112,147 @@ MINIMAX_PY = MINIMAX_ENV / "python.exe"
 if not MINIMAX_PY.is_file():
     MINIMAX_PY = MINIMAX_ENV / "Scripts" / "python.exe"
 GENERATE_REF = HELPERS_DIR / "generate_ref.py"
+DIFFUSION_MODELS_DIR = ROOT / "models" / "minimax_h3" / "diffusion_models"
+LORA_MODELS_DIR = ROOT / "models" / "minimax_h3" / "loras"
+
+def _find_music_hybrid_checkpoint() -> Optional[Path]:
+    """Prefer the newer SparseRef/hybrid checkpoints for Ref2VA music jobs."""
+    if not DIFFUSION_MODELS_DIR.is_dir():
+        return None
+    candidates = [p for p in DIFFUSION_MODELS_DIR.glob("*.safetensors") if p.is_file()]
+    def score(path: Path) -> tuple[int, str]:
+        name = path.name.lower()
+        if "sparseref" in name and "hybrid" in name:
+            rank = 0
+        elif "sparseref" in name:
+            rank = 1
+        elif "hybrid" in name:
+            rank = 2
+        elif "fused" in name and "ref" in name:
+            rank = 3
+        else:
+            rank = 99
+        return rank, name
+    candidates = [p for p in candidates if score(p)[0] < 99]
+    return min(candidates, key=score).resolve() if candidates else None
+
+def _find_music_turbo_lora() -> Optional[Path]:
+    """Pick a speed/Turbo LoRA only when the project has no explicit saved LoRA."""
+    if not LORA_MODELS_DIR.is_dir():
+        return None
+    candidates = [p for p in LORA_MODELS_DIR.glob("*.safetensors") if p.is_file()]
+    def score(path: Path) -> tuple[int, str]:
+        name = path.name.lower()
+        if "turbo" in name and "ema" in name:
+            rank = 0
+        elif "turbo" in name:
+            rank = 1
+        elif "ema" in name:
+            rank = 2
+        else:
+            rank = 99
+        return rank, name
+    candidates = [p for p in candidates if score(p)[0] < 99]
+    return min(candidates, key=score).resolve() if candidates else None
 
 NORMAL_FRAME_MAX = 719
 MUSIC_FRAME_MIN = 124
 MUSIC_FRAME_DEFAULT_MAX = 396
 MUSIC_FRAME_GRID = tuple(range(MUSIC_FRAME_MIN, MUSIC_FRAME_DEFAULT_MAX + 1, 17))
 FPS = 24.0
+
+
+_BG_REMOVE_HELPER = None
+_BG_REMOVE_HELPER_ERROR = ""
+
+
+def _load_background_helper():
+    global _BG_REMOVE_HELPER, _BG_REMOVE_HELPER_ERROR
+    if _BG_REMOVE_HELPER is not None:
+        return _BG_REMOVE_HELPER
+    candidates = [
+        ROOT / "helpers" / "background.py",
+        Path(__file__).resolve().with_name("background.py"),
+    ]
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            spec = importlib.util.spec_from_file_location("fv_background_helper", str(candidate))
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _BG_REMOVE_HELPER = module
+            _BG_REMOVE_HELPER_ERROR = ""
+            return module
+        except Exception as exc:
+            _BG_REMOVE_HELPER_ERROR = str(exc)
+    if not _BG_REMOVE_HELPER_ERROR:
+        _BG_REMOVE_HELPER_ERROR = "helpers/background.py was not found"
+    return None
+
+
+def _remove_background_from_reference_image(path: str, out_dir: Path) -> tuple[str, str]:
+    try:
+        helper = _load_background_helper()
+        if helper is None:
+            return path, _BG_REMOVE_HELPER_ERROR or "background helper unavailable"
+        models_dir = Path(helper.ROOT) / "models" / "bg"
+        modnet = helper.OnnxModel(helper._modnet_model_path(models_dir), "MODNet")
+        biref = helper.OnnxModel(helper._birefnet_model_path(models_dir), "BiRefNet")
+        if modnet.is_available():
+            engine = "modnet"
+            engine_label = "MODNet"
+        elif biref.is_available():
+            engine = "birefnet"
+            engine_label = "BiRefNet"
+        else:
+            return path, f"no MODNet/BiRefNet model found in {models_dir}"
+        source = Path(path).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cached = out_dir / f"{source.stem}_cutout.png"
+        try:
+            if cached.is_file() and cached.stat().st_mtime >= source.stat().st_mtime:
+                return str(cached), f"{engine_label} cached cutout"
+        except Exception:
+            pass
+        produced = helper.remove_background_file(
+            str(source),
+            engine=engine,
+            mode="keep_subject",
+            feather=6,
+            out_dir=str(out_dir),
+        )
+        return str(produced), f"{engine_label} cutout"
+    except Exception as exc:
+        return path, f"background removal failed: {exc}"
+
+
+def _should_remove_reference_background(kind: str) -> bool:
+    return _normalise_reference_kind(kind) in ("Character", "Object / Prop")
+
+
+def _prepare_music_generation_references(project: MusicProject, refs: Sequence[ReferenceAsset], out_dir: str | Path) -> tuple[List[ReferenceAsset], List[str]]:
+    if not bool(getattr(project, "remove_reference_backgrounds", True)):
+        return list(refs), []
+    cache_dir = Path(out_dir).resolve() / "_reference_cutouts"
+    prepared: List[ReferenceAsset] = []
+    notes: List[str] = []
+    for ref in refs:
+        if not _should_remove_reference_background(ref.kind):
+            prepared.append(ref)
+            continue
+        new_path, note = _remove_background_from_reference_image(ref.path, cache_dir)
+        if os.path.normcase(str(new_path)) != os.path.normcase(str(ref.path)):
+            prepared.append(ReferenceAsset(name=ref.name, kind=ref.kind, path=str(new_path), description=ref.description, enabled=ref.enabled))
+            notes.append(f"{ref.name}: {note}")
+        else:
+            prepared.append(ref)
+            if note and ("failed" in note.lower() or "unavailable" in note.lower() or "no modnet" in note.lower()):
+                notes.append(f"{ref.name}: {note}; using original reference")
+    return prepared, notes
+
 
 
 def _music_project_identity(title: str, audio_path: str) -> str:
@@ -205,7 +282,7 @@ def _safe_asset_name(index: int, path: str) -> str:
 
 
 def _copy_project_asset(source: str | Path, destination: Path) -> str:
-    """Keep a project-local snapshot without changing the live source path."""
+    """Keep a project-local snapshot without rewriting the live source path."""
     try:
         src = Path(source).expanduser().resolve()
         if not src.is_file():
@@ -277,6 +354,7 @@ def _persist_project_manifest(project: "MusicProject", snapshot_assets: bool = T
                     "snapshot": str(local.relative_to(out_dir)) if copied else "",
                 })
         else:
+            # Preserve asset metadata from an existing manifest when this is a fast state-only update.
             try:
                 if manifest.is_file():
                     old = json.loads(_read_text_tolerant(manifest))
@@ -291,11 +369,6 @@ def _persist_project_manifest(project: "MusicProject", snapshot_assets: bool = T
                 prompt_file = raw_dir / f"shot_{shot.index:03d}_prompt.txt"
                 if prompt_file.is_file():
                     assets.setdefault("prompt_files", {})[str(shot.index)] = str(prompt_file.relative_to(out_dir))
-                    if not getattr(shot, "generation_prompt", ""):
-                        try:
-                            shot.generation_prompt = _read_text_tolerant(prompt_file)
-                        except Exception:
-                            pass
 
         payload = {
             "manifest_version": 1,
@@ -310,6 +383,7 @@ def _persist_project_manifest(project: "MusicProject", snapshot_assets: bool = T
             tmp = manifest.with_suffix(manifest.suffix + ".tmp")
             tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
             os.replace(str(tmp), str(manifest))
+            # Keep the old hidden identity marker for compatibility, but never use it as a project save.
             marker = out_dir / PROJECT_MARKER_NAME
             marker.write_text(json.dumps({
                 "identity": project.output_identity,
@@ -323,57 +397,17 @@ def _persist_project_manifest(project: "MusicProject", snapshot_assets: bool = T
         return None
 
 
-def _latest_shot_output(raw_dir: Path, shot_index: int, current_path: str = "") -> Optional[Path]:
-    """Return the active rendered clip for a shot.
-
-    A successful recreation is intentionally written to shot_###_retry_TIMESTAMP.mp4 so
-    the original can stay open in a media player.  The newest retry is therefore the
-    authoritative output whenever one exists.  The stable shot_###.mp4 is only the
-    fallback for shots that have never been recreated.
-    """
-    if not raw_dir.is_dir():
-        return None
-
-    retries = []
-    try:
-        retries = [
-            path for path in raw_dir.glob(f"shot_{int(shot_index):03d}_retry_*.mp4")
-            if path.is_file() and path.stat().st_size > 0
-        ]
-    except Exception:
-        retries = []
-
-    if retries:
-        # Filename timestamps are sortable, and mtime is a useful tie breaker for the
-        # rare case where more than one retry was created in the same second.
-        retries.sort(key=lambda path: (path.name.lower(), path.stat().st_mtime_ns), reverse=True)
-        return retries[0].resolve()
-
-    current = Path(current_path) if current_path else None
-    if current is not None:
-        try:
-            if current.is_file() and current.stat().st_size > 0:
-                return current.resolve()
-        except Exception:
-            pass
-
-    base = raw_dir / f"shot_{int(shot_index):03d}.mp4"
-    try:
-        if base.is_file() and base.stat().st_size > 0:
-            return base.resolve()
-    except Exception:
-        pass
-    return None
-
-
 def _load_project_manifest(job_dir: Path) -> tuple["MusicProject", Path]:
-    """Load a persistent job folder and repair moved asset/output paths."""
+    """Load a persistent job folder and repair asset/output paths when originals moved."""
     job_dir = job_dir.expanduser().resolve()
     manifest = job_dir / PROJECT_MANIFEST_NAME
     if not manifest.is_file():
-        parent_candidate = job_dir.parent / PROJECT_MANIFEST_NAME
-        if parent_candidate.is_file():
-            job_dir, manifest = job_dir.parent, parent_candidate
+        # Allow selecting the manifest's parent/raw_clips/audio_chunks by mistake.
+        for parent in (job_dir.parent,):
+            candidate = parent / PROJECT_MANIFEST_NAME
+            if candidate.is_file():
+                job_dir, manifest = parent, candidate
+                break
     if not manifest.is_file():
         legacy = job_dir / PROJECT_MARKER_NAME
         if legacy.is_file():
@@ -413,15 +447,19 @@ def _load_project_manifest(job_dir: Path) -> tuple["MusicProject", Path]:
     raw_dir = job_dir / "raw_clips"
     if raw_dir.is_dir():
         for shot in project.shots:
-            active = _latest_shot_output(raw_dir, shot.index, shot.output_path)
-            if active is not None:
-                shot.output_path = str(active)
+            if shot.output_path and Path(shot.output_path).is_file():
+                continue
+            preferred = raw_dir / f"shot_{shot.index:03d}.mp4"
+            if preferred.is_file():
+                shot.output_path = str(preferred.resolve())
                 shot.status = "Generated"
-            elif shot.status == "Generated":
-                shot.output_path = ""
-                shot.status = "Planned"
+                continue
+            retries = sorted(raw_dir.glob(f"shot_{shot.index:03d}_retry_*.mp4"), key=lambda x: x.stat().st_mtime_ns, reverse=True)
+            if retries:
+                shot.output_path = str(retries[0].resolve())
+                shot.status = "Generated"
             prompt_file = raw_dir / f"shot_{shot.index:03d}_prompt.txt"
-            if prompt_file.is_file() and not getattr(shot, "generation_prompt", ""):
+            if prompt_file.is_file() and not shot.generation_prompt:
                 try:
                     shot.generation_prompt = _read_text_tolerant(prompt_file)
                 except Exception:
@@ -432,7 +470,6 @@ def _load_project_manifest(job_dir: Path) -> tuple["MusicProject", Path]:
 def _cleanup_music_clip_temp_artifacts() -> None:
     """Remove stale scratch data without touching rendered raw clips or final videos."""
     now = time.time()
-    # Analysis scratch dirs are normally deleted in a finally block, but crashes can leave them behind.
     try:
         temp_root = Path(tempfile.gettempdir())
         for child in temp_root.glob("fv_minimax_music_an_*"):
@@ -444,7 +481,6 @@ def _cleanup_music_clip_temp_artifacts() -> None:
     except Exception:
         pass
 
-    # Global Whisper scratch and thumbnail cache.
     for folder, max_age in ((OUTPUT_ROOT / "_temp", 3600), (OUTPUT_ROOT / "_preview_cache", 7 * 86400)):
         try:
             if not folder.is_dir():
@@ -452,18 +488,20 @@ def _cleanup_music_clip_temp_artifacts() -> None:
             for child in folder.iterdir():
                 try:
                     if now - child.stat().st_mtime > max_age:
-                        if child.is_dir(): shutil.rmtree(child, ignore_errors=True)
-                        else: child.unlink(missing_ok=True)
+                        if child.is_dir():
+                            shutil.rmtree(child, ignore_errors=True)
+                        else:
+                            child.unlink(missing_ok=True)
                 except Exception:
                     pass
             try:
-                if not any(folder.iterdir()): folder.rmdir()
+                if not any(folder.iterdir()):
+                    folder.rmdir()
             except Exception:
                 pass
         except Exception:
             pass
 
-    # Old assembly scratch directories can be large; only remove stale ones.
     try:
         if OUTPUT_ROOT.is_dir():
             for folder in OUTPUT_ROOT.rglob("_assembly"):
@@ -475,12 +513,27 @@ def _cleanup_music_clip_temp_artifacts() -> None:
     except Exception:
         pass
 
+    # Final prune: scratch cleanup can leave empty directory shells behind.
+    # Walk deepest-first so empty children are removed before their parents.
+    # Keep OUTPUT_ROOT itself as the permanent default destination.
+    try:
+        if OUTPUT_ROOT.is_dir():
+            dirs = [p for p in OUTPUT_ROOT.rglob("*") if p.is_dir()]
+            dirs.sort(key=lambda p: len(p.parts), reverse=True)
+            for folder in dirs:
+                try:
+                    if not any(folder.iterdir()):
+                        folder.rmdir()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
 RESOLUTION_PRESETS: Dict[str, Dict[str, Tuple[int, int]]] = {
     "576 × 320": {"16:9": (576, 320), "9:16": (320, 576), "1:1": (320, 320)},
     "736 × 384": {"16:9": (736, 384), "9:16": (384, 736), "1:1": (384, 384)},
     "832 × 480": {"16:9": (832, 480), "9:16": (480, 832), "1:1": (480, 480)},
     "960 × 544": {"16:9": (960, 544), "9:16": (544, 960), "1:1": (544, 544)},
-    "1024 × 576": {"16:9": (1024, 576), "9:16": (576, 1024), "1:1": (576, 576)},
     "1280 × 720": {"16:9": (1280, 704), "9:16": (704, 1280), "1:1": (704, 704)},
     "1344 × 768": {"16:9": (1344, 768), "9:16": (768, 1344), "1:1": (768, 768)},
     "1920 × 1088": {"16:9": (1920, 1088), "9:16": (1088, 1920), "1:1": (1088, 1088)},
@@ -512,10 +565,12 @@ def _fmt_time(seconds: float) -> str:
     return f"{minutes:02d}:{sec:05.2f}"
 
 
-
-
 def _read_text_tolerant(path) -> str:
-    """Read text files without failing on legacy or malformed byte sequences."""
+    """Read user/generated text without crashing on non-UTF-8 bytes.
+
+    Prefer UTF-8/UTF-8-BOM, then Windows-1252 for legacy Windows text,
+    and finally replace only undecodable bytes instead of aborting the workflow.
+    """
     p = Path(path)
     raw = p.read_bytes()
     for enc in ("utf-8-sig", "cp1252"):
@@ -527,8 +582,9 @@ def _read_text_tolerant(path) -> str:
 
 
 def _subprocess_text_kwargs() -> dict:
-    """Capture subprocess text without crashing on odd console glyphs."""
+    """Never let odd console glyphs/legacy bytes crash subprocess capture."""
     return {"text": True, "encoding": "utf-8", "errors": "replace"}
+
 
 def _existing_executable(candidates: Iterable[Path | str]) -> str:
     for candidate in candidates:
@@ -685,12 +741,21 @@ class MusicShot:
     lyrics: str = ""
     section: str = ""
     prompt: str = ""
-    generation_prompt: str = ""  # exact prompt handed to MiniMax for latest generation
+    generation_prompt: str = ""  # exact prompt handed to MiniMax for the latest generation
     reference_names: List[str] = field(default_factory=list)
     internal_cuts: List[float] = field(default_factory=list)  # song-absolute seconds
     output_path: str = ""
     status: str = "Planned"
     seed: int = -1
+    # Planner-style music-direction fields. These are deliberately separate from the
+    # final H3 prompt so the creative plan can be inspected/rebuilt without asking
+    # the LLM to know MiniMax prompt syntax.
+    director_action: str = ""
+    director_location: str = ""
+    director_camera: str = ""
+    director_section: str = ""
+    director_performance_mode: str = ""
+    director_reference_names: List[str] = field(default_factory=list)
 
     @property
     def edit_duration(self) -> float:
@@ -716,6 +781,8 @@ class MusicProject:
     characters_subjects: str = ""
     locations_world: str = ""
     camera_choreography: str = ""
+    auto_fill_locations: bool = False
+    auto_fill_camera: bool = False
     resolution: str = "832 × 480"
     aspect: str = "16:9"
     max_frames: int = MUSIC_FRAME_DEFAULT_MAX
@@ -726,13 +793,15 @@ class MusicProject:
     whisper_timing_enabled: bool = True
     visible_lyric_subtitles: bool = False
     job_seed: int = -1
-    steps: int = 15
+    steps: int = 10
     cfg: float = 1.0
     shift: float = 12.0
     audio_shift: float = 3.0
     ref_image_size: str = "match"
+    remove_reference_backgrounds: bool = True
     sage_attention: bool = False
-    spectrum: bool = False
+    sla_attention: bool = True
+    spectrum: bool = True
     use_hybrid_model: bool = False
     hybrid_model_path: str = ""
     vram_manager_enabled: bool = True
@@ -756,19 +825,59 @@ class MusicProject:
     vram_residency_refill_interval: int = 1
     turbo_lora_path: str = ""
     turbo_lora_strength: float = 1.0
+    extra_lora1_path: str = ""
+    extra_lora1_strength: float = 1.0
+    extra_lora2_path: str = ""
+    extra_lora2_strength: float = 1.0
     randomize_reference_characters: bool = False
     unlimited_random_references: bool = False
-    single_character_reference_per_clip: bool = False
+    use_framevision_queue: bool = False
+    use_hypir_x1_upscale: bool = False
+    use_lanczos_x2_upsampling: bool = False
     reference_random_seed: int = -1
-    # Snapshot of the authoritative main MiniMax GUI generation settings used for
-    # this project/job. The Music Clip Creator no longer owns a second copy of
-    # model/runtime controls; this is persisted only for review/reproducibility.
-    generation_settings_snapshot: Dict[str, Any] = field(default_factory=dict)
     references: List[ReferenceAsset] = field(default_factory=list)
     lyrics: List[LyricSegment] = field(default_factory=list)
     analysis: AnalysisResult = field(default_factory=AnalysisResult)
     shots: List[MusicShot] = field(default_factory=list)
 
+
+# ---------------------- planner-style music direction ----------------------
+#
+# The creative/LLM director is deliberately isolated in minimax_music_director.py.
+# Both the FrameVision-imported widget and the standalone MiniMax music creator can
+# import the same director module. Future creative-planner changes therefore live in
+# one file instead of requiring duplicate edits to both applications.
+try:
+    from .minimax_music_director import (
+        music_director_safe_task as _shared_music_director_safe_task,
+        apply_music_director_result as _shared_apply_music_director_result,
+        assign_music_shot_references as _shared_assign_music_shot_references,
+    )
+except ImportError:
+    from minimax_music_director import (
+        music_director_safe_task as _shared_music_director_safe_task,
+        apply_music_director_result as _shared_apply_music_director_result,
+        assign_music_shot_references as _shared_assign_music_shot_references,
+    )
+
+
+def _music_director_safe_task(progress, project: MusicProject) -> Dict[str, Any]:
+    return _shared_music_director_safe_task(
+        progress, project, root=ROOT,
+        clean_lyric=_clean_whisper_lyric_text,
+        normalize_ref_kind=_normalise_reference_kind,
+    )
+
+
+def _apply_music_director_result(project: MusicProject, result: Dict[str, Any]) -> bool:
+    return _shared_apply_music_director_result(project, result)
+
+
+def _assign_music_shot_references(project: MusicProject, shot: MusicShot) -> List[str]:
+    return _shared_assign_music_shot_references(
+        project, shot, normalize_ref_kind=_normalise_reference_kind,
+        fallback_assign=auto_assign_references,
+    )
 
 # ------------------------- lightweight music analysis -------------------------
 
@@ -1264,8 +1373,7 @@ def build_shot_plan(project: MusicProject) -> List[MusicShot]:
 
 def _selected_refs_for_shot(project: MusicProject, shot: MusicShot) -> List[ReferenceAsset]:
     by_name = {r.name: r for r in project.references if r.enabled and Path(r.path).is_file()}
-    names = _limit_character_reference_names(project, [name for name in shot.reference_names if name in by_name], list(by_name.values()))
-    return [by_name[name] for name in names if name in by_name][:9]
+    return [by_name[name] for name in shot.reference_names if name in by_name][:9]
 
 
 def _h3_ref_subject_definitions(project: MusicProject, refs: Sequence[ReferenceAsset], *, has_lyrics: bool = True) -> List[str]:
@@ -1459,7 +1567,7 @@ def build_h3_reference_prompt(
         )
     elif bool(getattr(project, "visible_lyric_subtitles", False)):
         sections.append(
-            "Visible lyric subtitles are enabled. The current lyric phrase from <Audio 1> may appear as synchronized readable subtitle/lyric text. "
+            "Visible lyric subtitles are enabled. The current lyric phrase from the supplied song may appear as synchronized readable subtitle/lyric text. "
             "Do not invent unrelated captions, title cards, logos, lower-thirds or other text. Text explicitly requested as a physical part of the scene may also remain visible."
         )
     else:
@@ -1468,9 +1576,14 @@ def build_h3_reference_prompt(
             "Only text explicitly requested as a physical part of a scene, object, poster, sign, monitor or interface may be visible. Do not turn spoken or sung words into on-screen text."
         )
 
-    # 2) summary. Creative-brief lists are option pools, not a checklist for one clip.
-    story_focus, story_pool_count = _creative_pool_choice(project.main_idea, shot.index, allow_commas=False)
-    story = re.sub(r"\s+", " ", story_focus.strip()) if story_focus.strip() else "the current music-video story"
+    # 2) summary. Planner-directed action wins; old creative-pool behavior remains
+    # as a fully compatible fallback when no local LLM is configured.
+    if str(getattr(shot, "director_action", "") or "").strip():
+        story_focus = str(shot.director_action).strip()
+        story_pool_count = 1
+    else:
+        story_focus, story_pool_count = _creative_pool_choice(project.main_idea, shot.index, allow_commas=False)
+    story = re.sub(r"\s+", " ", story_focus.strip()) if story_focus.strip() else "the current music-video performance"
     summary_bits = [f"[reference generation + audio reuse] Create a music-video shot for {story}."]
     if story_pool_count > 1:
         summary_bits.append("This is one selected story beat from the larger project idea; keep the other listed story beats for other clips instead of combining them here.")
@@ -1491,9 +1604,9 @@ def build_h3_reference_prompt(
         picture_summary = ", ".join(f"<Picture {picture_no}>" for _subject_no, picture_no, _ref in picture_anchors)
         summary_bits.append(f"Use {picture_summary} as concrete composition/shot-planning anchors rather than as character identities.")
     if has_lyrics:
-        summary_bits.append("Reuse <Audio 1> as the continuous authoritative song/performance source for this shot.")
+        summary_bits.append("Reuse the supplied audio as the continuous authoritative song/performance source for this shot.")
     else:
-        summary_bits.append("Reuse <Audio 1> as the continuous authoritative instrumental audio source for this shot; the visible character performs silent story action while the music continues unchanged.")
+        summary_bits.append("Reuse the supplied instrumental audio as the continuous authoritative audio source for this shot; the visible character performs silent story action while the music continues unchanged.")
     sections.append("summary:")
     sections.append(" ".join(summary_bits))
 
@@ -1532,17 +1645,21 @@ def build_h3_reference_prompt(
         )
     if has_lyrics:
         sections.append(
-            "<Audio 1>: fully_copy - keep the supplied song segment continuous as the target performance track; preserve its existing vocals, lyrics, instrumental passages, rhythm and timing instead of inventing replacement vocals or music."
+            "Supplied audio: fully_copy - keep the supplied song segment continuous as the target performance track; preserve its existing vocals, lyrics, instrumental passages, rhythm and timing instead of inventing replacement vocals or music."
         )
     else:
         sections.append(
-            "<Audio 1>: fully_copy - keep the supplied instrumental audio unchanged as the complete sound for this shot. Do not add any extra voice, speech, singing, humming, mumbling, narration or replacement music. Preserve its rhythm, beat, timing, continuity and musical energy."
+            "Supplied audio: fully_copy - keep the supplied instrumental audio unchanged as the complete sound for this shot. Do not add any extra voice, speech, singing, humming, mumbling, narration or replacement music. Preserve its rhythm, beat, timing, continuity and musical energy."
         )
 
     # 4) detailed_description
     sections.append("detailed_description:")
     style = re.sub(r"\s+", " ", project.style_theme.strip()) if project.style_theme.strip() else "cinematic music-video"
-    location, location_pool_count = _creative_pool_choice(project.locations_world, shot.index, allow_commas=True)
+    directed_location = str(getattr(shot, "director_location", "") or "").strip()
+    if directed_location:
+        location, location_pool_count = directed_location, 1
+    else:
+        location, location_pool_count = _creative_pool_choice(project.locations_world, shot.index, allow_commas=True)
     location = re.sub(r"\s+", " ", location.strip())
     if location:
         # Avoid awkward output such as "set in in the basement" when the user already
@@ -1571,17 +1688,30 @@ def build_h3_reference_prompt(
         shot1.append(f"Use {first_pictures} for the specified composition/framing purpose.")
     if story_focus.strip():
         shot1.append(re.sub(r"\s+", " ", story_focus.strip()) + ".")
-    shot1.append(f"This is the {shot.section or 'current'} section of the music video.")
-    camera_choice, camera_pool_count = _creative_pool_choice(project.camera_choreography, shot.index, allow_commas=True)
+    section_name = str(getattr(shot, "director_section", "") or shot.section or "current").strip()
+    shot1.append(f"This is the {section_name} section of the music video.")
+    directed_camera = str(getattr(shot, "director_camera", "") or "").strip()
+    if directed_camera:
+        camera_choice, camera_pool_count = directed_camera, 1
+    else:
+        camera_choice, camera_pool_count = _creative_pool_choice(project.camera_choreography, shot.index, allow_commas=True)
     if camera_choice.strip():
         shot1.append("Primary camera concept: " + re.sub(r"\s+", " ", camera_choice.strip()) + ".")
         if camera_pool_count > 1:
             shot1.append("Use this one selected camera concept as the dominant camera language for the clip. Do not stack the other camera moves from the Creative brief into this shot; they are reserved for later clips.")
+    performance_mode = re.sub(r"\s+", " ", str(getattr(shot, "director_performance_mode", "") or "").strip())
+    if performance_mode:
+        shot1.append(f"Performance mode: {performance_mode}.")
+    shot1.append(
+        "Music-video priority: keep the visible performers physically engaged with the music from the opening moment. "
+        "Use convincing rhythmic full-body action, choreography, vocal performance or other role-appropriate beat-driven interaction; avoid passive standing, blank posing or merely staring at the camera unless a brief deliberate visual break is explicitly directed. "
+        "Do not invent musical instruments or make any performer play an instrument unless the user-defined role, story direction or selected reference explicitly requires that instrument performance. Rappers and vocalists perform with voice, lip-sync, gestures, body movement and choreography rather than being turned into guitarists or drummers."
+    )
     if has_lyrics:
-        shot1.append("<Audio 1> begins immediately and remains continuous and synchronized with the visible vocal performance.")
+        shot1.append("The supplied song begins immediately and remains continuous and synchronized with the visible vocal performance.")
     else:
         shot1.append(
-            "<Audio 1> begins immediately as an instrumental-only passage and remains continuous. "
+            "The supplied instrumental audio begins immediately and remains continuous. "
             "Every visible character remains completely silent. Use expressive body movement, arm movement, eye movement and silent facial acting to communicate the story and react to the beat. "
             "Mouth movement stays minimal, natural and non-speaking, with no lip-sync, no sung articulation and no speech-like mouth shapes."
         )
@@ -1593,11 +1723,11 @@ def build_h3_reference_prompt(
             performer = f"<Subject {characters[0][0]}>"
             if visible_subtitles:
                 shot1.append(
-                    f"Lyric performance: <d>[Original language] {lyric}</d>. {performer} is the singer/performer and lip-syncs/sings these words in time with <Audio 1>. Visible lyric subtitles are enabled, so the current phrase may also appear as synchronized readable subtitle text."
+                    f"Lyric performance: <d>[Original language] {lyric}</d>. {performer} is the singer/performer and lip-syncs/sings these words in time with the supplied song. Visible lyric subtitles are enabled, so the current phrase may also appear as synchronized readable subtitle text."
                 )
             else:
                 shot1.append(
-                    f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. {performer} is the singer/performer and lip-syncs/sings these words in time with <Audio 1>. These lyric words are heard and lip-synced only; do not display them anywhere in the image."
+                    f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. {performer} is the singer/performer and lip-syncs/sings these words in time with the supplied song. These lyric words are heard and lip-synced only; do not display them anywhere in the image."
                 )
         elif len(characters) > 1:
             suffix = " Visible lyric subtitles are enabled for this phrase." if visible_subtitles else " The lyric words are audio-only and must not be displayed visually."
@@ -1607,15 +1737,15 @@ def build_h3_reference_prompt(
         else:
             if visible_subtitles:
                 shot1.append(
-                    f"Lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to <Audio 1>. Visible lyric subtitles are enabled and may show the current phrase."
+                    f"Lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to the supplied song. Visible lyric subtitles are enabled and may show the current phrase."
                 )
             else:
                 shot1.append(
-                    f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to <Audio 1>. These words are heard only and must not appear visually."
+                    f"Audio-only lyric performance: <d>[Original language] {lyric}</d>. Synchronize the visible performance and mouth movement to the supplied song. These words are heard only and must not appear visually."
                 )
     else:
         shot1.append(
-            "Instrumental interval: <Audio 1> contains the complete intended sound for this section. "
+            "Instrumental interval: the supplied audio contains the complete intended sound for this section. "
             "Translate every story idea into visible physical action rather than spoken or sung content. Characters may dance, gesture, react, work, move through the environment and interact with props, but they do not talk, sing, narrate, hum, mumble or mouth words. "
             "Do not interpret phrases such as asks, tells, explains, argues, jokes, calls, sings or says as permission to create audible speech; express the intended meaning silently through action and reaction instead."
         )
@@ -1627,9 +1757,9 @@ def build_h3_reference_prompt(
         ss = rel - mm * 60
         timestamp = f"{mm:02d}:{ss:06.3f}"
         if has_lyrics:
-            continuity = "<Audio 1> continues seamlessly across the cut with unchanged musical timing and vocal continuity."
+            continuity = "The supplied song continues seamlessly across the cut with unchanged musical timing and vocal continuity."
         else:
-            continuity = "<Audio 1> continues seamlessly across the cut as the same instrumental passage; every character remains completely silent with minimal natural non-speaking mouth movement and communicates only through visible action and reaction."
+            continuity = "The supplied instrumental audio continues seamlessly across the cut; every character remains completely silent with minimal natural non-speaking mouth movement and communicates only through visible action and reaction."
         sections.append(
             f"[Shot {cut_no}] At {timestamp}, the camera cuts to a complementary new angle or visual beat within the same established scene. "
             "Keep the same character identities, performer roles, props and background/location roles. " + continuity
@@ -1647,17 +1777,17 @@ def build_h3_reference_prompt(
     sections.append("overall_soundscape:")
     if has_lyrics:
         sections.append(
-            "Natural physical ambience and incidental scene sounds may be subtle and secondary. Keep <Audio 1> dominant, continuous and clearly synchronized with the vocal performance."
+            "Natural physical ambience and incidental scene sounds may be subtle and secondary. Keep the supplied song dominant, continuous and clearly synchronized with the vocal performance."
         )
     else:
         sections.append(
-            "<Audio 1> is the complete instrumental soundtrack for this interval. Natural physical ambience may be subtle and secondary, but must not replace, interrupt or compete with the supplied instrumental audio. Every visible character remains a silent visual participant rather than a speaker or singer."
+            "The supplied instrumental audio is the complete soundtrack for this interval. Natural physical ambience may be subtle and secondary, but must not replace, interrupt or compete with it. Every visible character remains a silent visual participant rather than a speaker or singer."
         )
     sections.append("non_diegetic_music:")
     if has_lyrics:
-        sections.append("<Audio 1> is directly reused as the complete music track for this shot. Do not add a separate score or replacement music.")
+        sections.append("The supplied audio is directly reused as the complete music track for this shot. Do not add a separate score or replacement music.")
     else:
-        sections.append("<Audio 1> is directly reused as the complete music track for this shot. Do not add a separate score, voice, vocalization or replacement music.")
+        sections.append("The supplied audio is directly reused as the complete music track for this shot. Do not add a separate score, voice, vocalization or replacement music.")
 
     return "\n".join(x.strip() for x in sections if x and x.strip())
 
@@ -1727,10 +1857,10 @@ def build_generation_prompt(project: MusicProject, shot: MusicShot, selected_ref
 def _randomized_character_reference_names(project: MusicProject, shot: MusicShot, enabled: Sequence[ReferenceAsset]) -> List[str]:
     """Return a stable per-shot random Character subset.
 
-    Normal random mode keeps the established one-or-two random picks. Unlimited
+    Normal random mode keeps the established one-or-two random picks.  Unlimited
     random mode treats the full Character pool as a shuffled deck: references are
     consumed across clips without repetition until every item has been used, then a
-    new deterministic shuffled round begins. The saved project seed makes rebuilds
+    new deterministic shuffled round begins.  The saved project seed makes rebuilds
     and retries reproduce the exact same assignment.
     """
     if not bool(getattr(project, "randomize_reference_characters", False)):
@@ -1738,8 +1868,7 @@ def _randomized_character_reference_names(project: MusicProject, shot: MusicShot
     chars = [r for r in enabled if _normalise_reference_kind(r.kind) == "Character" and r.name]
     if not chars:
         return []
-    single_character = bool(getattr(project, "single_character_reference_per_clip", False))
-    max_count = 1 if single_character else min(2, len(chars))
+    max_count = min(2, len(chars))
     try:
         base_seed = int(getattr(project, "reference_random_seed", -1))
     except Exception:
@@ -1768,17 +1897,17 @@ def _randomized_character_reference_names(project: MusicProject, shot: MusicShot
 
     names = [r.name for r in chars]
 
-    # Determine how many cards all earlier clips consumed. Counts are generated from
+    # Determine how many cards all earlier clips consumed.  Counts are generated from
     # per-shot deterministic RNGs so requesting shot N never depends on call order.
     def count_for(index: int) -> int:
-        if single_character or len(names) <= 1:
+        if len(names) <= 1:
             return 1
         return random.Random(f"{base_seed}:count:{index}:{len(names)}").randint(1, 2)
 
     offset = sum(count_for(i) for i in range(1, shot_index))
     count = count_for(shot_index)
 
-    # Build only the rounds needed for this shot. Each round contains every ref once.
+    # Build only the rounds needed for this shot.  Each round contains every ref once.
     needed = offset + count
     stream: List[str] = []
     round_no = 0
@@ -1790,102 +1919,13 @@ def _randomized_character_reference_names(project: MusicProject, shot: MusicShot
     return stream[offset:offset + count]
 
 
-def _limit_character_reference_names(project: MusicProject, names: Sequence[str], enabled: Sequence[ReferenceAsset]) -> List[str]:
-    """Limit reference usage according to the per-clip cap mode.
-
-    Legacy field name aside, the "Use only 1 ref per clip" toggle is intended to
-    mean at most one reference per role/type in a single prompt: one Character,
-    one Background / Location, one Object / Prop, one Style / Mood, one Picture /
-    Composition anchor, and one Other.
-    """
-    ordered = list(names)
-    if not bool(getattr(project, "single_character_reference_per_clip", False)):
-        # Normal mode keeps the existing project/router order, de-duplicated, up to
-        # the MiniMax per-shot image ceiling.
-        result: List[str] = []
-        for name in ordered:
-            if name not in result:
-                result.append(name)
-            if len(result) >= 9:
-                break
-        return result
-    kind_by_name = {r.name: _normalise_reference_kind(r.kind) for r in enabled if r.name}
-    result: List[str] = []
-    used_kinds: set[str] = set()
-    for name in ordered:
-        kind = kind_by_name.get(name, "Other")
-        if kind in used_kinds:
-            continue
-        if name not in result:
-            result.append(name)
-            used_kinds.add(kind)
-        if len(result) >= 9:
-            break
-    return result
-
-
-def _randomized_single_reference_per_kind_names(project: MusicProject, shot: MusicShot, names: Sequence[str], enabled: Sequence[ReferenceAsset]) -> List[str]:
-    """Pick one rotating/random reference for each represented role/type.
-
-    This is active only when both reference randomization and the one-ref-per-type
-    cap are enabled.  Each role gets its own deterministic shuffled deck, so a
-    Background / Location pool cycles through every candidate before repeating.
-    The saved reference_random_seed keeps rebuilds/retries reproducible.
-    """
-    ordered = []
-    for name in names:
-        if name and name not in ordered:
-            ordered.append(name)
-    if not (bool(getattr(project, "randomize_reference_characters", False)) and bool(getattr(project, "single_character_reference_per_clip", False))):
-        return ordered
-
-    kind_by_name = {r.name: _normalise_reference_kind(r.kind) for r in enabled if r.name}
-    try:
-        base_seed = int(getattr(project, "reference_random_seed", -1))
-    except Exception:
-        base_seed = -1
-    if base_seed < 0:
-        base_seed = random.SystemRandom().randint(0, 2_147_483_647)
-        try:
-            project.reference_random_seed = int(base_seed)
-        except Exception:
-            pass
-    try:
-        shot_index = max(1, int(getattr(shot, "index", 1) or 1))
-    except Exception:
-        shot_index = 1
-
-    by_kind: Dict[str, List[str]] = {}
-    kind_order: List[str] = []
-    for name in ordered:
-        kind = kind_by_name.get(name, "Other")
-        if kind not in by_kind:
-            by_kind[kind] = []
-            kind_order.append(kind)
-        if name not in by_kind[kind]:
-            by_kind[kind].append(name)
-
-    result: List[str] = []
-    offset = shot_index - 1
-    for kind in kind_order:
-        candidates = by_kind[kind]
-        if not candidates:
-            continue
-        if len(candidates) == 1:
-            result.append(candidates[0])
-            continue
-        round_no, position = divmod(offset, len(candidates))
-        deck = list(candidates)
-        random.Random(f"{base_seed}:role:{kind}:round:{round_no}:{len(candidates)}").shuffle(deck)
-        result.append(deck[position])
-    return result
-
-
 def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
-    """Conservative router with optional random Character references.
+    """Conservative first-pass router with optional per-shot random character refs.
 
-    Unlimited random mode may contain any number of source Character refs, but an
-    individual MiniMax Ref2VA shot still receives at most nine total references.
+    Users can edit the assignment in the shot table. This avoids sending all nine references
+    blindly while still giving the director useful defaults. When random character refs are
+    enabled, one or two Character references are chosen per shot while non-character
+    context (background/style plus explicitly named props/anchors) stays stable.
     """
     unlimited_pool = bool(getattr(project, "randomize_reference_characters", False) and getattr(project, "unlimited_random_references", False))
     source_refs = project.references if unlimited_pool else project.references[:9]
@@ -1899,6 +1939,8 @@ def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
             if randomize_chars and kind == "Character":
                 continue
             chosen.append(ref.name)
+    # Background/location and style refs are normally project-wide context, so include
+    # them even when the user did not repeat their names in every shot prompt.
     for ref in enabled:
         kind = _normalise_reference_kind(ref.kind)
         if kind in ("Background / Location", "Style / Mood") and ref.name not in chosen:
@@ -1908,10 +1950,43 @@ def auto_assign_references(project: MusicProject, shot: MusicShot) -> List[str]:
             if name not in chosen:
                 chosen.append(name)
     elif not any(_normalise_reference_kind(r.kind) == "Character" and r.name in chosen for r in enabled):
-        chars = [r.name for r in enabled if _normalise_reference_kind(r.kind) == "Character"]
-        chosen.extend(x for x in chars[:2] if x not in chosen)
-    chosen = _randomized_single_reference_per_kind_names(project, shot, chosen, enabled)
-    return _limit_character_reference_names(project, chosen, enabled)
+        # Non-random mode must still use the whole enabled character pool over the
+        # course of a music video.  The old fallback always selected chars[:2],
+        # which meant references 3..N could never reach MiniMax unless their names
+        # were explicitly written into a shot prompt.  Use a stable round-robin
+        # pair instead: shot 1 -> refs 1+2, shot 2 -> refs 3+4, shot 3 -> refs 5+1,
+        # etc.  This keeps retries/rebuilds deterministic while giving every enabled
+        # character a turn.  A single available character is simply reused.
+        chars = [r.name for r in enabled if _normalise_reference_kind(r.kind) == "Character" and r.name]
+        if chars:
+            try:
+                shot_index = max(1, int(getattr(shot, "index", 1) or 1))
+            except Exception:
+                shot_index = 1
+            pair_count = min(2, len(chars))
+            start = ((shot_index - 1) * pair_count) % len(chars)
+            for offset in range(pair_count):
+                name = chars[(start + offset) % len(chars)]
+                if name not in chosen:
+                    chosen.append(name)
+    # Objects/props and picture/composition anchors remain opt-in by name/purpose so an
+    # unrelated prop or storyboard image is not injected into every shot automatically.
+    return chosen[:9]
+
+
+def _append_optional_music_loras(cmd: List[str], project: MusicProject) -> None:
+    """Append the two user-selectable LoRAs after the creator's existing Turbo/4-step LoRA."""
+    slots = (
+        ("Extra LoRA 1", str(getattr(project, "extra_lora1_path", "") or "").strip(), float(getattr(project, "extra_lora1_strength", 1.0))),
+        ("Extra LoRA 2", str(getattr(project, "extra_lora2_path", "") or "").strip(), float(getattr(project, "extra_lora2_strength", 1.0))),
+    )
+    for label, path_text, strength in slots:
+        if not path_text or strength == 0.0:
+            continue
+        path = Path(path_text)
+        if not path.is_file():
+            raise RuntimeError(f"{label} not found: {path_text}")
+        cmd += ["--lora", str(path.resolve()), "--lora-strength", str(float(strength))]
 
 
 # ----------------------------- worker threads ------------------------------
@@ -2224,7 +2299,7 @@ def _whisper_task(progress, audio_path: str) -> List[LyricSegment]:
             raise RuntimeError("Whisper.cpp transcription failed:\n" + (cp.stderr or cp.stdout or ""))
         if not result_json.is_file():
             raise RuntimeError("Whisper.cpp completed but did not create its JSON result.")
-        data = json.loads(result_json.read_text(encoding="utf-8-sig"))
+        data = json.loads(_read_text_tolerant(result_json))
         raw_lyrics = _parse_whisper_json_segments(data)
         lyrics = _whisper_phrase_cleanup(raw_lyrics)
         language = ""
@@ -2314,126 +2389,6 @@ def _recreate_output_path(raw_dir: Path, shot_index: int) -> Tuple[Path, bool]:
     return candidate, True
 
 
-def _effective_generation_settings(project: MusicProject) -> Dict[str, Any]:
-    """Return the main-GUI generation settings snapshot with legacy fallbacks.
-
-    New standalone builds make the main MiniMax GUI the single source of truth.
-    Legacy project fields are kept only so older saved projects remain runnable.
-    """
-    raw = getattr(project, "generation_settings_snapshot", {})
-    cfg = dict(raw) if isinstance(raw, dict) else {}
-    cfg.setdefault("steps", int(getattr(project, "steps", 15)))
-    cfg.setdefault("cfg", float(getattr(project, "cfg", 1.0)))
-    cfg.setdefault("shift", float(getattr(project, "shift", 12.0)))
-    cfg.setdefault("audio_shift", float(getattr(project, "audio_shift", 3.0)))
-    cfg.setdefault("sampler", "euler")
-    cfg.setdefault("scheduler", "beta")
-    cfg.setdefault("ref_size", str(getattr(project, "ref_image_size", "match") or "match"))
-    cfg.setdefault("vram_manager_enabled", bool(getattr(project, "vram_manager_enabled", True)))
-    cfg.setdefault("vram_manager_auto_bypass", bool(getattr(project, "vram_auto_bypass", True)))
-    cfg.setdefault("vram_residency_engine", str(getattr(project, "vram_residency_engine", "static") or "static"))
-    cfg.setdefault("vram_runtime_free_gb", float(getattr(project, "vram_runtime_free_gb", 0.5)))
-    cfg.setdefault("vram_text_headroom_gb", float(getattr(project, "vram_text_headroom_gb", 1.0)))
-    cfg.setdefault("vram_diffusion_headroom_gb", float(getattr(project, "vram_diffusion_headroom_gb", 1.0)))
-    cfg.setdefault("vram_offload_chunk_mb", int(getattr(project, "vram_offload_chunk_mb", 512)))
-    cfg.setdefault("vram_max_resident_weights_gb", float(getattr(project, "vram_max_resident_weights_gb", 0.0)))
-    cfg.setdefault("vram_block_check_interval", int(getattr(project, "vram_block_check_interval", 1)))
-    cfg.setdefault("vram_async_streams", int(getattr(project, "vram_async_streams", 2)))
-    cfg.setdefault("vram_video_vae_reserve_gb", float(getattr(project, "vram_video_vae_reserve_gb", 2.0)))
-    cfg.setdefault("vram_audio_vae_reserve_gb", float(getattr(project, "vram_audio_vae_reserve_gb", 1.0)))
-    cfg.setdefault("vram_residency_fill", bool(getattr(project, "vram_residency_fill", False)))
-    cfg.setdefault("vram_residency_target_free_gb", float(getattr(project, "vram_residency_target_free_gb", 0.5)))
-    cfg.setdefault("vram_residency_warmup_blocks", int(getattr(project, "vram_residency_warmup_blocks", 2)))
-    cfg.setdefault("vram_residency_refill_interval", int(getattr(project, "vram_residency_refill_interval", 1)))
-    cfg.setdefault("sage_attention_enabled", bool(getattr(project, "sage_attention", False)))
-    cfg.setdefault("spectrum_enabled", bool(getattr(project, "spectrum", False)))
-    cfg.setdefault("sol_attention_enabled", False)
-    cfg.setdefault("sla_attention_enabled", False)
-    cfg.setdefault("use_hybrid_model", bool(getattr(project, "use_hybrid_model", False)))
-    cfg.setdefault("hybrid_model", str(getattr(project, "hybrid_model_path", "") or ""))
-    legacy_lora = str(getattr(project, "turbo_lora_path", "") or "").strip()
-    if "loras" not in cfg:
-        cfg["loras"] = ([{"path": legacy_lora, "strength": float(getattr(project, "turbo_lora_strength", 1.0))}] if legacy_lora else [])
-    return cfg
-
-
-def _append_main_gui_generation_args(args: List[str], project: MusicProject) -> Dict[str, Any]:
-    """Append model/runtime switches from the authoritative main MiniMax settings."""
-    cfg = _effective_generation_settings(project)
-
-    use_hybrid = bool(cfg.get("use_hybrid_model", False))
-    hybrid = str(cfg.get("hybrid_model", "") or "").strip()
-    ref2va = str(cfg.get("ref2va_model", "") or "").strip()
-    if use_hybrid:
-        hp = Path(hybrid)
-        if not hp.is_file():
-            raise RuntimeError("Use hybrid model is enabled in the main MiniMax settings, but the selected hybrid checkpoint was not found.")
-        args += ["--ref2va-checkpoint", str(hp.resolve())]
-    elif ref2va:
-        rp = Path(ref2va)
-        if not rp.is_file():
-            raise RuntimeError(f"Selected Ref2VA checkpoint was not found: {ref2va}")
-        args += ["--ref2va-checkpoint", str(rp.resolve())]
-
-    for key, flag in (("text_encoder_model", "--text-encoder"), ("video_vae_model", "--video-vae"), ("audio_vae_model", "--audio-vae")):
-        raw = str(cfg.get(key, "") or "").strip()
-        if raw:
-            mp = Path(raw)
-            if not mp.is_file():
-                raise RuntimeError(f"Selected MiniMax model file was not found: {raw}")
-            args += [flag, str(mp.resolve())]
-
-    if bool(cfg.get("vram_manager_enabled", True)):
-        args += ["--vram-manager-auto" if bool(cfg.get("vram_manager_auto_bypass", True)) else "--vram-manager"]
-        runtime_free_gb = float(cfg.get("vram_runtime_free_gb", 0.5))
-        if use_hybrid:
-            runtime_free_gb = max(1.50, runtime_free_gb)
-        args += [
-            "--vram-residency-engine", str(cfg.get("vram_residency_engine", "static") or "static"),
-            "--vram-runtime-free-gb", str(runtime_free_gb),
-            "--vram-text-headroom-gb", str(float(cfg.get("vram_text_headroom_gb", 1.0))),
-            "--vram-diffusion-headroom-gb", str(float(cfg.get("vram_diffusion_headroom_gb", 1.0))),
-            "--vram-offload-chunk-mb", str(int(cfg.get("vram_offload_chunk_mb", 512))),
-            "--vram-max-resident-weights-gb", str(float(cfg.get("vram_max_resident_weights_gb", 0.0))),
-            "--vram-block-check-interval", str(int(cfg.get("vram_block_check_interval", 1))),
-            "--vram-async-streams", str(int(cfg.get("vram_async_streams", 2))),
-            "--vram-video-vae-reserve-gb", str(float(cfg.get("vram_video_vae_reserve_gb", 2.0))),
-            "--vram-audio-vae-reserve-gb", str(float(cfg.get("vram_audio_vae_reserve_gb", 1.0))),
-            "--vram-residency-target-free-gb", str(float(cfg.get("vram_residency_target_free_gb", 0.5))),
-            "--vram-residency-warmup-blocks", str(int(cfg.get("vram_residency_warmup_blocks", 2))),
-            "--vram-residency-refill-interval", str(int(cfg.get("vram_residency_refill_interval", 1))),
-        ]
-        args += ["--vram-residency-fill" if bool(cfg.get("vram_residency_fill", False)) else "--no-vram-residency-fill"]
-
-    tile_size = int(cfg.get("vram_video_vae_tile_size", 256) or 256)
-    tile_overlap = int(cfg.get("vram_video_vae_tile_overlap", 64) or 64)
-    args += ["--video-vae-tile-size", str(tile_size), "--video-vae-tile-overlap", str(tile_overlap)]
-
-    if bool(cfg.get("spectrum_enabled", False)):
-        args += ["--spectrum"]
-    if bool(cfg.get("sage_attention_enabled", False)):
-        args += ["--sage-attention"]
-    if bool(cfg.get("sol_attention_enabled", False)):
-        args += ["--sol-attention"]
-    if bool(cfg.get("sla_attention_enabled", False)):
-        args += ["--sla-attention"]
-
-    for item in cfg.get("loras", []) or []:
-        if not isinstance(item, dict):
-            continue
-        raw = str(item.get("path", "") or "").strip()
-        if not raw:
-            continue
-        strength = float(item.get("strength", 1.0))
-        if strength == 0.0:
-            continue
-        lp = Path(raw)
-        if not lp.is_file():
-            raise RuntimeError(f"Selected LoRA file was not found: {raw}")
-        args += ["--lora", str(lp.resolve()), "--lora-strength", str(strength)]
-    return cfg
-
-
 def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -> List[Dict[str, Any]]:
     global _ACTIVE_GENERATION_PROCESS
     _GENERATION_CANCEL.clear()
@@ -2453,6 +2408,23 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
     logs_dir.mkdir(parents=True, exist_ok=True)
     width, height = RESOLUTION_PRESETS[project.resolution][project.aspect]
     refs_by_name = {r.name: r for r in project.references if r.enabled and Path(r.path).is_file()}
+    hybrid_checkpoint: Optional[Path] = None
+    if project.use_hybrid_model:
+        hybrid = Path(str(project.hybrid_model_path or "").strip())
+        if hybrid.is_file():
+            hybrid_checkpoint = hybrid.resolve()
+        else:
+            hybrid_checkpoint = _find_music_hybrid_checkpoint()
+            if hybrid_checkpoint is not None:
+                progress(f"Music clip: saved hybrid path unavailable; using detected hybrid {hybrid_checkpoint.name}")
+            else:
+                progress(f"__MINIMAX_HYBRID_FALLBACK__|{hybrid}")
+    else:
+        # New SparseRef/hybrid checkpoints are valid Ref2VA music backends even though
+        # the legacy Ref2VA filename validator does not recognize them. Prefer one when present.
+        hybrid_checkpoint = _find_music_hybrid_checkpoint()
+        if hybrid_checkpoint is not None:
+            progress(f"Music clip: using detected hybrid Ref2VA checkpoint {hybrid_checkpoint.name}")
     results: List[Dict[str, Any]] = []
     targets = [s for s in project.shots if s.index in shot_indices]
     for pos, shot in enumerate(targets, start=1):
@@ -2466,66 +2438,84 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
         if used_retry_name:
             progress(f"Shot {shot.index}: recreation uses a new output file {out_path.name}; the existing clip is left untouched.")
         shot.output_path = str(out_path)
-        if bool(getattr(project, "randomize_reference_characters", False)):
-            # Randomized projects must resolve references for this exact shot at run
-            # time. Do not let an older/stale Director assignment pin the first ref.
-            selected_names = [n for n in auto_assign_references(project, shot) if n in refs_by_name]
-            shot.reference_names = list(selected_names)
-        else:
-            selected_names = [n for n in shot.reference_names if n in refs_by_name]
+        selected_names = [n for n in shot.reference_names if n in refs_by_name]
         if not selected_names:
             # Older/restored projects can have an empty shot assignment even though valid
             # project references exist. Re-run the same conservative router at generation
-            # time so a selected project reference image is never silently dropped.
+            # time so a selected project character image is never silently dropped.
             selected_names = [n for n in auto_assign_references(project, shot) if n in refs_by_name]
         if not selected_names and refs_by_name:
             # Last-resort safety: Ref2VA music shots should not silently ignore all images.
             selected_names = [next(iter(refs_by_name))]
-        selected_names = _limit_character_reference_names(project, selected_names, list(refs_by_name.values()))
         selected = [refs_by_name[n] for n in selected_names[:9]]
+        selected, ref_cleanup_notes = _prepare_music_generation_references(project, selected, out_dir)
+        for note in ref_cleanup_notes:
+            progress(f"Shot {shot.index}: {note}")
         generation_prompt = build_generation_prompt(project, shot, selected)
         shot.generation_prompt = generation_prompt
         (raw_dir / f"shot_{shot.index:03d}_prompt.txt").write_text(generation_prompt, encoding="utf-8")
-        gen_cfg = _effective_generation_settings(project)
+        _persist_project_manifest(project, snapshot_assets=False)
         cmd = [
             str(MINIMAX_PY), "-u", str(GENERATE_REF),
             "--prompt", generation_prompt,
             "--width", str(width), "--height", str(height),
-            "--frames", str(shot.frames), "--steps", str(int(gen_cfg.get("steps", 15))),
-            "--cfg", str(float(gen_cfg.get("cfg", 1.0))), "--seed", str(shot.seed),
-            "--shift", str(float(gen_cfg.get("shift", 12.0))), "--audio-shift", str(float(gen_cfg.get("audio_shift", 3.0))),
-            "--sampler", str(gen_cfg.get("sampler", "euler") or "euler"),
-            "--scheduler", str(gen_cfg.get("scheduler", "beta") or "beta"),
-            "--ref-image-size", str(gen_cfg.get("ref_size", "match") or "match"),
+            "--frames", str(shot.frames), "--steps", "10",
+            "--cfg", str(project.cfg), "--seed", str(shot.seed),
+            "--shift", str(project.shift), "--audio-shift", str(project.audio_shift),
+            "--ref-image-size", project.ref_image_size,
             "--ref-audio", str(audio_chunk),
             "--lock-source-audio-index", "1",
             "--output", str(out_path),
         ]
-        _append_main_gui_generation_args(cmd, project)
+        if hybrid_checkpoint is not None:
+            cmd += ["--ref2va-checkpoint", str(hybrid_checkpoint)]
+        if project.vram_manager_enabled:
+            cmd += ["--vram-manager-auto" if project.vram_auto_bypass else "--vram-manager"]
+            cmd += [
+                "--vram-residency-engine", str(project.vram_residency_engine or "static"),
+                "--vram-runtime-free-gb", str(float(project.vram_runtime_free_gb)),
+                "--vram-text-headroom-gb", str(float(project.vram_text_headroom_gb)),
+                "--vram-diffusion-headroom-gb", str(float(project.vram_diffusion_headroom_gb)),
+                "--vram-offload-chunk-mb", str(int(project.vram_offload_chunk_mb)),
+                "--vram-max-resident-weights-gb", str(float(project.vram_max_resident_weights_gb)),
+                "--vram-block-check-interval", str(int(project.vram_block_check_interval)),
+                "--vram-async-streams", str(int(project.vram_async_streams)),
+                "--vram-video-vae-reserve-gb", str(float(project.vram_video_vae_reserve_gb)),
+                "--vram-audio-vae-reserve-gb", str(float(project.vram_audio_vae_reserve_gb)),
+                "--vram-residency-target-free-gb", str(float(project.vram_residency_target_free_gb)),
+                "--vram-residency-warmup-blocks", str(int(project.vram_residency_warmup_blocks)),
+                "--vram-residency-refill-interval", str(int(project.vram_residency_refill_interval)),
+            ]
+            cmd += ["--vram-residency-fill" if project.vram_residency_fill else "--no-vram-residency-fill"]
+        if project.sage_attention:
+            cmd += ["--sage-attention"]
+        # Music workflow quality preset: Turbo at 10 steps with SLA + Spectrum Forecasting.
+        cmd += ["--sla-attention", "--spectrum"]
+        turbo_lora = str(project.turbo_lora_path or "").strip()
+        turbo_path = Path(turbo_lora) if turbo_lora else None
+        if turbo_path is None or not turbo_path.is_file():
+            detected_turbo = _find_music_turbo_lora()
+            if detected_turbo is not None:
+                turbo_path = detected_turbo
+                project.turbo_lora_path = str(detected_turbo)
+                progress(f"Music clip: using detected Turbo LoRA {detected_turbo.name}")
+            elif turbo_lora:
+                raise RuntimeError(f"Turbo LoRA not found: {turbo_lora}")
+        if turbo_path is not None and turbo_path.is_file():
+            cmd += ["--lora", str(turbo_path.resolve()), "--lora-strength", str(float(project.turbo_lora_strength))]
+        _append_optional_music_loras(cmd, project)
         for ref in selected:
             cmd += ["--ref-image", ref.path]
         # Ref2VA only requires at least one reference. The song chunk already fills that requirement.
         stamp = time.strftime("%Y%m%d_%H%M%S")
         log_path = logs_dir / f"minimax_music_clip_{stamp}_shot{shot.index:03d}.log"
-        cp = subprocess.Popen(
-            cmd,
-            cwd=str(ROOT),
-            # Match the already-working MiniMax GUI launch behavior: use the
-            # dedicated MiniMax Python executable, but inherit the normal process
-            # environment unchanged. Do not sanitize PYTHONPATH/user-site/PATH here;
-            # the standalone MiniMax GUI does not do that and its Ref2VA runtime is
-            # already proven on this install.
-            env=os.environ.copy(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace",
-            bufsize=1,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        with _ACTIVE_GENERATION_LOCK:
-            _ACTIVE_GENERATION_PROCESS = cp
-        tail: List[str] = []
-        assert cp.stdout is not None
+        original_seed = int(shot.seed)
+        attempt_seed = original_seed
+        success = False
+        last_rc = None
+        last_tail: List[str] = []
+        cancelled_attempt = False
+
         with log_path.open("w", encoding="utf-8", errors="replace") as log:
             log.write("MiniMax Music Clip Creator - Ref2VA shot log\n")
             log.write(f"Shot: {shot.index}\n")
@@ -2533,41 +2523,129 @@ def _generation_task(progress, project: MusicProject, shot_indices: List[int]) -
             log.write(f"Working directory: {ROOT}\n")
             log.write(f"Audio chunk: {audio_chunk}\n")
             log.write(f"Output: {out_path}\n")
-            log.write("Command: " + subprocess.list2cmdline(cmd) + "\n\n")
             log.flush()
-            for line in cp.stdout:
-                if _GENERATION_CANCEL.is_set() and cp.poll() is None:
-                    _terminate_generation_process_tree()
-                log.write(line)
+
+            for attempt in (1, 2):
+                if attempt == 2:
+                    if _GENERATION_CANCEL.is_set():
+                        cancelled_attempt = True
+                        break
+                    attempt_seed = random.SystemRandom().randint(0, 2_147_483_647)
+                    shot.seed = int(attempt_seed)
+                    try:
+                        out_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    # Replace the existing CLI seed without rebuilding the complete command.
+                    try:
+                        seed_pos = cmd.index("--seed") + 1
+                        cmd[seed_pos] = str(attempt_seed)
+                    except Exception:
+                        pass
+                    progress(f"Shot {shot.index}: first attempt failed; retrying once with random seed {attempt_seed}...")
+                    log.write(f"\n===== AUTOMATIC RETRY 1/1 | new seed {attempt_seed} =====\n")
+
+                log.write(f"Attempt {attempt}/2 seed: {attempt_seed}\n")
+                log.write("Command: " + subprocess.list2cmdline(cmd) + "\n\n")
                 log.flush()
-                text = line.rstrip()
-                if text:
-                    tail.append(text)
-                    tail = tail[-40:]
-                    if "step" in text.lower() or "saved" in text.lower() or "error" in text.lower():
-                        progress(f"Shot {shot.index}: {text}")
-        rc = cp.wait()
-        with _ACTIVE_GENERATION_LOCK:
-            if _ACTIVE_GENERATION_PROCESS is cp:
-                _ACTIVE_GENERATION_PROCESS = None
-        if _GENERATION_CANCEL.is_set():
+                cp = subprocess.Popen(
+                    cmd,
+                    cwd=str(ROOT),
+                    env=os.environ.copy(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace",
+                    bufsize=1,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                with _ACTIVE_GENERATION_LOCK:
+                    _ACTIVE_GENERATION_PROCESS = cp
+                tail: List[str] = []
+                # MiniMax/Comfy's sampler reports progress with tqdm lines such as
+                #   20%|##        | 1/5 [03:01<12:04, ...]
+                # Those lines do not contain the literal word "step", so the old
+                # filter silently discarded them and the GUI looked frozen during
+                # long 768p sampling runs. Track the completed count and display the
+                # step that is currently being worked on instead.
+                sampler_last_displayed = None
+                sampler_progress_re = re.compile(r"(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)")
+                assert cp.stdout is not None
+                for line in cp.stdout:
+                    if _GENERATION_CANCEL.is_set() and cp.poll() is None:
+                        _terminate_generation_process_tree()
+                    log.write(line)
+                    log.flush()
+                    text = line.rstrip()
+                    if text:
+                        tail.append(text)
+                        tail = tail[-40:]
+                        low = text.lower()
+                        sampler_match = sampler_progress_re.search(text)
+                        is_sampler_line = sampler_match is not None and (
+                            "%|" in text or "it/s" in low or "s/it" in low
+                        )
+                        if is_sampler_line:
+                            completed = int(sampler_match.group(1))
+                            total = int(sampler_match.group(2))
+                            if total > 0:
+                                # tqdm prints 0/N before step 1 starts and N/N after
+                                # the final step finishes. While between updates, the
+                                # useful user-facing value is the next/current step.
+                                if completed >= total:
+                                    display_step = total
+                                    label = f"Shot {shot.index}: Sampling step {display_step}/{total} complete..."
+                                else:
+                                    display_step = completed + 1
+                                    label = f"Shot {shot.index}: Sampling step {display_step}/{total}..."
+                                state = (display_step, total, completed >= total)
+                                if state != sampler_last_displayed:
+                                    sampler_last_displayed = state
+                                    progress(label)
+                        elif "step" in low or "saved" in low or "error" in low:
+                            progress(f"Shot {shot.index}: {text}")
+                rc = cp.wait()
+                last_rc = rc
+                last_tail = list(tail)
+                log.write(f"\n[Music Clip] attempt {attempt}/2 exited with code {rc}; output_exists={out_path.is_file()}\n")
+                log.flush()
+                with _ACTIVE_GENERATION_LOCK:
+                    if _ACTIVE_GENERATION_PROCESS is cp:
+                        _ACTIVE_GENERATION_PROCESS = None
+
+                if _GENERATION_CANCEL.is_set():
+                    cancelled_attempt = True
+                    break
+                if rc == 0 and out_path.is_file():
+                    success = True
+                    break
+
+        if cancelled_attempt or _GENERATION_CANCEL.is_set():
             if out_path.is_file():
+                shot.output_path = str(out_path)
+                shot.status = "Generated"
+                _persist_project_manifest(project, snapshot_assets=False)
                 results.append({"index": shot.index, "ok": True, "output_path": str(out_path), "log_path": str(log_path)})
                 progress(f"__MINIMAX_SHOT_DONE__|{shot.index}|{out_path}")
             else:
                 results.append({"index": shot.index, "ok": False, "cancelled": True, "message": "Cancelled", "log_path": str(log_path)})
             progress("Generation stopped. Completed clips were kept.")
             break
-        if rc != 0 or not out_path.is_file():
+
+        if not success:
             results.append({
                 "index": shot.index,
                 "ok": False,
-                "message": ("\n".join(tail) or f"Exit code {rc}") + f"\n\nLog: {log_path}",
+                "message": ("\n".join(last_tail) or f"Exit code {last_rc}") + f"\n\nAutomatic retry with a new random seed also failed.\nLog: {log_path}",
                 "log_path": str(log_path),
             })
             progress(f"__MINIMAX_SHOT_FAILED__|{shot.index}|{log_path}")
             continue
-        results.append({"index": shot.index, "ok": True, "output_path": str(out_path), "log_path": str(log_path)})
+
+        shot.output_path = str(out_path)
+        shot.status = "Generated"
+        shot.seed = int(attempt_seed)
+        _persist_project_manifest(project, snapshot_assets=False)
+        results.append({"index": shot.index, "ok": True, "output_path": str(out_path), "log_path": str(log_path), "seed": int(attempt_seed), "retried": attempt_seed != original_seed})
         progress(f"__MINIMAX_SHOT_DONE__|{shot.index}|{out_path}")
     return results
 
@@ -2589,20 +2667,24 @@ def _probe_video_frame_count(path: str) -> int:
         return 0
 
 
-def _assembly_frame_plan(project: MusicProject) -> List[Tuple[MusicShot, int]]:
+def _assembly_frame_plan(project: MusicProject) -> List[Tuple[Shot, int]]:
     """Build one authoritative 24-fps edit timeline for the whole song.
 
-    Each shot uses adjacent absolute frame boundaries instead of independently
-    rounding floating-point durations. That prevents one-frame rounding errors from
-    accumulating across a long music video.
+    The old assembler converted every floating-point shot duration independently.
+    FFmpeg necessarily rounded each of those durations to whole frames, so a long
+    edit could gain roughly one frame at many cuts.  The plan below quantizes the
+    *shared absolute boundaries* once.  Adjacent shots therefore share the same
+    boundary and rounding cannot accumulate across the song.
     """
     if not project.shots:
         return []
     ordered = list(project.shots)
-    plan: List[Tuple[MusicShot, int]] = []
+    plan: List[Tuple[Shot, int]] = []
     previous_boundary = int(round(float(ordered[0].edit_start) * FPS))
     for pos, shot in enumerate(ordered):
         start_boundary = int(round(float(shot.edit_start) * FPS))
+        # A MiniMax music plan is contiguous.  Reject a genuinely broken plan
+        # instead of hiding a timeline gap/overlap during assembly.
         if pos and abs(start_boundary - previous_boundary) > 1:
             raise RuntimeError(
                 f"Shot timeline is not contiguous at shot {shot.index}: "
@@ -2630,8 +2712,8 @@ def _assembly_task(progress, project: MusicProject) -> str:
     if missing:
         raise RuntimeError("Missing generated clips for shots: " + ", ".join(map(str, missing)))
 
-    # One shared frame plan is the sync invariant. Never round each shot duration
-    # independently, because those one-frame errors accumulate across many cuts.
+    # One frame plan for the complete song is the key sync invariant.  Do not
+    # independently round shot.edit_duration values.
     frame_plan = _assembly_frame_plan(project)
     expected_total_frames = sum(frame_count for _shot, frame_count in frame_plan)
 
@@ -2646,9 +2728,11 @@ def _assembly_task(progress, project: MusicProject) -> str:
         )
         target = temp_dir / f"trim_{shot.index:03d}.mp4"
 
-        # Keep the tested MiniMax audio-context cut point, then normalize to native
-        # 24 fps and take an exact integer number of frames. Playback speed is never
-        # stretched or slowed to repair the finished video.
+        # Preserve the existing, already-tested MiniMax audio-context cut point
+        # (shot.trim_in).  After that cut, reset timestamps, normalize to the
+        # native 24-fps edit clock, and take an exact integer number of frames.
+        # This removes the root cause of cumulative drift without changing clip
+        # playback speed or retiming the completed music video.
         vf = (
             "tpad=stop_mode=clone:stop_duration=1.0,"
             f"trim=start={shot.trim_in:.6f},"
@@ -2684,9 +2768,9 @@ def _assembly_task(progress, project: MusicProject) -> str:
     video_only = temp_dir / "video_only.mp4"
     progress("Concatenating frame-locked shots...")
 
-    # Re-encode the stitch rather than packet-copying dozens of independent MP4
-    # timelines. Every input is already exact CFR 24 fps; this normalizes timestamps
-    # without retiming the footage.
+    # Match the robust LTX strategy: re-encode the stitch instead of packet-copying
+    # dozens of independently encoded MP4 timelines.  Because every input is now
+    # exact CFR 24 fps, this is normalization, not a speed/duration correction.
     cp = subprocess.run(
         [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file),
          "-an", "-r", str(FPS), "-fps_mode", "cfr",
@@ -2722,10 +2806,27 @@ def _assembly_task(progress, project: MusicProject) -> str:
     )
     if cp.returncode != 0 or not final.is_file():
         raise RuntimeError("Final mux failed:\n" + (cp.stderr or cp.stdout or ""))
-    progress(f"Saved final music video: {final}")
 
-    # Keep raw clips and WAV chunks as permanent project assets. Only assembly and
-    # queue scratch are disposable after a successful build.
+    if bool(getattr(project, "use_hypir_x1_upscale", False)) or bool(getattr(project, "use_lanczos_x2_upsampling", False)):
+        try:
+            try:
+                from helpers.musicclip_postprocess import postprocess_music_video
+            except Exception:
+                from musicclip_postprocess import postprocess_music_video
+            postprocess_music_video(
+                str(final),
+                use_hypir_x1=bool(getattr(project, "use_hypir_x1_upscale", False)),
+                use_lanczos_x2=bool(getattr(project, "use_lanczos_x2_upsampling", False)),
+                ffmpeg=ffmpeg,
+                progress=progress,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Final video upscale/restoration failed: {exc}") from exc
+
+    progress(f"Saved final music video: {final}")
+    # The WAV chunks are permanent project assets now: they are required to reopen
+    # an old job and regenerate only one shot without rebuilding the whole project.
+    # Assembly scratch and queue handoff data remain disposable.
     for disposable in (temp_dir, out_dir / "_queue"):
         try:
             if disposable.is_dir():
@@ -2742,23 +2843,265 @@ def _assembly_task(progress, project: MusicProject) -> str:
 class MiniMaxMusicClipWidget(QWidget):
     """Embeddable MiniMax Music Clip Creator widget."""
 
-    def __init__(self, parent: Optional[QWidget] = None, queue_adapter=None, settings_provider=None):
+    # Optional integration signal used by hidden/assistant-launched instances.
+    # Payload examples: {"type": "clip_done", "shot_index": 2, "path": "..."}.
+    music_clip_event = Signal(object)
+
+    def __init__(self, parent: Optional[QWidget] = None, queue_adapter=None):
         super().__init__(parent)
         self.queue_adapter = queue_adapter
-        self.settings_provider = settings_provider
         self.project = MusicProject(output_dir=str(OUTPUT_ROOT))
         self.project_path = ""
         self.worker: Optional[FunctionWorker] = None
         self._autosave_last_text = ""
         self._one_click_active = False
+        self._assistant_emitted_clip_paths = set()
+        self._hybrid_fallback_announced = False
+        self._assistant_event_callback = None
+        self._assistant_origin = "desktop_ui"
+        self._assistant_remote_chat_id = ""
+        self._assistant_run = False
+        self._one_click_assemble_after_generation = False
+        # Treat any handoff file that already existed before this visible widget
+        # started as already consumed.  Only handoffs created/updated after startup
+        # are eligible for live import.  This prevents stale assistant projects from
+        # being resurrected on every FrameVision launch.
+        try:
+            self._assistant_handoff_mtime_ns = (
+                ASSISTANT_HANDOFF_PATH.stat().st_mtime_ns
+                if ASSISTANT_HANDOFF_PATH.is_file() else 0
+            )
+        except Exception:
+            self._assistant_handoff_mtime_ns = 0
+        self._assistant_output_monitor = QTimer(self)
+        self._assistant_output_monitor.setInterval(1500)
+        self._assistant_output_monitor.timeout.connect(self._assistant_poll_outputs)
+        self._assistant_monitor_final_path = ""
+        self._assistant_monitor_total = 0
+        self._assistant_queue_assembly_when_ready = False
+        self._assistant_assembly_queued = False
+        self._assistant_handoff_timer = QTimer(self)
+        self._assistant_handoff_timer.setInterval(1000)
+        self._assistant_handoff_timer.timeout.connect(self._poll_assistant_handoff)
+        self._assistant_handoff_timer.start()
         _cleanup_music_clip_temp_artifacts()
         self._build_ui()
+        # Give every persistent control a stable identity. FrameVision also has a
+        # generic widget-state restorer; unnamed child widgets can otherwise be
+        # matched by construction/order after this helper gains or moves controls,
+        # which can put one field's saved value into another field on startup.
+        self._assign_persistence_object_names()
         # Restore the complete working session first. The older small settings file
         # remains only as a fallback for installs that do not have a session save yet.
         if not self._load_autosave():
             self._load_settings()
         self._sync_ui_from_project()
         self._start_autosave()
+        # The parent FrameVision window may run its generic restore only after this
+        # embedded widget has finished constructing. Re-assert our authoritative
+        # key-based project state after that pass, before the 1.5 s autosave can
+        # accidentally persist values injected into the wrong controls.
+        QTimer.singleShot(0, self._startup_reassert_project_state)
+        QTimer.singleShot(250, self._startup_reassert_project_state)
+
+    def _emit_music_clip_event(self, event_type: str, **payload) -> None:
+        """Best-effort event bridge for assistant/hidden launches."""
+        event = {"type": str(event_type or "status")}
+        event.update(payload)
+        callback = getattr(self, "_assistant_event_callback", None)
+        if bool(getattr(self, "_assistant_run", False)):
+            # Assistant jobs have exactly one reply target. Never broadcast to the
+            # widget signal as a fallback: a Telegram-origin job must not leak into
+            # FrameVision chat, and a FrameVision-chat job must not leak to Telegram.
+            if callable(callback):
+                try:
+                    callback(event)
+                except Exception:
+                    pass
+            return
+        if callable(callback):
+            try:
+                callback(event)
+                return
+            except Exception:
+                pass
+        try:
+            self.music_clip_event.emit(event)
+        except Exception:
+            pass
+
+    def _assistant_start_output_monitor(self, final_path: str = "") -> None:
+        """Monitor queued outputs even when this hidden widget is not the host queue UI."""
+        self._assistant_monitor_final_path = str(final_path or "")
+        self._assistant_monitor_total = len(self.project.shots)
+        if not self._assistant_output_monitor.isActive():
+            self._assistant_output_monitor.start()
+        self._assistant_poll_outputs()
+
+    def _assistant_poll_outputs(self) -> None:
+        completed = 0
+        for shot in list(self.project.shots or []):
+            output = str(getattr(shot, "output_path", "") or "").strip()
+            if not output or not Path(output).is_file():
+                continue
+            completed += 1
+            try:
+                norm_path = str(Path(output).resolve())
+            except Exception:
+                norm_path = output
+            if norm_path not in self._assistant_emitted_clip_paths:
+                self._assistant_emitted_clip_paths.add(norm_path)
+                self._emit_music_clip_event("clip_done", shot_index=int(shot.index), path=norm_path, completed=completed, total=self._assistant_monitor_total)
+        final = str(getattr(self, "_assistant_monitor_final_path", "") or "").strip()
+        if final and Path(final).is_file():
+            try:
+                final = str(Path(final).resolve())
+            except Exception:
+                pass
+            self._emit_music_clip_event("final_done", path=final)
+            self._assistant_output_monitor.stop()
+            return
+
+        # For assistant runs do not put assembly into the queue ahead of unfinished
+        # clip files.  Some FrameVision queue configurations do not guarantee that a
+        # later assembly item will physically execute after every MiniMax child job.
+        # Queue it only once the output monitor can see every planned clip on disk.
+        if (
+            bool(getattr(self, "_assistant_queue_assembly_when_ready", False))
+            and not bool(getattr(self, "_assistant_assembly_queued", False))
+            and self._assistant_monitor_total > 0
+            and completed >= self._assistant_monitor_total
+        ):
+            self._assistant_assembly_queued = True
+            self._assistant_queue_assembly_when_ready = False
+            self._emit_music_clip_event("progress", message="All clips are ready. Queueing final music-video assembly now...")
+            try:
+                self._queue_assembly()
+            except Exception as exc:
+                self._assistant_assembly_queued = False
+                self._emit_music_clip_event("failed", message=f"Could not queue final assembly: {exc}")
+
+    def _notify_hybrid_fallback(self, missing_path: str = "") -> None:
+        if self._hybrid_fallback_announced:
+            return
+        self._hybrid_fallback_announced = True
+        message = (
+            "Hybrid MiniMax checkpoint is unavailable; falling back to the normal Ref2VA checkpoint for this music clip run."
+        )
+        if missing_path:
+            message += f" Missing: {missing_path}"
+        self.status.setText(message)
+        self._emit_music_clip_event("hybrid_fallback", message=message, missing_path=missing_path, fallback="ref2va")
+
+    def _write_assistant_handoff(self) -> None:
+        """Publish the assistant-run project so the visible MiniMax tab can adopt it."""
+        if not bool(getattr(self, "_assistant_run", False)):
+            return
+        try:
+            self._pull_ui()
+            payload = {
+                "version": 1,
+                "updated_ns": time.time_ns(),
+                "project_path": str(self.project_path or ""),
+                "assistant_origin": str(getattr(self, "_assistant_origin", "desktop_ui") or "desktop_ui"),
+                "assistant_remote_chat_id": str(getattr(self, "_assistant_remote_chat_id", "") or ""),
+                "project": asdict(self.project),
+            }
+            ASSISTANT_HANDOFF_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = ASSISTANT_HANDOFF_PATH.with_suffix(ASSISTANT_HANDOFF_PATH.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(str(tmp), str(ASSISTANT_HANDOFF_PATH))
+            try:
+                self._assistant_handoff_mtime_ns = ASSISTANT_HANDOFF_PATH.stat().st_mtime_ns
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _poll_assistant_handoff(self) -> None:
+        """Visible widgets live-sync the latest assistant-created Music Clip project."""
+        if bool(getattr(self, "_assistant_run", False)):
+            return
+        try:
+            if not ASSISTANT_HANDOFF_PATH.is_file():
+                return
+            stat = ASSISTANT_HANDOFF_PATH.stat()
+            if stat.st_mtime_ns <= int(getattr(self, "_assistant_handoff_mtime_ns", 0) or 0):
+                return
+            data = json.loads(_read_text_tolerant(ASSISTANT_HANDOFF_PATH))
+            project_data = data.get("project") if isinstance(data, dict) else None
+            if not isinstance(project_data, dict):
+                return
+            self.project = self._project_from_dict(project_data)
+            self.project_path = str(data.get("project_path") or "")
+            self._assistant_handoff_mtime_ns = stat.st_mtime_ns
+            self._sync_ui_from_project()
+            self._write_autosave(force=True)
+            self.status.setText("Loaded the latest Music Clip project created by the assistant.")
+        except Exception:
+            pass
+
+    def _assign_persistence_object_names(self) -> None:
+        """Use stable names so host-level persistence never depends on widget order."""
+        persistent = {
+            "tabs": "minimax_music_tabs",
+            "edit_audio": "minimax_music_audio_path",
+            "edit_output": "minimax_music_output_dir",
+            "edit_title": "minimax_music_project_title",
+            "edit_idea": "minimax_music_main_idea",
+            "edit_style": "minimax_music_style_theme",
+            "edit_subjects": "minimax_music_reference_details",
+            "edit_world": "minimax_music_locations_world",
+            "edit_camera": "minimax_music_camera_choreography",
+            "check_auto_fill_locations": "minimax_music_auto_fill_locations",
+            "check_auto_fill_camera": "minimax_music_auto_fill_camera",
+            "check_randomize_ref_characters": "minimax_music_randomize_ref_characters",
+            "check_unlimited_random_refs": "minimax_music_unlimited_random_refs",
+            "spin_sensitivity": "minimax_music_beat_sensitivity",
+            "check_whisper_timing": "minimax_music_whisper_timing",
+            "check_visible_lyric_subtitles": "minimax_music_visible_lyrics",
+            "combo_resolution": "minimax_music_resolution",
+            "combo_aspect": "minimax_music_aspect",
+            "slider_frames": "minimax_music_max_frames",
+            "spin_head": "minimax_music_head_padding",
+            "spin_tail": "minimax_music_tail_padding",
+            "spin_snap": "minimax_music_phrase_snap",
+            "spin_steps": "minimax_music_steps",
+            "spin_cfg": "minimax_music_cfg",
+            "spin_shift": "minimax_music_shift",
+            "spin_audio_shift": "minimax_music_audio_shift",
+            "combo_ref_size": "minimax_music_ref_image_size",
+            "edit_turbo_lora": "minimax_music_turbo_lora_path",
+            "spin_turbo_lora": "minimax_music_turbo_lora_strength",
+            "edit_extra_lora1": "minimax_music_extra_lora1_path",
+            "spin_extra_lora1": "minimax_music_extra_lora1_strength",
+            "edit_extra_lora2": "minimax_music_extra_lora2_path",
+            "spin_extra_lora2": "minimax_music_extra_lora2_strength",
+            "check_hybrid_model": "minimax_music_use_hybrid_model",
+            "edit_hybrid_model": "minimax_music_hybrid_model_path",
+            "check_vram_manager": "minimax_music_vram_manager",
+            "check_vram_auto_bypass": "minimax_music_vram_auto_bypass",
+            "check_sage": "minimax_music_sage_attention",
+            "check_sla": "minimax_music_sla_attention",
+            "check_spectrum": "minimax_music_spectrum",
+            "check_hypir_x1_upscale": "minimax_music_hypir_x1",
+            "check_lanczos_x2_upsampling": "minimax_music_lanczos_x2",
+            "check_framevision_queue": "minimax_music_framevision_queue",
+        }
+        for attr, name in persistent.items():
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                try:
+                    widget.setObjectName(name)
+                except Exception:
+                    pass
+
+    def _startup_reassert_project_state(self) -> None:
+        """Undo any late host-level positional restore before autosave reads UI."""
+        try:
+            self._sync_ui_from_project()
+        except Exception:
+            pass
 
     # ---- UI construction ----
     def _build_ui(self) -> None:
@@ -2790,6 +3133,13 @@ class MiniMaxMusicClipWidget(QWidget):
         self._build_director_tab()
         self._build_generate_tab()
         self._build_settings_tab()
+        self._build_global_action_bar(outer)
+
+        # QTableWidget headers can fall back to the native Windows style even
+        # when FrameVision has already themed the table viewport.  Apply a tiny
+        # palette-derived fallback after Qt has polished the widgets so those
+        # headers/corner cells track the host theme instead of turning white.
+        QTimer.singleShot(0, self._apply_host_theme_fallbacks)
 
         footer = QHBoxLayout()
         self.progress = QProgressBar(self)
@@ -2800,6 +3150,121 @@ class MiniMaxMusicClipWidget(QWidget):
         footer.addWidget(self.progress, 1)
         footer.addWidget(self.status, 2)
         outer.addLayout(footer)
+
+    @staticmethod
+    def _css_color(color) -> str:
+        """Return a Qt stylesheet-safe ARGB/RGB color string."""
+        return color.name()
+
+    def _apply_host_theme_fallbacks(self) -> None:
+        """Keep native table chrome aligned with FrameVision's active theme.
+
+        FrameVision styles the table viewport globally, but on some Windows Qt
+        styles QHeaderView and the top-left corner button can still be painted by
+        the native light theme.  We sample each table's *effective* palette after
+        host styling and only style that native chrome.  No fixed MiniMax colors
+        are used, so light/dark/custom FrameVision themes remain authoritative.
+        """
+        tables = [
+            getattr(self, "refs_table", None),
+            getattr(self, "lyrics_table", None),
+            getattr(self, "shot_table", None),
+            getattr(self, "review_table", None),
+        ]
+        for table in tables:
+            if table is None:
+                continue
+            # The viewport is the best source when a host stylesheet targets
+            # QAbstractItemView/QTableWidget rather than QApplication's palette.
+            pal = table.viewport().palette()
+            base = self._css_color(pal.color(QPalette.ColorRole.Base))
+            text = self._css_color(pal.color(QPalette.ColorRole.Text))
+            border = self._css_color(pal.color(QPalette.ColorRole.Mid))
+            alt = self._css_color(pal.color(QPalette.ColorRole.AlternateBase))
+            highlight = self._css_color(pal.color(QPalette.ColorRole.Highlight))
+            highlighted_text = self._css_color(pal.color(QPalette.ColorRole.HighlightedText))
+            qss = f"""
+                QHeaderView {{ background: {base}; color: {text}; }}
+                QHeaderView::section {{
+                    background: {base}; color: {text}; border: 0px;
+                    border-right: 1px solid {border};
+                    border-bottom: 1px solid {border}; padding: 4px;
+                }}
+                QHeaderView::section:hover {{ background: {alt}; }}
+                QHeaderView::section:checked {{ background: {highlight}; color: {highlighted_text}; }}
+                QTableCornerButton::section {{
+                    background: {base}; border: 0px;
+                    border-right: 1px solid {border};
+                    border-bottom: 1px solid {border};
+                }}
+            """
+            table.horizontalHeader().setStyleSheet(qss)
+            table.verticalHeader().setStyleSheet(qss)
+            # Corner button belongs to QTableWidget rather than either header.
+            # Append only this narrow fallback; existing host rules still style
+            # the table body, selection, grid, scrollbars, etc.
+            table.setStyleSheet(table.styleSheet() + f"""
+                QTableWidget QTableCornerButton::section {{
+                    background: {base}; border: 0px;
+                    border-right: 1px solid {border};
+                    border-bottom: 1px solid {border};
+                }}
+            """)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.StyleChange):
+            # Theme switches can happen while FrameVision is running. Delay until
+            # the host style has finished propagating to child viewports.
+            QTimer.singleShot(0, self._apply_host_theme_fallbacks)
+
+    def _build_global_action_bar(self, outer: QVBoxLayout) -> None:
+        """Keep the primary music-clip actions visible on every tab."""
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+
+        self.btn_create_video_clip = QPushButton("Create video clip", self)
+        self.btn_create_video_clip.setToolTip(
+            "One-click workflow: analyze the selected song, use Whisper lyric timing when enabled, "
+            "build/direct the complete shot list, add all missing MiniMax clips to the FrameVision queue, "
+            "then queue final trim and assembly."
+        )
+        self.btn_generate_selected = QPushButton("Generate selected shot", self)
+        self.btn_generate_all = QPushButton("Generate all missing shots", self)
+        self.btn_stop_generation = QPushButton("Stop generation", self)
+        self.btn_stop_generation.setEnabled(False)
+        self.btn_stop_generation.setToolTip(
+            "Stops the current direct MiniMax clip. When FrameVision queue mode is active, "
+            "cancel or requeue running jobs from FrameVision's main Queue tab."
+        )
+        self.btn_assemble = QPushButton("Assemble final music video", self)
+        self.btn_open_output = QPushButton("Open output folder", self)
+
+        for button in (
+            self.btn_create_video_clip,
+            self.btn_generate_selected,
+            self.btn_generate_all,
+            self.btn_stop_generation,
+            self.btn_assemble,
+            self.btn_open_output,
+        ):
+            bar.addWidget(button)
+        self.check_framevision_queue = QCheckBox("Use FrameVision queue", self)
+        self.check_framevision_queue.setToolTip(
+            "When enabled, MiniMax Music Clip shots and final assembly are submitted to FrameVision's shared queue/worker. "
+            "When disabled, this helper generates clips directly as before. Failed queued shots retry once with a new random seed before being marked failed."
+        )
+        self.check_framevision_queue.toggled.connect(self._framevision_queue_toggled)
+        bar.addWidget(self.check_framevision_queue)
+        bar.addStretch(1)
+        outer.addLayout(bar)
+
+        self.btn_create_video_clip.clicked.connect(self.create_video_clip)
+        self.btn_generate_selected.clicked.connect(self._generate_selected)
+        self.btn_generate_all.clicked.connect(self._generate_all)
+        self.btn_stop_generation.clicked.connect(self._stop_generation)
+        self.btn_assemble.clicked.connect(self._assemble)
+        self.btn_open_output.clicked.connect(self._open_output_folder)
 
     def _scrollable_tab_body(self, page: QWidget) -> tuple[QVBoxLayout, QWidget, QVBoxLayout]:
         """Create a vertically scrollable tab body plus a fixed bottom area.
@@ -2816,10 +3281,10 @@ class MiniMaxMusicClipWidget(QWidget):
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background:#11151b; border:none; } QScrollArea > QWidget > QWidget { background:#11151b; }")
-        scroll.viewport().setStyleSheet("background:#11151b;")
+        # Do not paint a private dark theme here.  This widget is embedded in
+        # FrameVision, so the host application's global stylesheet/palette must
+        # remain authoritative (and standalone mode should inherit Qt/app style).
         body = QWidget(scroll)
-        body.setStyleSheet("background:#11151b;")
         body.setMinimumWidth(0)
         body.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
         body_layout = QVBoxLayout(body)
@@ -2856,20 +3321,27 @@ class MiniMaxMusicClipWidget(QWidget):
         self.edit_subjects = QPlainTextEdit(brief); self.edit_subjects.setMaximumHeight(90)
         self.edit_world = QLineEdit(brief)
         self.edit_camera = QLineEdit(brief)
+        self.check_auto_fill_locations = QCheckBox("Auto Fill locations with LLM", brief)
+        self.check_auto_fill_camera = QCheckBox("Auto Fill camera / effects with LLM", brief)
         self.edit_subjects.setToolTip("Optional continuity details for named reference images. Example: Erica is the blue-haired woman in her reference, keeps that outfit, and is always the drummer when the drum kit is present. Leave blank when MiniMax may invent role, outfit or props.")
-        self.edit_idea.setToolTip("Write one continuous story, or put alternative story beats on separate lines / separated by semicolons. Alternative beats are distributed across clips instead of being crammed into every clip.")
-        self.edit_world.setToolTip("Enter one location, or a list separated by commas, semicolons or new lines. One primary location is assigned per clip and the list rotates before reuse.")
-        self.edit_camera.setToolTip("Enter one camera concept, or a list separated by commas, semicolons or new lines. One primary camera concept is assigned per clip and the list rotates before reuse. Connected instructions such as 'whip pan then rack focus' stay together.")
+        self.edit_idea.setToolTip("The Music Director treats this as the creative authority for the complete song. A short idea is enough: the LLM expands it into music-driven clip actions instead of repeating the same sentence in every prompt.")
+        self.edit_world.setToolTip("Optional location material. With Auto Fill OFF, these locations are distributed without inventing unrelated worlds. With Auto Fill ON, the LLM expands them into a coherent section-by-section location plan.")
+        self.edit_camera.setToolTip("Optional camera/choreography material. With Auto Fill OFF, supplied ideas are distributed across clips. With Auto Fill ON, the LLM invents varied music-video camera positions, moves and effects for individual prompts while respecting your ideas.")
+        self.check_auto_fill_locations.setToolTip("When enabled, the Planner-style Music Director creates a suitable primary location for each detected musical section. If you supplied locations, they remain mandatory creative ingredients and the LLM expands around them.")
+        self.check_auto_fill_camera.setToolTip("When enabled, the Music Director creates varied camera positions, movements and music-video effects for individual clips, matched to the action and song energy. User-supplied camera ideas remain preferred ingredients.")
         bf.addRow("Main idea / story:", self.edit_idea)
         bf.addRow("Style / theme:", self.edit_style)
         bf.addRow("Ref image purpose details:", self.edit_subjects)
         bf.addRow("Locations / world:", self.edit_world)
+        bf.addRow("", self.check_auto_fill_locations)
         bf.addRow("Camera choreography:", self.edit_camera)
+        bf.addRow("", self.check_auto_fill_camera)
         lay.addWidget(brief)
 
         actions = QHBoxLayout()
         self.btn_new = QPushButton("New project", self.page_project)
         self.btn_open = QPushButton("Load project...", self.page_project)
+        self.btn_open.setToolTip("Load a previously created MiniMax music job folder. Projects are saved automatically inside each job folder.")
         actions.addWidget(self.btn_new); actions.addWidget(self.btn_open); actions.addStretch(1)
         lay.addStretch(1)
         outer.addLayout(actions)
@@ -2888,32 +3360,33 @@ class MiniMaxMusicClipWidget(QWidget):
             body,
         )
         info.setWordWrap(True); lay.addWidget(info)
-        ref_toggle_row = QHBoxLayout()
-        self.check_randomize_ref_characters = QCheckBox("Randomize references per clip", body)
+        self.check_randomize_ref_characters = QCheckBox("Randomize reference characters per clip", body)
         self.check_randomize_ref_characters.setToolTip(
-            "Randomize reference selection per shot. Character references keep the existing one-or-two random behavior. "
-            "When 'Use only 1 ref per clip' is also enabled, each non-character role/type (such as Background / Location or Style / Mood) "
-            "also rotates through its available images instead of always choosing the first one."
+            "When enabled, each shot automatically picks a random subset of enabled Character references. "
+            "The shot uses either 1 or 2 character refs at a time (or fewer when fewer are available). "
+            "When disabled, character references are still rotated in a stable round-robin order so later references are not ignored. "
+            "Backgrounds, style refs and other non-character references keep their normal behavior. Rebuild prompts or create a new plan to refresh assignments."
         )
-        self.check_single_character_ref = QCheckBox("Use only 1 ref per clip", body)
-        self.check_single_character_ref.setToolTip(
-            "Limit each clip to at most one reference per role/type. For example: one Character, one Background / Location, "
-            "one Object / Prop, one Style / Mood, one Picture / Composition anchor and one Other. "
-            "If multiple enabled refs share the same role, only one of that role is kept in the final prompt for that clip."
-        )
-        ref_toggle_row.addWidget(self.check_randomize_ref_characters)
-        ref_toggle_row.addWidget(self.check_single_character_ref)
-        ref_toggle_row.addStretch(1)
-        lay.addLayout(ref_toggle_row)
+
+        lay.addWidget(self.check_randomize_ref_characters)
         self.check_unlimited_random_refs = QCheckBox("Unlimited random refs", body)
         self.check_unlimited_random_refs.setToolTip(
             "Only available while random reference characters are enabled. Removes the 9-image project-pool limit, "
-            "allows loading a whole folder, and cycles through the complete Character pool without repeating an image until all have been used."
+            "allows loading a whole folder, and cycles through the complete enabled Character pool without repeats "
+            "before starting a newly shuffled round. Each individual MiniMax shot still receives only 1 or 2 random Character refs."
         )
         self.check_unlimited_random_refs.setVisible(False)
         lay.addWidget(self.check_unlimited_random_refs)
         self.check_randomize_ref_characters.toggled.connect(self._update_unlimited_random_ref_controls)
         self.check_unlimited_random_refs.toggled.connect(self._update_unlimited_random_ref_controls)
+        self.check_remove_ref_backgrounds = QCheckBox("Remove backgrounds from Character and Object / Prop references", body)
+        self.check_remove_ref_backgrounds.setChecked(True)
+        self.check_remove_ref_backgrounds.setToolTip(
+            "Default: on. Character and prop reference images are pre-cleaned before MiniMax Ref2VA generation. "
+            "MODNet is preferred for people because it keeps the subject while dropping the source background. "
+            "If MODNet is unavailable the helper falls back to BiRefNet. Background / Location and Style / Mood refs stay untouched."
+        )
+        lay.addWidget(self.check_remove_ref_backgrounds)
         self.refs_table = QTableWidget(0, 6, body)
         # Put the useful editable fields first. Long filenames/paths are supporting
         # metadata and must never consume the reference tab at the expense of role
@@ -2932,7 +3405,6 @@ class MiniMaxMusicClipWidget(QWidget):
         header.resizeSection(5, 150)
         self.refs_table.setWordWrap(True)
         self.refs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.refs_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.refs_table.setMinimumHeight(320)
         lay.addWidget(self.refs_table, 1)
         row = QHBoxLayout()
@@ -2941,17 +3413,11 @@ class MiniMaxMusicClipWidget(QWidget):
         self.btn_add_ref_folder.setToolTip("Add every supported image in a folder to the unlimited random Character reference pool.")
         self.btn_add_ref_folder.setVisible(False)
         self.btn_remove_ref = QPushButton("Remove selected", self.page_refs)
-        self.btn_select_all_refs = QPushButton("Select all", self.page_refs)
-        self.btn_clear_refs = QPushButton("Clear list", self.page_refs)
-        self.btn_select_all_refs.setToolTip("Select every reference row so role changes can be applied to the whole selection at once.")
-        self.btn_clear_refs.setToolTip("Remove every reference image from the current project reference list.")
-        row.addWidget(self.btn_add_ref); row.addWidget(self.btn_add_ref_folder); row.addWidget(self.btn_remove_ref); row.addWidget(self.btn_select_all_refs); row.addWidget(self.btn_clear_refs); row.addStretch(1)
+        row.addWidget(self.btn_add_ref); row.addWidget(self.btn_add_ref_folder); row.addWidget(self.btn_remove_ref); row.addStretch(1)
         outer.addLayout(row)
         self.btn_add_ref.clicked.connect(self._add_reference)
         self.btn_add_ref_folder.clicked.connect(self._add_reference_folder)
         self.btn_remove_ref.clicked.connect(self._remove_reference)
-        self.btn_select_all_refs.clicked.connect(self._select_all_references)
-        self.btn_clear_refs.clicked.connect(self._clear_reference_list)
 
     def _build_analysis_tab(self) -> None:
         outer, body, lay = self._scrollable_tab_body(self.page_analysis)
@@ -3042,31 +3508,17 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _build_generate_tab(self) -> None:
         outer, body, lay = self._scrollable_tab_body(self.page_generate)
-        row = QHBoxLayout()
-        self.btn_generate_selected = QPushButton("Generate selected shot", self.page_generate)
-        self.btn_generate_all = QPushButton("Generate all missing shots", self.page_generate)
-        self.btn_stop_generation = QPushButton("Stop generation", self.page_generate)
-        self.btn_stop_generation.setEnabled(False)
-        self.btn_stop_generation.setToolTip("Stops the current direct MiniMax clip. When embedded in the standalone app, use the main Queue tab to cancel/requeue jobs.")
-        if callable(getattr(self, "queue_adapter", None)):
-            self.btn_stop_generation.setVisible(False)
-        self.btn_assemble = QPushButton("Assemble final music video", self.page_generate)
-        self.btn_open_output = QPushButton("Open output folder", self.page_generate)
-        row.addWidget(self.btn_generate_selected); row.addWidget(self.btn_generate_all); row.addWidget(self.btn_stop_generation); row.addWidget(self.btn_assemble); row.addWidget(self.btn_open_output); row.addStretch(1)
         self.label_job_seed = QLabel("Job seed: auto (first generation locks one random seed for the whole job). Edit a shot's Seed value below to override it for retries.", body)
         self.label_job_seed.setWordWrap(True)
         lay.addWidget(self.label_job_seed)
         self.review_table = QTableWidget(0, 6, body)
-        # Keep the compact/editable values at the left and give the remaining width
-        # to Output.  Long Windows paths are much easier to inspect this way.
-        self.review_table.setHorizontalHeaderLabels(["#", "Seed", "Status", "Frames", "Edit range", "Output"])
+        self.review_table.setHorizontalHeaderLabels(["#", "Status", "Frames", "Edit range", "Output", "Seed"])
         self.review_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.review_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.review_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.review_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.review_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self.review_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
-        self.review_table.setTextElideMode(Qt.ElideMiddle)
+        self.review_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.review_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.review_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.review_table.setMinimumHeight(320)
         lay.addWidget(self.review_table, 1)
@@ -3077,11 +3529,9 @@ class MiniMaxMusicClipWidget(QWidget):
         self.review_preview.setAlignment(Qt.AlignCenter)
         self.review_preview.setMinimumHeight(180)
         self.review_preview.setMaximumHeight(280)
-        # Do not use palette(base) here: when embedded, Qt's native palette may still
-        # be light even though the standalone GUI uses a dark stylesheet.
-        self.review_preview.setStyleSheet(
-            "QLabel { border:1px solid #334556; background:#0b0f14; color:#9ab8d8; border-radius:5px; }"
-        )
+        # Let the host theme draw this panel instead of forcing MiniMax-specific
+        # dark colors that can clash with FrameVision themes.
+        self.review_preview.setFrameShape(QFrame.Shape.StyledPanel)
         preview_lay.addWidget(self.review_preview, 1)
         preview_actions = QHBoxLayout()
         self.btn_play_clip = QPushButton("Play selected clip", preview_box)
@@ -3089,13 +3539,6 @@ class MiniMaxMusicClipWidget(QWidget):
         preview_actions.addWidget(self.btn_play_clip); preview_actions.addWidget(self.btn_open_clip_folder); preview_actions.addStretch(1)
         preview_lay.addLayout(preview_actions)
         lay.addWidget(preview_box)
-        outer.addLayout(row)
-
-        self.btn_generate_selected.clicked.connect(self._generate_selected)
-        self.btn_generate_all.clicked.connect(self._generate_all)
-        self.btn_stop_generation.clicked.connect(self._stop_generation)
-        self.btn_assemble.clicked.connect(self._assemble)
-        self.btn_open_output.clicked.connect(self._open_output_folder)
         self.btn_play_clip.clicked.connect(self._play_selected_clip)
         self.btn_open_clip_folder.clicked.connect(self._open_selected_clip_folder)
         self.review_table.itemSelectionChanged.connect(self._show_selected_clip_preview)
@@ -3104,43 +3547,112 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _build_settings_tab(self) -> None:
         outer, body, lay = self._scrollable_tab_body(self.page_settings)
-        clip = QGroupBox("Music Clip Creator", body)
-        form = QFormLayout(clip)
-        self.combo_resolution = QComboBox(clip); self.combo_resolution.addItems(list(RESOLUTION_PRESETS.keys())); self.combo_resolution.setCurrentText("832 × 480")
-        self.combo_aspect = QComboBox(clip); self.combo_aspect.addItems(["16:9", "9:16", "1:1"])
+        gen = QGroupBox("MiniMax generation", body)
+        form = QFormLayout(gen)
+        self.combo_resolution = QComboBox(gen); self.combo_resolution.addItems(list(RESOLUTION_PRESETS.keys())); self.combo_resolution.setCurrentText("832 × 480")
+        self.combo_aspect = QComboBox(gen); self.combo_aspect.addItems(["16:9", "9:16", "1:1"])
         form.addRow("Resolution:", self.combo_resolution); form.addRow("Aspect ratio:", self.combo_aspect)
 
         max_row = QHBoxLayout()
-        self.slider_frames = QSlider(Qt.Horizontal, clip); self.slider_frames.setRange(0, len(MUSIC_FRAME_GRID) - 1); self.slider_frames.setValue(len(MUSIC_FRAME_GRID) - 1)
-        self.label_frames = QLabel(clip)
+        self.slider_frames = QSlider(Qt.Horizontal, gen); self.slider_frames.setRange(0, len(MUSIC_FRAME_GRID) - 1); self.slider_frames.setValue(len(MUSIC_FRAME_GRID) - 1)
+        self.label_frames = QLabel(gen)
         max_row.addWidget(self.slider_frames, 1); max_row.addWidget(self.label_frames)
         form.addRow("Maximum generated shot length:", max_row)
         self.slider_frames.setToolTip(
             "Sets the maximum MiniMax Ref2VA generation length used by the planner. The director may use shorter valid frame counts. "
             "Generated clips can include extra material at the beginning/end and are trimmed during final assembly."
         )
-        self.spin_head = QDoubleSpinBox(clip); self.spin_head.setRange(0.0, 2.0); self.spin_head.setSingleStep(0.05); self.spin_head.setValue(0.35); self.spin_head.setSuffix(" s")
-        self.spin_tail = QDoubleSpinBox(clip); self.spin_tail.setRange(0.0, 2.0); self.spin_tail.setSingleStep(0.05); self.spin_tail.setValue(0.45); self.spin_tail.setSuffix(" s")
-        self.spin_snap = QDoubleSpinBox(clip); self.spin_snap.setRange(0.0, 3.0); self.spin_snap.setSingleStep(0.05); self.spin_snap.setValue(1.25); self.spin_snap.setSuffix(" s")
+        self.spin_head = QDoubleSpinBox(gen); self.spin_head.setRange(0.0, 2.0); self.spin_head.setSingleStep(0.05); self.spin_head.setValue(0.35); self.spin_head.setSuffix(" s")
+        self.spin_tail = QDoubleSpinBox(gen); self.spin_tail.setRange(0.0, 2.0); self.spin_tail.setSingleStep(0.05); self.spin_tail.setValue(0.45); self.spin_tail.setSuffix(" s")
+        self.spin_snap = QDoubleSpinBox(gen); self.spin_snap.setRange(0.0, 3.0); self.spin_snap.setSingleStep(0.05); self.spin_snap.setValue(1.25); self.spin_snap.setSuffix(" s")
         form.addRow("Extra context before edit:", self.spin_head)
         form.addRow("Extra context after edit:", self.spin_tail)
         form.addRow("Phrase-boundary snap tolerance:", self.spin_snap)
-        lay.addWidget(clip)
+        self.spin_steps = QSpinBox(gen); self.spin_steps.setRange(1, 100); self.spin_steps.setValue(10)
+        self.spin_cfg = QDoubleSpinBox(gen); self.spin_cfg.setRange(0.0, 20.0); self.spin_cfg.setValue(1.0); self.spin_cfg.setDecimals(2)
+        self.spin_shift = QDoubleSpinBox(gen); self.spin_shift.setRange(0.0, 30.0); self.spin_shift.setValue(12.0); self.spin_shift.setDecimals(2)
+        self.spin_audio_shift = QDoubleSpinBox(gen); self.spin_audio_shift.setRange(0.0, 20.0); self.spin_audio_shift.setValue(3.0); self.spin_audio_shift.setDecimals(2)
+        form.addRow("Steps:", self.spin_steps); form.addRow("CFG:", self.spin_cfg); form.addRow("Shift:", self.spin_shift); form.addRow("Audio shift:", self.spin_audio_shift)
+        self.combo_ref_size = QComboBox(gen); self.combo_ref_size.addItems(["match", "max"]); form.addRow("Reference image size:", self.combo_ref_size)
+        lora_row = QHBoxLayout()
+        self.edit_turbo_lora = QLineEdit(gen)
+        self.edit_turbo_lora.setPlaceholderText("Optional speed / Turbo LoRA (.safetensors)")
+        self.btn_turbo_lora = QPushButton("Browse...", gen)
+        self.spin_turbo_lora = QDoubleSpinBox(gen); self.spin_turbo_lora.setRange(-4.0, 4.0); self.spin_turbo_lora.setSingleStep(0.05); self.spin_turbo_lora.setDecimals(2); self.spin_turbo_lora.setValue(1.0)
+        self.spin_turbo_lora.setToolTip("Strength for the selected MiniMax LoRA. 1.0 = normal strength.")
+        lora_row.addWidget(self.edit_turbo_lora, 1); lora_row.addWidget(self.btn_turbo_lora); lora_row.addWidget(QLabel("Strength:", gen)); lora_row.addWidget(self.spin_turbo_lora)
+        form.addRow("Turbo / speed LoRA:", lora_row)
+        self.btn_turbo_lora.clicked.connect(self._browse_turbo_lora)
 
-        inherited = QLabel(
-            "MiniMax generation settings are inherited from the main standalone Settings tab. "
-            "Model / hybrid checkpoint, LoRAs and strengths, steps, CFG, video/audio shift, sampler, scheduler, "
-            "Ref2VA/model paths, VRAM Manager, Spectrum and Sage/Sol/SLA Attention are not duplicated here.",
-            body,
-        )
-        inherited.setWordWrap(True)
-        lay.addWidget(inherited)
+        extra_note = QLabel("Two optional MiniMax H3 LoRAs can be stacked on top of the existing Turbo / 4-step LoRA. Maximum total: 3 LoRAs. Strength 0 disables an extra slot.", gen)
+        extra_note.setWordWrap(True)
+        form.addRow(extra_note)
+
+        extra1_row = QHBoxLayout()
+        self.edit_extra_lora1 = QLineEdit(gen); self.edit_extra_lora1.setPlaceholderText("Optional extra MiniMax H3 LoRA 1 (.safetensors)")
+        self.btn_extra_lora1 = QPushButton("Browse...", gen)
+        self.btn_clear_extra_lora1 = QPushButton("Clear", gen)
+        self.spin_extra_lora1 = QDoubleSpinBox(gen); self.spin_extra_lora1.setRange(-10.0, 10.0); self.spin_extra_lora1.setSingleStep(0.05); self.spin_extra_lora1.setDecimals(2); self.spin_extra_lora1.setValue(1.0)
+        self.spin_extra_lora1.setToolTip("LoRA strength. 1.0 = trained strength; 0 disables this slot; negative values are allowed for compatible LoRAs.")
+        extra1_row.addWidget(self.edit_extra_lora1, 1); extra1_row.addWidget(self.btn_extra_lora1); extra1_row.addWidget(self.btn_clear_extra_lora1); extra1_row.addWidget(QLabel("Strength:", gen)); extra1_row.addWidget(self.spin_extra_lora1)
+        form.addRow("Extra LoRA 1:", extra1_row)
+        self.btn_extra_lora1.clicked.connect(lambda: self._browse_extra_lora(1))
+        self.btn_clear_extra_lora1.clicked.connect(self.edit_extra_lora1.clear)
+
+        extra2_row = QHBoxLayout()
+        self.edit_extra_lora2 = QLineEdit(gen); self.edit_extra_lora2.setPlaceholderText("Optional extra MiniMax H3 LoRA 2 (.safetensors)")
+        self.btn_extra_lora2 = QPushButton("Browse...", gen)
+        self.btn_clear_extra_lora2 = QPushButton("Clear", gen)
+        self.spin_extra_lora2 = QDoubleSpinBox(gen); self.spin_extra_lora2.setRange(-10.0, 10.0); self.spin_extra_lora2.setSingleStep(0.05); self.spin_extra_lora2.setDecimals(2); self.spin_extra_lora2.setValue(1.0)
+        self.spin_extra_lora2.setToolTip("LoRA strength. 1.0 = trained strength; 0 disables this slot; negative values are allowed for compatible LoRAs.")
+        extra2_row.addWidget(self.edit_extra_lora2, 1); extra2_row.addWidget(self.btn_extra_lora2); extra2_row.addWidget(self.btn_clear_extra_lora2); extra2_row.addWidget(QLabel("Strength:", gen)); extra2_row.addWidget(self.spin_extra_lora2)
+        form.addRow("Extra LoRA 2:", extra2_row)
+        self.btn_extra_lora2.clicked.connect(lambda: self._browse_extra_lora(2))
+        self.btn_clear_extra_lora2.clicked.connect(self.edit_extra_lora2.clear)
+
+        self.check_hybrid_model = QCheckBox("Use hybrid model", gen)
+        self.check_hybrid_model.setToolTip("Use one hybrid MiniMax H3 diffusion checkpoint for these Ref2VA music clips instead of the normal Ref2VA checkpoint. This choice is remembered after restart.")
+        hybrid_row = QHBoxLayout()
+        self.edit_hybrid_model = QLineEdit(gen); self.edit_hybrid_model.setPlaceholderText("Hybrid MiniMax H3 checkpoint (.safetensors)")
+        self.btn_hybrid_model = QPushButton("Browse...", gen)
+        hybrid_row.addWidget(self.edit_hybrid_model, 1); hybrid_row.addWidget(self.btn_hybrid_model)
+        form.addRow(self.check_hybrid_model)
+        form.addRow("Hybrid checkpoint:", hybrid_row)
+        self.btn_hybrid_model.clicked.connect(self._browse_hybrid_model)
+        self.check_hybrid_model.toggled.connect(self._sync_hybrid_model_controls)
+        self._sync_hybrid_model_controls(False)
+        self.check_vram_manager = QCheckBox("Enable VRAM Manager protection", gen); self.check_vram_manager.setChecked(True)
+        self.check_vram_manager.setToolTip("Master switch. Off = never use VRAM Manager. On = use the setting below to choose automatic bypass or always-on protection.")
+        self.check_vram_auto_bypass = QCheckBox("Automatic bypass when job fits", gen); self.check_vram_auto_bypass.setChecked(True)
+        self.check_vram_auto_bypass.setToolTip("On = MiniMax decides per stage/job whether native loading is safe. Off = VRAM Manager stays active for every job.")
+        self.check_sage = QCheckBox("SageAttention", gen)
+        self.check_sla = QCheckBox("SLA Attention", gen); self.check_sla.setChecked(True)
+        self.check_spectrum = QCheckBox("Spectrum Forecasting", gen); self.check_spectrum.setChecked(True)
+        flags = QHBoxLayout(); flags.addWidget(self.check_vram_manager); flags.addWidget(self.check_vram_auto_bypass); flags.addWidget(self.check_sage); flags.addWidget(self.check_sla); flags.addWidget(self.check_spectrum); flags.addStretch(1)
+        form.addRow("Acceleration / VRAM:", flags)
+
+        post = QGroupBox("Final video upscale / restoration", body)
+        post_lay = QVBoxLayout(post)
+        self.check_hypir_x1_upscale = QCheckBox("Use HyPiR x1 Upscale", post)
+        self.check_hypir_x1_upscale.setToolTip("Runs HyPiR at 1x on the assembled final music video. This restores/enhances detail without changing resolution, but it may slightly change face details.")
+        hypir_note = QLabel("May slightly change face details.", post)
+        hypir_note.setWordWrap(True)
+        self.check_lanczos_x2_upsampling = QCheckBox("Use Lanczos x2 upsampling", post)
+        self.check_lanczos_x2_upsampling.setToolTip("Upsamples the assembled final music video to 2x width and 2x height with FFmpeg Lanczos scaling.")
+        order_note = QLabel("If both are enabled: HyPiR x1 runs first, then Lanczos x2.", post)
+        order_note.setWordWrap(True)
+        post_lay.addWidget(self.check_hypir_x1_upscale)
+        post_lay.addWidget(hypir_note)
+        post_lay.addWidget(self.check_lanczos_x2_upsampling)
+        post_lay.addWidget(order_note)
+
+        lay.addWidget(gen)
+        lay.addWidget(post)
         explanation = QLabel(
             "Timing rule: the song timeline is authoritative. MiniMax valid frame counts determine how much source footage is generated, "
-            "then FFmpeg trims each source clip to its exact edit slot.",
+            "then FFmpeg trims each source clip to its exact edit slot. Small timing mismatches are repaired during assembly instead of aborting.",
             body,
-        )
-        explanation.setWordWrap(True); lay.addWidget(explanation); lay.addStretch(1)
+        ); explanation.setWordWrap(True); lay.addWidget(explanation); lay.addStretch(1)
         self.slider_frames.valueChanged.connect(self._update_frame_label)
         self._update_frame_label()
 
@@ -3163,55 +3675,6 @@ class MiniMaxMusicClipWidget(QWidget):
                 item.setText(text)
                 self.shot_table.blockSignals(False)
 
-    def _read_main_gui_generation_settings(self) -> Dict[str, Any]:
-        """Read one authoritative MiniMax generation configuration.
-
-        When embedded, the host callback first saves and returns the live main-GUI
-        settings. When launched independently, fall back to the same persisted file.
-        """
-        if callable(getattr(self, "settings_provider", None)):
-            try:
-                data = self.settings_provider()
-                if isinstance(data, dict):
-                    return dict(data)
-            except (AttributeError, RuntimeError):
-                # The Music Clip tab is constructed before the main Settings tab,
-                # so some host widgets do not exist yet during initial restore.
-                # Fall back to the already-saved main GUI settings for startup only.
-                pass
-        try:
-            if MAIN_GUI_SETTINGS_PATH.is_file():
-                data = json.loads(_read_text_tolerant(MAIN_GUI_SETTINGS_PATH))
-                if isinstance(data, dict):
-                    return data
-        except Exception:
-            pass
-        return dict(getattr(self.project, "generation_settings_snapshot", {}) or {})
-
-    def _refresh_generation_settings_snapshot(self) -> Dict[str, Any]:
-        data = self._read_main_gui_generation_settings()
-        if data:
-            # Keep the complete main-GUI snapshot in the job manifest for review.
-            self.project.generation_settings_snapshot = data
-            # Populate legacy scalar fields too, only for backward compatibility with
-            # older manifests/tools that know these names. They are no longer UI-owned.
-            self.project.steps = int(data.get("steps", self.project.steps))
-            self.project.cfg = float(data.get("cfg", self.project.cfg))
-            self.project.shift = float(data.get("shift", self.project.shift))
-            self.project.audio_shift = float(data.get("audio_shift", self.project.audio_shift))
-            self.project.ref_image_size = str(data.get("ref_size", self.project.ref_image_size) or self.project.ref_image_size)
-            self.project.vram_manager_enabled = bool(data.get("vram_manager_enabled", self.project.vram_manager_enabled))
-            self.project.vram_auto_bypass = bool(data.get("vram_manager_auto_bypass", self.project.vram_auto_bypass))
-            self.project.sage_attention = bool(data.get("sage_attention_enabled", False))
-            self.project.spectrum = bool(data.get("spectrum_enabled", False))
-            self.project.use_hybrid_model = bool(data.get("use_hybrid_model", False))
-            self.project.hybrid_model_path = str(data.get("hybrid_model", "") or "")
-            loras = data.get("loras", []) or []
-            first = next((x for x in loras if isinstance(x, dict) and str(x.get("path", "") or "").strip()), None)
-            self.project.turbo_lora_path = str(first.get("path", "") or "") if first else ""
-            self.project.turbo_lora_strength = float(first.get("strength", 1.0)) if first else 1.0
-        return data
-
     def _pull_ui(self) -> None:
         # The Director prompt editor is authoritative. Commit it before ANY save,
         # queue, generation, restart autosave, or project-state snapshot.
@@ -3224,6 +3687,8 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.characters_subjects = self.edit_subjects.toPlainText().strip()
         self.project.locations_world = self.edit_world.text().strip()
         self.project.camera_choreography = self.edit_camera.text().strip()
+        self.project.auto_fill_locations = bool(getattr(self, "check_auto_fill_locations", None) and self.check_auto_fill_locations.isChecked())
+        self.project.auto_fill_camera = bool(getattr(self, "check_auto_fill_camera", None) and self.check_auto_fill_camera.isChecked())
         self.project.beat_sensitivity = self.spin_sensitivity.value()
         self.project.whisper_timing_enabled = self.check_whisper_timing.isChecked()
         self.project.visible_lyric_subtitles = self.check_visible_lyric_subtitles.isChecked()
@@ -3233,18 +3698,44 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project.head_padding = self.spin_head.value()
         self.project.tail_padding = self.spin_tail.value()
         self.project.phrase_snap_tolerance = self.spin_snap.value()
-        # Generation/runtime options come from the main MiniMax GUI and are
-        # snapshotted only when a generation job is actually prepared. This keeps
-        # an old project's historical generation snapshot intact while merely reviewing it.
+        self.project.steps = 10
+        if self.spin_steps.value() != 10:
+            self.spin_steps.setValue(10)
+        self.project.cfg = self.spin_cfg.value()
+        self.project.shift = self.spin_shift.value()
+        self.project.audio_shift = self.spin_audio_shift.value()
+        self.project.ref_image_size = self.combo_ref_size.currentText()
+        self.project.remove_reference_backgrounds = bool(getattr(self, "check_remove_ref_backgrounds", None) and self.check_remove_ref_backgrounds.isChecked())
+        self.project.turbo_lora_path = self.edit_turbo_lora.text().strip()
+        self.project.turbo_lora_strength = self.spin_turbo_lora.value()
+        self.project.extra_lora1_path = self.edit_extra_lora1.text().strip()
+        self.project.extra_lora1_strength = self.spin_extra_lora1.value()
+        self.project.extra_lora2_path = self.edit_extra_lora2.text().strip()
+        self.project.extra_lora2_strength = self.spin_extra_lora2.value()
+        self.project.use_hybrid_model = self.check_hybrid_model.isChecked()
+        self.project.hybrid_model_path = self.edit_hybrid_model.text().strip()
+        self.project.vram_manager_enabled = self.check_vram_manager.isChecked()
+        self.project.vram_auto_bypass = self.check_vram_auto_bypass.isChecked()
+        self.project.sage_attention = self.check_sage.isChecked()
+        self.project.sla_attention = True
+        self.project.spectrum = True
+        self.check_sla.setChecked(True)
+        self.check_spectrum.setChecked(True)
         self.project.randomize_reference_characters = bool(self.check_randomize_ref_characters.isChecked())
         self.project.unlimited_random_references = bool(self.project.randomize_reference_characters and self.check_unlimited_random_refs.isChecked())
-        self.project.single_character_reference_per_clip = bool(self.check_single_character_ref.isChecked())
+        self.project.use_framevision_queue = bool(self.check_framevision_queue.isChecked())
+        self.project.use_hypir_x1_upscale = bool(getattr(self, "check_hypir_x1_upscale", None) and self.check_hypir_x1_upscale.isChecked())
+        self.project.use_lanczos_x2_upsampling = bool(getattr(self, "check_lanczos_x2_upsampling", None) and self.check_lanczos_x2_upsampling.isChecked())
         self.project.references = self._refs_from_table()
 
     def _sync_ui_from_project(self) -> None:
         p = self.project
         self.edit_audio.setText(p.audio_path); self.edit_output.setText(p.output_dir or str(OUTPUT_ROOT)); self.edit_title.setText(p.title)
         self.edit_idea.setPlainText(p.main_idea); self.edit_style.setText(p.style_theme); self.edit_subjects.setPlainText(p.characters_subjects); self.edit_world.setText(p.locations_world); self.edit_camera.setText(p.camera_choreography)
+        if getattr(self, "check_auto_fill_locations", None) is not None:
+            self.check_auto_fill_locations.setChecked(bool(getattr(p, "auto_fill_locations", False)))
+        if getattr(self, "check_auto_fill_camera", None) is not None:
+            self.check_auto_fill_camera.setChecked(bool(getattr(p, "auto_fill_camera", False)))
         self.spin_sensitivity.setValue(p.beat_sensitivity)
         self.check_whisper_timing.setChecked(bool(getattr(p, "whisper_timing_enabled", True)))
         self.check_visible_lyric_subtitles.setChecked(bool(getattr(p, "visible_lyric_subtitles", False)))
@@ -3253,10 +3744,27 @@ class MiniMaxMusicClipWidget(QWidget):
         nearest_idx = min(range(len(MUSIC_FRAME_GRID)), key=lambda i: abs(MUSIC_FRAME_GRID[i] - int(p.max_frames or MUSIC_FRAME_DEFAULT_MAX)))
         self.slider_frames.setValue(nearest_idx)
         self.spin_head.setValue(p.head_padding); self.spin_tail.setValue(p.tail_padding); self.spin_snap.setValue(p.phrase_snap_tolerance)
+        self.spin_steps.setValue(p.steps); self.spin_cfg.setValue(p.cfg); self.spin_shift.setValue(p.shift); self.spin_audio_shift.setValue(p.audio_shift)
+        self.combo_ref_size.setCurrentText(p.ref_image_size if p.ref_image_size in ("match", "max") else "match")
+        self.edit_turbo_lora.setText(p.turbo_lora_path or "")
+        self.spin_turbo_lora.setValue(float(p.turbo_lora_strength if p.turbo_lora_strength is not None else 1.0))
+        self.edit_extra_lora1.setText(str(getattr(p, "extra_lora1_path", "") or ""))
+        self.spin_extra_lora1.setValue(float(getattr(p, "extra_lora1_strength", 1.0)))
+        self.edit_extra_lora2.setText(str(getattr(p, "extra_lora2_path", "") or ""))
+        self.spin_extra_lora2.setValue(float(getattr(p, "extra_lora2_strength", 1.0)))
+        self.check_hybrid_model.setChecked(bool(getattr(p, "use_hybrid_model", False)))
+        self.edit_hybrid_model.setText(str(getattr(p, "hybrid_model_path", "") or ""))
+        self.check_vram_manager.setChecked(bool(p.vram_manager_enabled)); self.check_vram_auto_bypass.setChecked(bool(p.vram_auto_bypass)); self.check_sage.setChecked(p.sage_attention); self.check_sla.setChecked(bool(getattr(p, "sla_attention", True))); self.check_spectrum.setChecked(p.spectrum)
         self.check_randomize_ref_characters.setChecked(bool(getattr(p, "randomize_reference_characters", False)))
         self.check_unlimited_random_refs.setChecked(bool(getattr(p, "unlimited_random_references", False)))
-        self.check_single_character_ref.setChecked(bool(getattr(p, "single_character_reference_per_clip", False)))
         self._update_unlimited_random_ref_controls()
+        if getattr(self, "check_remove_ref_backgrounds", None) is not None:
+            self.check_remove_ref_backgrounds.setChecked(bool(getattr(p, "remove_reference_backgrounds", True)))
+        self.check_framevision_queue.setChecked(bool(getattr(p, "use_framevision_queue", False)))
+        if getattr(self, "check_hypir_x1_upscale", None) is not None:
+            self.check_hypir_x1_upscale.setChecked(bool(getattr(p, "use_hypir_x1_upscale", False)))
+        if getattr(self, "check_lanczos_x2_upsampling", None) is not None:
+            self.check_lanczos_x2_upsampling.setChecked(bool(getattr(p, "use_lanczos_x2_upsampling", False)))
         self._populate_refs(); self._populate_analysis(); self._populate_shots(); self._populate_review(); self._update_frame_label()
 
     def _project_dict(self) -> Dict[str, Any]:
@@ -3278,12 +3786,11 @@ class MiniMaxMusicClipWidget(QWidget):
             beats=[Beat(**x) for x in a.get("beats", []) if isinstance(x, dict)],
             sections=[Section(**x) for x in a.get("sections", []) if isinstance(x, dict)],
         )
-        shot_fields = set(MusicShot.__dataclass_fields__)
-        p.shots = [MusicShot(**{k: v for k, v in x.items() if k in shot_fields}) for x in data.get("shots", []) if isinstance(x, dict)]
+        p.shots = [MusicShot(**x) for x in data.get("shots", []) if isinstance(x, dict)]
         return p
 
     def _ensure_project_output_folder(self, reset_generated_state: bool = True) -> Path:
-        """Bind output to the current title+track pair and create its persistent manifest."""
+        """Bind output to the current title+track pair so unrelated projects never share clips."""
         title = self.edit_title.text().strip() if hasattr(self, "edit_title") else self.project.title
         audio = self.edit_audio.text().strip() if hasattr(self, "edit_audio") else self.project.audio_path
         identity = _music_project_identity(title, audio)
@@ -3292,55 +3799,15 @@ class MiniMaxMusicClipWidget(QWidget):
 
         previous_identity = str(self.project.output_identity or "")
         if previous_identity and previous_identity != identity:
-            # A title/track identity change starts a new output job, but the existing
-            # project may already have a locked generation seed. Ask whether that
-            # seed should be carried into the new job or replaced with a fresh one.
-            try:
-                previous_job_seed = int(getattr(self.project, "job_seed", -1))
-            except Exception:
-                previous_job_seed = -1
-            if previous_job_seed >= 0:
-                box = QMessageBox(self)
-                box.setIcon(QMessageBox.Icon.Question)
-                box.setWindowTitle("Seed for new job")
-                box.setText(f"The previous job used seed {previous_job_seed}.")
-                box.setInformativeText(
-                    "Do you want the newly named job to reuse that seed, or start fresh with a new random seed?"
-                )
-                keep_btn = box.addButton("Use same seed again", QMessageBox.ButtonRole.AcceptRole)
-                fresh_btn = box.addButton("Start fresh with random seed", QMessageBox.ButtonRole.ActionRole)
-                box.setDefaultButton(fresh_btn)
-                box.exec()
-                if box.clickedButton() is fresh_btn:
-                    fresh_seed = self._next_job_seed()
-                    while fresh_seed == previous_job_seed:
-                        fresh_seed = self._next_job_seed()
-                    self.project.job_seed = fresh_seed
-                    # Any per-shot seeds inherited from the old job must follow the
-                    # new job seed on the next generation instead of silently keeping
-                    # the previous value.
-                    for shot in self.project.shots:
-                        shot.seed = -1
-                    try:
-                        self._update_job_seed_label()
-                        self._populate_review()
-                    except Exception:
-                        pass
-                else:
-                    # Explicitly preserve both the job seed and any per-shot retry
-                    # overrides when the user chooses reproducibility.
-                    self.project.job_seed = previous_job_seed
-
+            # A different title/track pair is a different persistent job. Never carry
+            # the previous job's stable ID into the new folder.
             self.project.project_id = ""
             self.project.created_at = ""
             self.project.updated_at = ""
             self.project_path = ""
 
         if self.project.output_identity == identity and self.project.output_dir:
-            out = Path(self.project.output_dir)
-            self.project_path = str(out / PROJECT_MANIFEST_NAME)
-            _persist_project_manifest(self.project, snapshot_assets=True)
-            return out
+            return Path(self.project.output_dir)
 
         label = _safe_stem(title or (Path(audio).stem if audio else "music_project")) or "music_project"
         track_label = _safe_stem(Path(audio).stem) if audio else ""
@@ -3351,8 +3818,9 @@ class MiniMaxMusicClipWidget(QWidget):
         base = OUTPUT_ROOT / label
         candidate = base
         serial = 2
+        marker_name = PROJECT_MARKER_NAME
         while candidate.exists():
-            marker = candidate / PROJECT_MARKER_NAME
+            marker = candidate / marker_name
             try:
                 if marker.is_file():
                     data = json.loads(_read_text_tolerant(marker))
@@ -3367,6 +3835,8 @@ class MiniMaxMusicClipWidget(QWidget):
 
         old_identity = previous_identity
         candidate.mkdir(parents=True, exist_ok=True)
+        # Reuse the persistent ID when re-entering an existing job folder. Otherwise
+        # allocate it exactly once when the new job folder is first bound.
         if not self.project.project_id:
             try:
                 existing_manifest = candidate / PROJECT_MANIFEST_NAME
@@ -3408,15 +3878,34 @@ class MiniMaxMusicClipWidget(QWidget):
         self.project = MusicProject(output_dir=str(OUTPUT_ROOT))
         for name in (
             "resolution", "aspect", "max_frames", "head_padding", "tail_padding",
-            "phrase_snap_tolerance", "beat_sensitivity", "whisper_timing_enabled", "visible_lyric_subtitles",
-            "randomize_reference_characters", "unlimited_random_references", "single_character_reference_per_clip",
+            "phrase_snap_tolerance", "steps", "cfg", "shift", "audio_shift",
+            "ref_image_size", "remove_reference_backgrounds", "turbo_lora_path", "turbo_lora_strength",
+            "extra_lora1_path", "extra_lora1_strength", "extra_lora2_path", "extra_lora2_strength",
+            "use_hybrid_model", "hybrid_model_path",
+            "vram_manager_enabled", "vram_auto_bypass", "vram_residency_engine",
+            "vram_runtime_free_gb", "vram_text_headroom_gb", "vram_diffusion_headroom_gb",
+            "vram_offload_chunk_mb", "vram_max_resident_weights_gb", "vram_block_check_interval",
+            "vram_async_streams", "vram_video_vae_reserve_gb", "vram_audio_vae_reserve_gb",
+            "vram_residency_fill", "vram_residency_target_free_gb", "vram_residency_warmup_blocks",
+            "vram_residency_refill_interval", "sage_attention", "sla_attention", "spectrum", "beat_sensitivity", "whisper_timing_enabled", "visible_lyric_subtitles",
+            "randomize_reference_characters", "unlimited_random_references",
         ):
             setattr(self.project, name, getattr(old, name))
-        self._refresh_generation_settings_snapshot()
         self.project.project_id = ""
         self.project.created_at = ""
         self.project.updated_at = ""
         self.project_path = ""
+        # A deliberate New Project must not be immediately replaced by a stale
+        # assistant handoff on the next 1-second poll.  Mark the current handoff
+        # snapshot as already seen; a genuinely new assistant update will have a
+        # newer mtime and will still import normally.
+        try:
+            self._assistant_handoff_mtime_ns = (
+                ASSISTANT_HANDOFF_PATH.stat().st_mtime_ns
+                if ASSISTANT_HANDOFF_PATH.is_file() else 0
+            )
+        except Exception:
+            pass
         _cleanup_music_clip_temp_artifacts()
         self._sync_ui_from_project()
         self.status.setText("New project.")
@@ -3424,9 +3913,8 @@ class MiniMaxMusicClipWidget(QWidget):
         self._write_autosave(force=True)
 
     def _browse_audio(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select master song", _dialog_start_dir("music_audio", fallback=ROOT), "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg);;All files (*.*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select master song", "", "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg);;All files (*.*)")
         if path:
-            _remember_dialog_folder("music_audio", path)
             self.edit_audio.setText(path)
             if not self.edit_title.text().strip(): self.edit_title.setText(Path(path).stem)
             # A newly selected track invalidates the old project's output binding.
@@ -3449,17 +3937,13 @@ class MiniMaxMusicClipWidget(QWidget):
             self.label_duration.setText(f"Duration: {_fmt_time(dur)} ({dur:.2f} s)" if dur else "Duration: unknown")
 
     def _browse_output(self) -> None:
-        current_output = self.edit_output.text().strip()
-        preferred_output = current_output if current_output and Path(current_output) != OUTPUT_ROOT else None
-        path = QFileDialog.getExistingDirectory(self, "Select project output folder", _dialog_start_dir("music_output", preferred_output, OUTPUT_ROOT))
-        if path:
-            _remember_dialog_folder("music_output", path)
-            self.edit_output.setText(path)
+        path = QFileDialog.getExistingDirectory(self, "Select project output folder", self.edit_output.text().strip() or str(OUTPUT_ROOT))
+        if path: self.edit_output.setText(path)
 
     def _save_project(self, force_as: bool = False) -> None:
         """Compatibility entry point: project saving is automatic and job-folder scoped."""
         self._pull_ui()
-        self._ensure_project_output_folder(reset_generated_state=False)
+        out_dir = self._ensure_project_output_folder(reset_generated_state=False)
         manifest = _persist_project_manifest(self.project, snapshot_assets=True)
         if manifest is not None:
             self.project_path = str(manifest)
@@ -3468,17 +3952,18 @@ class MiniMaxMusicClipWidget(QWidget):
         self._write_autosave(force=True)
 
     def _open_project(self) -> None:
-        preferred = self.project.output_dir if self.project.output_dir and Path(self.project.output_dir).is_dir() else None
-        folder = QFileDialog.getExistingDirectory(self, "Load MiniMax music job folder", _dialog_start_dir("music_projects", preferred, OUTPUT_ROOT))
+        start_dir = self.project.output_dir if self.project.output_dir and Path(self.project.output_dir).is_dir() else str(OUTPUT_ROOT)
+        folder = QFileDialog.getExistingDirectory(self, "Load MiniMax music job folder", start_dir)
         if not folder:
             return
-        _remember_dialog_folder("music_projects", folder)
         try:
             project, manifest = _load_project_manifest(Path(folder))
             self.project = project
             self.project_path = str(manifest)
             self._sync_ui_from_project()
             self.status.setText(f"Loaded project {self.project.project_id[:8]}: {manifest.parent.name}")
+            # Refresh the manifest so restored/fallback asset paths and generated clip paths
+            # are immediately authoritative for future restarts and reassembly.
             _persist_project_manifest(self.project, snapshot_assets=True)
             self._write_autosave(force=True)
         except Exception as exc:
@@ -3529,19 +4014,17 @@ class MiniMaxMusicClipWidget(QWidget):
             self.status.setText(f"Added {added} reference image{'s' if added != 1 else ''}.")
 
     def _add_reference(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, "Add MiniMax reference images", _dialog_start_dir("music_ref_images", fallback=ROOT), "Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*.*)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add MiniMax reference images", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*.*)")
         if not paths:
             return
-        _remember_dialog_folder("music_ref_images", paths[0])
         self._append_reference_paths(paths)
 
     def _add_reference_folder(self) -> None:
         if not self._unlimited_random_refs_enabled():
             return
-        folder = QFileDialog.getExistingDirectory(self, "Add random reference folder", _dialog_start_dir("music_ref_images", fallback=ROOT))
+        folder = QFileDialog.getExistingDirectory(self, "Add random reference folder", "")
         if not folder:
             return
-        _remember_dialog_folder("music_ref_images", folder)
         root = Path(folder)
         paths = [str(p) for p in sorted(root.iterdir(), key=lambda x: x.name.lower()) if p.is_file() and self._supported_reference_image(p)]
         if not paths:
@@ -3554,47 +4037,9 @@ class MiniMaxMusicClipWidget(QWidget):
         for row in rows: self.refs_table.removeRow(row)
         self.project.references = self._refs_from_table()
 
-    def _select_all_references(self) -> None:
-        if self.refs_table.rowCount() > 0:
-            self.refs_table.selectAll()
-
-    def _clear_reference_list(self) -> None:
-        if self.refs_table.rowCount() <= 0:
-            return
-        answer = QMessageBox.question(
-            self,
-            "Clear reference list",
-            "Remove all reference images from this project?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if answer != QMessageBox.Yes:
-            return
-        self.refs_table.setRowCount(0)
-        self.project.references = []
-
-    def _reference_role_changed(self, source_row: int, role: str) -> None:
-        """Apply a role edit to every selected reference row when editing a selection."""
-        role = _normalise_reference_kind(role)
-        selected_rows = sorted({idx.row() for idx in self.refs_table.selectedIndexes()})
-        target_rows = selected_rows if source_row in selected_rows and len(selected_rows) > 1 else [source_row]
-        for row in target_rows:
-            combo = self.refs_table.cellWidget(row, 2)
-            if not isinstance(combo, QComboBox) or combo.currentText() == role:
-                continue
-            combo.blockSignals(True)
-            combo.setCurrentText(role)
-            combo.blockSignals(False)
-        self.project.references = self._refs_from_table()
-
     def _populate_refs(self) -> None:
         self.refs_table.blockSignals(True); self.refs_table.setRowCount(0)
-        # The table is the editable project reference pool. In unlimited-random
-        # mode it must display the *entire* pool; otherwise the first UI refresh
-        # would silently collapse the project back to nine refs. MiniMax still
-        # receives at most nine refs per individual shot in auto_assign_references().
-        visible_refs = self.project.references if self._unlimited_random_refs_enabled() else self.project.references[:9]
-        for ref in visible_refs:
+        for ref in self.project.references:
             row = self.refs_table.rowCount(); self.refs_table.insertRow(row); self.refs_table.setRowHeight(row, 92)
             use = QTableWidgetItem(""); use.setFlags(use.flags() | Qt.ItemIsUserCheckable); use.setCheckState(Qt.Checked if ref.enabled else Qt.Unchecked); self.refs_table.setItem(row, 0, use)
             preview = QLabel(self.refs_table); preview.setAlignment(Qt.AlignCenter); preview.setMinimumSize(112, 78); preview.setMaximumSize(112, 78)
@@ -3610,10 +4055,8 @@ class MiniMaxMusicClipWidget(QWidget):
             role_combo.setCurrentText(_normalise_reference_kind(ref.kind))
             role_combo.setToolTip(
                 "Character = reusable person/identity. Background / Location = recurring environment. Object / Prop = reusable item. "
-                "Style / Mood = visual treatment. Picture / Composition anchor = use the image itself as framing/keyframe/shot-planning guidance. "
-                "When multiple rows are selected, changing this role applies it to all selected rows."
+                "Style / Mood = visual treatment. Picture / Composition anchor = use the image itself as framing/keyframe/shot-planning guidance."
             )
-            role_combo.currentTextChanged.connect(lambda value, r=row: self._reference_role_changed(r, value))
             self.refs_table.setCellWidget(row, 2, role_combo)
             desc_item = QTableWidgetItem(ref.description)
             desc_item.setToolTip(ref.description or "For characters: describe the individual appearance/identity traits that should stay distinct from other refs.")
@@ -3630,10 +4073,7 @@ class MiniMaxMusicClipWidget(QWidget):
             role_widget = self.refs_table.cellWidget(row, 2)
             kind = _normalise_reference_kind(role_widget.currentText() if isinstance(role_widget, QComboBox) else txt(2))
             refs.append(ReferenceAsset(name=txt(4) or Path(txt(5)).stem, kind=kind, path=txt(5), description=txt(3), enabled=bool(self.refs_table.item(row,0) and self.refs_table.item(row,0).checkState() == Qt.Checked)))
-        # Nine is the per-shot MiniMax input ceiling, not a project-pool ceiling.
-        # Keep every row when unlimited random refs is enabled so _pull_ui(),
-        # autosave and project persistence cannot throw away refs 10+.
-        return refs if self._unlimited_random_refs_enabled() else refs[:9]
+        return refs
 
     # ---- one-click video clip workflow ----
     def create_video_clip(self) -> None:
@@ -3651,12 +4091,11 @@ class MiniMaxMusicClipWidget(QWidget):
         audio = self.edit_audio.text().strip()
         if not audio or not Path(audio).is_file():
             path, _ = QFileDialog.getOpenFileName(
-                self, "Select master song for the video clip", _dialog_start_dir("music_audio", fallback=ROOT),
+                self, "Select master song for the video clip", "",
                 "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg);;All files (*.*)"
             )
             if not path:
                 return
-            _remember_dialog_folder("music_audio", path)
             self.edit_audio.setText(path)
             if not self.edit_title.text().strip():
                 self.edit_title.setText(Path(path).stem)
@@ -3664,8 +4103,24 @@ class MiniMaxMusicClipWidget(QWidget):
 
         self._pull_ui()
         self.project.audio_path = audio
+        # Assistant-launched runs must use FrameVision's shared queue whenever possible
+        # so the main app knows about every shot and the final assembly job.
+        if bool(getattr(self, "_assistant_run", False)) and getattr(self, "check_framevision_queue", None) is not None:
+            if not self.check_framevision_queue.isChecked():
+                self.check_framevision_queue.setChecked(True)
+            if not self._queue_mode_active():
+                self._emit_music_clip_event(
+                    "progress",
+                    message="FrameVision shared queue is unavailable. Running directly; I will still assemble automatically when all clips finish."
+                )
+        if self.project.use_hybrid_model:
+            hybrid = Path(str(self.project.hybrid_model_path or "").strip())
+            if not hybrid.is_file():
+                self._notify_hybrid_fallback(str(hybrid))
         self._ensure_project_output_folder(reset_generated_state=True)
+        self._write_assistant_handoff()
         self._one_click_active = True
+        self._emit_music_clip_event("progress", message="Analyzing the song and its structure...")
         # Show the stage that is actually running; the user can still inspect/change tabs.
         self.tabs.setCurrentIndex(2)
         self._set_busy("Video clip: analyzing track structure...")
@@ -3682,6 +4137,7 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _one_click_analysis_done(self, result: AnalysisResult) -> None:
         self.project.analysis = result
+        self._emit_music_clip_event("progress", message="Song analysis finished. Preparing timing and shot plan...")
         self._populate_analysis()
         self._write_autosave(force=True)
 
@@ -3690,6 +4146,7 @@ class MiniMaxMusicClipWidget(QWidget):
             return
 
         if _whisper_cpp_ready():
+            self._emit_music_clip_event("progress", message="Transcribing lyrics for clip timing...")
             self._set_busy("Video clip: transcribing lyrics with Whisper.cpp...")
             self._one_click_start_worker_when_idle(_whisper_task, self._one_click_whisper_done, self.project.audio_path)
             return
@@ -3724,22 +4181,18 @@ class MiniMaxMusicClipWidget(QWidget):
         self._one_click_build_plan_and_queue()
 
     def _one_click_build_plan_and_queue(self) -> None:
+        self._emit_music_clip_event("progress", message="Building the locked MiniMax timing plan...")
         self.tabs.setCurrentIndex(3)
         self._pull_ui()
+        self._ensure_project_output_folder(reset_generated_state=True)
         if self.project.analysis.duration <= 0:
             self.project.analysis.duration = probe_duration(self.project.audio_path)
         try:
             self.project.shots = build_shot_plan(self.project)
             self.project.reference_random_seed = self._next_job_seed() if self.project.randomize_reference_characters else -1
-            for shot in self.project.shots:
-                shot.reference_names = auto_assign_references(self.project, shot)
-                shot.prompt = build_default_prompt(self.project, shot)
-            self._populate_shots()
-            self._populate_review()
-            self._write_autosave(force=True)
         except Exception as exc:
             self._one_click_active = False
-            self._set_ready("Video clip planning failed.")
+            self._set_ready("Video clip timing plan failed.")
             QMessageBox.critical(self, "Video clip planning failed", str(exc))
             return
 
@@ -3749,6 +4202,29 @@ class MiniMaxMusicClipWidget(QWidget):
             QMessageBox.warning(self, "No shots", "The Director did not create any shots for this track.")
             return
 
+        self._emit_music_clip_event("progress", message="MiniMax timing is locked. The Music Director is planning the complete video...")
+        self._set_busy("Music Director: creating whole-video concept and clip directions...")
+        self._one_click_start_worker_when_idle(_music_director_safe_task, self._one_click_music_director_done, self.project)
+
+    def _one_click_music_director_done(self, result: Dict[str, Any]) -> None:
+        used_llm = _apply_music_director_result(self.project, result)
+        for shot in self.project.shots:
+            shot.reference_names = _assign_music_shot_references(self.project, shot)
+            shot.prompt = build_default_prompt(self.project, shot)
+        self._populate_shots()
+        self._populate_review()
+        self._write_autosave(force=True)
+        self._write_assistant_handoff()
+        if used_llm:
+            self._emit_music_clip_event("progress", message="Music Director finished. Building the MiniMax H3 generation queue...")
+        else:
+            warning = str((result or {}).get("warning") or "local LLM unavailable")
+            self._emit_music_clip_event("progress", message=f"Music Director fallback used: {warning}. Building the MiniMax queue with deterministic prompts.")
+        # FunctionWorker emits succeeded immediately before the QThread reports
+        # finished. Queue/direct-generation startup must wait for that handoff.
+        QTimer.singleShot(80, self._one_click_finish_plan_and_queue)
+
+    def _one_click_finish_plan_and_queue(self) -> None:
         self.tabs.setCurrentIndex(4)
         self._sync_existing_generated_outputs()
         missing = [
@@ -3759,22 +4235,41 @@ class MiniMaxMusicClipWidget(QWidget):
         if self._queue_mode_active():
             if missing:
                 self._queue_shots(missing)
-            # Assembly is deliberately enqueued last. The standalone queue therefore
-            # reaches it only after all physical shot jobs ahead of it have finished.
-            self._queue_assembly()
+            out_dir = Path(self.project.output_dir or OUTPUT_ROOT / _safe_stem(self.project.audio_path)).resolve()
+            final_path = out_dir / f"{_safe_stem(self.project.title or self.project.audio_path)}_minimax_music_video.mp4"
+            # Never enqueue assembly ahead of unfinished clip jobs.  This used to
+            # be protected only for assistant/Telegram runs; normal GUI one-click
+            # runs queued assembly immediately, which is unsafe on queue backends
+            # that do not guarantee strict child-job ordering.  Use the same
+            # output-ready gate for every one-click run.
+            self._assistant_queue_assembly_when_ready = bool(missing)
+            self._assistant_assembly_queued = False
+            if not missing:
+                self._queue_assembly()
+                self._assistant_assembly_queued = True
+            self._assistant_start_output_monitor(str(final_path))
+            self._emit_music_clip_event(
+                "progress",
+                message=(f"Queued {len(missing)} clip{'s' if len(missing) != 1 else ''}. I will send each clip here as soon as it finishes, then assemble the final video." if missing else "All clips already exist. Final assembly is queued."),
+                total=len(missing),
+            )
             self._one_click_active = False
             self._set_ready(
-                f"Video clip queued: {len(missing)} shot{'s' if len(missing) != 1 else ''} + final trim/assembly."
+                (f"Video clip queued: {len(missing)} shot{'s' if len(missing) != 1 else ''}; final assembly will queue after the clips finish."
+                 if bool(getattr(self, "_assistant_run", False)) else
+                 f"Video clip queued: {len(missing)} shot{'s' if len(missing) != 1 else ''} + final trim/assembly.")
                 if missing else "All shot files already exist; final trim/assembly queued."
             )
             return
 
-        # Direct/standalone helper fallback: generate first; assembly remains the
-        # explicit next action because there is no host queue dependency mechanism.
         self._one_click_active = False
         if missing:
+            # A normal GUI "Create a video clip" run is a complete workflow, not
+            # generation-only.  Arm final assembly for both GUI and assistant runs.
+            self._one_click_assemble_after_generation = True
             self._generate_indices(missing)
         else:
+            self._one_click_assemble_after_generation = False
             self._assemble()
 
     # ---- analysis ----
@@ -3796,6 +4291,10 @@ class MiniMaxMusicClipWidget(QWidget):
     def _worker_progress(self, text: str) -> None:
         marker = "__MINIMAX_SHOT_DONE__|"
         fail_marker = "__MINIMAX_SHOT_FAILED__|"
+        fallback_marker = "__MINIMAX_HYBRID_FALLBACK__|"
+        if text.startswith(fallback_marker):
+            self._notify_hybrid_fallback(text[len(fallback_marker):].strip())
+            return
         if text.startswith(marker):
             parts = text.split("|", 2)
             if len(parts) == 3:
@@ -3805,8 +4304,11 @@ class MiniMaxMusicClipWidget(QWidget):
                         if shot.index == index:
                             shot.output_path = output_path; shot.status = "Generated"; break
                     self._populate_review(select_index=index)
-                    self._write_autosave(force=True)
                     self.status.setText(f"Shot {index} finished. Continuing with the remaining shots...")
+                    norm_path = str(Path(output_path).resolve()) if output_path else ""
+                    if norm_path and norm_path not in self._assistant_emitted_clip_paths:
+                        self._assistant_emitted_clip_paths.add(norm_path)
+                        self._emit_music_clip_event("clip_done", shot_index=index, path=norm_path)
                     return
                 except Exception:
                     pass
@@ -3820,15 +4322,23 @@ class MiniMaxMusicClipWidget(QWidget):
                             shot.status = "Failed"; break
                     self._populate_review(select_index=index)
                     self.status.setText(f"Shot {index} failed. Continuing with the remaining shots...")
+                    log_path = parts[2] if len(parts) >= 3 else ""
+                    self._emit_music_clip_event("clip_failed", shot_index=index, log_path=log_path)
                     return
                 except Exception:
                     pass
         self.status.setText(text)
 
     def _worker_failed(self, message: str) -> None:
+        # Never let a failed/cancelled one-click generation leave an armed
+        # assembly flag that can fire on a later unrelated job.
+        self._one_click_assemble_after_generation = False
         if hasattr(self, "btn_stop_generation"):
             self.btn_stop_generation.setEnabled(False)
-        self._set_ready("Failed."); QMessageBox.critical(self, "MiniMax Music Clip Creator", message)
+        self._set_ready("Failed.")
+        self._emit_music_clip_event("failed", message=str(message or "MiniMax Music Clip Creator failed."))
+        if self.isVisible():
+            QMessageBox.critical(self, "MiniMax Music Clip Creator", message)
 
     def _start_analysis(self) -> None:
         audio = self._require_audio()
@@ -3888,25 +4398,45 @@ class MiniMaxMusicClipWidget(QWidget):
     # ---- director ----
     def _create_plan(self) -> None:
         audio = self._require_audio()
-        if not audio: return
+        if not audio:
+            return
         self._pull_ui()
         self._ensure_project_output_folder(reset_generated_state=True)
         if self.project.analysis.duration <= 0:
             self.project.analysis.duration = probe_duration(audio)
         try:
             self.project.shots = build_shot_plan(self.project)
-            for shot in self.project.shots:
-                shot.reference_names = auto_assign_references(self.project, shot); shot.prompt = build_default_prompt(self.project, shot)
-            self._populate_shots(); self._populate_review(); self.status.setText(f"Created {len(self.project.shots)} MiniMax shots.")
+            self.project.reference_random_seed = self._next_job_seed() if self.project.randomize_reference_characters else -1
         except Exception as exc:
             QMessageBox.critical(self, "Planning failed", str(exc))
+            return
+        self._set_busy("Music Director: creating whole-video concept and clip directions...")
+        self._run_worker(_music_director_safe_task, self._music_director_done, self.project)
+
+    def _music_director_done(self, result: Dict[str, Any]) -> None:
+        used_llm = _apply_music_director_result(self.project, result)
+        for shot in self.project.shots:
+            shot.reference_names = _assign_music_shot_references(self.project, shot)
+            shot.prompt = build_default_prompt(self.project, shot)
+        self._populate_shots()
+        self._populate_review()
+        self._write_autosave(force=True)
+        if used_llm:
+            concept = str((result or {}).get("concept_summary") or "").strip()
+            suffix = f" Director concept: {concept}" if concept else ""
+            self._set_ready(f"Created {len(self.project.shots)} Planner-directed MiniMax shots.{suffix}")
+        else:
+            warning = str((result or {}).get("warning") or "local LLM unavailable")
+            self._set_ready(f"Created {len(self.project.shots)} MiniMax shots with deterministic fallback. Music Director: {warning}.")
 
     def _rebuild_prompts(self) -> None:
         self._pull_ui()
         self.project.reference_random_seed = self._next_job_seed() if self.project.randomize_reference_characters else -1
         for shot in self.project.shots:
-            shot.reference_names = auto_assign_references(self.project, shot); shot.prompt = build_default_prompt(self.project, shot)
-        self._populate_shots(); self.status.setText("MiniMax-H3 Ref2VA prompts and reference suggestions rebuilt.")
+            shot.reference_names = _assign_music_shot_references(self.project, shot)
+            shot.prompt = build_default_prompt(self.project, shot)
+        self._populate_shots()
+        self.status.setText("MiniMax-H3 prompts rebuilt from the locked Music Director plan; no new LLM plan was requested.")
 
     def _populate_shots(self) -> None:
         selected_index = None
@@ -3994,7 +4524,7 @@ class MiniMaxMusicClipWidget(QWidget):
         return base_seed
 
     def _review_table_item_changed(self, item: QTableWidgetItem) -> None:
-        if item.column() != 1:
+        if item.column() != 5:
             return
         row = item.row()
         if not (0 <= row < len(self.project.shots)):
@@ -4043,27 +4573,21 @@ class MiniMaxMusicClipWidget(QWidget):
         out_dir = Path(self.project.output_dir or OUTPUT_ROOT / _safe_stem(self.project.audio_path)).resolve()
         raw_dir = out_dir / "raw_clips"
         found = 0
-        changed = False
         for shot in self.project.shots:
-            active = _latest_shot_output(raw_dir, shot.index, shot.output_path)
-            if active is not None:
-                active_text = str(active)
-                if shot.output_path != active_text or shot.status != "Generated":
-                    shot.output_path = active_text
+            expected = raw_dir / f"shot_{shot.index:03d}.mp4"
+            current = Path(shot.output_path) if shot.output_path else None
+            if current is not None and current.is_file():
+                if shot.status != "Generated":
                     shot.status = "Generated"
-                    changed = True
                 found += 1
-            elif shot.status == "Generated" or shot.output_path:
+                continue
+            if expected.is_file():
+                shot.output_path = str(expected)
+                shot.status = "Generated"
+                found += 1
+            elif shot.status == "Generated":
                 shot.output_path = ""
                 shot.status = "Planned"
-                changed = True
-        # Persist a discovered retry immediately so preview, assembly and the next
-        # restart all agree on the same active file.
-        if changed:
-            try:
-                _persist_project_manifest(self.project, snapshot_assets=False)
-            except Exception:
-                pass
         return found
 
     def _populate_review(self, select_index: Optional[int] = None) -> None:
@@ -4076,24 +4600,11 @@ class MiniMaxMusicClipWidget(QWidget):
         select_row = -1
         for shot in self.project.shots:
             r = self.review_table.rowCount(); self.review_table.insertRow(r)
-            output_path = str(shot.output_path or "")
-            # Show the useful tail of a potentially very long path in the cell.
-            # The complete path remains available by hovering the Output cell.
-            output_display = output_path
-            if output_path:
-                try:
-                    out = Path(output_path)
-                    parent = out.parent.name
-                    output_display = str(Path(parent) / out.name) if parent else out.name
-                except Exception:
-                    pass
-            vals = [str(shot.index), str(shot.seed), shot.status, str(shot.frames), f"{_fmt_time(shot.edit_start)}–{_fmt_time(shot.edit_end)}", output_display]
+            vals = [str(shot.index), shot.status, str(shot.frames), f"{_fmt_time(shot.edit_start)}–{_fmt_time(shot.edit_end)}", shot.output_path, str(shot.seed)]
             for c, value in enumerate(vals):
                 item = QTableWidgetItem(value)
-                if c != 1:
+                if c != 5:
                     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                if c == 5 and output_path:
-                    item.setToolTip(output_path)
                 self.review_table.setItem(r, c, item)
             if current_index == shot.index: select_row = r
         self.review_table.blockSignals(False)
@@ -4147,8 +4658,59 @@ class MiniMaxMusicClipWidget(QWidget):
             QMessageBox.information(self, "No clip", "Select a generated shot first."); return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(shot.output_path).resolve().parent)))
 
+    def _framevision_queue_toggled(self, enabled: bool) -> None:
+        self.project.use_framevision_queue = bool(enabled)
+        if enabled:
+            try:
+                self._ensure_framevision_queue_adapter()
+                self.status.setText("FrameVision queue enabled. New Music Clip jobs will be added to the shared queue.")
+            except Exception as exc:
+                self.check_framevision_queue.blockSignals(True)
+                self.check_framevision_queue.setChecked(False)
+                self.check_framevision_queue.blockSignals(False)
+                self.project.use_framevision_queue = False
+                QMessageBox.warning(self, "FrameVision queue unavailable", str(exc))
+        else:
+            self.status.setText("Direct generation enabled. Music Clip jobs will run immediately in this helper.")
+        try:
+            self._save_settings()
+            self._write_autosave(force=True)
+        except Exception:
+            pass
+
+    def _ensure_framevision_queue_adapter(self):
+        """Resolve FrameVision's shared queue from inside this helper.
+
+        Hosts may still inject an adapter, but the normal FrameVision helper does not
+        need its importer/host patched just to use the queue.
+        """
+        if callable(self.queue_adapter):
+            return self.queue_adapter
+        try:
+            from helpers.queue_adapter import enqueue_minimax_h3_job
+        except Exception:
+            try:
+                from queue_adapter import enqueue_minimax_h3_job
+            except Exception as exc:
+                raise RuntimeError(f"FrameVision queue adapter is unavailable: {exc}") from exc
+
+        def _submit(spec: Dict[str, Any]):
+            qid = enqueue_minimax_h3_job(spec)
+            if not qid:
+                raise RuntimeError("FrameVision queue did not accept the MiniMax Music Clip job.")
+            return qid
+
+        self.queue_adapter = _submit
+        return self.queue_adapter
+
     def _queue_mode_active(self) -> bool:
-        return callable(self.queue_adapter)
+        if not bool(getattr(self, "check_framevision_queue", None) and self.check_framevision_queue.isChecked()):
+            return False
+        try:
+            self._ensure_framevision_queue_adapter()
+            return True
+        except Exception:
+            return False
 
     def _prepare_shot_queue_job(self, shot: MusicShot) -> Dict[str, Any]:
         # A retry/recreate must use what is visible in Director right now, not a
@@ -4174,17 +4736,15 @@ class MiniMaxMusicClipWidget(QWidget):
                 f"Shot {shot.index}: recreation uses a new output file {out_path.name} so the existing clip can stay open."
             )
         refs_by_name = {r.name: r for r in self.project.references if r.enabled and Path(r.path).is_file()}
-        if bool(getattr(self.project, "randomize_reference_characters", False)):
-            selected_names = [n for n in auto_assign_references(self.project, shot) if n in refs_by_name]
-            shot.reference_names = list(selected_names)
-        else:
-            selected_names = [n for n in shot.reference_names if n in refs_by_name]
+        selected_names = [n for n in shot.reference_names if n in refs_by_name]
         if not selected_names:
             selected_names = [n for n in auto_assign_references(self.project, shot) if n in refs_by_name]
         if not selected_names and refs_by_name:
             selected_names = [next(iter(refs_by_name))]
-        selected_names = _limit_character_reference_names(self.project, selected_names, list(refs_by_name.values()))
         selected = [refs_by_name[n] for n in selected_names[:9]]
+        selected, ref_cleanup_notes = _prepare_music_generation_references(self.project, selected, out_dir)
+        for note in ref_cleanup_notes:
+            self.status.setText(f"Shot {shot.index}: {note}")
         generation_prompt = build_generation_prompt(self.project, shot, selected)
         shot.generation_prompt = generation_prompt
 
@@ -4192,24 +4752,69 @@ class MiniMaxMusicClipWidget(QWidget):
         # impossible to confuse the Director editor, autosave state, and actual queue prompt.
         prompt_sidecar = raw_dir / f"shot_{shot.index:03d}_prompt.txt"
         prompt_sidecar.write_text(generation_prompt, encoding="utf-8")
+        _persist_project_manifest(self.project, snapshot_assets=False)
 
         width, height = RESOLUTION_PRESETS[self.project.resolution][self.project.aspect]
-        gen_cfg = _effective_generation_settings(self.project)
         args = [
             "helpers/generate_ref.py",
             "--prompt", generation_prompt,
             "--width", str(width), "--height", str(height),
-            "--frames", str(shot.frames), "--steps", str(int(gen_cfg.get("steps", 15))),
-            "--cfg", str(float(gen_cfg.get("cfg", 1.0))), "--seed", str(shot.seed),
-            "--shift", str(float(gen_cfg.get("shift", 12.0))), "--audio-shift", str(float(gen_cfg.get("audio_shift", 3.0))),
-            "--sampler", str(gen_cfg.get("sampler", "euler") or "euler"),
-            "--scheduler", str(gen_cfg.get("scheduler", "beta") or "beta"),
-            "--ref-image-size", str(gen_cfg.get("ref_size", "match") or "match"),
+            "--frames", str(shot.frames), "--steps", "10",
+            "--cfg", str(self.project.cfg), "--seed", str(shot.seed),
+            "--shift", str(self.project.shift), "--audio-shift", str(self.project.audio_shift),
+            "--ref-image-size", self.project.ref_image_size,
             "--ref-audio", str(audio_chunk),
             "--lock-source-audio-index", "1",
             "--output", str(out_path),
         ]
-        _append_main_gui_generation_args(args, self.project)
+        hybrid_override: Optional[Path] = None
+        if self.project.use_hybrid_model:
+            hybrid = Path(str(self.project.hybrid_model_path or "").strip())
+            if hybrid.is_file():
+                hybrid_override = hybrid.resolve()
+            else:
+                hybrid_override = _find_music_hybrid_checkpoint()
+                if hybrid_override is None:
+                    self._notify_hybrid_fallback(str(hybrid))
+        else:
+            hybrid_override = _find_music_hybrid_checkpoint()
+        if hybrid_override is not None:
+            args += ["--ref2va-checkpoint", str(hybrid_override)]
+        if self.project.vram_manager_enabled:
+            args += ["--vram-manager-auto" if self.project.vram_auto_bypass else "--vram-manager"]
+            args += [
+                "--vram-residency-engine", str(self.project.vram_residency_engine or "static"),
+                "--vram-runtime-free-gb", str(float(self.project.vram_runtime_free_gb)),
+                "--vram-text-headroom-gb", str(float(self.project.vram_text_headroom_gb)),
+                "--vram-diffusion-headroom-gb", str(float(self.project.vram_diffusion_headroom_gb)),
+                "--vram-offload-chunk-mb", str(int(self.project.vram_offload_chunk_mb)),
+                "--vram-max-resident-weights-gb", str(float(self.project.vram_max_resident_weights_gb)),
+                "--vram-block-check-interval", str(int(self.project.vram_block_check_interval)),
+                "--vram-async-streams", str(int(self.project.vram_async_streams)),
+                "--vram-video-vae-reserve-gb", str(float(self.project.vram_video_vae_reserve_gb)),
+                "--vram-audio-vae-reserve-gb", str(float(self.project.vram_audio_vae_reserve_gb)),
+                "--vram-residency-target-free-gb", str(float(self.project.vram_residency_target_free_gb)),
+                "--vram-residency-warmup-blocks", str(int(self.project.vram_residency_warmup_blocks)),
+                "--vram-residency-refill-interval", str(int(self.project.vram_residency_refill_interval)),
+            ]
+            args += ["--vram-residency-fill" if self.project.vram_residency_fill else "--no-vram-residency-fill"]
+        if self.project.sage_attention:
+            args += ["--sage-attention"]
+        # Music workflow quality preset: Turbo at 10 steps with SLA + Spectrum Forecasting.
+        args += ["--sla-attention", "--spectrum"]
+        turbo_lora = str(self.project.turbo_lora_path or "").strip()
+        turbo_path = Path(turbo_lora) if turbo_lora else None
+        if turbo_path is None or not turbo_path.is_file():
+            detected_turbo = _find_music_turbo_lora()
+            if detected_turbo is not None:
+                turbo_path = detected_turbo
+                self.project.turbo_lora_path = str(detected_turbo)
+                self.edit_turbo_lora.setText(str(detected_turbo))
+            elif turbo_lora:
+                raise RuntimeError(f"Turbo LoRA not found: {turbo_lora}")
+        if turbo_path is not None and turbo_path.is_file():
+            args += ["--lora", str(turbo_path.resolve()), "--lora-strength", str(float(self.project.turbo_lora_strength))]
+        _append_optional_music_loras(args, self.project)
         for ref in selected:
             args += ["--ref-image", ref.path]
         shot.output_path = str(out_path)
@@ -4219,21 +4824,29 @@ class MiniMaxMusicClipWidget(QWidget):
             "output": str(out_path),
             "label": f"Music Clip Shot {shot.index}: {(self.project.title or _safe_stem(self.project.audio_path))}",
             "frames": int(shot.frames),
-            "steps": int(gen_cfg.get("steps", 15)),
+            "steps": 10,
             "seed": int(shot.seed),
             "resolution": f"{width} × {height}",
             "prompt": generation_prompt,
             "music_prompt_file": str(prompt_sidecar),
+            "music_clip_job": True,
             "music_shot_index": int(shot.index),
+            # The worker owns one immediate retry for Music Clip shots. Keeping the
+            # retry inside the same queue item preserves FIFO order: final assembly
+            # cannot overtake a retry and start while a required clip is still missing.
+            "music_retry_once": True,
             "music_project_output": str(out_dir),
             "music_recreated_to_new_name": bool(used_retry_name),
+            "assistant_origin": str(getattr(self, "_assistant_origin", "desktop_ui") or "desktop_ui"),
+            "assistant_reply_target": str(getattr(self, "_assistant_origin", "desktop_ui") or "desktop_ui"),
+            "telegram_chat_id": (str(getattr(self, "_assistant_remote_chat_id", "") or "")
+                                 if str(getattr(self, "_assistant_origin", "") or "") == "telegram" else ""),
         }
 
     def _queue_shots(self, indices: Sequence[int]) -> None:
         if not self._queue_mode_active():
             return
         self._pull_ui()
-        self._refresh_generation_settings_snapshot()
         self._prepare_generation_seeds(list(indices))
         by_index = {s.index: s for s in self.project.shots}
         queued = 0
@@ -4259,9 +4872,9 @@ class MiniMaxMusicClipWidget(QWidget):
         out_dir = Path(self.project.output_dir or OUTPUT_ROOT / _safe_stem(self.project.audio_path)).resolve()
         raw_dir = out_dir / "raw_clips"
         for shot in self.project.shots:
-            active = _latest_shot_output(raw_dir, shot.index, shot.output_path)
-            if active is not None:
-                shot.output_path = str(active)
+            expected = raw_dir / f"shot_{shot.index:03d}.mp4"
+            if not shot.output_path:
+                shot.output_path = str(expected)
         queue_dir = out_dir / "_queue"
         queue_dir.mkdir(parents=True, exist_ok=True)
         snapshot = queue_dir / f"assembly_project_{int(time.time() * 1000)}.json"
@@ -4278,6 +4891,10 @@ class MiniMaxMusicClipWidget(QWidget):
             "prompt": "Assemble trimmed Music Clip shots and mux the original master song.",
             "music_assembly": True,
             "music_project_output": str(out_dir),
+            "assistant_origin": str(getattr(self, "_assistant_origin", "desktop_ui") or "desktop_ui"),
+            "assistant_reply_target": str(getattr(self, "_assistant_origin", "desktop_ui") or "desktop_ui"),
+            "telegram_chat_id": (str(getattr(self, "_assistant_remote_chat_id", "") or "")
+                                 if str(getattr(self, "_assistant_origin", "") or "") == "telegram" else ""),
         }
         self.queue_adapter(spec)
         self.status.setText("Added final Music Clip assembly to the MiniMax queue.")
@@ -4288,6 +4905,25 @@ class MiniMaxMusicClipWidget(QWidget):
         if changed or (job and (job.get("music_shot_index") or job.get("music_assembly"))):
             self._populate_review(select_index=(int(job.get("music_shot_index")) if job and job.get("music_shot_index") else None))
             self._write_autosave(force=True)
+        if job and job.get("music_shot_index"):
+            try:
+                index = int(job.get("music_shot_index"))
+            except Exception:
+                index = 0
+            output = str(job.get("output") or job.get("output_path") or "").strip()
+            if output and Path(output).is_file():
+                norm_path = str(Path(output).resolve())
+                if norm_path not in self._assistant_emitted_clip_paths:
+                    self._assistant_emitted_clip_paths.add(norm_path)
+                    self._emit_music_clip_event("clip_done", shot_index=index, path=norm_path)
+            else:
+                status = str(job.get("status") or job.get("stage") or "").strip().lower()
+                if status in {"failed", "error"}:
+                    self._emit_music_clip_event("clip_failed", shot_index=index, message=str(job.get("error") or job.get("message") or "Queue job failed."))
+        if job and job.get("music_assembly"):
+            final = str(job.get("output") or job.get("output_path") or "").strip()
+            if final and Path(final).is_file():
+                self._emit_music_clip_event("final_done", path=str(Path(final).resolve()))
 
     def _generate_selected(self) -> None:
         rows = sorted({i.row() for i in self.review_table.selectedIndexes()})
@@ -4312,7 +4948,6 @@ class MiniMaxMusicClipWidget(QWidget):
         _GENERATION_CANCEL.clear()
         self.btn_stop_generation.setEnabled(True)
         self._pull_ui()
-        self._refresh_generation_settings_snapshot()
         self._ensure_project_output_folder(reset_generated_state=True)
         base_seed = self._prepare_generation_seeds(indices)
         selected_index = indices[0] if len(indices) == 1 else None
@@ -4339,6 +4974,11 @@ class MiniMaxMusicClipWidget(QWidget):
             if not shot: continue
             if result.get("ok"):
                 shot.output_path = str(result.get("output_path") or ""); shot.status = "Generated"
+                if result.get("seed") is not None:
+                    try:
+                        shot.seed = int(result.get("seed"))
+                    except Exception:
+                        pass
             elif result.get("cancelled"):
                 shot.status = "Planned"
                 cancelled = True
@@ -4347,11 +4987,33 @@ class MiniMaxMusicClipWidget(QWidget):
         self.btn_stop_generation.setEnabled(False)
         self._populate_review()
         if cancelled or _GENERATION_CANCEL.is_set():
+            self._one_click_assemble_after_generation = False
             self._set_ready("Generation stopped. Finished clips were kept; unfinished clips remain planned.")
         else:
             self._set_ready("Generation finished." if not failures else f"Generation finished with {len(failures)} failed shot(s).")
-        if failures: QMessageBox.warning(self, "Some shots failed", "\n\n".join(failures[:5]))
-        self._write_autosave(force=True)
+        self._write_assistant_handoff()
+        if failures:
+            self._one_click_assemble_after_generation = False
+            self._emit_music_clip_event("error", message=f"Music Clip generation finished with {len(failures)} failed shot(s); final assembly was not started.")
+            if self.isVisible():
+                QMessageBox.warning(self, "Some shots failed", "\n\n".join(failures[:5]))
+        elif bool(getattr(self, "_one_click_assemble_after_generation", False)) and not cancelled and not _GENERATION_CANCEL.is_set():
+            self._one_click_assemble_after_generation = False
+            self._emit_music_clip_event("progress", message="All clips are ready. Assembling the final music video...")
+            # FunctionWorker emits succeeded before its QThread has fully stopped.
+            # Calling _assemble() immediately here can therefore hit _run_worker()'s
+            # "Busy" guard and silently leave a one-click job unassembled.  Wait
+            # until the generation worker is genuinely idle before starting assembly.
+            self._one_click_assemble_when_idle()
+
+    def _one_click_assemble_when_idle(self) -> None:
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            QTimer.singleShot(60, self._one_click_assemble_when_idle)
+            return
+        if _GENERATION_CANCEL.is_set():
+            return
+        self._assemble()
 
     def _assemble(self) -> None:
         if not self.project.shots: QMessageBox.warning(self, "No plan", "Create and generate the shot plan first."); return
@@ -4362,13 +5024,53 @@ class MiniMaxMusicClipWidget(QWidget):
 
     def _assembly_done(self, path: str) -> None:
         self._set_ready(f"Final video saved: {path}")
-        self._write_autosave(force=True)
-        QMessageBox.information(self, "Finished", f"Final music video saved:\n{path}")
+        try:
+            final_path = str(Path(path).resolve())
+        except Exception:
+            final_path = str(path or "")
+        self._write_assistant_handoff()
+        self._emit_music_clip_event("final_done", path=final_path)
+        if self.isVisible():
+            QMessageBox.information(self, "Finished", f"Final music video saved:\n{path}")
 
     def _open_output_folder(self) -> None:
         self._pull_ui()
         path = self._ensure_project_output_folder(reset_generated_state=False)
         path.mkdir(parents=True, exist_ok=True); QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+
+    def _sync_hybrid_model_controls(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self.edit_hybrid_model.setEnabled(enabled)
+        self.btn_hybrid_model.setEnabled(enabled)
+
+    def _browse_hybrid_model(self) -> None:
+        start = self.edit_hybrid_model.text().strip() or str(ROOT / "models" / "minimax_h3")
+        path, _ = QFileDialog.getOpenFileName(self, "Select hybrid MiniMax H3 checkpoint", start, "SafeTensors (*.safetensors);;All files (*.*)")
+        if path:
+            self.edit_hybrid_model.setText(path)
+            self._pull_ui(); self._save_settings()
+
+    def _browse_turbo_lora(self) -> None:
+        start = self.edit_turbo_lora.text().strip()
+        if start and Path(start).is_file():
+            start = str(Path(start).parent)
+        if not start:
+            start = str(ROOT / "models" / "minimax_h3" / "loras")
+        path, _ = QFileDialog.getOpenFileName(self, "Select MiniMax Turbo / speed LoRA", start, "LoRA files (*.safetensors *.pt *.bin);;All files (*.*)")
+        if path:
+            self.edit_turbo_lora.setText(path)
+
+    def _browse_extra_lora(self, slot: int) -> None:
+        edit = self.edit_extra_lora1 if int(slot) == 1 else self.edit_extra_lora2
+        start = edit.text().strip()
+        if start and Path(start).is_file():
+            start = str(Path(start).parent)
+        if not start:
+            start = str(ROOT / "models" / "minimax_h3" / "loras")
+        path, _ = QFileDialog.getOpenFileName(self, f"Select MiniMax Extra LoRA {int(slot)}", start, "LoRA files (*.safetensors *.pt *.bin);;All files (*.*)")
+        if path:
+            edit.setText(path)
+            self._pull_ui(); self._save_settings()
 
     # ---- working-session autosave ----
     def _autosave_payload(self, pull_ui: bool = True) -> Dict[str, Any]:
@@ -4418,6 +5120,7 @@ class MiniMaxMusicClipWidget(QWidget):
             os.replace(str(tmp), str(AUTOSAVE_PATH))
             self._autosave_last_text = compare_text
             # Once a real job folder exists, that folder owns a complete project manifest.
+            # This makes Save / Save As unnecessary and lets Load Project reconstruct old jobs.
             _persist_project_manifest(self.project, snapshot_assets=True)
             # Generation preferences also survive deliberate New Project/session resets.
             self._save_settings()
@@ -4446,10 +5149,6 @@ class MiniMaxMusicClipWidget(QWidget):
         self.label_frames.setText(f"{frames} frames (~{frames / FPS:.2f} s)")
 
     def _load_settings(self) -> None:
-        """Load only Music Clip Creator-specific preferences.
-
-        Generation/model/runtime settings intentionally live only in the main MiniMax GUI.
-        """
         try:
             if SETTINGS_PATH.is_file():
                 data = json.loads(_read_text_tolerant(SETTINGS_PATH))
@@ -4457,30 +5156,76 @@ class MiniMaxMusicClipWidget(QWidget):
                 self.project.resolution = str(data.get("resolution") or self.project.resolution)
                 self.project.aspect = str(data.get("aspect") or self.project.aspect)
                 self.project.max_frames = int(data.get("max_frames") or self.project.max_frames)
-                self.project.head_padding = float(data.get("head_padding", self.project.head_padding))
-                self.project.tail_padding = float(data.get("tail_padding", self.project.tail_padding))
-                self.project.phrase_snap_tolerance = float(data.get("phrase_snap_tolerance", self.project.phrase_snap_tolerance))
+                self.project.steps = int(data.get("steps") or self.project.steps)
+                self.project.turbo_lora_path = str(data.get("turbo_lora_path") or self.project.turbo_lora_path)
+                self.project.turbo_lora_strength = float(data.get("turbo_lora_strength", self.project.turbo_lora_strength))
+                self.project.extra_lora1_path = str(data.get("extra_lora1_path") or self.project.extra_lora1_path)
+                self.project.extra_lora1_strength = float(data.get("extra_lora1_strength", self.project.extra_lora1_strength))
+                self.project.extra_lora2_path = str(data.get("extra_lora2_path") or self.project.extra_lora2_path)
+                self.project.extra_lora2_strength = float(data.get("extra_lora2_strength", self.project.extra_lora2_strength))
+                # Migration: older Music Clip Creator builds stored one vram_auto flag.
+                if "vram_manager_enabled" in data:
+                    self.project.vram_manager_enabled = bool(data.get("vram_manager_enabled"))
+                    self.project.vram_auto_bypass = bool(data.get("vram_auto_bypass", True))
+                elif "vram_auto" in data:
+                    # Old checked state meant --vram-manager-auto; old unchecked state meant no manager.
+                    self.project.vram_manager_enabled = bool(data.get("vram_auto"))
+                    self.project.vram_auto_bypass = True
+                for key in (
+                    "vram_residency_engine", "vram_runtime_free_gb", "vram_text_headroom_gb",
+                    "vram_diffusion_headroom_gb", "vram_offload_chunk_mb", "vram_max_resident_weights_gb",
+                    "vram_block_check_interval", "vram_async_streams", "vram_video_vae_reserve_gb",
+                    "vram_audio_vae_reserve_gb", "vram_residency_fill", "vram_residency_target_free_gb",
+                    "vram_residency_warmup_blocks", "vram_residency_refill_interval",
+                ):
+                    if key in data:
+                        setattr(self.project, key, data[key])
+                self.project.use_hybrid_model = bool(data.get("use_hybrid_model", self.project.use_hybrid_model))
+                self.project.hybrid_model_path = str(data.get("hybrid_model_path") or self.project.hybrid_model_path)
+                self.project.sage_attention = bool(data.get("sage_attention", self.project.sage_attention))
+                self.project.sla_attention = bool(data.get("sla_attention", getattr(self.project, "sla_attention", True)))
+                self.project.spectrum = bool(data.get("spectrum", self.project.spectrum))
                 self.project.randomize_reference_characters = bool(data.get("randomize_reference_characters", self.project.randomize_reference_characters))
-                self.project.unlimited_random_references = bool(data.get("unlimited_random_references", self.project.unlimited_random_references))
-                self.project.single_character_reference_per_clip = bool(data.get("single_character_reference_per_clip", self.project.single_character_reference_per_clip))
+                self.project.auto_fill_locations = bool(data.get("auto_fill_locations", getattr(self.project, "auto_fill_locations", False)))
+                self.project.auto_fill_camera = bool(data.get("auto_fill_camera", getattr(self.project, "auto_fill_camera", False)))
+                self.project.use_framevision_queue = bool(data.get("use_framevision_queue", getattr(self.project, "use_framevision_queue", False)))
+                self.project.use_hypir_x1_upscale = bool(data.get("use_hypir_x1_upscale", getattr(self.project, "use_hypir_x1_upscale", False)))
+                self.project.use_lanczos_x2_upsampling = bool(data.get("use_lanczos_x2_upsampling", getattr(self.project, "use_lanczos_x2_upsampling", False)))
         except Exception:
             pass
-        self._refresh_generation_settings_snapshot()
 
     def _save_settings(self) -> None:
         try:
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
             data = {
-                "output_dir": self.project.output_dir,
-                "resolution": self.project.resolution,
-                "aspect": self.project.aspect,
-                "max_frames": self.project.max_frames,
-                "head_padding": self.project.head_padding,
-                "tail_padding": self.project.tail_padding,
-                "phrase_snap_tolerance": self.project.phrase_snap_tolerance,
+                "output_dir": self.project.output_dir, "resolution": self.project.resolution, "aspect": self.project.aspect,
+                "max_frames": self.project.max_frames, "steps": self.project.steps,
+                "vram_manager_enabled": self.project.vram_manager_enabled, "vram_auto_bypass": self.project.vram_auto_bypass,
+                "vram_residency_engine": self.project.vram_residency_engine,
+                "vram_runtime_free_gb": self.project.vram_runtime_free_gb,
+                "vram_text_headroom_gb": self.project.vram_text_headroom_gb,
+                "vram_diffusion_headroom_gb": self.project.vram_diffusion_headroom_gb,
+                "vram_offload_chunk_mb": self.project.vram_offload_chunk_mb,
+                "vram_max_resident_weights_gb": self.project.vram_max_resident_weights_gb,
+                "vram_block_check_interval": self.project.vram_block_check_interval,
+                "vram_async_streams": self.project.vram_async_streams,
+                "vram_video_vae_reserve_gb": self.project.vram_video_vae_reserve_gb,
+                "vram_audio_vae_reserve_gb": self.project.vram_audio_vae_reserve_gb,
+                "vram_residency_fill": self.project.vram_residency_fill,
+                "vram_residency_target_free_gb": self.project.vram_residency_target_free_gb,
+                "vram_residency_warmup_blocks": self.project.vram_residency_warmup_blocks,
+                "vram_residency_refill_interval": self.project.vram_residency_refill_interval,
+                "turbo_lora_path": self.project.turbo_lora_path, "turbo_lora_strength": self.project.turbo_lora_strength,
+                "extra_lora1_path": self.project.extra_lora1_path, "extra_lora1_strength": self.project.extra_lora1_strength,
+                "extra_lora2_path": self.project.extra_lora2_path, "extra_lora2_strength": self.project.extra_lora2_strength,
+                "use_hybrid_model": self.project.use_hybrid_model, "hybrid_model_path": self.project.hybrid_model_path,
+                "sage_attention": self.project.sage_attention, "sla_attention": self.project.sla_attention, "spectrum": self.project.spectrum,
                 "randomize_reference_characters": self.project.randomize_reference_characters,
-                "unlimited_random_references": self.project.unlimited_random_references,
-                "single_character_reference_per_clip": self.project.single_character_reference_per_clip,
+                "auto_fill_locations": bool(getattr(self.project, "auto_fill_locations", False)),
+                "auto_fill_camera": bool(getattr(self.project, "auto_fill_camera", False)),
+                "use_framevision_queue": bool(getattr(self.project, "use_framevision_queue", False)),
+                "use_hypir_x1_upscale": bool(getattr(self.project, "use_hypir_x1_upscale", False)),
+                "use_lanczos_x2_upsampling": bool(getattr(self.project, "use_lanczos_x2_upsampling", False)),
             }
             SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:

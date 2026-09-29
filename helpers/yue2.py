@@ -431,11 +431,11 @@ class SheetSageInstallThread(QThread):
         try:
             SHEETSAGE_ENV.parent.mkdir(parents=True, exist_ok=True)
             SHEETSAGE_MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
+            uv = _find_uv()
             if not SHEETSAGE_PYTHON.is_file():
-                uv = _find_uv()
                 if uv:
-                    self.message.emit("[SheetSage2] Creating isolated Python 3.11 environment with UV...")
-                    self._run([str(uv), "venv", str(SHEETSAGE_ENV), "--python", "3.11"])
+                    self.message.emit("[SheetSage2] Creating isolated Python 3.11 environment with UV and seeded packaging tools...")
+                    self._run([str(uv), "venv", str(SHEETSAGE_ENV), "--python", "3.11", "--seed"])
                 elif os.name == "nt" and shutil.which("py"):
                     self.message.emit("[SheetSage2] UV not found; using Windows Python launcher for Python 3.11...")
                     self._run(["py", "-3.11", "-m", "venv", str(SHEETSAGE_ENV)])
@@ -444,8 +444,21 @@ class SheetSageInstallThread(QThread):
                         "Python 3.11 is required for SheetSage2. Install UV or Python 3.11, then retry."
                     )
             py = str(SHEETSAGE_PYTHON)
-            self._run([py, "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"])
-            self._run([py, "-m", "pip", "install", "huggingface-hub==0.36.0", "hf_transfer"])
+
+            # A UV-created environment can exist without an importable pip module when
+            # it was previously created without --seed. Repair such environments through
+            # uv pip, which does not depend on pip already being installed inside the venv.
+            if uv:
+                self.message.emit("[SheetSage2] Bootstrapping packaging tools with UV...")
+                self._run([str(uv), "pip", "install", "--python", py, "--upgrade", "pip", "wheel", "setuptools"])
+                self._run([str(uv), "pip", "install", "--python", py, "huggingface-hub==0.36.0", "hf_transfer"])
+            else:
+                try:
+                    self._run([py, "-m", "ensurepip", "--upgrade"])
+                except Exception:
+                    pass
+                self._run([py, "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"])
+                self._run([py, "-m", "pip", "install", "huggingface-hub==0.36.0", "hf_transfer"])
             if not SHEETSAGE_INFER.is_file():
                 self.message.emit("[SheetSage2] Downloading official m-a-p/SheetSage2 model snapshot...")
                 code = (
@@ -463,11 +476,15 @@ class SheetSageInstallThread(QThread):
                 if proc.wait() != 0:
                     raise RuntimeError("SheetSage2 model download failed")
             self.message.emit("[SheetSage2] Installing the official CUDA 12.6 PyTorch stack...")
-            self._run([py, "-m", "pip", "install", "torch==2.8.0", "torchaudio==2.8.0", "--index-url", "https://download.pytorch.org/whl/cu126"])
             req = SHEETSAGE_MODEL_DIR / "requirements.txt"
             if not req.is_file():
                 raise RuntimeError(f"Missing SheetSage2 requirements file: {req}")
-            self._run([py, "-m", "pip", "install", "-r", str(req)])
+            if uv:
+                self._run([str(uv), "pip", "install", "--python", py, "torch==2.8.0", "torchaudio==2.8.0", "--index-url", "https://download.pytorch.org/whl/cu126"])
+                self._run([str(uv), "pip", "install", "--python", py, "-r", str(req)])
+            else:
+                self._run([py, "-m", "pip", "install", "torch==2.8.0", "torchaudio==2.8.0", "--index-url", "https://download.pytorch.org/whl/cu126"])
+                self._run([py, "-m", "pip", "install", "-r", str(req)])
             if not _sheetsage_ready():
                 raise RuntimeError("SheetSage2 installation finished but infer.py or the isolated Python environment is missing")
             self.finished_ok.emit(True, "SheetSage2 is installed and ready for audio-to-ABC transcription.")
