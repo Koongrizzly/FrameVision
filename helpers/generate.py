@@ -14,6 +14,31 @@ from runtime import vram_manager as _vram_manager_module
 
 _EXPECTED_VRAM_SIGNATURE = "V11_5_EXTREME_DIFFUSION_SAFE_20260826A"
 
+def _prune_orphan_isolated_dirs(parent: Path, prefixes=("h3_isolated_", "h3_ref_isolated_")) -> int:
+    """Best-effort removal of leftover empty isolated worker folders."""
+    parent = Path(parent)
+    if not parent.is_dir():
+        return 0
+    removed = 0
+    for child in parent.iterdir():
+        try:
+            if not child.is_dir() or not any(child.name.startswith(prefix) for prefix in prefixes):
+                continue
+            try:
+                next(child.iterdir())
+                continue
+            except StopIteration:
+                pass
+            child.rmdir()
+            removed += 1
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+    if removed:
+        print(f"[CLEANUP] Removed {removed} empty isolated worker folder(s) from {parent}", flush=True)
+    return removed
+
 def _verify_vram_runtime():
     actual = getattr(_vram_manager_module, "VRAM_MANAGER_SIGNATURE", None)
     if actual != _EXPECTED_VRAM_SIGNATURE:
@@ -30,6 +55,8 @@ def main():
     import os, sys, tempfile, subprocess, shutil, time
     from runtime.ffmpeg_tools import ensure_ffmpeg_tools, tool_path
 
+    _prune_orphan_isolated_dirs(ROOT / "output")
+
     ap = argparse.ArgumentParser(description="MiniMax-H3 W4A8 ConvRot standalone generator")
     ap.add_argument("--prompt", default="A cinematic red sports car races through rain-soaked neon streets at night, dynamic tracking camera, realistic reflections and natural engine sound.")
     ap.add_argument("--width", type=int, default=832); ap.add_argument("--height", type=int, default=448)
@@ -37,7 +64,7 @@ def main():
     ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
     ap.add_argument("--shift", type=float, default=12.0); ap.add_argument("--audio-shift", type=float, default=3.0)
     ap.add_argument("--sampler", default="euler"); ap.add_argument("--scheduler", default="simple")
-    ap.add_argument("--first-frame"); ap.add_argument("--last-frame"); ap.add_argument("--continue-video"); ap.add_argument("--continue-context-frames", type=int, default=39); ap.add_argument("--continue-audio-memory", action="store_true", help="Experimental: use source clip audio as continuation memory/context"); ap.add_argument("--latent-continuation", action="store_true", help="Prefer the saved native H3 latent sidecar for continuation history; fall back to video history if unavailable/incompatible"); ap.add_argument("--glue-source"); ap.add_argument("--output")
+    ap.add_argument("--first-frame"); ap.add_argument("--last-frame"); ap.add_argument("--continue-video"); ap.add_argument("--continue-context-frames", type=int, default=90); ap.add_argument("--continue-audio-memory", action="store_true", help="Experimental: use source clip audio as continuation memory/context"); ap.add_argument("--latent-continuation", action="store_true", help="Prefer the saved native H3 latent sidecar for continuation history; fall back to video history if unavailable/incompatible"); ap.add_argument("--combine-frames-latent", action="store_true", help="When latent continuation is active, combine saved H3 latent history with decoded source-video frame history and the exact final-frame boundary"); ap.add_argument("--glue-source"); ap.add_argument("--output")
     ap.add_argument("--fl2va-checkpoint"); ap.add_argument("--ref2va-checkpoint"); ap.add_argument("--text-encoder"); ap.add_argument("--video-vae"); ap.add_argument("--audio-vae")
     ap.add_argument("--lora", action="append", default=[]); ap.add_argument("--lora-strength", action="append", type=float, default=[])
     ap.add_argument("--extended-logging", action="store_true")
@@ -393,7 +420,11 @@ def main():
                     latent_sidecar = continue_path.with_suffix(".h3latent.pt")
                     if latent_sidecar.is_file():
                         sample_cmd += ["--continue-latent", str(latent_sidecar)]
-                        print(f"Latent continuation: using saved H3 state {latent_sidecar.name}", flush=True)
+                        if ns.combine_frames_latent:
+                            sample_cmd += ["--combine-frames-latent"]
+                            print(f"Latent continuation: using saved H3 state {latent_sidecar.name} + decoded frame memory", flush=True)
+                        else:
+                            print(f"Latent continuation: using saved H3 state {latent_sidecar.name}", flush=True)
                     else:
                         print(f"Latent continuation requested, but no sidecar was found at {latent_sidecar.name}; falling back to decoded-video history.", flush=True)
                 if ns.continue_audio_memory:

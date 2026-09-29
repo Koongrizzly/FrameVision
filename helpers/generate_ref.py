@@ -31,6 +31,32 @@ def _remove_isolated_workdir(path: Path, attempts: int = 8, delay: float = 0.25)
     return False
 
 
+def _prune_orphan_isolated_dirs(parent: Path, prefixes=("h3_ref_isolated_", "h3_isolated_")) -> int:
+    """Remove leftover empty isolated worker folders from earlier jobs."""
+    parent = Path(parent)
+    if not parent.is_dir():
+        return 0
+    removed = 0
+    for child in parent.iterdir():
+        try:
+            if not child.is_dir() or not any(child.name.startswith(prefix) for prefix in prefixes):
+                continue
+            try:
+                next(child.iterdir())
+                continue
+            except StopIteration:
+                pass
+            child.rmdir()
+            removed += 1
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+    if removed:
+        print(f"[CLEANUP] Removed {removed} empty isolated worker folder(s) from {parent}", flush=True)
+    return removed
+
+
 @contextmanager
 def _isolated_workdir(parent: Path):
     """Create a per-job Ref2VA work folder and always clean it on exit."""
@@ -66,6 +92,7 @@ from runtime.ffmpeg_tools import ensure_ffmpeg_tools, tool_path
 
 
 def main():
+    _prune_orphan_isolated_dirs(ROOT / "output")
     ap = argparse.ArgumentParser(description="MiniMax-H3 Ref2VA W4A8 standalone generator")
     ap.add_argument("--prompt", required=True); ap.add_argument("--width", type=int, default=832); ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--frames", type=int, default=362); ap.add_argument("--experimental-long-duration", action="store_true", help="Allow H3 native-grid research durations beyond the normal 719-frame range, up to 2385 frames"); ap.add_argument("--steps", type=int, default=15); ap.add_argument("--cfg", type=float, default=1.0); ap.add_argument("--seed", type=int, default=-1)
