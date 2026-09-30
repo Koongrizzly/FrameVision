@@ -39,7 +39,8 @@ Because a.i. never sleeps😄
    
 ---
 - 💬 LLM Chat : your own little (offline) chat gpt at home. Load any (gguf) model and start chatting/coding/creating images, video, even music with the installed models.
-  Chat memory allows user for the chat to remember something in new chat
+  It comes with telegram bot support so tou can create music/images/video from your phone while using
+  your pc at home.
 - 🧠 The Planner : from a prompt to a finished storyline long form video in a couple of clicks. Also allows using own prompts, own character bible, reference images, TTS narration, own llama (gguf) models etc for more control.
 - 🎵 (music) videoclip creator : 3 modes : use ready made clips and a music track for creating a videoclip fast or use a workflow to create a clip from scratch with only an idea and reference images (ltx 2.3, 2.5 and minimax H3).
 The older LTX 2.3 workflow also includes Licon Studio MSR V2.
