@@ -4301,12 +4301,8 @@ def main():
 # -----------------------------
 # FrameVision integration hook
 # -----------------------------
-class AceStep15Pane(QtWidgets.QWidget):
-    """Embeddable QWidget wrapper for FrameVision tabs.
-
-    Keeps the existing MainWindow logic intact by instantiating it and
-    re-parenting its central widget into this pane.
-    """
+class _AceStep15ContentPane(QtWidgets.QWidget):
+    """Embeddable wrapper around the existing ACE-Step MainWindow UI."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4318,8 +4314,6 @@ class AceStep15Pane(QtWidgets.QWidget):
         if cw is None:
             cw = QtWidgets.QWidget()
 
-        # If takeCentralWidget succeeded, the window now has no central widget.
-        # If it didn't, we still re-parent the existing central widget.
         try:
             cw.setParent(self)
         except Exception:
@@ -4329,18 +4323,77 @@ class AceStep15Pane(QtWidgets.QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(cw, 1)
 
-    def closeEvent(self, e):
-        # Ensure background threads stop when the tab is closed / app exits.
+    def shutdown(self):
         try:
             if hasattr(self._mw, '_stop_run'):
                 self._mw._stop_run()
+        except Exception:
+            pass
+
+
+class AceStep15Pane(QtWidgets.QWidget):
+    """FrameVision Music pane with ACE-Step and YuE2 as sibling tabs.
+
+    Existing FrameVision integrations that instantiate ``AceStep15Pane`` or call
+    ``create_pane`` now receive the combined two-tab music workspace.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.tabs = QtWidgets.QTabWidget(self)
+        self.tabs.setDocumentMode(True)
+        layout.addWidget(self.tabs, 1)
+
+        self.ace_step_pane = _AceStep15ContentPane(self.tabs)
+        self.tabs.addTab(self.ace_step_pane, "ACE Step")
+
+        self.yue2_pane = self._create_yue2_pane()
+        self.tabs.addTab(self.yue2_pane, "Yue2")
+
+    def _create_yue2_pane(self):
+        try:
+            try:
+                from .yue2 import Yue2Pane  # package-style import
+            except Exception:
+                from yue2 import Yue2Pane   # helpers folder on sys.path
+            return Yue2Pane(self.tabs)
+        except Exception as exc:
+            # Keep the ACE-Step tab usable even if YuE2 has a local dependency/import issue.
+            fallback = QtWidgets.QWidget(self.tabs)
+            lay = QtWidgets.QVBoxLayout(fallback)
+            lay.setContentsMargins(24, 24, 24, 24)
+            label = QtWidgets.QLabel(
+                "YuE2 could not be loaded.\n\n"
+                f"{type(exc).__name__}: {exc}"
+            )
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            lay.addWidget(label)
+            lay.addStretch(1)
+            return fallback
+
+    def closeEvent(self, e):
+        try:
+            self.ace_step_pane.shutdown()
+        except Exception:
+            pass
+        try:
+            yue_window = getattr(self.yue2_pane, '_window', None)
+            if yue_window is not None:
+                yue_window.save_settings(quiet=True)
+                if yue_window._process.state() != QtCore.QProcess.NotRunning:
+                    yue_window._process.kill()
+                    yue_window._process.waitForFinished(3000)
         except Exception:
             pass
         return super().closeEvent(e)
 
 
 def create_pane(parent=None) -> QtWidgets.QWidget:
-    """Factory used by FrameVision to create the Ace-Step 1.5 tab widget."""
+    """Factory used by FrameVision to create the combined music tab widget."""
     return AceStep15Pane(parent)
 
 

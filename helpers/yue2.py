@@ -1913,6 +1913,42 @@ Yue2Window = YuE2Window
 Yue2Helper = YuE2Window
 
 
+class Yue2Pane(QWidget):
+    """Embeddable YuE2 QWidget for FrameVision / composite helper tabs."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._window = YuE2Window()
+        try:
+            central = self._window.takeCentralWidget()
+        except Exception:
+            central = self._window.centralWidget()
+        if central is None:
+            central = QWidget()
+        try:
+            central.setParent(self)
+        except Exception:
+            pass
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(central, 1)
+
+    def closeEvent(self, event):  # noqa: N802
+        try:
+            self._window.closeEvent(event)
+            if event.isAccepted():
+                return
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+
+def create_pane(parent=None) -> QWidget:
+    """Factory for embedding YuE2 without opening a separate top-level window."""
+    return Yue2Pane(parent)
+
+
 def create_window(parent=None) -> YuE2Window:
     return YuE2Window(parent)
 
