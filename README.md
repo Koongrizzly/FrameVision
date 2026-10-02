@@ -23,7 +23,7 @@ Because a.i. never sleeps😄
 ---
                               
 
--> Small update v2.5.5 brings LTX 2.5
+-> Small update v2.5.6 brings Hye2 and Qwen edit/image 2.1
 
 ---
 - Comes with a simple setup menu and a one click installer for the main app,
