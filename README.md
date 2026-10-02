@@ -101,7 +101,7 @@ The older LTX 2.3 workflow also includes Licon Studio MSR V2.
  <p align="center">  ## 🛠 Installation
 
 ---   
-Run **`framevision.exe`** — it automatically:
+Run **`framevision.bat`** — it automatically:
 1. Opens the installer menu if setup is incomplete. (give 1 time approval in windows to use an unknown app)
 2. select 'check requirements' if you never installed something A.i. related before to have environment, git, python, miniconda,... installed before you start the install of the app.
 3. After install it starts the app and background worker. (Always keep the background worker open when using queue)
