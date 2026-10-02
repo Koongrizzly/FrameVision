@@ -3,7 +3,7 @@
 </p>
 
  <p align="center">                                  
-✨  FrameVision 2.5.5  ✨
+✨  FrameVision 2.5.6  ✨
  <p align="center">     
 All-in-one Sound/Image/Video Tool 
   <p align="center">     
