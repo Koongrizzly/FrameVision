@@ -14,7 +14,7 @@ FrameVision
 
 Born from one question about PySide in August 2025.
 
-11,993 patch and bugfix files later (as on september 14th 2026)…
+12,240 patch and bugfix files later (as on October 2nd 2026)…
 
 Still adding one more feature. 
 
@@ -24,6 +24,8 @@ Because a.i. never sleeps😄
                               
 
 -> Small update v2.5.6 brings Hye2 and Qwen edit/image 2.1
+
+also were added since last release : lora trainer and 
 
 ---
 - Comes with a simple setup menu and a one click installer for the main app,
