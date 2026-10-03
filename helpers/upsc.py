@@ -593,10 +593,17 @@ class UpscPane(QtWidgets.QWidget):
         # Temporal overlap
         self.chk_seedvr2_temporal = QtWidgets.QCheckBox("Temporal overlap", self)
         self.chk_seedvr2_temporal.setChecked(True)
+        self.chk_seedvr2_temporal.setToolTip(
+            "Shares/blends frames between neighboring processing chunks to hide chunk seams. "
+            "Usually improves continuity, but disable it when diagnosing temporal ghosting/afterimages."
+        )
         lay_seed.addWidget(self.chk_seedvr2_temporal)
 
         self.chk_seedvr2_prepend = QtWidgets.QCheckBox("Prepend frames", self)
-        self.chk_seedvr2_prepend.setToolTip("Prepends 4 reversed frames at the start to reduce startup artifacts. The helper frames are removed automatically from the final output.")
+        self.chk_seedvr2_prepend.setToolTip(
+            "Prepends 4 reversed helper frames at the start so SeedVR2 has temporal context immediately. "
+            "This mainly affects the beginning of the video; the helper frames are removed from the final output."
+        )
         lay_seed.addWidget(self.chk_seedvr2_prepend)
 
         # Color correction
@@ -606,6 +613,10 @@ class UpscPane(QtWidgets.QWidget):
         for _cc in ("lab", "none"):
             self.combo_seedvr2_color.addItem(_cc)
         self.combo_seedvr2_color.setCurrentText("lab")
+        self.combo_seedvr2_color.setToolTip(
+            "LAB color correction helps keep the upscaled result close to the source colors. "
+            "It affects color matching, not temporal motion/ghosting."
+        )
         row_c.addWidget(self.combo_seedvr2_color, 1)
         lay_seed.addLayout(row_c)
 
@@ -621,12 +632,21 @@ class UpscPane(QtWidgets.QWidget):
         self.spin_seedvr2_batch = QtWidgets.QSpinBox(self)
         self.spin_seedvr2_batch.setRange(1, 16)
         self.spin_seedvr2_batch.setValue(1)
+        self.spin_seedvr2_batch.setToolTip(
+            "Number of frames SeedVR2 processes together for temporal reconstruction. "
+            "For video, 5 is a good baseline; SeedVR2 commonly uses 1 or 4n+1 values (5, 9, 13...). "
+            "If you see ghosting/afterimages, compare batch 1 and batch 5."
+        )
         adv.addWidget(self.spin_seedvr2_batch, 0, 1)
 
         adv.addWidget(QtWidgets.QLabel("Chunk size:", self), 1, 0)
         self.spin_seedvr2_chunk = QtWidgets.QSpinBox(self)
         self.spin_seedvr2_chunk.setRange(1, 999)
         self.spin_seedvr2_chunk.setValue(20)
+        self.spin_seedvr2_chunk.setToolTip(
+            "Outer streaming chunk size for long videos. Larger chunks can reduce chunk-boundary overhead but use more memory. "
+            "This is separate from Batch size, which controls SeedVR2's temporal frame group."
+        )
         adv.addWidget(self.spin_seedvr2_chunk, 1, 1)
 
         self.chk_seedvr2_blockswap = QtWidgets.QCheckBox("BlockSwap (DiT offload to CPU)", self)
@@ -1834,8 +1854,8 @@ class UpscPane(QtWidgets.QWidget):
 
     def _update_seedvr2_warnings(self):
         # Apply resolution-based presets for SeedVR2 advanced settings.
-        # 720p: faster/lighter defaults.
-        # 1080p+ (1080/1440/2160 etc): enable tiled VAE decode + heavier defaults.
+        # 720p: temporal-quality default (batch 5).
+        # 1080p+ (1080/1440/2160 etc): VRAM-safe default (batch 1) with tiled VAE decode.
         try:
             self._apply_seedvr2_resolution_preset()
         except Exception:
@@ -1855,8 +1875,8 @@ class UpscPane(QtWidgets.QWidget):
         """Auto-tune SeedVR2 advanced settings based on target resolution.
 
         Rules:
-        - 720p: VAE decode tiled OFF, batch=4, chunk=40
-        - 1080p or higher: VAE decode tiled ON, batch=2, chunk=20,
+        - 720p: VAE decode tiled OFF, batch=5, chunk=50
+        - 1080p or higher: VAE decode tiled ON, batch=1, chunk=20,
           decode tile size=1536, decode overlap=64
         """
         try:
@@ -1890,13 +1910,13 @@ class UpscPane(QtWidgets.QWidget):
 
         if res >= 1080:
             _set(self.chk_seedvr2_vae_dec, self.chk_seedvr2_vae_dec.setChecked, True)
-            _set(self.spin_seedvr2_batch, self.spin_seedvr2_batch.setValue, 2)
+            _set(self.spin_seedvr2_batch, self.spin_seedvr2_batch.setValue, 1)
             _set(self.spin_seedvr2_chunk, self.spin_seedvr2_chunk.setValue, 20)
             _set(self.spin_seedvr2_dec_tile, self.spin_seedvr2_dec_tile.setValue, 1536)
             _set(self.spin_seedvr2_dec_ov, self.spin_seedvr2_dec_ov.setValue, 64)
         elif res == 720:
             _set(self.chk_seedvr2_vae_dec, self.chk_seedvr2_vae_dec.setChecked, False)
-            _set(self.spin_seedvr2_batch, self.spin_seedvr2_batch.setValue, 4)
+            _set(self.spin_seedvr2_batch, self.spin_seedvr2_batch.setValue, 5)
             _set(self.spin_seedvr2_chunk, self.spin_seedvr2_chunk.setValue, 50)
 
     def _update_seedvr2_mode(self, on: bool | None = None):
