@@ -94,18 +94,34 @@ def _seedvr2_runner_path() -> Optional[Path]:
     return None
 
 
-def scan_seedvr2_gguf() -> List[str]:
-    """Return GGUF filenames found under models/SEEDVR2 (recursively)."""
+def scan_seedvr2_models() -> List[str]:
+    """Return supported SeedVR2 DiT model files found under models/SEEDVR2.
+
+    Supports both GGUF quantized weights and native safetensors weights
+    (FP16/BF16/FP8/etc.). VAE safetensors are intentionally excluded.
+    """
     names: List[str] = []
     try:
         if SEEDVR2_MODELS_DIR.exists():
-            for p in sorted(SEEDVR2_MODELS_DIR.rglob("*.gguf")):
-                # The CLI typically expects just the filename (argparse choices)
+            for p in sorted(SEEDVR2_MODELS_DIR.rglob("*")):
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() not in {".gguf", ".safetensors"}:
+                    continue
+                low = p.name.lower()
+                # Do not offer the VAE as a DiT model.
+                if "vae" in low:
+                    continue
                 names.append(p.name)
     except Exception:
         pass
-    # Reasonable defaults if none found yet
+    # Reasonable default if none found yet.
     return names or ["seedvr2_ema_3b-Q4_K_M.gguf"]
+
+
+# Backward-compatible helper name used by older patches/settings code.
+def scan_seedvr2_gguf() -> List[str]:
+    return scan_seedvr2_models()
 
 def _gfpgan_python() -> Optional[Path]:
     try:
@@ -563,11 +579,15 @@ class UpscPane(QtWidgets.QWidget):
         self.lbl_seedvr2_note.setStyleSheet("color:#b9c3cf;font-size:12px;")
         lay_seed.addWidget(self.lbl_seedvr2_note)
 
-        # GGUF model picker + refresh
+        # SeedVR2 DiT model picker (GGUF + safetensors) + refresh
         row_m = QtWidgets.QHBoxLayout()
-        row_m.addWidget(QtWidgets.QLabel("GGUF model:", self))
+        row_m.addWidget(QtWidgets.QLabel("DiT model:", self))
         self.combo_seedvr2_gguf = QtWidgets.QComboBox(self)
-        for m in scan_seedvr2_gguf():
+        self.combo_seedvr2_gguf.setToolTip(
+            "SeedVR2 DiT weights. Supports .gguf and .safetensors models found under models/SEEDVR2, "
+            "including FP16/BF16 safetensors such as seedvr2_ema_3b_bf16.safetensors."
+        )
+        for m in scan_seedvr2_models():
             self.combo_seedvr2_gguf.addItem(m)
         row_m.addWidget(self.combo_seedvr2_gguf, 1)
         self.btn_seedvr2_refresh = QtWidgets.QPushButton("Refresh", self)
@@ -590,14 +610,26 @@ class UpscPane(QtWidgets.QWidget):
         self.lbl_seedvr2_2160_warn.setVisible(False)
         lay_seed.addWidget(self.lbl_seedvr2_2160_warn)
 
-        # Temporal overlap
-        self.chk_seedvr2_temporal = QtWidgets.QCheckBox("Temporal overlap", self)
-        self.chk_seedvr2_temporal.setChecked(True)
-        self.chk_seedvr2_temporal.setToolTip(
-            "Shares/blends frames between neighboring processing chunks to hide chunk seams. "
-            "Usually improves continuity, but disable it when diagnosing temporal ghosting/afterimages."
+        # Temporal overlap (numeric; SeedVR2 supports 0-16)
+        row_t = QtWidgets.QHBoxLayout()
+        row_t.addWidget(QtWidgets.QLabel("Temporal overlap:", self))
+        self.spin_seedvr2_temporal = QtWidgets.QSpinBox(self)
+        self.spin_seedvr2_temporal.setRange(0, 16)
+        self.spin_seedvr2_temporal.setValue(3)
+        self.spin_seedvr2_temporal.setToolTip(
+            "How many frames neighboring processing chunks share/blend to hide chunk seams. "
+            "0 disables overlap; 3 matches the high-quality SeedVR2 workflow you tested against."
         )
-        lay_seed.addWidget(self.chk_seedvr2_temporal)
+        row_t.addWidget(self.spin_seedvr2_temporal, 1)
+        lay_seed.addLayout(row_t)
+
+        self.chk_seedvr2_uniform_batch = QtWidgets.QCheckBox("Uniform batch size", self)
+        self.chk_seedvr2_uniform_batch.setChecked(True)
+        self.chk_seedvr2_uniform_batch.setToolTip(
+            "Pads the final short batch to the selected Batch size. SeedVR2 recommends this for video "
+            "because a small final batch can create temporal artifacts."
+        )
+        lay_seed.addWidget(self.chk_seedvr2_uniform_batch)
 
         self.chk_seedvr2_prepend = QtWidgets.QCheckBox("Prepend frames", self)
         self.chk_seedvr2_prepend.setToolTip(
@@ -630,12 +662,13 @@ class UpscPane(QtWidgets.QWidget):
 
         adv.addWidget(QtWidgets.QLabel("Batch size:", self), 0, 0)
         self.spin_seedvr2_batch = QtWidgets.QSpinBox(self)
-        self.spin_seedvr2_batch.setRange(1, 16)
+        self.spin_seedvr2_batch.setRange(1, 81)
         self.spin_seedvr2_batch.setValue(1)
         self.spin_seedvr2_batch.setToolTip(
             "Number of frames SeedVR2 processes together for temporal reconstruction. "
-            "For video, 5 is a good baseline; SeedVR2 commonly uses 1 or 4n+1 values (5, 9, 13...). "
-            "If you see ghosting/afterimages, compare batch 1 and batch 5."
+            "For video use 4n+1 values: 5, 9, 13, 17, 21, 25, 29, 33, etc. "
+            "Batch 33 matches the high-quality ComfyUI workflow; higher values need more VRAM/RAM. "
+            "Batch 1 is a low-VRAM diagnostic/single-frame mode with little temporal context."
         )
         adv.addWidget(self.spin_seedvr2_batch, 0, 1)
 
@@ -1285,7 +1318,8 @@ class UpscPane(QtWidgets.QWidget):
             ("chk_seedvr2", "toggled"),
             ("combo_seedvr2_gguf", "currentTextChanged"),
             ("combo_seedvr2_res", "currentTextChanged"),
-            ("chk_seedvr2_temporal", "toggled"),
+            ("spin_seedvr2_temporal", "valueChanged"),
+            ("chk_seedvr2_uniform_batch", "toggled"),
             ("chk_seedvr2_prepend", "toggled"),
             ("combo_seedvr2_color", "currentTextChanged"),
             ("spin_seedvr2_batch", "valueChanged"),
@@ -1394,13 +1428,18 @@ class UpscPane(QtWidgets.QWidget):
         try: d["sharpen"] = int(self.sld_sharpen.value())
         except Exception: pass
                 # SeedVR2
+        # Version the SeedVR2 settings block so old/disabled GUI layouts cannot
+        # leak stale numeric values into newer controls.
+        d["seedvr2_settings_version"] = 2
         try: d["seedvr2_enabled"] = bool(self.chk_seedvr2.isChecked())
         except Exception: pass
         try: d["seedvr2_gguf"] = self.combo_seedvr2_gguf.currentText()
         except Exception: pass
         try: d["seedvr2_res"] = self.combo_seedvr2_res.currentText()
         except Exception: pass
-        try: d["seedvr2_temporal"] = bool(self.chk_seedvr2_temporal.isChecked())
+        try: d["seedvr2_temporal_overlap"] = int(self.spin_seedvr2_temporal.value())
+        except Exception: pass
+        try: d["seedvr2_uniform_batch"] = bool(self.chk_seedvr2_uniform_batch.isChecked())
         except Exception: pass
         try: d["seedvr2_prepend"] = bool(self.chk_seedvr2_prepend.isChecked())
         except Exception: pass
@@ -1496,6 +1535,14 @@ class UpscPane(QtWidgets.QWidget):
             pass
 
         # SeedVR2
+        # Settings schema v2.  Older FrameVision builds used a different/disabled
+        # SeedVR2 UI and reused some of these keys with incompatible ranges.
+        # Do not import those stale advanced values into the current panel.
+        try:
+            _sv2 = int(d.get("seedvr2_settings_version", 0) or 0) >= 2
+        except Exception:
+            _sv2 = False
+
         try:
             self.chk_seedvr2.setChecked(bool(d.get("seedvr2_enabled", False)))
         except Exception:
@@ -1514,53 +1561,83 @@ class UpscPane(QtWidgets.QWidget):
                 if i >= 0: self.combo_seedvr2_res.setCurrentIndex(i)
         except Exception:
             pass
-        try:
-            self.chk_seedvr2_temporal.setChecked(bool(d.get("seedvr2_temporal", True)))
-        except Exception:
-            pass
-        try:
-            self.chk_seedvr2_prepend.setChecked(bool(d.get("seedvr2_prepend", False)))
-        except Exception:
-            pass
-        try:
-            cc = d.get("seedvr2_color")
-            if cc:
-                i = self.combo_seedvr2_color.findText(cc)
-                if i >= 0: self.combo_seedvr2_color.setCurrentIndex(i)
-        except Exception:
-            pass
-        try:
-            self.spin_seedvr2_batch.setValue(int(d.get("seedvr2_batch", 1)))
-            self.spin_seedvr2_chunk.setValue(int(d.get("seedvr2_chunk", 20)))
-            self.chk_seedvr2_blockswap.setChecked(bool(d.get("seedvr2_blockswap", False)))
-            self.spin_seedvr2_blocks.setValue(int(d.get("seedvr2_blocks", 16)))
-            self.spin_seedvr2_blocks.setEnabled(bool(self.chk_seedvr2_blockswap.isChecked()))
-            am = str(d.get("seedvr2_attn") or "").strip()
-            if am:
-                _am_map = {
-                    "xformers": "sdpa",
-                    "flash": "flash_attn",
-                    "flash_attn_2": "flash_attn",
-                    "sageattention": "sage",
-                    "sageattn": "sage",
-                    "sageattn_2": "sage",
-                    "off": "none",
-                    "disabled": "none",
-                }
-                am = _am_map.get(am.lower(), am)
-                i = self.combo_seedvr2_attn.findText(am)
-                if i >= 0:
-                    self.combo_seedvr2_attn.setCurrentIndex(i)
-                else:
-                    self.combo_seedvr2_attn.setCurrentText("auto")
-            self.chk_seedvr2_vae_enc.setChecked(bool(d.get("seedvr2_vae_enc", False)))
-            self.chk_seedvr2_vae_dec.setChecked(bool(d.get("seedvr2_vae_dec", True)))
-            self.spin_seedvr2_enc_tile.setValue(int(d.get("seedvr2_enc_tile", 1536)))
-            self.spin_seedvr2_enc_ov.setValue(int(d.get("seedvr2_enc_ov", 64)))
-            self.spin_seedvr2_dec_tile.setValue(int(d.get("seedvr2_dec_tile", 1536)))
-            self.spin_seedvr2_dec_ov.setValue(int(d.get("seedvr2_dec_ov", 64)))
-        except Exception:
-            pass
+
+        if _sv2:
+            try:
+                _ov = int(d.get("seedvr2_temporal_overlap", 3))
+                self.spin_seedvr2_temporal.setValue(max(0, min(16, _ov)))
+            except Exception:
+                pass
+            try:
+                self.chk_seedvr2_uniform_batch.setChecked(bool(d.get("seedvr2_uniform_batch", True)))
+            except Exception:
+                pass
+            try:
+                self.chk_seedvr2_prepend.setChecked(bool(d.get("seedvr2_prepend", False)))
+            except Exception:
+                pass
+            try:
+                cc = d.get("seedvr2_color")
+                if cc:
+                    i = self.combo_seedvr2_color.findText(cc)
+                    if i >= 0: self.combo_seedvr2_color.setCurrentIndex(i)
+            except Exception:
+                pass
+            try:
+                self.spin_seedvr2_batch.setValue(max(1, min(81, int(d.get("seedvr2_batch", 1)))))
+                self.spin_seedvr2_chunk.setValue(max(1, min(999, int(d.get("seedvr2_chunk", 20)))))
+                self.chk_seedvr2_blockswap.setChecked(bool(d.get("seedvr2_blockswap", False)))
+                self.spin_seedvr2_blocks.setValue(max(1, min(36, int(d.get("seedvr2_blocks", 16)))))
+                self.spin_seedvr2_blocks.setEnabled(bool(self.chk_seedvr2_blockswap.isChecked()))
+                am = str(d.get("seedvr2_attn") or "").strip()
+                if am:
+                    _am_map = {
+                        "xformers": "sdpa", "flash": "flash_attn",
+                        "flash_attn_2": "flash_attn", "sageattention": "sage",
+                        "sageattn": "sage", "sageattn_2": "sage",
+                        "off": "none", "disabled": "none",
+                    }
+                    am = _am_map.get(am.lower(), am)
+                    i = self.combo_seedvr2_attn.findText(am)
+                    self.combo_seedvr2_attn.setCurrentIndex(i if i >= 0 else self.combo_seedvr2_attn.findText("auto"))
+                self.chk_seedvr2_vae_enc.setChecked(bool(d.get("seedvr2_vae_enc", False)))
+                self.chk_seedvr2_vae_dec.setChecked(bool(d.get("seedvr2_vae_dec", True)))
+                enc_tile = max(128, min(4096, int(d.get("seedvr2_enc_tile", 1536))))
+                enc_ov = max(0, min(1024, int(d.get("seedvr2_enc_ov", 64))))
+                dec_tile = max(128, min(4096, int(d.get("seedvr2_dec_tile", 1536))))
+                dec_ov = max(0, min(1024, int(d.get("seedvr2_dec_ov", 64))))
+                # Overlap must not exceed its tile size.  Clamp malformed saved values.
+                enc_ov = min(enc_ov, max(0, enc_tile - 1))
+                dec_ov = min(dec_ov, max(0, dec_tile - 1))
+                self.spin_seedvr2_enc_tile.setValue(enc_tile)
+                self.spin_seedvr2_enc_ov.setValue(enc_ov)
+                self.spin_seedvr2_dec_tile.setValue(dec_tile)
+                self.spin_seedvr2_dec_ov.setValue(dec_ov)
+            except Exception:
+                pass
+        else:
+            # One-time migration from the old/disabled SeedVR2 GUI: keep only
+            # harmless high-level choices and reset advanced values to the current
+            # implementation's known-good defaults.  The next save writes v2.
+            try:
+                self.spin_seedvr2_temporal.setValue(3)
+                self.chk_seedvr2_uniform_batch.setChecked(True)
+                self.chk_seedvr2_prepend.setChecked(False)
+                self.combo_seedvr2_color.setCurrentText("lab")
+                self.chk_seedvr2_blockswap.setChecked(False)
+                self.spin_seedvr2_blocks.setValue(16)
+                self.spin_seedvr2_blocks.setEnabled(False)
+                self.combo_seedvr2_attn.setCurrentText("auto")
+                self.chk_seedvr2_vae_enc.setChecked(False)
+                self.spin_seedvr2_enc_tile.setValue(1536)
+                self.spin_seedvr2_enc_ov.setValue(64)
+                self.spin_seedvr2_dec_tile.setValue(1536)
+                self.spin_seedvr2_dec_ov.setValue(64)
+                # Resolution preset supplies batch/chunk/decode-tiling defaults.
+                self._apply_seedvr2_resolution_preset()
+            except Exception:
+                pass
+
         try:
             self._update_seedvr2_mode(self.chk_seedvr2.isChecked())
         except Exception:
@@ -1836,7 +1913,7 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             cur = ""
         try:
-            items = scan_seedvr2_gguf()
+            items = scan_seedvr2_models()
             self.combo_seedvr2_gguf.blockSignals(True)
             self.combo_seedvr2_gguf.clear()
             for it in items:
@@ -2362,27 +2439,31 @@ class UpscPane(QtWidgets.QWidget):
                         QtWidgets.QMessageBox.critical(self, "SeedVR2 missing", f"SeedVR2 model folder was not found:\n{SEEDVR2_MODELS_DIR}")
                         return
 
-                    gguf_name = (self.combo_seedvr2_gguf.currentText() or "").strip()
-                    if not gguf_name:
-                        QtWidgets.QMessageBox.warning(self, "SeedVR2", "Please select a GGUF model.")
+                    model_name = (self.combo_seedvr2_gguf.currentText() or "").strip()
+                    if not model_name:
+                        QtWidgets.QMessageBox.warning(self, "SeedVR2", "Please select a SeedVR2 DiT model.")
                         return
-                    gguf_path = None
+                    model_path = None
                     try:
-                        for p in SEEDVR2_MODELS_DIR.rglob("*.gguf"):
-                            if p.name == gguf_name:
-                                gguf_path = p
+                        for p in SEEDVR2_MODELS_DIR.rglob("*"):
+                            if (p.is_file() and p.name == model_name and
+                                    p.suffix.lower() in {".gguf", ".safetensors"} and
+                                    "vae" not in p.name.lower()):
+                                model_path = p
                                 break
                     except Exception:
-                        gguf_path = None
-                    if gguf_path is None or not gguf_path.exists():
-                        QtWidgets.QMessageBox.critical(self, "SeedVR2 missing", f"Selected GGUF model was not found in models/SEEDVR2:\n{gguf_name}")
+                        model_path = None
+                    if model_path is None or not model_path.exists():
+                        QtWidgets.QMessageBox.critical(
+                            self, "SeedVR2 missing",
+                            f"Selected SeedVR2 model was not found in models/SEEDVR2:\n{model_name}"
+                        )
                         return
 
-                    # Use the actual parent folder of the selected GGUF.
-                    # The UI scans recursively, so a nested model can be found
-                    # here, but the CLI will fail if we always pass the top-level
-                    # models/SEEDVR2 folder instead of the file's real location.
-                    seedvr2_model_dir = gguf_path.parent
+                    # Use the actual parent folder of the selected model. The CLI discovers
+                    # both GGUF and safetensors files from --model_dir. This also allows
+                    # custom BF16 files such as seedvr2_ema_3b_bf16.safetensors.
+                    seedvr2_model_dir = model_path.parent
 
                     res = int((self.combo_seedvr2_res.currentText() or "1440").strip() or 1440)
                     if is_video and res >= 2160:
@@ -2427,7 +2508,7 @@ class UpscPane(QtWidgets.QWidget):
 
                     self._last_outfile = outfile
 
-                    temporal = 1 if bool(self.chk_seedvr2_temporal.isChecked()) else 0
+                    temporal = int(self.spin_seedvr2_temporal.value())
                     prepend_frames = 4 if bool(getattr(self, "chk_seedvr2_prepend", None) and self.chk_seedvr2_prepend.isChecked()) else 0
                     cc = (self.combo_seedvr2_color.currentText() or "").strip() or "lab"
                     attn = (self.combo_seedvr2_attn.currentText() or "auto").strip() or "auto"
@@ -2437,7 +2518,7 @@ class UpscPane(QtWidgets.QWidget):
                            "--output_format", out_fmt,
                            "--video_backend", "ffmpeg",
                            "--model_dir", str(seedvr2_model_dir),
-                           "--dit_model", gguf_path.name,
+                           "--dit_model", model_path.name,
                            "--resolution", str(res),
                            "--batch_size", str(int(self.spin_seedvr2_batch.value())),
                            "--chunk_size", str(int(self.spin_seedvr2_chunk.value())),
@@ -2446,6 +2527,12 @@ class UpscPane(QtWidgets.QWidget):
                            "--color_correction", str(cc),
                            "--attention_mode", str(attn),
                            ]
+
+                    try:
+                        if self.chk_seedvr2_uniform_batch.isChecked():
+                            seed_forward.append("--uniform_batch_size")
+                    except Exception:
+                        pass
 
                     try:
                         if self.chk_seedvr2_blockswap.isChecked():
@@ -2497,7 +2584,7 @@ class UpscPane(QtWidgets.QWidget):
                     self._append_log(f"CLI: {SEEDVR2_CLI}")
                     self._append_log(f"Runner: {runner if runner else '(missing — using CLI directly)'}")
                     self._append_log(f"Model dir: {seedvr2_model_dir}")
-                    self._append_log(f"GGUF: {gguf_path.name}")
+                    self._append_log(f"DiT model: {model_path.name}")
                     self._append_log(f"Upscale to: {res}")
                     self._append_log(f"Temporal overlap: {temporal}")
                     self._append_log(f"Color correction: {cc}")
@@ -2507,9 +2594,25 @@ class UpscPane(QtWidgets.QWidget):
 
                     self._run_cmd([cmd], open_on_success=True, cwd=SEEDVR2_CLI.parent, env=env)
                     return
-            except Exception:
-                # If SeedVR2 block fails unexpectedly, fall back to normal engines
-                pass
+            except Exception as e:
+                # SeedVR2 is an explicit override. If its setup/build fails, NEVER
+                # fall through to whichever normal upscaler happened to be selected
+                # before SeedVR2 was enabled. Doing so can silently launch HYPIR,
+                # Real-ESRGAN, etc. with the wrong command.
+                try:
+                    self._append_log(f"SeedVR2 setup error: {e!r}")
+                except Exception:
+                    pass
+                try:
+                    QtWidgets.QMessageBox.critical(
+                        self,
+                        "SeedVR2 error",
+                        "SeedVR2 could not start, so the job was stopped instead of falling back "
+                        "to the normal upscaler.\n\n" + repr(e),
+                    )
+                except Exception:
+                    pass
+                return
 
             engine_label = self.combo_engine.currentText()
             do_gfpgan = ("gfpgan" in (engine_label or "").lower())

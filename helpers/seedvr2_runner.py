@@ -552,8 +552,10 @@ def _legacy_mode(args: argparse.Namespace) -> int:
             if seed_cfg.get("10bit") is True:
                 cmd.append("--10bit")
 
-    # Choose cwd as repo root (where inference_cli.py lives)
-    cwd = cli.parent
+    # Run from the FrameVision root. SeedVR2 adds its own script directory to
+    # sys.path, while using this cwd makes its pre-argparse model discovery see
+    # <FrameVision>/models/SEEDVR2, including custom .safetensors filenames.
+    cwd = root
 
     rc = _run_cmd(cmd, cwd=cwd, root=root)
     if rc == 0 and str(args.is_video).strip() not in ("0", "false", "False", "") and out_path:
@@ -757,7 +759,9 @@ def _new_mode(args: argparse.Namespace) -> int:
     try:
         p = subprocess.Popen(
             cmd,
-            cwd=str(cli.parent),
+            # Use FrameVision root as cwd so SeedVR2's ./models/SEEDVR2 discovery
+            # includes custom GGUF/safetensors files before argparse validates --dit_model.
+            cwd=str(root),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=_utf8_env(env),
