@@ -33,6 +33,16 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
 .pill{padding:6px 10px;border-radius:999px;background:rgba(59,130,246,.16);border:1px solid var(--card-border);font-size:12px}
 .time{min-width:110px;text-align:right;font-variant-numeric:tabular-nums}.muted{color:var(--muted)}
 .kbd{padding:3px 6px;border-radius:6px;border:1px solid var(--card-border);background:var(--bg-soft);font-size:11px;color:var(--muted)}
+
+.compare-viewport{position:relative;height:520px;border-radius:12px;overflow:hidden;background:var(--bg-soft);border:1px solid var(--card-border);user-select:none;touch-action:none}
+.compare-canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+.compare-top{clip-path:inset(0 0 0 50%)}
+.compare-divider{position:absolute;top:0;bottom:0;left:50%;width:3px;background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.45),0 0 14px rgba(255,255,255,.45);transform:translateX(-1.5px);pointer-events:none}
+.compare-handle{position:absolute;top:50%;left:50%;width:44px;height:44px;border-radius:50%;transform:translate(-50%,-50%);background:var(--card);border:2px solid #fff;box-shadow:var(--shadow);display:grid;place-items:center;font-weight:700;pointer-events:none}
+.compare-handle::before{content:'↔';font-size:22px}
+.compare-label{position:absolute;top:12px;padding:6px 10px;border-radius:999px;background:rgba(0,0,0,.58);border:1px solid rgba(255,255,255,.22);font-size:12px;font-weight:700;pointer-events:none}
+.compare-label.left{left:12px}.compare-label.right{right:12px}
+.compare-empty{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);pointer-events:none}
 </style>
 </head>
 <body>
@@ -128,6 +138,26 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
       </div>
     </div>
   </section>
+
+  <div class="panel" style="margin-top:16px" id="comparePanel">
+    <h3>Wipe compare <span class="badge">Drag left/right directly on the preview</span></h3>
+    <div class="compare-viewport" id="compareViewport" tabindex="0">
+      <canvas id="compareBase" class="compare-canvas"></canvas>
+      <canvas id="compareTop" class="compare-canvas compare-top"></canvas>
+      <div id="compareEmpty" class="compare-empty">Load media on both sides to compare</div>
+      <div class="compare-label left">LEFT / A</div>
+      <div class="compare-label right">RIGHT / B</div>
+      <div id="compareDivider" class="compare-divider"></div>
+      <div id="compareHandle" class="compare-handle"></div>
+    </div>
+    <div class="row">
+      <span class="pill">Reveal</span>
+      <input id="compareSlider" type="range" min="0" max="100" step="0.1" value="50" class="slider" style="flex:1"/>
+      <span id="comparePct" class="time muted" style="min-width:52px">50%</span>
+      <button id="compareCenter" class="button" type="button">Center</button>
+      <button id="compareFullscreen" class="button" type="button">⤢ Fullscreen</button>
+    </div>
+  </div>
 
   <div class="panel" style="margin-top:16px">
     <h3>Linked playback • frame-step • A/B loop <span class="badge">Works when both are videos</span></h3>
@@ -246,9 +276,10 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
       if(blob.type.startsWith('video/')){
         view.type='video'; E.video.src=url; E.video.classList.add('show'); E.image.classList.remove('show'); E.video.load();
         E.badge.textContent='Video • loading…';
-        // try to start muted (user gesture from file picker)
+        // Keep newly loaded comparison videos paused. Starting each side independently
+        // causes the A/B wipe to show different moments in time.
         E.video.muted = true;
-        E.video.play().catch(()=>{});
+        E.video.pause();
       } else if(blob.type.startsWith('image/')){
         view.type='image'; E.image.src=url; E.image.classList.add('show'); E.video.classList.remove('show');
         E.badge.textContent='Image • loading…';
@@ -306,11 +337,93 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
     }
     on(E.exportBtn,'click', ()=>exportPNG('export_'+id+'.png'));
 
-    return { setView, fit, isVideo:()=>E.video.classList.contains('show'), currentTime:()=>E.video.currentTime||0, duration:()=>E.video.duration||0, seekTo:t=>{E.video.currentTime=t;}, play:()=>E.video.play(), pause:()=>E.video.pause(), stepBack:()=>step(-1), stepFwd:()=>step(1), video:()=>E.video, exportPNG:()=>exportPNG('export_'+id+'.png') };
+    return { setView, fit, isVideo:()=>E.video.classList.contains('show'), hasMedia:()=>!!view.type, type:()=>view.type, media:()=>view.type==='video'?E.video:E.image, currentTime:()=>E.video.currentTime||0, duration:()=>E.video.duration||0, seekTo:t=>{E.video.currentTime=t;}, play:()=>E.video.play(), pause:()=>E.video.pause(), stepBack:()=>step(-1), stepFwd:()=>step(1), video:()=>E.video, exportPNG:()=>exportPNG('export_'+id+'.png') };
   }
 
   const panes={A:makePanel('A'),B:makePanel('B')};
   on($('#exportBoth'),'click', ()=>{ panes.A.exportPNG(); panes.B.exportPNG(); });
+
+  // Keep video comparisons on the same moment in time. The wipe is meant to
+  // compare the same source frame before/after processing, not two independently
+  // running players.
+  function alignCompareVideos(reset=false){
+    if(!panes.A.isVideo() || !panes.B.isVideo()) return;
+    const a=panes.A.video(), b=panes.B.video();
+    const maxCommon=Math.max(0, Math.min(a.duration||0,b.duration||0));
+    const target=reset ? 0 : clamp(a.currentTime||0,0,maxCommon||0);
+    a.pause(); b.pause();
+    a.currentTime=target; b.currentTime=target;
+  }
+
+  // Once the second video is ready, start from an identical timestamp.
+  panes.A.video().addEventListener('loadedmetadata', ()=>{ if(panes.B.isVideo() && panes.B.video().readyState>=1) alignCompareVideos(true); });
+  panes.B.video().addEventListener('loadedmetadata', ()=>{ if(panes.A.isVideo() && panes.A.video().readyState>=1) alignCompareVideos(true); });
+
+  // Single-pane A/B wipe comparison. LEFT/A is the base; RIGHT/B is revealed from the divider to the right.
+  const compare={
+    vp:$('#compareViewport'), base:$('#compareBase'), top:$('#compareTop'), empty:$('#compareEmpty'),
+    divider:$('#compareDivider'), handle:$('#compareHandle'), slider:$('#compareSlider'), pct:$('#comparePct'), dragging:false, pos:50
+  };
+
+  function setComparePos(v){
+    compare.pos=clamp(Number(v)||0,0,100);
+    const p=compare.pos+'%';
+    compare.top.style.clipPath=`inset(0 0 0 ${p})`;
+    compare.divider.style.left=p; compare.handle.style.left=p; compare.slider.value=String(compare.pos);
+    compare.pct.textContent=Math.round(compare.pos)+'%';
+  }
+
+  function mediaSize(el,type){
+    return type==='video' ? {w:el.videoWidth||0,h:el.videoHeight||0} : {w:el.naturalWidth||0,h:el.naturalHeight||0};
+  }
+
+  function containedRect(el,type,W,H){
+    const n=mediaSize(el,type); if(!n.w||!n.h) return null;
+    const scale=Math.min(W/n.w,H/n.h), dw=n.w*scale, dh=n.h*scale;
+    return {dx:(W-dw)/2,dy:(H-dh)/2,dw,dh};
+  }
+
+  function drawIntoRect(ctx,el,rect){
+    if(!rect) return false;
+    try{ ctx.drawImage(el,rect.dx,rect.dy,rect.dw,rect.dh); return true; }catch(e){ return false; }
+  }
+
+  function renderCompare(){
+    if(compare.vp){
+      const r=compare.vp.getBoundingClientRect(), dpr=Math.max(1,window.devicePixelRatio||1);
+      const W=Math.max(1,Math.round(r.width*dpr)), H=Math.max(1,Math.round(r.height*dpr));
+      [compare.base,compare.top].forEach(c=>{ if(c.width!==W||c.height!==H){c.width=W;c.height=H;} });
+      const a=compare.base.getContext('2d'), b=compare.top.getContext('2d');
+      a.setTransform(1,0,0,1,0,0); b.setTransform(1,0,0,1,0,0);
+      a.clearRect(0,0,W,H); b.clearRect(0,0,W,H);
+      const bg=getComputedStyle(document.body).getPropertyValue('--bg-soft')||'#111827';
+      a.fillStyle=bg; b.fillStyle=bg; a.fillRect(0,0,W,H); b.fillRect(0,0,W,H);
+      // Use LEFT/A as the reference geometry for both layers. This prevents an
+      // upscaled result from being independently re-fit/re-centered because its
+      // native pixel dimensions are larger. Both are drawn into the exact same
+      // destination rectangle, which is what a before/after wipe needs.
+      const refRect=panes.A.hasMedia()?containedRect(panes.A.media(),panes.A.type(),W,H):null;
+      const okA=panes.A.hasMedia()&&drawIntoRect(a,panes.A.media(),refRect);
+      const okB=panes.B.hasMedia()&&drawIntoRect(b,panes.B.media(),refRect);
+      compare.empty.style.display=(okA&&okB)?'none':'grid';
+      compare.divider.style.display=(okA&&okB)?'block':'none';
+      compare.handle.style.display=(okA&&okB)?'grid':'none';
+    }
+    requestAnimationFrame(renderCompare);
+  }
+  requestAnimationFrame(renderCompare);
+
+  function posFromPointer(e){
+    const r=compare.vp.getBoundingClientRect(); return clamp(((e.clientX-r.left)/Math.max(1,r.width))*100,0,100);
+  }
+  on(compare.vp,'pointerdown',e=>{ compare.dragging=true; compare.vp.setPointerCapture?.(e.pointerId); setComparePos(posFromPointer(e)); });
+  on(compare.vp,'pointermove',e=>{ if(compare.dragging) setComparePos(posFromPointer(e)); });
+  on(compare.vp,'pointerup',e=>{ compare.dragging=false; compare.vp.releasePointerCapture?.(e.pointerId); });
+  on(compare.vp,'pointercancel',()=>{compare.dragging=false;});
+  on(compare.slider,'input',()=>setComparePos(compare.slider.value));
+  on($('#compareCenter'),'click',()=>setComparePos(50));
+  on($('#compareFullscreen'),'click',async()=>{ try{ await compare.vp.requestFullscreen?.(); }catch(e){} });
+  setComparePos(50);
 
   function bothVideos(){ return panes.A.isVideo() && panes.B.isVideo(); }
   const seekBoth=$('#seekBoth'), timeBoth=$('#timeBoth');
@@ -323,8 +436,19 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
     if(timeBoth) timeBoth.textContent=fmt(t)+' / '+fmt(d);
   }
   setInterval(syncBoth,200);
-  on($('#playBoth'),'click', ()=>{ if(bothVideos()){ panes.A.play(); panes.B.play(); } });
-  on($('#pauseBoth'),'click', ()=>{ if(bothVideos()){ panes.A.pause(); panes.B.pause(); } });
+  setInterval(()=>{
+    if(!bothVideos()) return;
+    const a=panes.A.video(), b=panes.B.video();
+    if(!a.paused && !b.paused && Math.abs((a.currentTime||0)-(b.currentTime||0))>0.035){
+      b.currentTime=a.currentTime;
+    }
+  },250);
+  on($('#playBoth'),'click', ()=>{ if(bothVideos()){
+    const a=panes.A.video(), b=panes.B.video();
+    b.currentTime=a.currentTime;
+    Promise.allSettled([a.play(),b.play()]);
+  } });
+  on($('#pauseBoth'),'click', ()=>{ if(bothVideos()){ panes.A.pause(); panes.B.pause(); panes.B.seekTo(panes.A.currentTime()); } });
   on($('#restartBoth'),'click', ()=>{ if(bothVideos()){ panes.A.seekTo(0); panes.B.seekTo(0); } });
   on(seekBoth,'input', ()=>{ if(!bothVideos()) return; const v=parseFloat(seekBoth.value)||0; panes.A.seekTo(v); panes.B.seekTo(v); });
 
