@@ -133,7 +133,7 @@ def enqueue(job_type, input_path=None, out_dir=None, factor=None, model=None, fm
                     cmd_txt = cmd.lower()
             except Exception:
                 cmd_txt = ''
-            if eng == 'seedvr2' or ('seedvr2' in cmd_txt) or ('inference_cli.py' in cmd_txt and 'seedvr2' in cmd_txt):
+            if eng.startswith('seedvr2') or ('seedvr2_community_runner.py' in cmd_txt) or ('seedvr2_official_runner.py' in cmd_txt) or ('seedvr2' in cmd_txt) or ('inference_cli.py' in cmd_txt and 'seedvr2' in cmd_txt):
                 return enqueue_seedvr2(job)
             if eng == 'hypir' or ('hypir_runner.py' in cmd_txt) or ('hypir_queue_chain.py' in cmd_txt):
                 return enqueue_hypir(job)
@@ -1278,8 +1278,9 @@ def _infer_seedvr2_input_from_cmd(cmd):
         else:
             return ''
 
-        # Current FrameVision launches SeedVR2 through seedvr2_runner.py and
-        # supplies the real media as an explicit --input argument.  Resolve
+        # Current FrameVision launches SeedVR2 through seedvr2_community_runner.py
+        # or seedvr2_official_runner.py and supplies the real media as an explicit
+        # --input argument. Resolve
         # that FIRST.  Looking immediately after inference_cli.py would return
         # the literal token '--input' from the wrapper command.
         for i, part in enumerate(parts):
@@ -1333,7 +1334,11 @@ def enqueue_seedvr2(job: dict):
         # SeedVR2 is mostly video; default to video upscale folder
         out_dir = default_outdir(True, 'upscale')
     # Ensure UI and worker have the fields they expect
-    args.setdefault('engine', 'seedvr2')
+    # Keep SeedVR2 as a first-class external command. Do not turn it into an
+    # upscale_video/upscale_photo job: those worker paths perform their own
+    # extraction, FPS selection and delivery encode.
+    args['engine'] = 'seedvr2'
+    args.setdefault('label', str(job.get('label') or job.get('name') or 'SeedVR2'))
     args.setdefault('outfile', out_file)
     args.setdefault('output', out_file)
     args.setdefault('cwd', job.get('cwd'))

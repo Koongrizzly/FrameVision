@@ -2674,6 +2674,26 @@ def tools_ffmpeg(job, cfg, mani):
         return 1
 
 
+def seedvr2_run(job, cfg, mani):
+    """Run a queued SeedVR2 command without generic Upscale post-processing.
+
+    The command is authored by helpers/seedvr2_gui.py and already contains the
+    selected backend, resolution/model/memory settings and (for the official
+    backend) optional output FPS.  Reusing tools_ffmpeg here gives Queue
+    progress/cancel/log handling only; it does NOT call upscale_video(), probe or
+    replace FPS, select an upscale model, or add another codec/FFmpeg encode.
+    """
+    try:
+        args = job.get("args", {}) or {}
+        cmd = args.get("cmd") or args.get("ffmpeg_cmd") or job.get("cmd")
+        print("[worker][seedvr2] direct SeedVR2 queue route; preserving GUI command/settings", flush=True)
+        if cmd:
+            print("[worker][seedvr2] no generic Upscale FPS/codec override will be applied", flush=True)
+    except Exception:
+        pass
+    return tools_ffmpeg(job, cfg, mani)
+
+
 def upscale_photo(job, cfg, mani):
     print("[worker] upscale_photo: start", job.get("input"))
     inp = Path(job["input"])
@@ -7253,11 +7273,10 @@ def handle_job(jpath: Path):
             # streamed stdout/logs, cancel markers, active PID, and normal
             # pending -> running -> done/failed transitions.
             code = tools_ffmpeg(job, cfg, mani)
-        # SeedVR2: external CLI runner (python inference_cli.py ...)
-        # Queue writes type="seedvr2" with args.cmd + args.outfile.
-        # Reuse the robust external runner (progress parsing + log capture).
+        # SeedVR2 is deliberately isolated from upscale_video/upscale_photo.
+        # Its GUI-built command owns resolution/FPS/codec behavior end-to-end.
         elif t in ('seedvr2','seedvr2_upscale','seedvr2_video'):
-            code = tools_ffmpeg(job, cfg, mani)
+            code = seedvr2_run(job, cfg, mani)
         elif t=='rife_interpolate':
             code = rife_interpolate(job, cfg, mani)
         elif t in ('txt2img','txt2img_qwen'):

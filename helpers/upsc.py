@@ -37,6 +37,12 @@ GFPGAN_ENV_DIR = GFPGAN_DIR / ".GFPGAN"
 GFPGAN_MODEL_V14 = GFPGAN_DIR / "GFPGANv1.4.pth"
 GFPGAN_MODEL_V13 = GFPGAN_DIR / "GFPGANv1.3.pth"
 
+# SeedVR2 integration
+# The old inline SeedVR2 panel/execution path remains disabled for reference.
+# The visible "Use seedVR2" toggle now opens helpers/seedvr2_gui.py instead.
+LEGACY_SEEDVR2_ENABLED = False
+NEW_SEEDVR2_GUI_ENABLED = True
+
 # SeedVR2 (video upscaler) paths
 SEEDVR2_MODELS_DIR = MODELS_DIR / "SEEDVR2"
 SEEDVR2_CLI = ROOT / "presets" / "extra_env" / "seedvr2_src" / "ComfyUI-SeedVR2_VideoUpscaler" / "inference_cli.py"
@@ -452,7 +458,17 @@ class UpscPane(QtWidgets.QWidget):
         self._main = main
 
     def _build_ui(self):
-        v_main = QtWidgets.QVBoxLayout(self)
+        # Upscale now has two permanent in-app tabs: the existing upscaler and
+        # the new SeedVR2 GUI.  SeedVR2 is embedded here instead of being
+        # launched from the old on/off checkbox as a separate window.
+        root_layout = QtWidgets.QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        self.upscale_backend_tabs = QtWidgets.QTabWidget(self)
+        root_layout.addWidget(self.upscale_backend_tabs, 1)
+
+        self.upscale_classic_tab = QtWidgets.QWidget(self.upscale_backend_tabs)
+        v_main = QtWidgets.QVBoxLayout(self.upscale_classic_tab)
+        self.upscale_backend_tabs.addTab(self.upscale_classic_tab, "Upscale")
         
         # ----- Top action bar (fixed; does not scroll) -----
         topbar = QtWidgets.QHBoxLayout()
@@ -535,9 +551,14 @@ class UpscPane(QtWidgets.QWidget):
         
         v.addLayout(row)
 
-        # SeedVR2 (optional upscaler)
+        # SeedVR2 launcher. The old inline SeedVR2 controls below are kept only
+        # as dormant legacy code; this toggle opens the new standalone GUI.
+        # Legacy launcher retained only as an internal compatibility object for
+        # older settings code.  The user-facing SeedVR2 switch is now the tab.
         self.chk_seedvr2 = QtWidgets.QCheckBox("Use seedVR2", self)
-        v.addWidget(self.chk_seedvr2)
+        self.chk_seedvr2.setChecked(False)
+        self.chk_seedvr2.setEnabled(False)
+        self.chk_seedvr2.hide()
 
         scale_lay = QtWidgets.QHBoxLayout()
         scale_lay.addWidget(QtWidgets.QLabel("Scale:", self))
@@ -587,8 +608,9 @@ class UpscPane(QtWidgets.QWidget):
             "SeedVR2 DiT weights. Supports .gguf and .safetensors models found under models/SEEDVR2, "
             "including FP16/BF16 safetensors such as seedvr2_ema_3b_bf16.safetensors."
         )
-        for m in scan_seedvr2_models():
-            self.combo_seedvr2_gguf.addItem(m)
+        if LEGACY_SEEDVR2_ENABLED:
+            for m in scan_seedvr2_models():
+                self.combo_seedvr2_gguf.addItem(m)
         row_m.addWidget(self.combo_seedvr2_gguf, 1)
         self.btn_seedvr2_refresh = QtWidgets.QPushButton("Refresh", self)
         self.btn_seedvr2_refresh.setFixedWidth(90)
@@ -1232,6 +1254,49 @@ class UpscPane(QtWidgets.QWidget):
         except Exception:
             pass
 
+        # ----- Embedded SeedVR2 tab -----
+        try:
+            try:
+                from helpers.seedvr2_gui import SeedVR2Window
+            except Exception:
+                from seedvr2_gui import SeedVR2Window
+
+            self.seedvr2_tab = SeedVR2Window()
+            self.seedvr2_tab.setParent(self.upscale_backend_tabs)
+            self.seedvr2_tab.setWindowFlags(Qt.Widget)
+            self.seedvr2_tab.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+            )
+            self.upscale_backend_tabs.addTab(self.seedvr2_tab, "SeedVR2")
+
+            def _sync_input_when_seedvr2_selected(index):
+                try:
+                    if self.upscale_backend_tabs.widget(index) is not self.seedvr2_tab:
+                        return
+                    src = (self.edit_input.text() or "").strip()
+                    # Do not overwrite a file the user explicitly chose in the
+                    # SeedVR2 tab; just make switching tabs convenient.
+                    if src and hasattr(self.seedvr2_tab, "input_edit"):
+                        if not (self.seedvr2_tab.input_edit.text() or "").strip():
+                            self.seedvr2_tab.input_edit.setText(src)
+                except Exception:
+                    pass
+
+            self.upscale_backend_tabs.currentChanged.connect(_sync_input_when_seedvr2_selected)
+        except Exception as e:
+            # Keep the normal upscaler usable even if the optional SeedVR2 GUI
+            # cannot import on a particular installation.
+            self.seedvr2_tab = None
+            unavailable = QtWidgets.QWidget(self.upscale_backend_tabs)
+            unavailable_layout = QtWidgets.QVBoxLayout(unavailable)
+            msg = QtWidgets.QLabel(
+                "SeedVR2 could not be loaded.\n\n" + str(e), unavailable
+            )
+            msg.setWordWrap(True)
+            unavailable_layout.addWidget(msg)
+            unavailable_layout.addStretch(1)
+            self.upscale_backend_tabs.addTab(unavailable, "SeedVR2")
+
 # UI helpers
     def _set_section_state(self, box, open_: bool):
         """Reliably set a CollapsibleSection open/closed, even if setChecked() is ignored.
@@ -1431,7 +1496,7 @@ class UpscPane(QtWidgets.QWidget):
         # Version the SeedVR2 settings block so old/disabled GUI layouts cannot
         # leak stale numeric values into newer controls.
         d["seedvr2_settings_version"] = 2
-        try: d["seedvr2_enabled"] = bool(self.chk_seedvr2.isChecked())
+        try: d["seedvr2_enabled"] = False  # launcher state is transient; never auto-open SeedVR2 at startup
         except Exception: pass
         try: d["seedvr2_gguf"] = self.combo_seedvr2_gguf.currentText()
         except Exception: pass
@@ -1544,7 +1609,7 @@ class UpscPane(QtWidgets.QWidget):
             _sv2 = False
 
         try:
-            self.chk_seedvr2.setChecked(bool(d.get("seedvr2_enabled", False)))
+            self.chk_seedvr2.setChecked(False)  # new SeedVR2 GUI is opened only by an explicit user toggle
         except Exception:
             pass
         try:
@@ -1996,30 +2061,80 @@ class UpscPane(QtWidgets.QWidget):
             _set(self.spin_seedvr2_batch, self.spin_seedvr2_batch.setValue, 5)
             _set(self.spin_seedvr2_chunk, self.spin_seedvr2_chunk.setValue, 50)
 
-    def _update_seedvr2_mode(self, on: bool | None = None):
+    def _seedvr2_window_closed(self, *args):
+        """Keep the launcher toggle in sync when the new SeedVR2 window closes."""
+        self._seedvr2_window = None
         try:
-            enabled = bool(self.chk_seedvr2.isChecked()) if on is None else bool(on)
-        except Exception:
-            enabled = False
-        # Show SeedVR2 panel and hide normal controls when enabled
-        try:
-            self.box_seedvr2.setVisible(enabled)
-            self.box_seedvr2.setEnabled(enabled)
+            self.chk_seedvr2.blockSignals(True)
+            self.chk_seedvr2.setChecked(False)
+            self.chk_seedvr2.blockSignals(False)
         except Exception:
             pass
-        for w in (getattr(self, "_w_scale", None), getattr(self, "box_models", None), getattr(self, "box_encoder", None), getattr(self, "box_advanced", None)):
+
+    def _open_new_seedvr2_gui(self):
+        """Open/re-focus helpers/seedvr2_gui.py without exposing the legacy panel."""
+        try:
+            win = getattr(self, "_seedvr2_window", None)
+            if win is not None:
+                try:
+                    if win.isVisible():
+                        win.showNormal()
+                        win.raise_()
+                        win.activateWindow()
+                        return win
+                except Exception:
+                    self._seedvr2_window = None
+
             try:
-                if w is None:
-                    continue
-                w.setVisible(not enabled)
-                w.setEnabled(not enabled)
+                from helpers.seedvr2_gui import SeedVR2Window
+            except Exception:
+                # Fallback for layouts where helpers itself is on sys.path.
+                from seedvr2_gui import SeedVR2Window
+
+            win = SeedVR2Window()
+            win.setAttribute(Qt.WA_DeleteOnClose, True)
+
+            # Convenience: carry the currently selected Upscale-tab input into
+            # the new SeedVR2 GUI when one is already selected.
+            try:
+                current_input = (self.edit_input.text() or "").strip()
+                if current_input and hasattr(win, "input_edit"):
+                    win.input_edit.setText(current_input)
             except Exception:
                 pass
-        # Keep warnings in sync
+
+            self._seedvr2_window = win
+            try:
+                win.destroyed.connect(self._seedvr2_window_closed)
+            except Exception:
+                pass
+            win.show()
+            win.raise_()
+            win.activateWindow()
+            return win
+        except Exception as e:
+            self._seedvr2_window = None
+            try:
+                self.chk_seedvr2.blockSignals(True)
+                self.chk_seedvr2.setChecked(False)
+                self.chk_seedvr2.blockSignals(False)
+            except Exception:
+                pass
+            QtWidgets.QMessageBox.critical(
+                self,
+                "SeedVR2",
+                "Could not open the new SeedVR2 GUI.\n\n" + str(e),
+            )
+            return None
+
+    def _update_seedvr2_mode(self, on: bool | None = None):
+        """Legacy compatibility hook. SeedVR2 now lives in its own in-app tab."""
         try:
-            self._update_seedvr2_warnings()
+            self.box_seedvr2.setVisible(False)
+            self.box_seedvr2.setEnabled(False)
         except Exception:
             pass
+        return
 
     def _sync_scale_from_spin(self, v: float):
         # Scale is intentionally limited to half-step values only:
@@ -2427,7 +2542,9 @@ class UpscPane(QtWidgets.QWidget):
     
             # SeedVR2 path (overrides all other engines when enabled)
             try:
-                if getattr(self, "chk_seedvr2", None) is not None and self.chk_seedvr2.isChecked():
+                if (LEGACY_SEEDVR2_ENABLED and
+                        getattr(self, "chk_seedvr2", None) is not None and
+                        self.chk_seedvr2.isChecked()):
                     # Basic validation
                     if not SEEDVR2_ENV_PY.exists():
                         QtWidgets.QMessageBox.critical(self, "SeedVR2 missing", f"SeedVR2 environment python was not found:\n{SEEDVR2_ENV_PY}")
@@ -3162,47 +3279,9 @@ def _fv_call_enqueue(self, enq, where_label, cmds, open_on_success, **_kwargs):
 
 
     
-    # SeedVR2: when enabled, never use the 4-arg enqueue signature (it would lose the custom CLI cmd).
-    # Always enqueue a job dict that contains the exact command + cwd/env.
-    try:
-        if getattr(self, "chk_seedvr2", None) is not None and getattr(self, "chk_seedvr2").isChecked():
-            if cmds:
-                c0 = cmds[0]
-                txt0 = " ".join(map(str, c0)).lower()
-                if "seedvr2" in txt0 or "inference_cli.py" in txt0:
-                    job = {
-                        "name": "Upscale (seedVR2)",
-                        "label": "Upscale (seedVR2)",
-                        "category": "upscale",
-                        "engine": "seedvr2",
-                        "input": str(input_path or ""),
-                        "cmd": c0,
-                        "cwd": str((_kwargs.get("cwd") or globals().get("ROOT", "."))),
-                        "open_on_success": bool(open_on_success),
-                        "output": str(getattr(self, "_last_outfile", "")),
-                        "outfile": str(getattr(self, "_last_outfile", "")),
-                    }
-                    # pass env through if the queue/worker supports it
-                    try:
-                        if _kwargs.get("env"):
-                            job["env"] = _kwargs.get("env")
-                    except Exception:
-                        pass
-                    try:
-                        enq(job)
-                        try:
-                            self._append_log(f"Queued SeedVR2 via {where_label}.")
-                        except Exception:
-                            pass
-                        return True
-                    except Exception as e:
-                        try:
-                            self._append_log(f"Queue error (SeedVR2) via {where_label}: {e}")
-                        except Exception:
-                            pass
-                        return False
-    except Exception:
-        pass
+    # SeedVR2 queueing is owned by the new embedded helpers/seedvr2_gui.py tab.
+    # The old hidden chk_seedvr2 path must not enqueue anything here; otherwise a
+    # SeedVR2 job could accidentally be converted into the generic Upscale queue path.
 
 
     # HYPIR must preserve its exact command. The generic 4-argument upscale
