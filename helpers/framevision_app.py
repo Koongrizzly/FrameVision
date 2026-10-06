@@ -223,6 +223,19 @@ except Exception:
     pass
 # --- END: Image allocation limit bump ---
 
+# Preload Qt WebEngine before QApplication is created.
+# MiniMax H3 is imported later as an embedded tool; loading QtWebEngine for the
+# first time after QApplication already exists can make Qt abort during startup.
+# Preloading it here keeps FrameVision startup order safe while allowing the
+# embedded Prompt Builder to reuse the already-loaded WebEngine modules.
+try:
+    from PySide6.QtWebEngineWidgets import QWebEngineView as _FV_QWebEngineView  # noqa: F401
+    from PySide6.QtWebEngineCore import QWebEnginePage as _FV_QWebEnginePage  # noqa: F401
+    _FV_WEBENGINE_PRELOADED = True
+except Exception as _fv_webengine_error:
+    _FV_WEBENGINE_PRELOADED = False
+    print("[framevision] Qt WebEngine preload failed:", _fv_webengine_error)
+
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QFileDialog, QTabWidget, QSplitter, QStackedWidget, QListWidget, QListWidgetItem, QLineEdit, QFormLayout, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QCheckBox, QTreeWidget, QTreeWidgetItem, QHeaderView, QStyle, QSlider, QToolButton, QSizePolicy, QScrollArea, QFrame, QGroupBox, QScrollArea, QFrame)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
 from helpers.tools_tab import InstantToolsPane

@@ -10,7 +10,18 @@ from PySide6.QtGui import QDesktopServices, QTextCursor, QPainter, QColor, QBrus
 # Qt WebEngine/Multimedia can initialize native subsystems during import, so
 # embedded mode deliberately skips them and uses the existing fallbacks.
 _FRAMEVISION_EMBEDDED_IMPORT = os.environ.get("FRAMEVISION_MINIMAX_EMBEDDED_IMPORT", "") == "1"
-if not _FRAMEVISION_EMBEDDED_IMPORT:
+
+# When embedded in FrameVision, Qt WebEngine must already have been imported
+# before FrameVision created QApplication.  If those modules are present in
+# sys.modules, it is safe to reuse them here.  Otherwise keep the old embedded
+# safeguard and show the friendly Prompt Builder fallback instead of attempting
+# a late WebEngine initialization.
+_FRAMEVISION_WEBENGINE_PRELOADED = (
+    "PySide6.QtWebEngineWidgets" in sys.modules
+    and "PySide6.QtWebEngineCore" in sys.modules
+)
+
+if (not _FRAMEVISION_EMBEDDED_IMPORT) or _FRAMEVISION_WEBENGINE_PRELOADED:
     try:
         from PySide6.QtWebEngineWidgets import QWebEngineView
         from PySide6.QtWebEngineCore import QWebEnginePage
@@ -2461,6 +2472,12 @@ class MainWindow(QMainWindow):
         fontrow.addWidget(self.font_size_slider, 1)
         fontrow.addWidget(self.font_size_label)
         fontv.addLayout(fontrow)
+        # FrameVision owns the surrounding UI scale/font behavior.  Keep the
+        # MiniMax standalone font control available only when this window is
+        # running as its own application.
+        if self._embedded:
+            self.font_size_slider.setEnabled(False)
+            fontg.setVisible(False)
         v.addWidget(fontg)
         self.font_size_slider.valueChanged.connect(self._font_size_slider_changed)
 
@@ -2938,7 +2955,7 @@ class MainWindow(QMainWindow):
             "system_hud": False if self._embedded else self.system_hud_toggle.isChecked(),
             "use_framevision_queue": self._framevision_queue_mode(),
             "auto_update_enabled": self.auto_update_enabled.isChecked(),
-            "font_size_pt": int(self.font_size_slider.value()) if hasattr(self, "font_size_slider") else int(self._font_size_pt),
+            "font_size_pt": (10 if self._embedded else int(self.font_size_slider.value())) if hasattr(self, "font_size_slider") else int(self._font_size_pt),
             "play_result_finished": self.play_result_finished.isChecked(),
             "play_result_queue_player": self.play_result_queue_player.isChecked(),
             "spectrum_enabled": self.spectrum_enabled.isChecked(),
@@ -2995,7 +3012,10 @@ class MainWindow(QMainWindow):
             if hasattr(self, "use_framevision_queue"):
                 self.use_framevision_queue.setChecked(bool(d.get("use_framevision_queue", False)) if self._embedded else False)
             self.auto_update_enabled.setChecked(bool(d.get("auto_update_enabled", True)))
-            saved_font = max(5, min(15, int(d.get("font_size_pt", 10))))
+            # In embedded/FrameVision mode the MiniMax font-size control is
+            # intentionally disabled and hidden, so do not restore a standalone
+            # font override from settings.
+            saved_font = 10 if self._embedded else max(5, min(15, int(d.get("font_size_pt", 10))))
             self.font_size_slider.blockSignals(True)
             self.font_size_slider.setValue(saved_font)
             self.font_size_slider.blockSignals(False)
