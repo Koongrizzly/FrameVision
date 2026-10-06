@@ -7450,7 +7450,7 @@ def handle_job(jpath: Path):
         return 1
 
 def main():
-    print("FrameVision Worker V2.5.4 Waiting for jobs in", JOBS["pending"])
+    print("FrameVision Worker V2.5.6 Waiting for jobs in", JOBS["pending"])
     try:
         n = cleanup_stale_running_jobs(quiet=False)
         if n:
