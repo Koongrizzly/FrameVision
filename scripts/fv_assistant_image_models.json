@@ -264,7 +264,7 @@
       "cli": "helpers/ltx23_vram_lab_cli.py",
       "env_win": "environments/.ltx23/python.exe",
       "env_posix": "environments/.ltx23/bin/python",
-      "output_dir": "output\\video\\ltx23",
+      "output_dir": "output\\video",
       "defaults": {
         "pipeline": "two_stages",
         "vram_lab": "safe",
