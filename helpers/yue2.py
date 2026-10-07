@@ -84,6 +84,7 @@ DEFAULTS = {
     "instrumental_score": False,
     "backend": "cuda",
     "output_dir": str(OUTPUT_DIR),
+    "output_format": "wav",
     "last_abc": "",
     "cover_source_audio": "",
     "last_style": DEFAULT_STYLE,
@@ -220,6 +221,45 @@ def _trim_wav_exact(path: Path, seconds: int) -> tuple[bool, str]:
         except Exception:
             pass
         return False, str(exc)
+
+
+def _convert_wav_to_mp3_320(path: Path) -> tuple[bool, str, Optional[Path]]:
+    """Convert a generated WAV to constant-bitrate 320 kbps MP3 using FFmpeg.
+
+    The WAV is removed only after FFmpeg reports success and the MP3 exists.
+    """
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg is None:
+        return False, "ffmpeg was not found", None
+    mp3_path = path.with_suffix(".mp3")
+    temp = mp3_path.with_suffix(".tmp.mp3")
+    try:
+        if temp.exists():
+            temp.unlink()
+        result = subprocess.run(
+            [
+                str(ffmpeg), "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(path), "-map_metadata", "0", "-vn",
+                "-c:a", "libmp3lame", "-b:a", "320k",
+                str(temp),
+            ],
+            capture_output=True, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode != 0 or not temp.is_file():
+            if temp.exists():
+                temp.unlink()
+            return False, (result.stderr or "ffmpeg MP3 conversion failed").strip(), None
+        os.replace(temp, mp3_path)
+        path.unlink()
+        return True, "MP3 320 kbps", mp3_path
+    except Exception as exc:
+        try:
+            if temp.exists():
+                temp.unlink()
+        except Exception:
+            pass
+        return False, str(exc), None
 
 
 def _ensure_dirs() -> None:
@@ -406,6 +446,26 @@ def _sheetsage_ready() -> bool:
     return SHEETSAGE_PYTHON.is_file() and SHEETSAGE_INFER.is_file()
 
 
+def _sheetsage_hf_env() -> dict[str, str]:
+    """Run SheetSage2 public-model downloads without using the user's HF login.
+
+    SheetSage2 and its MERT parent are public repositories.  An expired token in
+    the user's global Hugging Face cache must therefore not be allowed to break
+    transcription.  Disabling implicit-token use keeps the user's login intact
+    for other applications while these subprocesses access public files
+    anonymously.
+    """
+    env = os.environ.copy()
+    for key in (
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "HUGGINGFACE_HUB_TOKEN",
+    ):
+        env.pop(key, None)
+    env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+    return env
+
+
 class SheetSageInstallThread(QThread):
     message = Signal(str)
     finished_ok = Signal(bool, str)
@@ -465,8 +525,9 @@ class SheetSageInstallThread(QThread):
                     "from huggingface_hub import snapshot_download; "
                     f"snapshot_download('m-a-p/SheetSage2', local_dir=r'{str(SHEETSAGE_MODEL_DIR)}')"
                 )
-                env = os.environ.copy()
+                env = _sheetsage_hf_env()
                 env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+                self.message.emit("[SheetSage2] Hugging Face public downloads: anonymous mode (saved login ignored).")
                 flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
                 proc = subprocess.Popen([py, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                         text=True, encoding="utf-8", errors="replace", env=env, creationflags=flags)
@@ -513,8 +574,9 @@ class SheetSageTranscribeThread(QThread):
                 shutil.rmtree(out, ignore_errors=True)
             out.mkdir(parents=True, exist_ok=True)
             args = [str(SHEETSAGE_PYTHON), str(SHEETSAGE_INFER), str(source), "--output", str(out), "--melody-only"]
-            env = os.environ.copy()
+            env = _sheetsage_hf_env()
             env["PYTHONUTF8"] = "1"
+            self.message.emit("[SheetSage2] Hugging Face public downloads: anonymous mode (saved login ignored).")
             ffmpeg = _find_ffmpeg()
             if ffmpeg:
                 env["PATH"] = str(ffmpeg.parent) + os.pathsep + env.get("PATH", "")
@@ -908,7 +970,15 @@ class YuE2Window(QMainWindow):
         lyrics.setMinimumHeight(260)
 
         style = QPlainTextEdit()
-        style.setPlaceholderText("Language, genre, instruments, vocal character, production style...")
+        style.setPlaceholderText(
+            "YuE2 style descriptors only — e.g. English, drum and bass, energetic, 174 BPM, "
+            "crisp breakbeats, deep sub-bass, reese bass, atmospheric synths, powerful female vocal"
+        )
+        style.setToolTip(
+            "YuE2's Style input is conditioning text, not an instruction prompt. Use a compact, "
+            "comma-separated description of language, genre, vocal character, tempo, instruments, "
+            "groove and production. Do not write instructions such as 'create a cover' or 'transform this song'."
+        )
         style.setMaximumHeight(110)
 
         steps = SafeSpinBox()
@@ -1130,10 +1200,18 @@ class YuE2Window(QMainWindow):
         self.threads_spin = SafeSpinBox()
         self.threads_spin.setRange(1, 128)
         self.output_edit = QLineEdit()
+        self.output_format_combo = SafeComboBox()
+        self.output_format_combo.addItem("WAV (lossless)", "wav")
+        self.output_format_combo.addItem("MP3 320 kbps", "mp3_320")
+        self.output_format_combo.setToolTip(
+            "YuE2 renders WAV internally. When MP3 320 kbps is selected, the finished WAV is converted "
+            "with FFmpeg/libmp3lame at 320 kbps and the temporary WAV is removed after a successful conversion."
+        )
         self.cli_log_check = QCheckBox("Pass --log to audio.cpp")
         form.addRow("Backend", self.backend_combo)
         form.addRow("CPU threads", self.threads_spin)
         form.addRow("Output folder", self._folder_picker_row(self.output_edit))
+        form.addRow("Save audio as", self.output_format_combo)
         form.addRow("CLI logging", self.cli_log_check)
         layout.addWidget(runtime_box)
 
@@ -1303,6 +1381,9 @@ class YuE2Window(QMainWindow):
         self.backend_combo.setCurrentIndex(max(0, idx))
         self.threads_spin.setValue(int(self.settings.get("threads", 8)))
         self.output_edit.setText(str(self.settings.get("output_dir", OUTPUT_DIR)))
+        output_format = str(self.settings.get("output_format", "wav"))
+        idx = self.output_format_combo.findData(output_format)
+        self.output_format_combo.setCurrentIndex(max(0, idx))
         self.cli_log_check.setChecked(bool(self.settings.get("log_cli", True)))
         self.cfg_auto_check.setChecked(bool(self.settings.get("cfg_auto", True)))
         self.cfg_scale_spin.setValue(float(self.settings.get("cfg_scale", 1.01)))
@@ -1365,6 +1446,7 @@ class YuE2Window(QMainWindow):
             "instrumental_score": self.score_instrumental.isChecked(),
             "backend": self.backend_combo.currentText(),
             "output_dir": self.output_edit.text().strip() or str(OUTPUT_DIR),
+            "output_format": self.output_format_combo.currentData() or "wav",
             "last_abc": self.cover_abc.text().strip() or self.score_abc.text().strip(),
             "cover_source_audio": self.cover_audio.text().strip(),
             "last_style": source_style,
@@ -1713,8 +1795,13 @@ class YuE2Window(QMainWindow):
 
         output_dir = Path(self.output_edit.text().strip() or OUTPUT_DIR)
         output_dir.mkdir(parents=True, exist_ok=True)
+        output_format = self.output_format_combo.currentData() or "wav"
         if requested_name:
-            output_name = requested_name if requested_name.lower().endswith(".wav") else requested_name + ".wav"
+            requested_path = Path(requested_name)
+            # audio.cpp always renders WAV first; accept either .wav or .mp3 in the name field
+            # without creating names such as song.mp3.wav.
+            stem_name = requested_path.stem if requested_path.suffix.lower() in {".wav", ".mp3"} else requested_name
+            output_name = stem_name + ".wav"
         else:
             output_name = f"{label}_{_timestamp()}.wav"
         output_path = output_dir / output_name
@@ -1805,6 +1892,7 @@ class YuE2Window(QMainWindow):
             "duration_seconds": duration_seconds,
             "backend": self.backend_combo.currentText(),
             "output_dir": str(output_dir),
+            "output_format": output_format,
             "last_abc": abc_file,
             "cover_source_audio": self.cover_audio.text().strip(),
             "last_style": style,
@@ -1839,6 +1927,16 @@ class YuE2Window(QMainWindow):
         _write_json_atomic(SETTINGS_PATH, self.settings)
 
         self.log(f"[RUN] mode={mode} cot={cot} backend={self.backend_combo.currentText()} ode_steps={steps} seed={actual_seed}")
+        self.log(f"[RUN] style={style}")
+        # Keep the exact lyrics available for reproducibility without losing line breaks in the log.
+        self.log(f"[RUN] lyrics={lyrics!r}")
+        style_l = style.lstrip().lower()
+        if style_l.startswith(("create ", "make ", "generate ", "transform ", "turn this ", "create a cover", "make a cover")):
+            self.log(
+                "[RUN] WARNING: Style looks like an instruction prompt. YuE2 expects compact style descriptors "
+                "(language, genre, voice, tempo, instruments, groove/production), not commands such as "
+                "'create a cover' or 'transform this song'."
+            )
         self.log(
             f"[RUN] semantic temp={self.semantic_temperature_spin.value()} top_p={self.semantic_top_p_spin.value()} "
             f"top_k={self.semantic_top_k_spin.value()} rep={self.semantic_rep_spin.value()} "
@@ -1854,8 +1952,26 @@ class YuE2Window(QMainWindow):
         self.log(f"[RUN] vae={vae}")
         if abc_file:
             self.log(f"[RUN] abc={abc_file}")
+            try:
+                abc_lines = Path(abc_file).read_text(encoding="utf-8", errors="replace").splitlines()
+                header = {}
+                for line in abc_lines:
+                    stripped = line.strip()
+                    if len(stripped) >= 2 and stripped[1:2] == ":" and stripped[:1] in {"M", "L", "Q", "K"}:
+                        header[stripped[0]] = stripped[2:].strip()
+                    if all(k in header for k in ("M", "L", "Q", "K")):
+                        break
+                self.log(
+                    "[RUN] abc header: "
+                    f"meter={header.get('M', '?')} note_length={header.get('L', '?')} "
+                    f"tempo={header.get('Q', '?')} key={header.get('K', '?')}"
+                )
+            except Exception as exc:
+                self.log(f"[RUN] abc header read failed: {exc}")
+        final_output_path = output_path.with_suffix(".mp3") if output_format == "mp3_320" else output_path
         self.log(f"[RUN] output={output_path}")
-        self._pending_duration_target = (str(output_path), int(duration_seconds))
+        self.log(f"[RUN] save_format={'MP3 320 kbps' if output_format == 'mp3_320' else 'WAV (lossless)'} final_output={final_output_path}")
+        self._pending_duration_target = (str(output_path), int(duration_seconds), output_format)
         self._set_generation_enabled(False)
         self._process.start_command(str(AUDIOCPP_EXE), args, str(output_path))
 
@@ -1868,8 +1984,11 @@ class YuE2Window(QMainWindow):
         self._set_generation_enabled(True)
         if ok and Path(target).is_file():
             requested_duration = None
+            output_format = "wav"
             if self._pending_duration_target and self._pending_duration_target[0] == target:
                 requested_duration = self._pending_duration_target[1]
+                if len(self._pending_duration_target) >= 3:
+                    output_format = self._pending_duration_target[2]
             self._pending_duration_target = None
 
             if requested_duration is not None:
@@ -1887,8 +2006,23 @@ class YuE2Window(QMainWindow):
                         f"The generated WAV was kept.",
                     )
 
-            self.log(f"[DONE] YuE2 generation finished: {target}")
-            QMessageBox.information(self, "YuE2", f"Generation complete:\n{target}")
+            final_target = Path(target)
+            if output_format == "mp3_320":
+                mp3_ok, mp3_detail, mp3_path = _convert_wav_to_mp3_320(final_target)
+                if mp3_ok and mp3_path is not None:
+                    final_target = mp3_path
+                    self.log(f"[OUTPUT] Converted to {mp3_detail}: {final_target}")
+                else:
+                    self.log(f"[OUTPUT] WARNING: MP3 320 kbps conversion failed: {mp3_detail}")
+                    QMessageBox.warning(
+                        self,
+                        "YuE2 MP3 conversion",
+                        f"Generation finished, but MP3 320 kbps conversion failed.\n\n"
+                        f"Reason: {mp3_detail}\n\nThe generated WAV was kept.",
+                    )
+
+            self.log(f"[DONE] YuE2 generation finished: {final_target}")
+            QMessageBox.information(self, "YuE2", f"Generation complete:\n{final_target}")
         elif ok:
             self.log(f"[DONE] Process returned success but output was not found: {target}")
             QMessageBox.warning(self, "YuE2", "audio.cpp returned success but the expected WAV file was not found. Check the Logs tab.")
