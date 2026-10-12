@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import math
 import os
 import runpy
 import shutil
@@ -137,6 +140,158 @@ def _finalize_browser_safe_mp4(source: Path, video_only: Path, final: Path) -> N
         pass
 
 
+
+def _ffprobe(path: Path) -> dict:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        ffmpeg = _find_ffmpeg()
+        if ffmpeg and Path(ffmpeg).name.lower() == "ffmpeg.exe":
+            candidate = Path(ffmpeg).with_name("ffprobe.exe")
+            if candidate.exists():
+                ffprobe = str(candidate)
+    if not ffprobe:
+        raise RuntimeError("Crash-safe SeedVR2 requires ffprobe.exe beside ffmpeg.exe or on PATH")
+    proc = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                           "-count_frames", "-show_entries", "stream=nb_read_frames,nb_frames,r_frame_rate,width,height",
+                           "-of", "json", str(path)], capture_output=True, text=True)
+    if proc.returncode:
+        raise RuntimeError(f"ffprobe failed for {path}: {proc.stderr}")
+    streams = json.loads(proc.stdout).get("streams", [])
+    if not streams:
+        raise RuntimeError(f"No video stream in {path}")
+    return streams[0]
+
+
+def _frame_count(info: dict) -> int:
+    for key in ("nb_read_frames", "nb_frames"):
+        val = info.get(key)
+        if val and val != "N/A":
+            return int(val)
+    raise RuntimeError("Could not determine actual number of decoded frames")
+
+
+def _run_checked(cmd: list[str], description: str) -> None:
+    print(description, flush=True)
+    rc = subprocess.call(cmd)
+    if rc:
+        raise RuntimeError(f"{description} failed (exit code {rc}); completed checkpoints remain saved")
+
+
+def _run_checkpointed(args, src: Path, final: Path, dit: Path, vae: Path) -> int:
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required for checkpointed upscaling")
+    info = _ffprobe(src)
+    total_frames = _frame_count(info)
+    if args.chunk_size <= 0 or args.segment_chunks <= 0:
+        raise RuntimeError("Crash-safe upscaling needs positive chunk size and segment chunks")
+    group_frames = args.chunk_size * args.segment_chunks
+    overlap = max(0, args.temporal_overlap)
+    if overlap >= args.chunk_size:
+        raise RuntimeError("Temporal overlap must be less than chunk size")
+    count = math.ceil(total_frames / group_frames)
+
+    # Fingerprint includes source identity, backend parameters, and model files.
+    source_signature = {"path": str(src), "size": src.stat().st_size, "mtime_ns": src.stat().st_mtime_ns}
+    model_signature = [{"path": str(p), "size": p.stat().st_size, "mtime_ns": p.stat().st_mtime_ns}
+                       for p in (dit, vae)]
+    config = {k: v for k, v in vars(args).items() if k not in
+              {"output", "crash_safe", "segment_chunks", "_segment_worker", "_skip", "_cap"}}
+    signature = hashlib.sha256(json.dumps([source_signature, model_signature, config, group_frames],
+                                          sort_keys=True).encode()).hexdigest()[:16]
+    checkpoint_dir = final.parent / (final.stem + "_seedvr_checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = checkpoint_dir / "manifest.json"
+    old = None
+    if manifest_path.exists():
+        try:
+            old = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            pass
+    if old and old.get("signature") != signature:
+        raise RuntimeError(f"Checkpoint settings/input changed. Existing files preserved in {checkpoint_dir}. "
+                           "Use a different output name to start a new job, or archive the old checkpoint directory.")
+    if not old:
+        manifest_path.write_text(json.dumps({"signature": signature, "source": source_signature,
+                                             "settings": config, "group_frames": group_frames,
+                                             "total_frames": total_frames, "segments": count}, indent=2), encoding="utf-8")
+
+    print(f"CRASH-SAFE: {count} checkpoint segments; {group_frames} new frames each; {overlap} context frames", flush=True)
+    print(f"CHECKPOINT DIRECTORY: {checkpoint_dir}", flush=True)
+    segments = []
+    for index in range(count):
+        start = index * group_frames
+        needed = min(group_frames, total_frames - start)
+        context = min(overlap, start)
+        skip = start - context
+        cap = needed + context
+        segment = checkpoint_dir / f"segment_{index + 1:04d}.mp4"
+        segments.append(segment)
+        if segment.is_file():
+            try:
+                if _frame_count(_ffprobe(segment)) == needed:
+                    print(f"RESUME: checkpoint {index + 1}/{count} verified; skipping", flush=True)
+                    continue
+            except Exception as exc:
+                print(f"Invalid checkpoint {segment.name}: {exc}", flush=True)
+        print(f"CHECKPOINT {index + 1}/{count}: source frames {skip}..{skip+cap-1} "
+              f"({context} context, {needed} new)", flush=True)
+        raw_output = checkpoint_dir / f"working_{index + 1:04d}.mp4"
+        temp_segment = checkpoint_dir / f"segment_{index + 1:04d}.partial.mp4"
+        # Only remove incomplete files for the segment currently being retried.
+        raw_output.unlink(missing_ok=True)
+        temp_segment.unlink(missing_ok=True)
+        worker_args = [sys.executable, str(Path(__file__).resolve()),
+                       "--repo", args.repo, "--input", args.input, "--output", str(raw_output),
+                       "--dit", args.dit, "--vae", args.vae,
+                       "--resolution", str(args.resolution), "--max-resolution", str(args.max_resolution),
+                       "--batch-size", str(args.batch_size), "--chunk-size", str(args.chunk_size),
+                       "--temporal-overlap", str(args.temporal_overlap), "--prepend-frames", str(args.prepend_frames if index == 0 else 0),
+                       "--blocks-to-swap", str(args.blocks_to_swap), "--attention-mode", args.attention_mode,
+                       "--color-correction", args.color_correction, "--seed", str(args.seed),
+                       "--vae-encode-tile-size", str(args.vae_encode_tile_size),
+                       "--vae-encode-overlap", str(args.vae_encode_overlap),
+                       "--vae-decode-tile-size", str(args.vae_decode_tile_size),
+                       "--vae-decode-overlap", str(args.vae_decode_overlap),
+                       "--_segment-worker", "--_skip", str(skip), "--_cap", str(cap)]
+        for enabled, flag in ((args.uniform_batch_size, "--uniform-batch-size"),
+                              (args.vae_encode_tiled, "--vae-encode-tiled"),
+                              (args.vae_decode_tiled, "--vae-decode-tiled"),
+                              (args.cpu_offload, "--cpu-offload")):
+            if enabled:
+                worker_args.append(flag)
+        _run_checked(worker_args, f"Running isolated SeedVR2 worker {index + 1}/{count}")
+        actual = _frame_count(_ffprobe(raw_output))
+        if actual != cap:
+            raise RuntimeError(f"Segment {index + 1}: expected {cap} frames, got {actual}; checkpoint not accepted")
+        # Trim repeated input context with frame-based trim; finalize to uniform H.264 segments.
+        _run_checked([ffmpeg, "-hide_banner", "-loglevel", "warning", "-y", "-i", str(raw_output),
+                      "-vf", f"trim=start_frame={context},setpts=PTS-STARTPTS",
+                      "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "16",
+                      "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(temp_segment)],
+                     f"Finalizing checkpoint {index + 1}/{count}")
+        if _frame_count(_ffprobe(temp_segment)) != needed:
+            raise RuntimeError(f"Checkpoint {index + 1} has incorrect frame count; refusing to mark complete")
+        temp_segment.replace(segment)
+        raw_output.unlink(missing_ok=True)
+        print(f"SAVED CHECKPOINT {index + 1}/{count}: {segment}", flush=True)
+
+    concat_file = checkpoint_dir / "concat.txt"
+    concat_file.write_text("".join("file '" + str(p.resolve()).replace("'", "'\''") + "'\n" for p in segments),
+                           encoding="utf-8")
+    merged = checkpoint_dir / "assembled_videoonly.mp4"
+    merged_tmp = checkpoint_dir / "assembled_videoonly.partial.mp4"
+    merged_tmp.unlink(missing_ok=True)
+    _run_checked([ffmpeg, "-hide_banner", "-loglevel", "warning", "-y", "-f", "concat", "-safe", "0",
+                  "-i", str(concat_file), "-c", "copy", str(merged_tmp)], "Assembling checkpoints")
+    if _frame_count(_ffprobe(merged_tmp)) != total_frames:
+        raise RuntimeError("Joined video frame count mismatch; keeping all checkpoints")
+    merged_tmp.replace(merged)
+    _finalize_browser_safe_mp4(src, merged, final)
+    print(f"DONE: {final} (checkpoints retained in {checkpoint_dir})", flush=True)
+    return 0
+
+
 def main() -> int:
     # Must happen before importing anything from the community SeedVR2 repo.
     _force_utf8_console()
@@ -164,6 +319,11 @@ def main() -> int:
     ap.add_argument("--vae-decode-tile-size", type=int, default=768)
     ap.add_argument("--vae-decode-overlap", type=int, default=128)
     ap.add_argument("--cpu-offload", action="store_true")
+    ap.add_argument("--crash-safe", action="store_true", help="Checkpoint segments and resume automatically")
+    ap.add_argument("--segment-chunks", type=int, default=3, help="Chunks per checkpoint (default: 3)")
+    ap.add_argument("--_segment-worker", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--_skip", type=int, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--_cap", type=int, default=0, help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     repo = Path(args.repo).resolve()
@@ -187,6 +347,9 @@ def main() -> int:
     except Exception:
         pass
 
+    if args.crash_safe and not args._segment_worker:
+        return _run_checkpointed(args, src, final, dit, vae)
+
     _register_selected_models(repo, dit, vae)
 
     cli_args = [
@@ -201,6 +364,10 @@ def main() -> int:
         "--vae_decode_tile_size", str(args.vae_decode_tile_size), "--vae_decode_tile_overlap", str(args.vae_decode_overlap),
         "--cuda_device", "0", "--tensor_offload_device", "cpu",
     ]
+    if args._skip:
+        cli_args += ["--skip_first_frames", str(args._skip)]
+    if args._cap:
+        cli_args += ["--load_cap", str(args._cap)]
     if args.uniform_batch_size:
         cli_args.append("--uniform_batch_size")
     if args.vae_encode_tiled:

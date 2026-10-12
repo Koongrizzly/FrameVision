@@ -2644,3 +2644,34 @@ def enqueue_mage_edit_request(request: dict, root=None, priority: int = 610):
         pass
     return path
 # -----------------------------------------------------------------------------
+
+
+# Qwen Image 2.1 (sd-cli): queue via existing FrameVision external-command runner.
+def enqueue_qwen_image_2_1_from_widget(widget):
+    from pathlib import Path as _Path
+    if widget is None or not hasattr(widget, "build_command"):
+        raise RuntimeError("Qwen Image 2.1 GUI is unavailable")
+    cli, argv, output_path = widget.build_command()
+    cli_path = _Path(cli).expanduser()
+    if not cli_path.is_file():
+        raise FileNotFoundError(f"sd-cli not found: {cli_path}")
+    out_path = _Path(output_path).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    refs = list(getattr(widget, "references", []) or [])
+    prompt = widget.prompt.toPlainText().strip()
+    label = "Qwen Image 2.1: " + (" ".join(prompt.split())[:72] or "image generation")
+    args = {
+        "label": label,
+        "title": label,
+        "engine": "qwen_image_2_1",
+        "queue_family": "qwen_image_2_1",
+        "ffmpeg_cmd": [str(cli_path), *[str(x) for x in argv]],
+        "cwd": str(cli_path.resolve().parent),
+        "outfile": str(out_path),
+        "out_file": str(out_path),
+        "scan_dir": str(out_path.parent),
+        "scan_ext": ".png",
+        "prompt": prompt,
+        "reference_images": refs,
+    }
+    return enqueue_tool_job("tools_ffmpeg", refs[0] if refs else "", str(out_path.parent), args, priority=600)

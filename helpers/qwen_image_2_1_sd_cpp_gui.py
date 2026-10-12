@@ -7,6 +7,7 @@ import sys
 import time
 import struct
 import hashlib
+import tempfile
 import os
 import urllib.request
 import urllib.error
@@ -15,7 +16,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, Signal, QUrl, QThread
+from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, Signal, QUrl, QThread, QTimer
 from PySide6.QtGui import QDesktopServices, QPixmap, QImageReader, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -75,6 +76,7 @@ class LoraEntry:
 
 
 class ReferenceTile(QFrame):
+    """Static 170x150 preview. No source decoding or resize hooks in Qt."""
     remove_requested = Signal(str)
 
     def __init__(self, path: str, parent=None):
@@ -83,41 +85,31 @@ class ReferenceTile(QFrame):
         self.setFrameShape(QFrame.StyledPanel)
         self.setMinimumWidth(190)
         self.setMaximumWidth(240)
-
         lay = QVBoxLayout(self)
         lay.setContentsMargins(6, 6, 6, 6)
-
-        self.preview = QLabel("Preview")
+        self.preview = QLabel("Preview pending…")
         self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumSize(170, 150)
+        self.preview.setFixedSize(170, 150)
         self.preview.setStyleSheet("background:#171a1f; border:1px solid #303741;")
         lay.addWidget(self.preview)
-
         name = QLabel(Path(path).name)
         name.setWordWrap(True)
         name.setToolTip(path)
         lay.addWidget(name)
-
         btn = QPushButton("Remove")
         btn.clicked.connect(lambda: self.remove_requested.emit(self.path))
         lay.addWidget(btn)
-        self._load()
 
-    def _load(self):
-        reader = QImageReader(self.path)
-        reader.setAutoTransform(True)
-        img = reader.read()
-        if img.isNull():
-            self.preview.setText("Unable to preview")
-            return
-        pix = QPixmap.fromImage(img)
-        self.preview.setPixmap(
-            pix.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
+    def display_cached_preview(self, cached_file: str):
+        # Only small, internally generated PNG files reach QPixmap.
+        pix = QPixmap(cached_file)
+        if pix.isNull():
+            self.preview.setText("Preview unavailable")
+        else:
+            self.preview.setPixmap(pix)
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._load()
+    def set_preview_message(self, message: str):
+        self.preview.setText(message)
 
 
 def _qwen3vl_rewrite_key(key: str) -> str:
@@ -330,6 +322,13 @@ class QwenImage21Widget(QWidget):
         super().__init__(parent)
         self.process: Optional[QProcess] = None
         self.references: List[str] = []
+        self._ref_tiles = {}
+        self._preview_pending = []
+        self._preview_active = None
+        self._preview_proc = None
+        self._preview_timeout = QTimer(self)
+        self._preview_timeout.setSingleShot(True)
+        self._preview_timeout.timeout.connect(self._preview_timed_out)
         self.loras: List[LoraEntry] = []
         self.last_output: Optional[str] = None
         self.settings_path = DEFAULT_SETTINGS
@@ -947,9 +946,10 @@ class QwenImage21Widget(QWidget):
             self, "Add reference images", str(ROOT),
             "Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*)"
         )
-        for p in files:
-            if p not in self.references:
-                self.references.append(p)
+        new_files = [p for p in files if p not in self.references]
+        if not new_files:
+            return
+        self.references.extend(new_files)
         self._update_ref_strip()
 
     def clear_references(self):
@@ -961,23 +961,117 @@ class QwenImage21Widget(QWidget):
         self._update_ref_strip()
 
     def _update_ref_strip(self):
+        # Keep existing widgets and previews: adding a second image must not
+        # rebuild the first, restart its decoder, or generate resize storms.
+        wanted = set(self.references)
+        for path in list(self._ref_tiles):
+            if path not in wanted:
+                tile = self._ref_tiles.pop(path)
+                self.ref_layout.removeWidget(tile)
+                tile.deleteLater()
+        self._preview_pending = [p for p in self._preview_pending if p in wanted]
+
         while self.ref_layout.count():
             item = self.ref_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-
+            if item.widget() is not None and item.widget() not in self._ref_tiles.values():
+                item.widget().deleteLater()
         if not self.references:
             lbl = QLabel("No reference images loaded — text-to-image mode")
             lbl.setAlignment(Qt.AlignCenter)
             self.ref_layout.addWidget(lbl)
             return
 
-        for p in self.references:
-            tile = ReferenceTile(p)
-            tile.remove_requested.connect(self._remove_reference)
+        for path in self.references:
+            tile = self._ref_tiles.get(path)
+            if tile is None:
+                tile = ReferenceTile(path, self.ref_strip)
+                tile.remove_requested.connect(self._remove_reference)
+                self._ref_tiles[path] = tile
+                self._preview_pending.append(path)
             self.ref_layout.addWidget(tile)
         self.ref_layout.addStretch(1)
+        QTimer.singleShot(0, self._start_next_reference_preview)
+
+    def _preview_cache_path(self, path):
+        try:
+            source = Path(path)
+            st = source.stat()
+            key = f"{source.resolve()}|{st.st_size}|{st.st_mtime_ns}|static-v2"
+            folder = Path(tempfile.gettempdir()) / "framevision_qwen21_previews"
+            folder.mkdir(parents=True, exist_ok=True)
+            return folder / (hashlib.sha256(key.encode('utf-8', 'surrogatepass')).hexdigest() + '.png')
+        except OSError:
+            return None
+
+    def _start_next_reference_preview(self):
+        if self._preview_active is not None:
+            return
+        while self._preview_pending:
+            path = self._preview_pending.pop(0)
+            tile = self._ref_tiles.get(path)
+            if tile is None:
+                continue
+            cache_file = self._preview_cache_path(path)
+            if cache_file is None:
+                tile.set_preview_message("Preview unavailable")
+                continue
+            if cache_file.is_file() and 0 < cache_file.stat().st_size < 2000000:
+                tile.display_cached_preview(str(cache_file))
+                continue
+            worker = HERE / "qwen21_thumbnail_worker.py"
+            if not worker.is_file():
+                tile.set_preview_message("Preview helper missing")
+                continue
+            self._preview_active = (path, cache_file)
+            tile.set_preview_message("Loading preview…")
+            proc = QProcess(self)
+            self._preview_proc = proc
+            proc.setProgram(sys.executable)
+            proc.setArguments([str(worker), path, str(cache_file)])
+            proc.finished.connect(self._reference_preview_finished)
+            proc.errorOccurred.connect(self._reference_preview_error)
+            proc.start()
+            self._preview_timeout.start(12000)
+            return
+
+    def _preview_timed_out(self):
+        if self._preview_active is not None and self._preview_proc is not None:
+            path, _ = self._preview_active
+            tile = self._ref_tiles.get(path)
+            if tile is not None:
+                tile.set_preview_message("Preview timed out")
+            self._preview_proc.kill()
+
+    def _reference_preview_error(self, error):
+        # Failed-to-start does not always emit finished; unblock the queue.
+        if self._preview_proc is not None and error == QProcess.FailedToStart:
+            self._finish_preview(False)
+
+    def _reference_preview_finished(self, exit_code, status):
+        self._finish_preview(exit_code == 0 and status == QProcess.NormalExit)
+
+    def _finish_preview(self, success):
+        self._preview_timeout.stop()
+        active = self._preview_active
+        proc = self._preview_proc
+        self._preview_active = None
+        self._preview_proc = None
+        if proc is not None:
+            try:
+                proc.finished.disconnect(self._reference_preview_finished)
+                proc.errorOccurred.disconnect(self._reference_preview_error)
+            except (TypeError, RuntimeError):
+                pass
+            proc.deleteLater()
+        if active is not None:
+            path, cache = active
+            tile = self._ref_tiles.get(path)
+            if tile is not None:
+                if success and cache.is_file() and 0 < cache.stat().st_size < 2000000:
+                    tile.display_cached_preview(str(cache))
+                else:
+                    tile.set_preview_message("Preview unavailable\n(reference still usable)")
+        QTimer.singleShot(0, self._start_next_reference_preview)
 
     def _refresh_lora_list(self):
         if not hasattr(self, "available_loras"):
@@ -1208,7 +1302,8 @@ class QwenImage21Widget(QWidget):
         out_dir = Path(self.output_dir.text().strip())
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        return str(out_dir / f"qwen21_{stamp}.png")
+        import uuid
+        return str(out_dir / f"qwen21_{stamp}_{uuid.uuid4().hex[:8]}.png")
 
     def build_command(self, output_path: Optional[str] = None):
         cli = self.cli_path.text().strip()

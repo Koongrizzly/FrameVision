@@ -12,7 +12,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QProcess, QProcessEnvironment, QSettings, Qt, QThread, Signal
+from PySide6.QtCore import QEvent, QProcess, QProcessEnvironment, Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QAbstractSpinBox, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGridLayout,
@@ -31,6 +31,53 @@ except Exception:
 
 
 APP_NAME = "SeedVR2 PySide6"
+
+# Portable settings live alongside the FrameVision helper (never in the Registry).
+SETTINGS_FILE = Path(__file__).resolve().parent / "seedvr2_settings.json"
+
+class JsonSettings:
+    """Minimal QSettings-compatible portable store with atomic writes."""
+    def __init__(self, path):
+        self.path = Path(path)
+        self.data = {}
+        self._batch = False
+        if self.path.is_file():
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                if not isinstance(loaded, dict):
+                    raise ValueError("Expected a JSON object")
+                self.data = loaded
+            except Exception as exc:
+                # Preserve the bad file so the user's settings can be recovered.
+                print(f"SeedVR2: ignoring invalid settings JSON {self.path}: {exc}")
+
+    def value(self, key, default=None):
+        return self.data.get(key, default)
+
+    def setValue(self, key, value):
+        if self.data.get(key) == value:
+            return
+        self.data[key] = value
+        if not self._batch:
+            self.sync()
+
+    def sync(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, indent=2, ensure_ascii=False)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
 
 
 # Community/safetensor models used by the working SeedVR2 backend.
@@ -656,15 +703,16 @@ class SeedVR2Window(QMainWindow):
         self.download_worker: SafetensorModelDownloadWorker | None = None
         self.dependency_worker: DependencyInstallWorker | None = None
         self.standalone_install_worker: StandaloneInstallWorker | None = None
-        # Embedded SeedVR2 uses its own settings namespace.  The previous
-        # standalone/legacy integration shared a settings store that could contain
-        # values from older widgets with incompatible ranges/meanings.  Do not let
-        # those stale values leak into the new tab.
-        self.settings = QSettings("FrameVision", "SeedVR2EmbeddedV2")
-        self.legacy_settings = QSettings("SeedVR2Standalone", "SeedVR2GUI")
+        # Registry settings are deliberately ignored, including old standalone
+        # namespaces that contained stale/incompatible values.
+        self.settings = JsonSettings(SETTINGS_FILE)
+        self._settings_dirty = False
+        self._settings_ready = False
         self._build_ui()
         self._load_settings()
         self._autofill_ckpts()
+        self._enable_json_autosave()
+        self._settings_ready = True
 
     def _build_ui(self):
         # Three-tab layout: everyday controls, rarely changed quality/model controls,
@@ -695,7 +743,7 @@ class SeedVR2Window(QMainWindow):
 
         # ---------------- Simple tab ----------------
         intro = QLabel(
-            "Everyday SeedVR2 controls. Choose the input/output, model backend, resolution and seed here. "
+            "Community SeedVR2: choose the input/output, target resolution and seed here. "
             "Less frequently changed quality/memory controls are kept out of the way on the other tabs."
         )
         intro.setWordWrap(True)
@@ -716,20 +764,18 @@ class SeedVR2Window(QMainWindow):
 
         basic = QGroupBox("Basic settings")
         bg = QGridLayout(basic)
-        self.backend = QComboBox(); self.backend.addItems(["Community / ComfyUI backend (safetensors/GGUF)", "Original ByteDance backend (.pth)"])
-        self.backend.setToolTip("Community mode uses the memory-efficient numz/AInVFX backend. Original mode keeps the ByteDance .pth release available.")
+        self.backend = QComboBox(self); self.backend.addItem("Community SeedVR2")
+        self.backend.setToolTip("Community SeedVR2 only")
         self.community_resolution = QComboBox()
         for val, label in [(720, "720p"), (768, "768p"), (1080, "1080p"), (1440, "1440p"), (2560, "2560p")]:
             self.community_resolution.addItem(label, val)
-        self.community_max_resolution = QSpinBox(); self.community_max_resolution.setRange(0, 8192); self.community_max_resolution.setSingleStep(16); self.community_max_resolution.setValue(0); self.community_max_resolution.setSpecialValueText("none")
-        self.width = QSpinBox(); self.width.setRange(256, 8192); self.width.setSingleStep(16); self.width.setValue(1920)
-        self.height = QSpinBox(); self.height.setRange(256, 8192); self.height.setSingleStep(16); self.height.setValue(1080)
+        self.community_max_resolution = QSpinBox(self); self.community_max_resolution.setRange(0, 8192); self.community_max_resolution.setSingleStep(16); self.community_max_resolution.setValue(0); self.community_max_resolution.setSpecialValueText("none")
+        self.width = QSpinBox(self); self.width.setRange(256, 8192); self.width.setSingleStep(16); self.width.setValue(1920)
+        self.height = QSpinBox(self); self.height.setRange(256, 8192); self.height.setSingleStep(16); self.height.setValue(1080)
         self.seed = QSpinBox(); self.seed.setRange(-1, 2_147_483_647); self.seed.setValue(-1); self.seed.setSpecialValueText("random")
         self.fps = QDoubleSpinBox(); self.fps.setRange(0.0, 240.0); self.fps.setDecimals(3); self.fps.setValue(0.0); self.fps.setSpecialValueText("source")
         basic_items = [
-            ("Backend", self.backend), ("Target short-side resolution", self.community_resolution),
-            ("Maximum edge", self.community_max_resolution), ("Seed", self.seed),
-            ("Official width", self.width), ("Official height", self.height), ("Output FPS", self.fps),
+            ("Target short-side resolution", self.community_resolution), ("Seed", self.seed), ("Output FPS", self.fps),
         ]
         for i, (label, widget) in enumerate(basic_items):
             row, col = divmod(i, 3)
@@ -747,12 +793,15 @@ class SeedVR2Window(QMainWindow):
         )
         self.cancel_btn = QPushButton("Cancel"); self.cancel_btn.setEnabled(False)
         self.open_btn = QPushButton("Open output folder")
+        self.save_settings_btn = QPushButton("Save settings")
+        self.save_settings_btn.setToolTip("Save all SeedVR2 settings to helpers/seedvr2_settings.json")
+        self.save_settings_btn.clicked.connect(self._save_settings)
         self.validate_btn.clicked.connect(lambda: self._validate(show=True))
         self.run_btn.clicked.connect(self.run)
         self.queue_btn.clicked.connect(self.queue_run)
         self.cancel_btn.clicked.connect(self.cancel)
         self.open_btn.clicked.connect(self.open_output_folder)
-        for b in (self.validate_btn, self.run_btn, self.queue_btn, self.cancel_btn, self.open_btn): run_layout.addWidget(b)
+        for b in (self.validate_btn, self.run_btn, self.queue_btn, self.cancel_btn, self.open_btn, self.save_settings_btn): run_layout.addWidget(b)
         simple.addWidget(run_group)
 
         preview_group = QGroupBox("Finished result preview")
@@ -788,12 +837,11 @@ class SeedVR2Window(QMainWindow):
         # ---------------- Advanced tab ----------------
         model_group = QGroupBox("Models and backend paths")
         pf = QGridLayout(model_group)
-        self.repo_edit = QLineEdit()
+        self.repo_edit = QLineEdit(self)
         self.community_repo_edit = QLineEdit(str(self._default_community_repo()))
         self.dit_edit = QLineEdit()
         self.vae_edit = QLineEdit()
         rows = [
-            ("Official SeedVR repo", self.repo_edit, self._pick_repo),
             ("Community SeedVR2 repo", self.community_repo_edit, self._pick_community_repo),
             ("DiT checkpoint", self.dit_edit, self._pick_dit),
             ("VAE checkpoint", self.vae_edit, self._pick_vae),
@@ -821,8 +869,9 @@ class SeedVR2Window(QMainWindow):
         self.batch_size = QComboBox()
         for val in range(1, 82, 4):
             self.batch_size.addItem(str(val), val)
-        self.chunk_size = QSpinBox(); self.chunk_size.setRange(0, 5000); self.chunk_size.setValue(330)
+        self.chunk_size = QSpinBox(); self.chunk_size.setRange(0, 5000); self.chunk_size.setValue(165)
         self.uniform_batch = QCheckBox("Uniform batch size"); self.uniform_batch.setChecked(True)
+        self.crash_safe = QCheckBox("Crash-safe checkpoints / automatic resume (recommended)"); self.crash_safe.setChecked(True)
         self.temporal_overlap = QSpinBox(); self.temporal_overlap.setRange(0, 16); self.temporal_overlap.setValue(3)
         self.prepend_frames = QSpinBox(); self.prepend_frames.setRange(0, 32); self.prepend_frames.setValue(0)
         self.color_correction = QComboBox(); self.color_correction.addItems(["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"])
@@ -840,11 +889,12 @@ class SeedVR2Window(QMainWindow):
         ]
         for i, (label, widget) in enumerate(citems):
             row, col = divmod(i, 3); cell = QVBoxLayout(); cell.addWidget(QLabel(label)); cell.addWidget(widget); cg.addLayout(cell, row, col)
+        cg.addWidget(self.crash_safe, 4, 0, 1, 3)
         cg.addWidget(self.uniform_batch, 3, 0); cg.addWidget(self.vae_encode_tiled, 3, 1); cg.addWidget(self.vae_decode_tiled, 3, 2)
         self.community_group = community
         advanced.addWidget(community)
 
-        official_adv = QGroupBox("Original ByteDance advanced settings")
+        official_adv = QGroupBox("Original ByteDance advanced settings", self)
         og = QGridLayout(official_adv)
         self.model_size = QComboBox(); self.model_size.addItems(["3B", "7B"])
         self.steps = QSpinBox(); self.steps.setRange(1, 50); self.steps.setValue(1)
@@ -855,7 +905,7 @@ class SeedVR2Window(QMainWindow):
         for i, (label, widget) in enumerate([("Model architecture", self.model_size), ("Sampling steps", self.steps), ("CFG scale", self.cfg), ("CFG rescale", self.cfg_rescale), ("Sequence parallel size", self.sp_size)]):
             row, col = divmod(i, 3); cell = QVBoxLayout(); cell.addWidget(QLabel(label)); cell.addWidget(widget); og.addLayout(cell, row, col)
         og.addWidget(self.color_fix, 2, 0, 1, 3)
-        advanced.addWidget(official_adv)
+        official_adv.hide()  # Keep compatibility controls alive but never display them.
         advanced.addStretch(1)
 
         # ---------------- System / Log tab ----------------
@@ -877,10 +927,13 @@ class SeedVR2Window(QMainWindow):
         self.blocks_to_swap = QSpinBox(); self.blocks_to_swap.setRange(0, 36); self.blocks_to_swap.setValue(32)
         self.attention_mode = QComboBox(); self.attention_mode.addItems(["sageattn_2", "flash_attn_2", "sdpa", "auto"])
         self.cpu_offload = QCheckBox("DiT + VAE offload to CPU"); self.cpu_offload.setChecked(True)
-        self.dit_offload = QCheckBox("Strict staged VRAM offload (original backend)"); self.dit_offload.setChecked(True); self.dit_offload.setEnabled(False)
+        self.dit_offload = QCheckBox("Strict staged VRAM offload (original backend)", official_adv)
+        self.dit_offload.setChecked(True)
+        self.dit_offload.setEnabled(False)
+        self.dit_offload.hide()  # Parent to permanently hidden compatibility group.
         for i, (label, widget) in enumerate([("Blocks to swap", self.blocks_to_swap), ("Attention", self.attention_mode)]):
             cell = QVBoxLayout(); cell.addWidget(QLabel(label)); cell.addWidget(widget); mg.addLayout(cell, 0, i)
-        mg.addWidget(self.cpu_offload, 1, 0, 1, 2); mg.addWidget(self.dit_offload, 2, 0, 1, 2)
+        mg.addWidget(self.cpu_offload, 1, 0, 1, 2)
         system.addWidget(machine)
 
         log_group = QGroupBox("Log")
@@ -892,11 +945,18 @@ class SeedVR2Window(QMainWindow):
         self.repo_edit.textChanged.connect(self._autofill_ckpts)
         self.backend.currentIndexChanged.connect(self._backend_changed)
         self._backend_changed()
+        # These legacy compatibility widgets must NEVER become top-level children
+        # covering the tabs (especially on Windows or after style changes).
+        for unused_control in (self.backend, self.community_max_resolution,
+                               self.width, self.height, self.repo_edit):
+            unused_control.setParent(official_adv)
+            unused_control.hide()
+        official_adv.hide()
 
         self.community_resolution.setToolTip("Default: 1080p. Quick presets for the community backend short-side target: 720p, 768p, 1080p, 1440p or 2560p.")
         self.community_max_resolution.setToolTip("Default: none. Set a maximum long-edge clamp for the community backend, or leave it at none.")
-        self.batch_size.setToolTip("Default: 25. Only valid 4n+1 values are available here: 1, 5, 9, 13, 17, 21, 25, 29, 33, and so on.")
-        self.chunk_size.setToolTip("Default: 330. Streaming chunk size for long videos. Lower values can reduce memory pressure.")
+        self.batch_size.setToolTip("Default: 21. Only valid 4n+1 values are available here: 1, 5, 9, 13, 17, 21, 25, 29, 33, and so on.")
+        self.chunk_size.setToolTip("Default: 165. Streaming chunk size for long videos. Lower values can reduce memory pressure.")
         self.temporal_overlap.setToolTip("Default: 3. Frames shared between adjacent temporal chunks to reduce seams.")
         self.prepend_frames.setToolTip("Default: 0. Reuse a number of previous frames at the start of each chunk when needed.")
         self.color_correction.setToolTip("Default: lab. Community backend color correction mode.")
@@ -1015,19 +1075,9 @@ class SeedVR2Window(QMainWindow):
         if p: self.community_repo_edit.setText(p)
 
     def _backend_changed(self):
-        community = self.backend.currentIndex() == 0
-        self.community_group.setEnabled(community)
-        self.model_size.setEnabled(not community)
-        self.steps.setEnabled(not community)
-        self.cfg.setEnabled(not community)
-        self.cfg_rescale.setEnabled(not community)
-        self.sp_size.setEnabled(not community)
-        self.dit_offload.setEnabled(False)
-        self.color_fix.setEnabled(not community)
-        if community:
-            self.dit_offload.setText("Original-backend staged VRAM offload (not used in community mode)")
-        else:
-            self.dit_offload.setText("Strict staged VRAM offload (recommended for RTX 3090 / 24 GB)")
+        # Community-only build; never select or validate the Official backend.
+        self.backend.setCurrentIndex(0)
+        self.community_group.setEnabled(True)
         self._autofill_ckpts()
 
     def _community_runner_path(self):
@@ -1281,51 +1331,19 @@ class SeedVR2Window(QMainWindow):
             self.output_edit.setText(str(self._next_available_output(Path(p))))
 
     def _autofill_ckpts(self):
-        community = hasattr(self, "backend") and self.backend.currentIndex() == 0
         dit_text = self.dit_edit.text().strip()
         vae_text = self.vae_edit.text().strip()
-
-        if community:
-            model_dir = self._app_root() / "models" / "seedvr2"
-            # Replace an old official .pth auto-selection when community mode is active,
-            # but never overwrite a valid user-selected community model.
-            if (not dit_text) or Path(dit_text).suffix.lower() == ".pth":
-                candidates = [
-                    "seedvr2_ema_3b_fp16.safetensors",
-                    "seedvr2_ema_3b_bf16.safetensors",
-                    "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
-                    "seedvr2_ema_3b-Q8_0.gguf",
-                    "seedvr2_ema_3b-Q4_K_M.gguf",
-                ]
-                for name in candidates:
-                    q = model_dir / name
-                    if q.exists():
-                        self.dit_edit.setText(str(q)); break
-            if (not vae_text) or Path(vae_text).suffix.lower() == ".pth":
-                for name in ("ema_vae_fp16.safetensors", "ema_vae.safetensors"):
-                    q = model_dir / name
-                    if q.exists():
-                        self.vae_edit.setText(str(q)); break
-            return
-
-        official = self._official_model_dir()
-        if not dit_text or Path(dit_text).suffix.lower() in (".safetensors", ".gguf"):
-            q = official / "seedvr2_ema_3b.pth"
-            if q.exists(): self.dit_edit.setText(str(q))
-        if not vae_text or Path(vae_text).suffix.lower() == ".safetensors":
-            q = official / "ema_vae.pth"
-            if q.exists(): self.vae_edit.setText(str(q))
-
-        repo = Path(self.repo_edit.text().strip())
-        if not repo.exists(): return
-        if not self.dit_edit.text().strip():
-            for name in ("seedvr2_ema_3b.pth", "seedvr2_ema_3b.safetensors"):
-                q = repo / "ckpts" / name
-                if q.exists(): self.dit_edit.setText(str(q)); break
-        if not self.vae_edit.text().strip():
-            for name in ("ema_vae.pth", "ema_vae_fp16.safetensors", "ema_vae.safetensors"):
-                q = repo / "ckpts" / name
-                if q.exists(): self.vae_edit.setText(str(q)); break
+        model_dir = self._app_root() / "models" / "seedvr2"
+        if not dit_text or Path(dit_text).suffix.lower() == ".pth":
+            for name in ("seedvr2_ema_3b_bf16.safetensors", "seedvr2_ema_3b_fp16.safetensors", "seedvr2_ema_3b_fp8_e4m3fn.safetensors", "seedvr2_ema_3b-Q8_0.gguf", "seedvr2_ema_3b-Q4_K_M.gguf"):
+                q = model_dir / name
+                if q.exists():
+                    self.dit_edit.setText(str(q)); break
+        if not vae_text or Path(vae_text).suffix.lower() == ".pth":
+            for name in ("ema_vae_fp16.safetensors", "ema_vae.safetensors"):
+                q = model_dir / name
+                if q.exists():
+                    self.vae_edit.setText(str(q)); break
 
     def _validate(self, show=True):
         errors = []
@@ -1333,7 +1351,7 @@ class SeedVR2Window(QMainWindow):
         dit = Path(self.dit_edit.text().strip())
         vae = Path(self.vae_edit.text().strip())
         inp = Path(self.input_edit.text().strip())
-        community = self.backend.currentIndex() == 0
+        community = True
 
         if not py.exists(): errors.append("Python executable does not exist.")
         if not dit.exists(): errors.append("DiT checkpoint does not exist.")
@@ -1352,31 +1370,19 @@ class SeedVR2Window(QMainWindow):
                 errors.append("Community backend expects a .safetensors VAE.")
             if dit.exists() and vae.exists() and dit.parent.resolve() != vae.parent.resolve():
                 errors.append("For the community backend, place the selected DiT and VAE in the same model folder.")
-            b = self._combo_int_value(self.batch_size, 25)
+            b = self._combo_int_value(self.batch_size, 21)
             if b != 1 and (b - 1) % 4 != 0:
                 errors.append("Community batch size must follow 4n+1 (1, 5, 9, 13, 17, ...).")
             if self.vae_encode_overlap.value() >= self.vae_encode_tile_size.value():
                 errors.append("VAE encode overlap must be smaller than encode tile size.")
             if self.vae_decode_overlap.value() >= self.vae_decode_tile_size.value():
                 errors.append("VAE decode overlap must be smaller than decode tile size.")
-        else:
-            repo = Path(self.repo_edit.text().strip())
-            required_repo = [repo / "projects" / "inference_seedvr2_3b.py", repo / "configs_3b" / "main.yaml"]
-            if not repo.exists() or not all(p.exists() for p in required_repo): errors.append("Selected folder is not a complete official SeedVR repository.")
-            emb_dir = dit.parent if dit.exists() else self._official_model_dir()
-            have_embeds = (emb_dir / "pos_emb.pt").exists() and (emb_dir / "neg_emb.pt").exists()
-            if not have_embeds:
-                have_embeds = (repo / "pos_emb.pt").exists() and (repo / "neg_emb.pt").exists()
-            if not have_embeds: errors.append("pos_emb.pt and neg_emb.pt are missing beside the DiT checkpoint and from the SeedVR repo root.")
-            missing = self._python_missing_imports() if py.exists() else []
-            if missing: errors.append("SeedVR2 Python environment is missing: " + ", ".join(missing) + ". Click 'Install / repair official runtime dependencies'.")
-            if self.model_size.currentText() == "7B" and not (repo / "configs_7b" / "main.yaml").exists(): errors.append("7B config is missing.")
 
         if errors:
             if show: QMessageBox.critical(self, "Validation failed", "\n".join(errors))
             return False
         if show:
-            mode = "Community/ComfyUI safetensors backend" if community else "Original ByteDance backend"
+            mode = "Community SeedVR2 backend"
             QMessageBox.information(self, "Validation", f"{mode}: paths and settings look valid.")
         return True
 
@@ -1388,37 +1394,25 @@ class SeedVR2Window(QMainWindow):
         if seed < 0:
             import secrets
             seed = secrets.randbelow(2_147_483_647)
-        if self.backend.currentIndex() == 0:
-            args = [
-                str(self._community_runner_path()),
-                "--repo", self.community_repo_edit.text().strip(),
-                "--input", self.input_edit.text().strip(), "--output", self.output_edit.text().strip(),
-                "--dit", self.dit_edit.text().strip(), "--vae", self.vae_edit.text().strip(),
-                "--resolution", str(self._combo_int_value(self.community_resolution, 1080)),
-                "--max-resolution", str(self.community_max_resolution.value()),
-                "--batch-size", str(self._combo_int_value(self.batch_size, 25)), "--chunk-size", str(self.chunk_size.value()),
-                "--temporal-overlap", str(self.temporal_overlap.value()), "--prepend-frames", str(self.prepend_frames.value()),
-                "--blocks-to-swap", str(self.blocks_to_swap.value()), "--attention-mode", self.attention_mode.currentText(),
-                "--color-correction", self.color_correction.currentText(), "--seed", str(seed),
-                "--vae-encode-tile-size", str(self.vae_encode_tile_size.value()), "--vae-encode-overlap", str(self.vae_encode_overlap.value()),
-                "--vae-decode-tile-size", str(self.vae_decode_tile_size.value()), "--vae-decode-overlap", str(self.vae_decode_overlap.value()),
-            ]
-            if self.uniform_batch.isChecked(): args.append("--uniform-batch-size")
-            if self.vae_encode_tiled.isChecked(): args.append("--vae-encode-tiled")
-            if self.vae_decode_tiled.isChecked(): args.append("--vae-decode-tiled")
-            if self.cpu_offload.isChecked(): args.append("--cpu-offload")
-            return self.python_edit.text().strip(), args
-
         args = [
-            str(self._runner_path()), "--repo", self.repo_edit.text().strip(), "--input", self.input_edit.text().strip(),
-            "--output", self.output_edit.text().strip(), "--dit", self.dit_edit.text().strip(), "--vae", self.vae_edit.text().strip(),
-            "--model-size", self.model_size.currentText(), "--width", str(self.width.value()), "--height", str(self.height.value()),
-            "--seed", str(seed), "--steps", str(self.steps.value()), "--cfg-scale", str(self.cfg.value()),
-            "--cfg-rescale", str(self.cfg_rescale.value()), "--sp-size", str(self.sp_size.value())
+            str(self._community_runner_path()),
+            "--repo", self.community_repo_edit.text().strip(),
+            "--input", self.input_edit.text().strip(), "--output", self.output_edit.text().strip(),
+            "--dit", self.dit_edit.text().strip(), "--vae", self.vae_edit.text().strip(),
+            "--resolution", str(self._combo_int_value(self.community_resolution, 1080)),
+            "--max-resolution", "0",
+            "--batch-size", str(self._combo_int_value(self.batch_size, 21)), "--chunk-size", str(self.chunk_size.value()),
+            "--temporal-overlap", str(self.temporal_overlap.value()), "--prepend-frames", str(self.prepend_frames.value()),
+            "--blocks-to-swap", str(self.blocks_to_swap.value()), "--attention-mode", self.attention_mode.currentText(),
+            "--color-correction", self.color_correction.currentText(), "--seed", str(seed),
+            "--vae-encode-tile-size", str(self.vae_encode_tile_size.value()), "--vae-encode-overlap", str(self.vae_encode_overlap.value()),
+            "--vae-decode-tile-size", str(self.vae_decode_tile_size.value()), "--vae-decode-overlap", str(self.vae_decode_overlap.value()),
         ]
-        if self.fps.value() > 0: args += ["--out-fps", str(self.fps.value())]
-        if self.dit_offload.isChecked(): args.append("--dit-offload")
-        if self.color_fix.isChecked(): args.append("--color-fix")
+        if self.crash_safe.isChecked(): args.append("--crash-safe")
+        if self.uniform_batch.isChecked(): args.append("--uniform-batch-size")
+        if self.vae_encode_tiled.isChecked(): args.append("--vae-encode-tiled")
+        if self.vae_decode_tiled.isChecked(): args.append("--vae-decode-tiled")
+        if self.cpu_offload.isChecked(): args.append("--cpu-offload")
         return self.python_edit.text().strip(), args
 
     def queue_run(self):
@@ -1443,7 +1437,7 @@ class SeedVR2Window(QMainWindow):
         input_path = self.input_edit.text().strip()
         output_path = self.output_edit.text().strip()
         out_dir = str(Path(output_path).resolve().parent) if output_path else ""
-        backend_name = "community" if self.backend.currentIndex() == 0 else "official"
+        backend_name = "community"
 
         job = {
             "name": "SeedVR2",
@@ -1544,12 +1538,13 @@ class SeedVR2Window(QMainWindow):
         self.seed.setValue(-1)
         self.fps.setValue(0.0)  # source FPS
 
-        self._set_combo_int_value(self.batch_size, 25)
-        self.chunk_size.setValue(330)
+        self._set_combo_int_value(self.batch_size, 21)
+        self.chunk_size.setValue(165)
         self.temporal_overlap.setValue(3)
         self.prepend_frames.setValue(0)
         self.color_correction.setCurrentText("lab")
         self.uniform_batch.setChecked(True)
+        self.crash_safe.setChecked(True)
         self.vae_encode_tiled.setChecked(True)
         self.vae_encode_tile_size.setValue(1024)
         self.vae_encode_overlap.setValue(128)
@@ -1604,31 +1599,16 @@ class SeedVR2Window(QMainWindow):
         return str(value).strip().lower() not in ("false", "0", "no", "off", "")
 
     def _load_settings(self):
-        # First launch of the embedded-v2 tab: start from known-good values and
-        # migrate only harmless path fields from the old standalone settings.
-        schema = int(self.settings.value("settings_schema_version", 0) or 0)
-        if schema < 2:
+        # Never replace existing user values during a schema migration.
+        # Fresh JSON starts from the widgets' validated Community defaults.
+        if not self.settings.data:
+            # Widgets already carry known-good defaults. Loading must be read-only.
             self._apply_embedded_defaults()
-            for edit, key in [
-                (self.repo_edit, "repo"),
-                (self.community_repo_edit, "community_repo"),
-                (self.python_edit, "python"),
-                (self.dit_edit, "dit"),
-                (self.vae_edit, "vae"),
-            ]:
-                try:
-                    v = self.legacy_settings.value(key, "")
-                    if v:
-                        edit.setText(str(v))
-                except Exception:
-                    pass
-            self.settings.setValue("settings_schema_version", 2)
-            self._save_settings()
             return
 
         # Paths / I/O.
         for edit, key in [
-            (self.repo_edit,"repo"), (self.community_repo_edit,"community_repo"),
+            (self.community_repo_edit,"community_repo"),
             (self.python_edit,"python"), (self.dit_edit,"dit"), (self.vae_edit,"vae"),
             (self.input_edit,"input"), (self.output_edit,"output")
         ]:
@@ -1637,21 +1617,23 @@ class SeedVR2Window(QMainWindow):
                 edit.setText(str(v))
 
         # Simple tab.
-        self.backend.setCurrentIndex(int(self.settings.value("backend", 0)))
+        self.backend.setCurrentIndex(0)
         self._set_combo_int_value(self.community_resolution, int(self.settings.value("community_resolution", 1080)), default_value=1080)
-        self.community_max_resolution.setValue(int(self.settings.value("community_max_resolution", 0)))
+        self.community_max_resolution.setValue(0)
         self.width.setValue(int(self.settings.value("width", 1920)))
         self.height.setValue(int(self.settings.value("height", 1080)))
         self.seed.setValue(int(self.settings.value("seed", -1)))
         self.fps.setValue(float(self.settings.value("fps", 0.0)))
 
         # Community quality / temporal.
-        self._set_combo_int_value(self.batch_size, int(self.settings.value("batch_size", 25)), default_value=25)
-        self.chunk_size.setValue(int(self.settings.value("chunk_size", 330)))
+        self._set_combo_int_value(self.batch_size, int(self.settings.value("batch_size", 21)), default_value=21)
+        self.chunk_size.setValue(int(self.settings.value("chunk_size", 165)))
         self.temporal_overlap.setValue(int(self.settings.value("temporal_overlap", 3)))
         self.prepend_frames.setValue(int(self.settings.value("prepend_frames", 0)))
         self.color_correction.setCurrentText(str(self.settings.value("color_correction", "lab")))
+        if self.color_correction.currentIndex() < 0: self.color_correction.setCurrentText("lab")
         self.uniform_batch.setChecked(self._setting_bool(self.settings, "uniform_batch", True))
+        self.crash_safe.setChecked(self._setting_bool(self.settings, "crash_safe", True))
         self.vae_encode_tiled.setChecked(self._setting_bool(self.settings, "vae_encode_tiled", True))
         self.vae_encode_tile_size.setValue(int(self.settings.value("vae_encode_tile_size", 1024)))
         self.vae_encode_overlap.setValue(int(self.settings.value("vae_encode_overlap", 128)))
@@ -1662,6 +1644,7 @@ class SeedVR2Window(QMainWindow):
         # Machine / VRAM.
         self.blocks_to_swap.setValue(int(self.settings.value("blocks_to_swap", 32)))
         self.attention_mode.setCurrentText(str(self.settings.value("attention_mode", "sageattn_2")))
+        if self.attention_mode.currentIndex() < 0: self.attention_mode.setCurrentText("sageattn_2")
         self.cpu_offload.setChecked(self._setting_bool(self.settings, "cpu_offload", True))
 
         # Original backend advanced settings.
@@ -1672,31 +1655,69 @@ class SeedVR2Window(QMainWindow):
         self.sp_size.setValue(int(self.settings.value("sp_size", 1)))
         self.color_fix.setChecked(self._setting_bool(self.settings, "color_fix", False))
 
+    def _user_edited_settings(self, *_args):
+        """Only direct user interactions may schedule a settings write."""
+        if not getattr(self, "_settings_ready", False):
+            return
+        self._settings_dirty = True
+        self._settings_save_timer.start()
+
+    def _autosave_if_dirty(self):
+        if self._settings_ready and self._settings_dirty:
+            self._save_settings()
+
+    def _enable_json_autosave(self):
+        """User-only signals; programmatic setValue/setCurrentIndex must not write JSON."""
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.setInterval(500)
+        self._settings_save_timer.timeout.connect(self._autosave_if_dirty)
+        for combo in (self.community_resolution, self.batch_size,
+                      self.color_correction, self.attention_mode):
+            combo.activated.connect(self._user_edited_settings)
+        for checkbox in (self.uniform_batch, self.crash_safe,
+                         self.vae_encode_tiled, self.vae_decode_tiled,
+                         self.cpu_offload):
+            checkbox.clicked.connect(self._user_edited_settings)
+        for spin in (self.seed, self.fps, self.chunk_size,
+                     self.temporal_overlap, self.prepend_frames,
+                     self.vae_encode_tile_size, self.vae_encode_overlap,
+                     self.vae_decode_tile_size, self.vae_decode_overlap,
+                     self.blocks_to_swap):
+            spin.editingFinished.connect(self._user_edited_settings)
+        for edit in (self.community_repo_edit, self.python_edit,
+                     self.dit_edit, self.vae_edit, self.input_edit,
+                     self.output_edit):
+            edit.textEdited.connect(self._user_edited_settings)
+        # Browse buttons and auto-filled paths use setText programmatically.
+        # Those paths will be saved via the explicit Save button / Run action.
+
     def _save_settings(self):
-        self.settings.setValue("settings_schema_version", 2)
+        self.settings._batch = True
+        for key in ("repo", "width", "height", "model_size", "steps", "cfg", "cfg_rescale", "sp_size", "color_fix", "backend"):
+            self.settings.data.pop(key, None)
+        self.settings.setValue("settings_schema_version", 3)
         for edit, key in [
-            (self.repo_edit,"repo"), (self.community_repo_edit,"community_repo"),
+            (self.community_repo_edit,"community_repo"),
             (self.python_edit,"python"), (self.dit_edit,"dit"), (self.vae_edit,"vae"),
             (self.input_edit,"input"), (self.output_edit,"output")
         ]:
             self.settings.setValue(key, edit.text())
 
         # Simple tab.
-        self.settings.setValue("backend", self.backend.currentIndex())
         self.settings.setValue("community_resolution", self._combo_int_value(self.community_resolution, 1080))
-        self.settings.setValue("community_max_resolution", self.community_max_resolution.value())
-        self.settings.setValue("width", self.width.value())
-        self.settings.setValue("height", self.height.value())
+        self.settings.setValue("community_max_resolution", 0)
         self.settings.setValue("seed", self.seed.value())
         self.settings.setValue("fps", self.fps.value())
 
         # Community quality / temporal.
-        self.settings.setValue("batch_size", self._combo_int_value(self.batch_size, 25))
+        self.settings.setValue("batch_size", self._combo_int_value(self.batch_size, 21))
         self.settings.setValue("chunk_size", self.chunk_size.value())
         self.settings.setValue("temporal_overlap", self.temporal_overlap.value())
         self.settings.setValue("prepend_frames", self.prepend_frames.value())
         self.settings.setValue("color_correction", self.color_correction.currentText())
         self.settings.setValue("uniform_batch", self.uniform_batch.isChecked())
+        self.settings.setValue("crash_safe", self.crash_safe.isChecked())
         self.settings.setValue("vae_encode_tiled", self.vae_encode_tiled.isChecked())
         self.settings.setValue("vae_encode_tile_size", self.vae_encode_tile_size.value())
         self.settings.setValue("vae_encode_overlap", self.vae_encode_overlap.value())
@@ -1710,15 +1731,14 @@ class SeedVR2Window(QMainWindow):
         self.settings.setValue("cpu_offload", self.cpu_offload.isChecked())
 
         # Original backend advanced settings.
-        self.settings.setValue("model_size", self.model_size.currentText())
-        self.settings.setValue("steps", self.steps.value())
-        self.settings.setValue("cfg", self.cfg.value())
-        self.settings.setValue("cfg_rescale", self.cfg_rescale.value())
-        self.settings.setValue("sp_size", self.sp_size.value())
-        self.settings.setValue("color_fix", self.color_fix.isChecked())
+        self.settings._batch = False
+        self.settings.sync()
+        self._settings_dirty = False
 
     def closeEvent(self, event):
-        self._save_settings()
+        # Never overwrite a correctly loaded JSON with incidental widget state.
+        if getattr(self, "_settings_dirty", False):
+            self._save_settings()
         if self.proc: self.proc.kill()
         if self.download_worker is not None:
             self.download_worker.cancel()
