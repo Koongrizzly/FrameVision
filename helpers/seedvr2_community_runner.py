@@ -292,6 +292,26 @@ def _run_checkpointed(args, src: Path, final: Path, dit: Path, vae: Path) -> int
     return 0
 
 
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def _finalize_image(intermediate: Path, final: Path) -> None:
+    """Deliver an image rather than sending still frames to the MP4 muxer."""
+    from PIL import Image
+    if not intermediate.is_file():
+        raise FileNotFoundError(f"SeedVR2 did not produce its image: {intermediate}")
+    with Image.open(intermediate) as im:
+        im.load()
+        if final.suffix.lower() in {".jpg", ".jpeg"}:
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.save(final, format="JPEG", quality=96, subsampling=0)
+        else:
+            im.save(final)
+    if intermediate != final:
+        intermediate.unlink(missing_ok=True)
+
+
 def main() -> int:
     # Must happen before importing anything from the community SeedVR2 repo.
     _force_utf8_console()
@@ -301,8 +321,8 @@ def main() -> int:
     ap.add_argument("--output", required=True)
     ap.add_argument("--dit", required=True)
     ap.add_argument("--vae", required=True)
-    ap.add_argument("--resolution", type=int, default=1080)
-    ap.add_argument("--max-resolution", type=int, default=0)
+    ap.add_argument("--resolution", type=int, default=1080, help="Target short-side resolution derived from the selected GUI scale factor")
+    ap.add_argument("--max-resolution", type=int, default=0, help="Target long-edge clamp derived from the selected GUI scale factor")
     ap.add_argument("--batch-size", type=int, default=33)
     ap.add_argument("--chunk-size", type=int, default=330)
     ap.add_argument("--uniform-batch-size", action="store_true")
@@ -338,16 +358,21 @@ def main() -> int:
     if dit.parent != vae.parent:
         raise RuntimeError("Community DiT and VAE must be in the same model directory.")
 
-    # Community CLI writes the video stream. Use an intermediate file so we can
-    # restore the original audio afterward without re-encoding SeedVR2's video.
+    # Images must stay images throughout inference and finalization. The video
+    # path alone needs an MP4 intermediate and browser-safe audio muxing.
+    is_image = src.suffix.lower() in IMAGE_SUFFIXES
+    if is_image and final.suffix.lower() not in IMAGE_SUFFIXES:
+        raise ValueError("Image input requires an image output path (.png, .jpg, .webp, etc.)")
+    if not is_image and final.suffix.lower() != ".mp4":
+        raise ValueError("Video input requires an .mp4 output path")
     final.parent.mkdir(parents=True, exist_ok=True)
-    temp_out = final.with_name(final.stem + "_videoonly" + final.suffix)
+    temp_out = final.with_name(final.stem + ("_seedvr_intermediate.png" if is_image else "_videoonly.mp4"))
     try:
         temp_out.unlink(missing_ok=True)
     except Exception:
         pass
 
-    if args.crash_safe and not args._segment_worker:
+    if args.crash_safe and not args._segment_worker and not is_image:
         return _run_checkpointed(args, src, final, dit, vae)
 
     _register_selected_models(repo, dit, vae)
@@ -402,7 +427,10 @@ def main() -> int:
 
     if not temp_out.exists():
         raise RuntimeError(f"Community SeedVR2 finished without creating output: {temp_out}")
-    _finalize_browser_safe_mp4(src, temp_out, final)
+    if is_image:
+        _finalize_image(temp_out, final)
+    else:
+        _finalize_browser_safe_mp4(src, temp_out, final)
     print(f"DONE: {final}", flush=True)
     return 0
 

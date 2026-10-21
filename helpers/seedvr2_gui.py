@@ -32,8 +32,17 @@ except Exception:
 
 APP_NAME = "SeedVR2 PySide6"
 
-# Portable settings live alongside the FrameVision helper (never in the Registry).
-SETTINGS_FILE = Path(__file__).resolve().parent / "seedvr2_settings.json"
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+
+def _app_root_for_paths() -> Path:
+    here = Path(__file__).resolve().parent
+    return here.parent if here.name.lower() == "helpers" else here
+
+
+# Portable settings always live in the application root presets/setsave folder.
+SETTINGS_FILE = _app_root_for_paths() / "presets" / "setsave" / "seedvr2_settings.json"
 
 class JsonSettings:
     """Minimal QSettings-compatible portable store with atomic writes."""
@@ -743,8 +752,8 @@ class SeedVR2Window(QMainWindow):
 
         # ---------------- Simple tab ----------------
         intro = QLabel(
-            "Community SeedVR2: choose the input/output, target resolution and seed here. "
-            "Less frequently changed quality/memory controls are kept out of the way on the other tabs."
+            "Community SeedVR2: choose the input/output, native scale factor and seed here. "
+            "Less frequently changed quality and memory controls are kept out of the way on the other tabs."
         )
         intro.setWordWrap(True)
         simple.addWidget(intro)
@@ -766,20 +775,26 @@ class SeedVR2Window(QMainWindow):
         bg = QGridLayout(basic)
         self.backend = QComboBox(self); self.backend.addItem("Community SeedVR2")
         self.backend.setToolTip("Community SeedVR2 only")
-        self.community_resolution = QComboBox()
-        for val, label in [(720, "720p"), (768, "768p"), (1080, "1080p"), (1440, "1440p"), (2560, "2560p")]:
-            self.community_resolution.addItem(label, val)
-        self.community_max_resolution = QSpinBox(self); self.community_max_resolution.setRange(0, 8192); self.community_max_resolution.setSingleStep(16); self.community_max_resolution.setValue(0); self.community_max_resolution.setSpecialValueText("none")
+        self.community_scale = QComboBox()
+        for val, label in [(1, "1×"), (2, "2×"), (3, "3×"), (4, "4×")]:
+            self.community_scale.addItem(label, val)
+        self.community_max_resolution = QSpinBox(self); self.community_max_resolution.setRange(0, 8192); self.community_max_resolution.setSingleStep(16); self.community_max_resolution.setValue(0); self.community_max_resolution.setSpecialValueText("auto")
         self.width = QSpinBox(self); self.width.setRange(256, 8192); self.width.setSingleStep(16); self.width.setValue(1920)
         self.height = QSpinBox(self); self.height.setRange(256, 8192); self.height.setSingleStep(16); self.height.setValue(1080)
         self.seed = QSpinBox(); self.seed.setRange(-1, 2_147_483_647); self.seed.setValue(-1); self.seed.setSpecialValueText("random")
         self.fps = QDoubleSpinBox(); self.fps.setRange(0.0, 240.0); self.fps.setDecimals(3); self.fps.setValue(0.0); self.fps.setSpecialValueText("source")
+        self.scale_preview = QLabel("Select an input to see the scaled output resolution.")
+        self.scale_preview.setWordWrap(True)
         basic_items = [
-            ("Target short-side resolution", self.community_resolution), ("Seed", self.seed), ("Output FPS", self.fps),
+            ("Native scale", self.community_scale), ("Seed", self.seed), ("Output FPS", self.fps),
         ]
         for i, (label, widget) in enumerate(basic_items):
             row, col = divmod(i, 3)
             cell = QVBoxLayout(); cell.addWidget(QLabel(label)); cell.addWidget(widget); bg.addLayout(cell, row, col)
+        preview_cell = QVBoxLayout()
+        preview_cell.addWidget(QLabel("Scaled output resolution"))
+        preview_cell.addWidget(self.scale_preview)
+        bg.addLayout(preview_cell, 1, 0, 1, 3)
         simple.addWidget(basic)
 
         run_group = QGroupBox("Run")
@@ -794,7 +809,7 @@ class SeedVR2Window(QMainWindow):
         self.cancel_btn = QPushButton("Cancel"); self.cancel_btn.setEnabled(False)
         self.open_btn = QPushButton("Open output folder")
         self.save_settings_btn = QPushButton("Save settings")
-        self.save_settings_btn.setToolTip("Save all SeedVR2 settings to helpers/seedvr2_settings.json")
+        self.save_settings_btn.setToolTip("Save all SeedVR2 settings to presets/setsave/seedvr2_settings.json")
         self.save_settings_btn.clicked.connect(self._save_settings)
         self.validate_btn.clicked.connect(lambda: self._validate(show=True))
         self.run_btn.clicked.connect(self.run)
@@ -944,6 +959,8 @@ class SeedVR2Window(QMainWindow):
 
         self.repo_edit.textChanged.connect(self._autofill_ckpts)
         self.backend.currentIndexChanged.connect(self._backend_changed)
+        self.input_edit.textChanged.connect(self._update_scale_preview)
+        self.community_scale.currentIndexChanged.connect(lambda _=None: self._update_scale_preview())
         self._backend_changed()
         # These legacy compatibility widgets must NEVER become top-level children
         # covering the tabs (especially on Windows or after style changes).
@@ -953,7 +970,7 @@ class SeedVR2Window(QMainWindow):
             unused_control.hide()
         official_adv.hide()
 
-        self.community_resolution.setToolTip("Default: 1080p. Quick presets for the community backend short-side target: 720p, 768p, 1080p, 1440p or 2560p.")
+        self.community_scale.setToolTip("Choose a native upscale multiplier. 1× keeps the original size for restoration-only passes; 2×/3×/4× upscale proportionally.")
         self.community_max_resolution.setToolTip("Default: none. Set a maximum long-edge clamp for the community backend, or leave it at none.")
         self.batch_size.setToolTip("Default: 21. Only valid 4n+1 values are available here: 1, 5, 9, 13, 17, 21, 25, 29, 33, and so on.")
         self.chunk_size.setToolTip("Default: 165. Streaming chunk size for long videos. Lower values can reduce memory pressure.")
@@ -1297,7 +1314,7 @@ class SeedVR2Window(QMainWindow):
 
     def _suggest_output_for_input(self, input_path: str) -> Path:
         src = Path(input_path)
-        base = src.with_name(src.stem + "_seedvr2.mp4")
+        base = src.with_name(src.stem + "_seedvr2" + (src.suffix.lower() if src.suffix.lower() in IMAGE_SUFFIXES else ".mp4"))
         return self._next_available_output(base)
 
     def _ensure_unique_output_path(self):
@@ -1325,10 +1342,66 @@ class SeedVR2Window(QMainWindow):
             # stale output filename remembered from the previous job.
             self.output_edit.setText(str(self._suggest_output_for_input(p)))
     def _pick_output(self):
-        p, _ = QFileDialog.getSaveFileName(self, "Output", self.output_edit.text() or "seedvr2_output.mp4", "MP4 (*.mp4);;All files (*)")
+        source_is_image = Path(self.input_edit.text().strip()).suffix.lower() in IMAGE_SUFFIXES
+        filters = "PNG (*.png);;JPEG (*.jpg *.jpeg);;WebP (*.webp);;BMP (*.bmp);;TIFF (*.tif *.tiff)" if source_is_image else "MP4 (*.mp4)"
+        default_path = self.output_edit.text() or ("seedvr2_output.png" if source_is_image else "seedvr2_output.mp4")
+        p, selected_filter = QFileDialog.getSaveFileName(self, "Output", default_path, filters)
+        if p:
+            candidate = Path(p)
+            if source_is_image:
+                suffix_by_filter = {"PNG": ".png", "JPEG": ".jpg", "WebP": ".webp", "BMP": ".bmp", "TIFF": ".tif"}
+                target_suffix = next((ext for key, ext in suffix_by_filter.items() if selected_filter.startswith(key)), ".png")
+                if candidate.suffix.lower() not in IMAGE_SUFFIXES:
+                    candidate = candidate.with_suffix(target_suffix)
+            elif candidate.suffix.lower() != ".mp4":
+                candidate = candidate.with_suffix(".mp4")
         if p:
             # Respect the chosen base name, but do not allow a silent overwrite.
-            self.output_edit.setText(str(self._next_available_output(Path(p))))
+            self.output_edit.setText(str(self._next_available_output(candidate)))
+
+    def _find_ffprobe(self) -> str | None:
+        root = self._app_root()
+        for candidate in (root / "presets" / "bin" / "ffprobe.exe", root / "presets" / "bin" / "ffprobe"):
+            if candidate.exists():
+                return str(candidate)
+        return shutil.which("ffprobe")
+
+    def _probe_input_resolution(self, path: str) -> tuple[int, int] | tuple[None, None]:
+        path = (path or "").strip()
+        if not path:
+            return None, None
+        ffprobe = self._find_ffprobe()
+        if not ffprobe:
+            return None, None
+        try:
+            proc = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
+                capture_output=True, text=True, check=True
+            )
+            line = (proc.stdout or "").strip().splitlines()[0].strip()
+            w_str, h_str = line.split("x", 1)
+            w, h = int(w_str), int(h_str)
+            if w > 0 and h > 0:
+                return w, h
+        except Exception:
+            return None, None
+        return None, None
+
+    def _scaled_dimensions(self) -> tuple[int, int] | tuple[None, None]:
+        src_w, src_h = self._probe_input_resolution(self.input_edit.text().strip())
+        if not src_w or not src_h:
+            return None, None
+        scale = self._combo_int_value(self.community_scale, 2)
+        return src_w * scale, src_h * scale
+
+    def _update_scale_preview(self):
+        src_w, src_h = self._probe_input_resolution(self.input_edit.text().strip())
+        if not src_w or not src_h:
+            self.scale_preview.setText("Select an input video/image and make sure ffprobe is available to preview the scaled size.")
+            return
+        scale = self._combo_int_value(self.community_scale, 2)
+        out_w, out_h = src_w * scale, src_h * scale
+        self.scale_preview.setText(f"Source: {src_w} × {src_h}   →   {scale}× output: {out_w} × {out_h}")
 
     def _autofill_ckpts(self):
         dit_text = self.dit_edit.text().strip()
@@ -1358,7 +1431,15 @@ class SeedVR2Window(QMainWindow):
         if not vae.exists(): errors.append("VAE checkpoint does not exist.")
         if not self.input_edit.text().strip(): errors.append("Select an input video or image.")
         elif not inp.exists(): errors.append("Input file does not exist.")
-        if not self.output_edit.text().strip(): errors.append("Select an output path.")
+        if not self.output_edit.text().strip():
+            errors.append("Select an output path.")
+        elif self.input_edit.text().strip():
+            source_is_image = inp.suffix.lower() in IMAGE_SUFFIXES
+            output_suffix = Path(self.output_edit.text().strip()).suffix.lower()
+            if source_is_image and output_suffix not in IMAGE_SUFFIXES:
+                errors.append("Image inputs must have an image output filename (.png, .jpg, .jpeg, .webp, .bmp or .tif), not MP4.")
+            elif not source_is_image and output_suffix != ".mp4":
+                errors.append("Video inputs must use an MP4 output filename.")
 
         if community:
             crepo = Path(self.community_repo_edit.text().strip())
@@ -1394,13 +1475,22 @@ class SeedVR2Window(QMainWindow):
         if seed < 0:
             import secrets
             seed = secrets.randbelow(2_147_483_647)
+        src_w, src_h = self._probe_input_resolution(self.input_edit.text().strip())
+        scale = self._combo_int_value(self.community_scale, 2)
+        if src_w and src_h:
+            target_resolution = min(src_w, src_h) * scale
+            max_resolution = max(src_w, src_h) * scale
+        else:
+            # Conservative fallback if probing fails; 2× assumes a common 1080-ish short side target.
+            target_resolution = 1080 if scale <= 1 else 1080 * scale // 2
+            max_resolution = 0
         args = [
             str(self._community_runner_path()),
             "--repo", self.community_repo_edit.text().strip(),
             "--input", self.input_edit.text().strip(), "--output", self.output_edit.text().strip(),
             "--dit", self.dit_edit.text().strip(), "--vae", self.vae_edit.text().strip(),
-            "--resolution", str(self._combo_int_value(self.community_resolution, 1080)),
-            "--max-resolution", "0",
+            "--resolution", str(target_resolution),
+            "--max-resolution", str(max_resolution),
             "--batch-size", str(self._combo_int_value(self.batch_size, 21)), "--chunk-size", str(self.chunk_size.value()),
             "--temporal-overlap", str(self.temporal_overlap.value()), "--prepend-frames", str(self.prepend_frames.value()),
             "--blocks-to-swap", str(self.blocks_to_swap.value()), "--attention-mode", self.attention_mode.currentText(),
@@ -1408,7 +1498,7 @@ class SeedVR2Window(QMainWindow):
             "--vae-encode-tile-size", str(self.vae_encode_tile_size.value()), "--vae-encode-overlap", str(self.vae_encode_overlap.value()),
             "--vae-decode-tile-size", str(self.vae_decode_tile_size.value()), "--vae-decode-overlap", str(self.vae_decode_overlap.value()),
         ]
-        if self.crash_safe.isChecked(): args.append("--crash-safe")
+        if self.crash_safe.isChecked() and Path(self.input_edit.text().strip()).suffix.lower() not in IMAGE_SUFFIXES: args.append("--crash-safe")
         if self.uniform_batch.isChecked(): args.append("--uniform-batch-size")
         if self.vae_encode_tiled.isChecked(): args.append("--vae-encode-tiled")
         if self.vae_decode_tiled.isChecked(): args.append("--vae-decode-tiled")
@@ -1531,10 +1621,11 @@ class SeedVR2Window(QMainWindow):
         """Known-good defaults for the new embedded SeedVR2 integration."""
         # Everyday/community controls.
         self.backend.setCurrentIndex(0)
-        self._set_combo_int_value(self.community_resolution, 1080)
+        self._set_combo_int_value(self.community_scale, 2)
         self.community_max_resolution.setValue(0)
         self.width.setValue(1920)
         self.height.setValue(1080)
+        self._update_scale_preview()
         self.seed.setValue(-1)
         self.fps.setValue(0.0)  # source FPS
 
@@ -1618,10 +1709,11 @@ class SeedVR2Window(QMainWindow):
 
         # Simple tab.
         self.backend.setCurrentIndex(0)
-        self._set_combo_int_value(self.community_resolution, int(self.settings.value("community_resolution", 1080)), default_value=1080)
+        self._set_combo_int_value(self.community_scale, int(self.settings.value("community_scale", 2)), default_value=2)
         self.community_max_resolution.setValue(0)
         self.width.setValue(int(self.settings.value("width", 1920)))
         self.height.setValue(int(self.settings.value("height", 1080)))
+        self._update_scale_preview()
         self.seed.setValue(int(self.settings.value("seed", -1)))
         self.fps.setValue(float(self.settings.value("fps", 0.0)))
 
@@ -1672,7 +1764,7 @@ class SeedVR2Window(QMainWindow):
         self._settings_save_timer.setSingleShot(True)
         self._settings_save_timer.setInterval(500)
         self._settings_save_timer.timeout.connect(self._autosave_if_dirty)
-        for combo in (self.community_resolution, self.batch_size,
+        for combo in (self.community_scale, self.batch_size,
                       self.color_correction, self.attention_mode):
             combo.activated.connect(self._user_edited_settings)
         for checkbox in (self.uniform_batch, self.crash_safe,
@@ -1705,7 +1797,7 @@ class SeedVR2Window(QMainWindow):
             self.settings.setValue(key, edit.text())
 
         # Simple tab.
-        self.settings.setValue("community_resolution", self._combo_int_value(self.community_resolution, 1080))
+        self.settings.setValue("community_scale", self._combo_int_value(self.community_scale, 2))
         self.settings.setValue("community_max_resolution", 0)
         self.settings.setValue("seed", self.seed.value())
         self.settings.setValue("fps", self.fps.value())
