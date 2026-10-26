@@ -17,6 +17,21 @@ except Exception:
     from typing_extensions import Literal
 from typing import Optional, List, Dict, Any, Tuple
 
+class _JsonGifSettings:
+    """Portable settings stored under application-root/presets/setsave/."""
+    def __init__(self, pane):
+        import json
+        root = Path(getattr(pane, "APP_ROOT", getattr(pane, "ROOT", Path(__file__).resolve().parent.parent)))
+        self.path = root / "presets" / "setsave" / "gif_creator.json"
+        try: self.data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError): self.data = {}
+    def value(self, name, default=None): return self.data.get(name, default)
+    def setValue(self, name, value):
+        import json
+        self.data[name] = value
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
+
 # ---- Types ----
 Format = Literal["gif", "webp", "apng"]
 StatsMode = Literal["single", "diff"]
@@ -128,16 +143,14 @@ def _probe_info(input_path: Path, ffprobe: str) -> Dict[str, Any]:
     return info
 
 def _input_trim_args(opts: GifOptions) -> List[str]:
-    args: List[str] = []
-    if opts.trim_start and float(opts.trim_start) > 0:
-        args += ["-ss", f"{opts.trim_start}"]
-    if opts.trim_end is not None:
-        try:
-            te = float(opts.trim_end); ts = float(opts.trim_start or 0.0)
-            if te > 0 and te > ts:
-                args += ["-to", f"{te}"]
-        except Exception:
-            pass
+    """Seek and limit duration; -to after input-side -ss is error-prone."""
+    start = max(0.0, float(opts.trim_start or 0))
+    end = float(opts.trim_end) if opts.trim_end is not None else None
+    if end is not None and end > 0 and end <= start:
+        raise GifError("Trim end must be greater than trim start.")
+    args = ["-ss", str(start)] if start else []
+    if end is not None and end > 0:
+        args += ["-t", str(end - start)]
     return args
 
 def _calc_aspect_tuple(preset: ArPreset) -> Tuple[int,int]:
@@ -189,71 +202,61 @@ def _palettegen(opts: GifOptions) -> str:
 
 def _gif_filters(opts: GifOptions) -> str:
     fs = []
-    if opts.frame_step and int(opts.frame_step)>1:
-        fs.append(f"select=not(mod(n\\,{int(opts.frame_step)}))")
+    # Apply a single explicit output fps before palette generation so each pass sees
+    # precisely the same frames. The old -r option was sometimes missing its value.
+    if opts.fps and opts.fps > 0:
+        fs.append(f"fps={int(opts.fps)}")
+    if opts.frame_step and int(opts.frame_step) > 1:
+        fs.append(f"select='not(mod(n\\,{int(opts.frame_step)}))'")
         fs.append("setpts=N/FRAME_RATE/TB")
-    ce = _build_crop_expr(opts)
-    if ce: fs.append(ce)
-    fs += _build_scale_pad_expr(opts)
+    crop = _build_crop_expr(opts)
+    if crop: fs.append(crop)
+    fs.extend(_build_scale_pad_expr(opts))
     return ",".join(fs) if fs else "null"
 
-# ---- Command builders ----
-def build_gif_cmds(input_path: Path, out_path: Path, opts: GifOptions, ffmpeg: str = "ffmpeg", work_dir: Optional[Path] = None) -> List[List[str]]:
-    input_path = Path(input_path); out_path = Path(out_path)
-    work_dir = Path(work_dir) if work_dir else out_path.parent
-    _ensure_parent(out_path); work_dir.mkdir(parents=True, exist_ok=True)
-    filters = _gif_filters(opts)
+
+def _paletteuse(opts: GifOptions) -> str:
+    dither = opts.dither
+    if dither == "bayer":
+        return f"paletteuse=dither=bayer:bayer_scale={max(1,min(5,int(opts.bayer_scale)))}"
+    return f"paletteuse=dither={dither}"
+
+
+def build_gif_cmds(input_path: Path, out_path: Path, opts: GifOptions,
+                   ffmpeg: str = "ffmpeg", work_dir: Optional[Path] = None) -> List[List[str]]:
+    input_path, out_path = Path(input_path), Path(out_path)
+    _ensure_parent(out_path)
+    vf = _gif_filters(opts)
+    base = [ffmpeg, "-y", *_input_trim_args(opts), "-i", str(input_path)]
+    ending = ["-an", "-loop", str(max(0, int(opts.loop))), "-f", "gif", str(out_path)]
+    if opts.boomerang:
+        # Exclude the duplicated turnaround endpoints when possible.
+        forward = f"[0:v]{vf},split[f][r];[r]reverse[rev];[f][rev]concat=n=2:v=1:a=0[loop]"
+        if not opts.use_palette:
+            return [base + ["-filter_complex", forward, "-map", "[loop]"] + ending]
+        graph = forward + f";[loop]split[a][b];[a]{_palettegen(opts)}[p];[b][p]{_paletteuse(opts)}[v]"
+        return [base + ["-filter_complex", graph, "-map", "[v]"] + ending]
     if not opts.use_palette:
-        vf = f"{filters}" if filters else "null"
-        cmd = [ffmpeg, "-y", *_input_trim_args(opts), "-i", str(input_path), "-vf", vf, "-r"]
-        cmd += [str(opts.fps or 0)] if opts.fps else []
-        cmd += ["-loop","0" if opts.loop==0 else str(opts.loop), str(out_path)]
-        return [cmd]
-    # With palette
-    if opts.two_pass:
-        pal = work_dir / (out_path.stem + "_pal.png")
-        cmd1 = [ffmpeg, "-y", *_input_trim_args(opts), "-i", str(input_path),
-                "-vf", f"{filters},{_palettegen(opts)}", str(pal)]
-        dither = "bayer:bayer_scale="+str(max(1,min(5,opts.bayer_scale))) if opts.dither=="bayer" else opts.dither
-        paluse = f"paletteuse=dither={dither}"
-        cmd2 = [ffmpeg, "-y", "-i", str(input_path), "-i", str(pal),
-                "-lavfi", f"{filters} [x]; [x][1:v] {paluse}",
-                "-r"]
-        cmd2 += [str(opts.fps or 0)] if opts.fps else []
-        cmd2 += ["-loop","0" if opts.loop==0 else str(opts.loop), str(out_path)]
-        return [cmd1, cmd2]
-    # Single pass (split) chain
-    dither = "bayer:bayer_scale="+str(max(1,min(5,opts.bayer_scale))) if opts.dither=="bayer" else opts.dither
-    paluse = f"paletteuse=dither={dither}"
-    vf = f"{filters},split [a][b]; [a] {_palettegen(opts)} [p]; [b][p] {paluse}"
-    cmd = [ffmpeg, "-y", *_input_trim_args(opts), "-i", str(input_path),
-           "-vf", vf, "-r"]
-    cmd += [str(opts.fps or 0)] if opts.fps else []
-    cmd += ["-loop","0" if opts.loop==0 else str(opts.loop), str(out_path)]
-    return [cmd]
+        return [base + ["-vf", vf] + ending]
+    # A single filter graph avoids a palette PNG being mistaken for the final
+    # output and also ensures trims and fps are identical on palette/output.
+    graph = f"[0:v]{vf},split[a][b];[a]{_palettegen(opts)}[p];[b][p]{_paletteuse(opts)}[v]"
+    return [base + ["-filter_complex", graph, "-map", "[v]"] + ending]
+
 
 def build_webp_cmd(input_path: Path, out_path: Path, opts: GifOptions, ffmpeg: str = "ffmpeg") -> List[str]:
-    cmd = [ffmpeg, "-y", *_input_trim_args(opts), "-i", str(input_path), "-r"]
-    cmd += [str(opts.fps or 0)] if opts.fps else []
-    vf = _gif_filters(opts); 
-    # keep alpha / quality knobs
-    if opts.lossless_webp:
-        cmd += ["-lossless", "1"]
-    else:
-        cmd += ["-q:v", str(max(0,min(100,opts.quality_webp)))]
-    cmd += ["-compression_level", str(max(0,min(9,opts.compression_webp)))]
-    if vf: cmd += ["-vf", vf]
-    cmd += [str(out_path)]
+    cmd = [ffmpeg, "-y", *_input_trim_args(opts), "-i", str(input_path), "-an", "-vf", _gif_filters(opts)]
+    if opts.lossless_webp: cmd += ["-lossless", "1"]
+    else: cmd += ["-q:v", str(max(0,min(100,opts.quality_webp)))]
+    cmd += ["-compression_level", str(max(0,min(6,opts.compression_webp))),
+            "-loop", str(max(0,int(opts.loop))), "-f", "webp", str(out_path)]
     return cmd
 
+
 def build_apng_cmd(input_path: Path, out_path: Path, opts: GifOptions, ffmpeg: str = "ffmpeg") -> List[str]:
-    vf = _gif_filters(opts)
-    cmd = [ffmpeg, "-y", *_input_trim_args(opts), "-i", str(input_path)]
-    if vf: cmd += ["-vf", vf]
-    if (getattr(opts, 'img_duration_sec', None) in (None, 0)) and opts.fps:
-            cmd += ["-r", str(opts.fps)]
-    cmd += [str(out_path)]
-    return cmd
+    return [ffmpeg, "-y", *_input_trim_args(opts), "-i", str(input_path),
+            "-an", "-vf", _gif_filters(opts), "-plays", str(max(0,int(opts.loop))),
+            "-f", "apng", str(out_path)]
 
 def build_commands(input_path: Path, out_path: Path, opts: GifOptions, ffmpeg: str = "ffmpeg", work_dir: Optional[Path] = None) -> List[List[str]]:
     if opts.format == "gif":
@@ -416,7 +419,7 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
     pane.gif_keep_alpha = QCheckBox("Keep alpha"); pane.gif_keep_alpha.setChecked(True); pane.gif_keep_alpha.setToolTip(TOOLTIPS["keep_alpha"])
     pane.gif_webp_lossless = QCheckBox("WebP lossless"); pane.gif_webp_lossless.setChecked(False)
     pane.gif_webp_quality = QSpinBox(); pane.gif_webp_quality.setRange(0,100); pane.gif_webp_quality.setValue(80)
-    pane.gif_webp_comp = QSpinBox(); pane.gif_webp_comp.setRange(0,9); pane.gif_webp_comp.setValue(6)
+    pane.gif_webp_comp = QSpinBox(); pane.gif_webp_comp.setRange(0,6); pane.gif_webp_comp.setValue(6)
 
     # Enable/disable rules
     def _sync_two_pass():
@@ -598,12 +601,11 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
     # --- Create new from images (single animation) ---
     try:
         from PySide6.QtWidgets import (QGroupBox, QFormLayout, QFileDialog, QLineEdit, QSpinBox, QLabel, QHBoxLayout, QPushButton, QCheckBox, QToolButton, QWidget, QVBoxLayout, QMessageBox, QTableWidget, QTableWidgetItem, QAbstractItemView)
-        from PySide6.QtCore import QSettings, Qt
+        from PySide6.QtCore import Qt
     except Exception:
         QGroupBox = None
     if QGroupBox is not None:
         grp_imgs = QGroupBox("Create new from images")
-        grp_imgs.setStyleSheet("QGroupBox{background: palette(base);} QGroupBox:title{subcontrol-origin: margin; left: 6px; padding: 2px 4px;}")
         lay_imgs = QFormLayout(grp_imgs)
 
         
@@ -621,7 +623,7 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
         row_i1.addWidget(QLabel("Folder")); row_i1.addWidget(pane.gif_imgs_dir); row_i1.addWidget(pane.gif_imgs_browse)
         row_i2 = QHBoxLayout()
         row_i2.addWidget(QLabel("Images FPS")); row_i2.addWidget(pane.gif_imgs_fps)
-        pane.gif_img_sec = QDoubleSpinBox(); pane.gif_img_sec.setRange(0.1, 10.0); pane.gif_img_sec.setSingleStep(0.1); pane.gif_img_sec.setValue(1.0)
+        pane.gif_img_sec = QDoubleSpinBox(); pane.gif_img_sec.setRange(0.0, 10.0); pane.gif_img_sec.setSingleStep(0.1); pane.gif_img_sec.setValue(0.0); pane.gif_img_sec.setToolTip("0 = use Images FPS; otherwise set seconds per picture")
         row_i2.addSpacing(12); row_i2.addWidget(QLabel("Seconds/image")); row_i2.addWidget(pane.gif_img_sec); row_i2.addStretch(1)
         def _sync_img_fps_enable(val):
             try:
@@ -644,17 +646,14 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
             hh = pane.gif_imgs_preview.horizontalHeader(); hh.setStretchLastSection(True)
             pane.gif_imgs_preview.setMinimumHeight(110)
             pane.gif_imgs_preview.setMaximumHeight(140)
-            try:
-                pane.gif_imgs_preview.setAlternatingRowColors(False)
-                _qss = ("QTableWidget { background-color: palette(base); color: palette(text); gridline-color: palette(mid); } QHeaderView::section { background-color: palette(window); color: palette(window-text); padding: 4px; border: 0px; } QTableWidget::item:selected { background: palette(highlight); color: palette(highlighted-text); } QTableWidget::item:selected:!active { background: palette(midlight); color: palette(window-text); }")
-                pane.gif_imgs_preview.setStyleSheet(_qss)
-            except Exception:
-                pass
         except Exception:
             pass
 
-        pane.gif_imgs_create = QPushButton("New")
-        pane.gif_imgs_create.setStyleSheet("QPushButton{background: palette(button); color: palette(window-text); border: 1px solid palette(mid); border-radius: 8px; padding: 8px 14px;} QPushButton:hover{background: palette(mid);} QPushButton:pressed{background: palette(dark);}")
+        pane.gif_imgs_create = QPushButton("Create animation from images…")
+        try:
+            pane.gif_imgs_create.setEnabled(False)
+        except Exception:
+            pass
 
 
         lay_imgs.addRow(row_i1)
@@ -699,7 +698,7 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
         # Remember last-used folder
         def _choose_source():
             try:
-                settings = QSettings("FrameVision", "FrameVision")
+                settings = _JsonGifSettings(pane)
                 start = settings.value("tools/export_gif/images_last_dir", "")
             except Exception:
                 settings = None; start = ""
@@ -765,6 +764,10 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
                     else:
                         imgs = []
                 table.setRowCount(len(imgs))
+                try:
+                    pane.gif_imgs_create.setEnabled(bool(imgs))
+                except Exception:
+                    pass
                 ffprobe = _ffprobe_from_ffmpeg(getattr(pane, 'ffmpeg_path', lambda: 'ffmpeg')())
                 for i, p in enumerate(imgs):
                     try:
@@ -844,13 +847,13 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
                 pass
             # Remember last save dir
             try:
-                settings = QSettings('FrameVision', 'FrameVision')
+                settings = _JsonGifSettings(pane)
                 settings.setValue('tools/export_gif/last_save_dir', str(sp.parent))
             except Exception:
                 pass
             out = sp
 
-            encode_images_with_progress(
+            success = encode_images_with_progress(
                 pane,
                 Path(folder),
                 out,
@@ -861,6 +864,8 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
                 work_dir=Path(getattr(pane, 'OUT_TEMP', out.parent)),
                 explicit_imgs=list(explicit) if explicit else None,
             )
+            if not success:
+                return
             # Open folder after export
             try:
                 (
@@ -878,106 +883,53 @@ def install_ui(pane, lay_gif, sec_gif) -> None:
 
         pane.gif_imgs_create.clicked.connect(_do_create)
     # ---- Progress encode (GUI) ----
-def encode_with_progress(pane, input_path: Path, out_path: Path, opts: GifOptions, ffmpeg: str = "ffmpeg", work_dir: Optional[Path] = None) -> None:
-    """Spawn ffmpeg with -progress and show ETA like interp.py. Falls back to encode() on error."""
+def _run_export_commands(pane, cmds, out_path):
+    """Capture actual encoder diagnostics and never report a partial export as success."""
+    from PySide6.QtWidgets import QMessageBox, QApplication
+    out_path = Path(out_path)
     try:
-        from PySide6.QtCore import QTimer
-        from PySide6.QtWidgets import QMessageBox
-    except Exception:
-        return encode(input_path, out_path, opts, ffmpeg=ffmpeg, work_dir=work_dir)
-
-    cmds = build_commands(input_path, out_path, opts, ffmpeg=ffmpeg, work_dir=work_dir)
-    ffprobe = _ffprobe_from_ffmpeg(ffmpeg)
-    info = _probe_info(input_path, ffprobe)
-    src_fps = (info.get("fps") or 0.0) or 25.0
-    use_fps = float(opts.fps or src_fps)
-    step = max(1, int(opts.frame_step or 1))
-    # estimate frames within trim
-    duration = info.get("duration") or 0.0
-    if opts.trim_start: duration = max(0.0, duration - float(opts.trim_start))
-    if opts.trim_end and float(opts.trim_end)>0: duration = min(duration, float(opts.trim_end) - float(opts.trim_start or 0.0))
-    est_frames = max(1, int(duration * use_fps / step))
-    if opts.boomerang and opts.format=="gif": est_frames *= 2
-    # progress infra
-    progress_file = Path(work_dir or out_path.parent) / "_gif_progress.txt"
-    try:
-        progress_file.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    # Inject -progress into each cmd
-    def _inject(cmd: List[str]) -> List[str]:
-        return [cmd[0], "-hide_banner", "-nostats", "-progress", str(progress_file)] + cmd[1:]
-
-    proc = None
-    pane.gif_pb.setVisible(True); pane.gif_eta.setVisible(True); pane.gif_pb.setValue(0); pane.gif_eta.setText("Starting…")
-    start = time.time()
-
-    def _parse():
-        try:
-            txt = progress_file.read_text('utf-8', errors='ignore')
-        except Exception:
-            return
-        done = 0
-        for ln in txt.splitlines()[::-1]:
-            if ln.startswith("frame="):
-                try:
-                    done = int(ln.split("=")[1].strip())
-                    break
-                except Exception: pass
-            if ln.startswith("out_time_ms="):
-                try:
-                    ms = int(ln.split("=")[1]); done = int((ms/1000.0) * use_fps / step)
-                    break
-                except Exception: pass
-        done = max(0, min(est_frames, done))
-        pct = int(round(100.0 * done / max(1, est_frames)))
-        pane.gif_pb.setValue(pct)
-        elapsed = time.time() - start
-        if done>0 and pct<100:
-            total_est = elapsed * est_frames / max(1, done)
-            eta = max(0, int(total_est - elapsed))
-            pane.gif_eta.setText(f"{pct}% — ETA {eta}s")
-        else:
-            pane.gif_eta.setText(f"{pct}%")
-
-    timer = QTimer(pane); timer.setInterval(300)
-    def _tick(): 
-        _parse()
-        # completed?
-        if proc is None: return
-        ret = proc.poll()
-        if ret is None: return
-        timer.stop()
-        pane.gif_pb.setVisible(False); pane.gif_eta.setVisible(False)
-        if ret != 0:
-            try:
-                QMessageBox.critical(pane, "FFmpeg error", f"Command failed (code {ret}).")
+        pane.gif_pb.setVisible(True)
+        pane.gif_eta.setVisible(True)
+        pane.gif_pb.setRange(0, 0)  # indeterminate instead of misleading 100%
+        pane.gif_eta.setText("Encoding animation…")
+        QApplication.processEvents()
+        for command in cmds:
+            proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                    text=True, errors="replace")
+            # Drain stderr via communicate (avoids deadlock on long FFmpeg output).
+            _, stderr = proc.communicate()
+            if proc.returncode:
+                raise GifError(f"FFmpeg failed (exit {proc.returncode}):\n" + stderr[-5500:])
+        if not out_path.is_file() or out_path.stat().st_size < 20:
+            raise GifError("Encoder finished without producing a valid output file.")
+        pane._gif_last_out = out_path
+        if hasattr(pane, "gif_btn_play"): pane.gif_btn_play.setEnabled(True)
+        pane.gif_eta.setText(f"Created {out_path.name} ({_human_size(out_path.stat().st_size)})")
+        if getattr(pane, "cb_autoplay_gif", None) and pane.cb_autoplay_gif.isChecked():
+            try: pane.main.video.open(str(out_path))
             except Exception: pass
-            return
-        # success
-        pane._gif_last_out = Path(out_path)
-        try: pane.gif_btn_play.setEnabled(True)
+        return True
+    except Exception as exc:
+        try: out_path.unlink(missing_ok=True)
         except Exception: pass
-        try:
-            if getattr(pane, "cb_autoplay_gif", None) and pane.cb_autoplay_gif.isChecked():
-                if getattr(pane, "main", None) and getattr(pane.main, "video", None):
-                    pane.main.video.open(str(out_path))
-        except Exception: pass
-
-    timer.timeout.connect(_tick); timer.start()
-    # Run
-    try:
-        for i, c in enumerate(cmds):
-            proc = subprocess.Popen(_inject(c), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-            while True:
-                _tick()
-                if proc.poll() is not None: break
-                time.sleep(0.1)
-            if proc.returncode != 0: break
+        pane.gif_eta.setText("Export failed")
+        QMessageBox.critical(pane, "Animation export failed", str(exc))
+        return False
     finally:
-        try: progress_file.unlink(missing_ok=True)
-        except Exception: pass
+        pane.gif_pb.setVisible(False)
+        pane.gif_pb.setRange(0, 100)
+        pane.gif_eta.setVisible(True)
+
+
+def encode_with_progress(pane, input_path: Path, out_path: Path, opts: GifOptions,
+                         ffmpeg: str = "ffmpeg", work_dir: Optional[Path] = None) -> bool:
+    try:
+        cmds = build_commands(input_path, out_path, opts, ffmpeg=ffmpeg, work_dir=work_dir)
+    except Exception as exc:
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.critical(pane, "Animation export failed", str(exc))
+        return False
+    return _run_export_commands(pane, cmds, out_path)
 
 # ---- Misc ----
 def output_ext_for(fmt: str) -> str:
@@ -1081,129 +1033,38 @@ def build_commands_from_images(
     lst = _write_concat_list(imgs, float(opts.fps or 12), (opts.boomerang if opts.format == "gif" else False), work_dir, img_duration_sec=getattr(opts, 'img_duration_sec', None))
     filters = _gif_filters(opts)
 
+    common = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst)]
+    # Image sequences need variable per-frame durations; do not resample to the
+    # GIF video-FPS setting when a per-image duration was explicitly chosen.
+    if opts.img_duration_sec and opts.img_duration_sec > 0:
+        from dataclasses import replace
+        filters = _gif_filters(replace(opts, fps=None))
+    else:
+        filters = _gif_filters(opts)
     if opts.format == "gif":
-        if not opts.use_palette:
-            cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst)]
-            if filters: cmd += ["-vf", filters]
-            if (getattr(opts, 'img_duration_sec', None) in (None, 0)) and opts.fps:
-                cmd += ["-r", str(opts.fps)]
-            cmd += ["-loop", "0" if opts.loop == 0 else str(opts.loop), str(out_path)]
-            return [cmd]
-
-        if opts.two_pass:
-            pal = work_dir / (out_path.stem + "_pal.png")
-            cmd1 = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-                    "-vf", f"{filters},{_palettegen(opts)}", str(pal)]
-            dither = "bayer:bayer_scale=" + str(max(1, min(5, opts.bayer_scale))) if opts.dither == "bayer" else opts.dither
-            paluse = f"paletteuse=dither={dither}"
-            cmd2 = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-i", str(pal),
-                    "-lavfi", f"{filters} [x]; [x][1:v] {paluse}"]
-            if opts.fps: cmd2 += ["-r", str(opts.fps)]
-            cmd2 += ["-loop", "0" if opts.loop == 0 else str(opts.loop), str(out_path)]
-            return [cmd1, cmd2]
-
-        dither = "bayer:bayer_scale=" + str(max(1, min(5, opts.bayer_scale))) if opts.dither == "bayer" else opts.dither
-        paluse = f"paletteuse=dither={dither}"
-        vf = f"{filters},split [a][b]; [a] {_palettegen(opts)} [p]; [b][p] {paluse}"
-        cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-vf", vf]
-        if (getattr(opts, 'img_duration_sec', None) in (None, 0)) and opts.fps:
-            cmd += ["-r", str(opts.fps)]
-        cmd += ["-loop", "0" if opts.loop == 0 else str(opts.loop), str(out_path)]
-        return [cmd]
-
+        end_args = ["-an", "-loop", str(max(0,int(opts.loop))), "-f", "gif", str(out_path)]
+        if opts.use_palette:
+            graph = f"[0:v]{filters},split[a][b];[a]{_palettegen(opts)}[p];[b][p]{_paletteuse(opts)}[v]"
+            return [common + ["-filter_complex", graph, "-map", "[v]"] + end_args]
+        return [common + ["-vf", filters] + end_args]
     if opts.format == "webp":
-        cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst)]
-        if filters: cmd += ["-vf", filters]
-        if opts.lossless_webp: cmd += ["-lossless", "1"]
-        else: cmd += ["-q:v", str(max(0, min(100, opts.quality_webp)))]
-        cmd += ["-compression_level", str(max(0, min(9, opts.compression_webp)))]
-        if (getattr(opts, 'img_duration_sec', None) in (None, 0)) and opts.fps:
-            cmd += ["-r", str(opts.fps)]
-        cmd += [str(out_path)]
-        return [cmd]
-
+        q = ["-lossless", "1"] if opts.lossless_webp else ["-q:v", str(max(0,min(100,opts.quality_webp)))]
+        return [common + ["-vf", filters, *q, "-compression_level", str(max(0,min(6,opts.compression_webp))), "-loop", str(max(0,int(opts.loop))), "-f", "webp", str(out_path)]]
     if opts.format == "apng":
-        cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst)]
-        if filters: cmd += ["-vf", filters]
-        if (getattr(opts, 'img_duration_sec', None) in (None, 0)) and opts.fps:
-            cmd += ["-r", str(opts.fps)]
-        cmd += [str(out_path)]
-        return [cmd]
-
+        return [common + ["-vf", filters, "-plays", str(max(0,int(opts.loop))), "-f", "apng", str(out_path)]]
     raise GifError("Unknown format")
 
 
 
-def encode_images_with_progress(
-    pane,
-    folder: Path,
-    out_path: Path,
-    opts: GifOptions,
-    patterns: str,
-    include_subdirs: bool,
-    ffmpeg: str = "ffmpeg",
-    work_dir: Optional[Path] = None,
-    explicit_imgs: list[Path] | None = None,
-) -> None:
-    # GUI path: show progress + ETA; fallback = run commands directly
+def encode_images_with_progress(pane, folder: Path, out_path: Path, opts: GifOptions,
+                                patterns: str, include_subdirs: bool, ffmpeg: str = "ffmpeg",
+                                work_dir: Optional[Path] = None,
+                                explicit_imgs: list[Path] | None = None) -> bool:
     try:
+        cmds = build_commands_from_images(folder, out_path, opts, patterns, include_subdirs,
+                                          ffmpeg=ffmpeg, work_dir=work_dir, explicit_imgs=explicit_imgs)
+    except Exception as exc:
         from PySide6.QtWidgets import QMessageBox
-    except Exception:
-        for c in build_commands_from_images(folder, out_path, opts, patterns, include_subdirs, ffmpeg=ffmpeg, work_dir=work_dir):
-            _ffmpeg_exec(c)
-        return
-
-    cmds = build_commands_from_images(folder, out_path, opts, patterns, include_subdirs, ffmpeg=ffmpeg, work_dir=work_dir, explicit_imgs=explicit_imgs)
-
-    imgs = (list(explicit_imgs) if explicit_imgs else _gather_images(Path(folder), patterns, include_subdirs))
-    est_frames = max(1, len(imgs))
-    if opts.boomerang and opts.format == "gif" and len(imgs) > 1:
-        est_frames = len(imgs) * 2 - 2
-
-    progress_file = Path(work_dir or out_path.parent) / "_gif_progress.txt"
-    try: progress_file.unlink(missing_ok=True)
-    except Exception: pass
-
-    def _inject(cmd: List[str]) -> List[str]:
-        return [cmd[0], "-hide_banner", "-nostats", "-progress", str(progress_file)] + cmd[1:]
-
-    try:
-        pane.gif_pb.setVisible(True); pane.gif_eta.setVisible(True)
-        pane.gif_pb.setValue(0); pane.gif_eta.setText("Starting…")
-    except Exception: pass
-
-    import subprocess, time
-    start = time.time()
-
-    def _parse_done():
-        try:
-            txt = progress_file.read_text("utf-8", errors="ignore")
-        except Exception:
-            return 0
-        for ln in reversed(txt.splitlines()):
-            if ln.startswith("frame="):
-                try: return int(ln.split("=",1)[1].strip())
-                except Exception: return 0
-        return 0
-
-    while cmds:
-        c = cmds.pop(0)
-        p = subprocess.Popen(_inject(c), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-        while True:
-            done = _parse_done()
-            pct = int(round(100.0 * done / max(1, est_frames)))
-            try:
-                pane.gif_pb.setValue(pct)
-                pane.gif_eta.setText(f"{pct}%")
-            except Exception:
-                pass
-            if p.poll() is not None:
-                break
-            time.sleep(0.1)
-        if p.returncode != 0:
-            break
-
-    try: progress_file.unlink(missing_ok=True)
-    except Exception: pass
-    try: pane.gif_pb.setVisible(False); pane.gif_eta.setVisible(False)
-    except Exception: pass
+        QMessageBox.critical(pane, "Animation export failed", str(exc))
+        return False
+    return _run_export_commands(pane, cmds, out_path)
