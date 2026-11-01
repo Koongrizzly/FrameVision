@@ -5588,9 +5588,9 @@ class MainWindow(QMainWindow):
                         idx_tools = -1
 
                     if idx_tools is not None and idx_tools >= 0:
-                        self.tabs.insertTab(idx_tools, self.ace_step_15, 'Ace-Step 1.5')
+                        self.tabs.insertTab(idx_tools, self.ace_step_15, 'Music Creation')
                     else:
-                        self.tabs.addTab(self.ace_step_15, 'Ace-Step 1.5')
+                        self.tabs.addTab(self.ace_step_15, 'Music Creation')
             else:
                 self.ace_step_15 = None
         except Exception as _e:

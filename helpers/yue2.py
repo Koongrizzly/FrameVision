@@ -76,6 +76,7 @@ DEFAULT_LYRICS = """[Verse]\nSoft morning light is touching the window.\nI hear 
 DEFAULT_STYLE = "English, indie pop, bright acoustic guitar, soft drums, warm lead vocal, polished demo mix"
 
 DEFAULTS = {
+    "use_framevision_queue": False,
     "model_gguf": "",
     "vae_gguf": "",
     "threads": 8,
@@ -1111,8 +1112,9 @@ class Yue2PresetManager(QDialog):
 class YuE2Window(QMainWindow):
     """Standalone-friendly YuE2 helper. FrameVision can instantiate YuE2Window directly."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, embedded=False):
         super().__init__(parent)
+        self._embedded_in_framevision = bool(embedded)
         _ensure_dirs()
         self.settings = _read_json(SETTINGS_PATH, DEFAULTS)
         auto_model, auto_vae = _auto_model_defaults()
@@ -1178,8 +1180,23 @@ class YuE2Window(QMainWindow):
         footer.addWidget(lyrics_manager)
         footer.addWidget(genre_manager)
         footer.addStretch(1)
+        # The actions belong to the fixed footer, not the scrolling song pages.
+        # Reparent the original buttons so their signals and generation logic stay intact.
+        self._footer_generation_buttons = (self.gen_button, self.cover_button, self.score_button)
+        for button in self._footer_generation_buttons:
+            old_layout = button.parentWidget().layout() if button.parentWidget() else None
+            if old_layout is not None:
+                old_layout.removeWidget(button)
+            footer.addWidget(button)
+        self.tabs.currentChanged.connect(self._update_footer_generation_buttons)
+        self._update_footer_generation_buttons(self.tabs.currentIndex())
         outer.addLayout(footer)
         self.setCentralWidget(central)
+
+    def _update_footer_generation_buttons(self, tab_index: int) -> None:
+        # Only the active generation mode has an action; Settings and Logs do not.
+        for index, button in enumerate(self._footer_generation_buttons):
+            button.setVisible(tab_index == index)
 
     def _active_song_widgets(self):
         # Non-song tabs use the direct generation editor as a sensible default.
@@ -1298,12 +1315,8 @@ class YuE2Window(QMainWindow):
         form.addRow("Output name", self.gen_name)
         layout.addWidget(box)
 
-        row = QHBoxLayout()
         self.gen_button = QPushButton("Generate Song")
         self.gen_button.clicked.connect(lambda: self._run_mode("generate"))
-        row.addStretch(1)
-        row.addWidget(self.gen_button)
-        layout.addLayout(row)
         layout.addStretch(1)
         return self._scroll_tab(page)
 
@@ -1371,12 +1384,9 @@ class YuE2Window(QMainWindow):
         form.addRow("Output name", self.cover_name)
         layout.addWidget(box)
 
-        row = QHBoxLayout()
         self.cover_button = QPushButton("Create Cover")
         self.cover_button.setToolTip("If source audio is loaded but no ABC has been created yet, this automatically transcribes the audio first and then starts YuE2 cover generation.")
         self.cover_button.clicked.connect(lambda: self._run_mode("cover"))
-        row.addStretch(1); row.addWidget(self.cover_button)
-        layout.addLayout(row)
         layout.addStretch(1)
         self._refresh_sheetsage_status()
         return self._scroll_tab(page)
@@ -1418,11 +1428,8 @@ class YuE2Window(QMainWindow):
         form.addRow("Output name", self.score_name)
         layout.addWidget(box)
 
-        row = QHBoxLayout()
         self.score_button = QPushButton("Generate From Score")
         self.score_button.clicked.connect(lambda: self._run_mode("score"))
-        row.addStretch(1); row.addWidget(self.score_button)
-        layout.addLayout(row)
         layout.addStretch(1)
         return self._scroll_tab(page)
 
@@ -1480,6 +1487,12 @@ class YuE2Window(QMainWindow):
         ode_note.setWordWrap(True)
         gen_form.addRow("", ode_note)
         layout.addWidget(gen_box)
+
+        self.queue_check = QCheckBox("Use FrameVision Queue for generation")
+        self.queue_check.setToolTip("When enabled, Generate submits a YuE2 job to FrameVision's shared queue instead of starting it immediately. Jobs run in the FrameVision worker.")
+        self.queue_check.setVisible(self._embedded_in_framevision)
+        self.queue_check.toggled.connect(lambda _checked: self.save_settings(quiet=True))
+        layout.addWidget(self.queue_check)
 
         semantic_box = QGroupBox("Semantic music-token sampling")
         semantic_form = QFormLayout(semantic_box)
@@ -1622,6 +1635,7 @@ class YuE2Window(QMainWindow):
     # --------------------------- settings -------------------------------
 
     def _load_settings_to_ui(self) -> None:
+        self.queue_check.setChecked(bool(self.settings.get("use_framevision_queue", False)))
         self.model_edit.setText(str(self.settings.get("model_gguf", "")))
         self.vae_edit.setText(str(self.settings.get("vae_gguf", "")))
         backend = str(self.settings.get("backend", "cuda"))
@@ -1697,6 +1711,7 @@ class YuE2Window(QMainWindow):
             "output_format": self.output_format_combo.currentData() or "wav",
             "last_abc": self.cover_abc.text().strip() or self.score_abc.text().strip(),
             "cover_source_audio": self.cover_audio.text().strip(),
+            "use_framevision_queue": bool(self.queue_check.isChecked()),
             "last_style": source_style,
             "last_lyrics": source_lyrics,
             "log_cli": self.cli_log_check.isChecked(),
@@ -2120,8 +2135,8 @@ class YuE2Window(QMainWindow):
             "semantic_top_k": self.semantic_top_k_spin.value(),
             "semantic_repetition_penalty": self.semantic_rep_spin.value(),
             "semantic_penalty_window": self.semantic_window_spin.value(),
-            "semantic_min_tokens": self.semantic_min_tokens_spin.value(),
-            "semantic_max_tokens": self.semantic_max_tokens_spin.value(),
+            "semantic_min_tokens": duration_tokens,
+            "semantic_max_tokens": duration_tokens,
         }
         for key, value in advanced.items():
             if isinstance(value, float):
@@ -2132,6 +2147,7 @@ class YuE2Window(QMainWindow):
             args.append("--log")
 
         self.settings.update({
+            "use_framevision_queue": bool(self.queue_check.isChecked()),
             "model_gguf": str(model),
             "vae_gguf": str(vae),
             "threads": self.threads_spin.value(),
@@ -2219,6 +2235,29 @@ class YuE2Window(QMainWindow):
         final_output_path = output_path.with_suffix(".mp3") if output_format == "mp3_320" else output_path
         self.log(f"[RUN] output={output_path}")
         self.log(f"[RUN] save_format={'MP3 320 kbps' if output_format == 'mp3_320' else 'WAV (lossless)'} final_output={final_output_path}")
+        if self._embedded_in_framevision and self.queue_check.isChecked():
+            try:
+                try:
+                    from helpers.queue_adapter import enqueue_tool_job
+                except ImportError:
+                    from queue_adapter import enqueue_tool_job
+                enqueue_tool_job(
+                    job_type="yue2_generate", input_path=str(abc_file or ""),
+                    out_dir=str(output_dir.resolve()),
+                    args={
+                        "label": f"YuE2 {mode}: {output_path.stem} (seed {actual_seed})",
+                        "engine": "yue2", "queue_family": "yue2",
+                        "executable": str(AUDIOCPP_EXE), "cli_args": args,
+                        "cwd": str(PROJECT_ROOT), "outfile": str(output_path),
+                        "duration_seconds": int(duration_seconds), "output_format": output_format,
+                        "log_file": str(LOG_DIR / f"yue2_queue_{_timestamp()}.log"),
+                    }, priority=620,
+                )
+                self.log(f"[QUEUE] Added YuE2 {mode} to FrameVision queue: {output_path}")
+            except Exception as exc:
+                self.log(f"[QUEUE] Failed: {exc!r}")
+                QMessageBox.warning(self, "FrameVision Queue", f"Could not add YuE2 job to the FrameVision queue.\n\n{exc}")
+            return
         self._pending_duration_target = (str(output_path), int(duration_seconds), output_format)
         self._set_generation_enabled(False)
         self._process.start_command(str(AUDIOCPP_EXE), args, str(output_path))
@@ -2300,7 +2339,7 @@ class Yue2Pane(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._window = YuE2Window()
+        self._window = YuE2Window(embedded=True)
         try:
             central = self._window.takeCentralWidget()
         except Exception:

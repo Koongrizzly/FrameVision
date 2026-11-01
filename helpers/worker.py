@@ -3990,6 +3990,91 @@ def ace_generate(job, cfg, mani):
     return 0
 
 
+def yue2_generate(job, cfg, mani):
+    """Run the exact YuE2 command captured at enqueue time; postprocess in the worker."""
+    from pathlib import Path as _Path
+    import subprocess as _sp
+    import os as _os
+    import wave as _wave
+    import shutil as _shutil
+
+    a = job.get("args") or {}
+    exe = _Path(str(a.get("executable") or ""))
+    outfile = _Path(str(a.get("outfile") or ""))
+    if not exe.is_file() or not outfile.name:
+        _mark_error(job, "YuE2 executable or output filename missing")
+        return 2
+    cmd = [str(exe)] + list(a.get("cli_args") or [])
+    if len(cmd) < 2:
+        _mark_error(job, "YuE2 queue job has no command arguments")
+        return 2
+    # Reuse worker's cancellation, subprocess log and progress handling.
+    work = dict(job)
+    tool_args = dict(a)
+    tool_args.update({"cmd": cmd, "outfile": str(outfile), "cwd": str(a.get("cwd") or exe.parent)})
+    work["args"] = tool_args
+    code = tools_ffmpeg(work, cfg, mani)
+    if code != 0:
+        if work.get("error"):
+            _mark_error(job, str(work["error"]))
+        return code
+    if not outfile.is_file():
+        _mark_error(job, f"YuE2 generated file missing: {outfile}")
+        return 2
+    duration = int(a.get("duration_seconds") or 0)
+    if duration > 0:
+        # Use standard-library trimming for PCM WAV, with FFmpeg fallback.
+        trim_error = None
+        try:
+            with _wave.open(str(outfile), "rb") as source:
+                params = source.getparams()
+                count = min(source.getnframes(), duration * source.getframerate())
+                raw = source.readframes(count)
+            tmp = outfile.with_suffix(".duration_tmp.wav")
+            with _wave.open(str(tmp), "wb") as target:
+                target.setparams(params)
+                target.writeframes(raw)
+            _os.replace(tmp, outfile)
+        except Exception as exc:
+            trim_error = str(exc)
+            ffmpeg = _Path(str(BASE)) / "presets" / "bin" / "ffmpeg.exe"
+            if not ffmpeg.exists():
+                ffmpeg_found = _shutil.which("ffmpeg")
+                ffmpeg = _Path(ffmpeg_found) if ffmpeg_found else ffmpeg
+            if ffmpeg.is_file():
+                temp = outfile.with_suffix(".duration_tmp.wav")
+                result = _sp.run([str(ffmpeg), "-y", "-hide_banner", "-loglevel", "error", "-i", str(outfile), "-t", str(duration), "-c:a", "pcm_s16le", str(temp)], capture_output=True, text=True)
+                if result.returncode == 0 and temp.is_file():
+                    _os.replace(temp, outfile)
+                    trim_error = None
+        if trim_error:
+            _mark_error(job, "YuE2 output generated but duration trim failed: " + trim_error)
+            job["produced"] = str(outfile)
+            return 2
+    final = outfile
+    if a.get("output_format") == "mp3_320":
+        ffmpeg = _Path(str(BASE)) / "presets" / "bin" / "ffmpeg.exe"
+        if not ffmpeg.is_file():
+            ffmpeg_found = _shutil.which("ffmpeg")
+            ffmpeg = _Path(ffmpeg_found) if ffmpeg_found else ffmpeg
+        if not ffmpeg.is_file():
+            _mark_error(job, "YuE2 WAV generated but FFmpeg was not found for MP3 conversion")
+            job["produced"] = str(outfile)
+            return 2
+        mp3 = outfile.with_suffix(".mp3")
+        temp = mp3.with_suffix(".tmp.mp3")
+        proc = _sp.run([str(ffmpeg), "-y", "-hide_banner", "-loglevel", "error", "-i", str(outfile), "-map_metadata", "0", "-vn", "-c:a", "libmp3lame", "-b:a", "320k", str(temp)], capture_output=True, text=True)
+        if proc.returncode != 0 or not temp.is_file():
+            _mark_error(job, "YuE2 WAV generated but MP3 conversion failed: " + (proc.stderr or "unknown error"))
+            job["produced"] = str(outfile)
+            return 2
+        _os.replace(temp, mp3)
+        outfile.unlink()
+        final = mp3
+    job["produced"] = str(final)
+    return 0
+
+
 def ace15_generate(job, cfg, mani):
     """Queue worker entry for Ace-Step 1.5 (runs cli.py with a generated TOML).
 
@@ -7313,6 +7398,8 @@ def handle_job(jpath: Path):
             code = wan22_generate(job, cfg, mani)
         elif t in ("hiar_generate","hiar","wan21_hiar"):
             code = hiar_generate(job, cfg, mani)
+        elif t in ("yue2_generate", "yue2"):
+            code = yue2_generate(job, cfg, mani)
         elif t in ("ace_step_15","ace_step15","ace15"):
             code = ace15_generate(job, cfg, mani)
         elif t in ("ace_text2music","ace_audio2audio","ace","ace_step","ace_music"):
@@ -7490,14 +7577,6 @@ def main():
             continue
         handle_job(items[0])
 
-if __name__ == "__main__":
-    try:
-        main()
-    except BaseException as e:
-        try:
-            print("[worker main] fatal error caught:", e)
-        except Exception:
-            pass
 
 def _find_rife_exe(cfg: dict, mani: dict):
     names = ["rife-ncnn-vulkan.exe","rife-ncnn-vulkan"]
@@ -7781,3 +7860,12 @@ def _mark_error(job, msg):
         job['error'] = str(msg)
     except Exception:
         pass
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BaseException as e:
+        try:
+            print("[worker main] fatal error caught:", e)
+        except Exception:
+            pass
