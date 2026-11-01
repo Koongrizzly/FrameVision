@@ -24,6 +24,8 @@ from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
+    QListWidget,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -57,6 +59,7 @@ AUDIOCPP_DIR = PROJECT_ROOT / "presets" / "bin" / "audio"
 AUDIOCPP_EXE = AUDIOCPP_DIR / "audiocpp_cli.exe"
 MODEL_DIR = PROJECT_ROOT / "models" / "yue2"
 SETTINGS_PATH = PROJECT_ROOT / "presets" / "setsave" / "yue2.json"
+PRESETS_PATH = PROJECT_ROOT / "presets" / "setsave" / "yue2_presets.json"
 LOG_DIR = PROJECT_ROOT / "logs"
 OUTPUT_DIR = PROJECT_ROOT / "output" / "yue2"
 TEMP_DIR = PROJECT_ROOT / "temp"
@@ -891,6 +894,220 @@ class GenerationProcess(QProcess):
         self.line.emit(f"[PROCESS] QProcess error: {error}")
 
 
+
+class Yue2PresetManager(QDialog):
+    """Portable JSON-backed manager for lyrics and hierarchical genre presets."""
+
+    def __init__(self, owner: "YuE2Window", kind: str):
+        super().__init__(owner)
+        self.owner = owner
+        self.kind = kind
+        self.setWindowTitle("Lyrics Manager" if kind == "lyrics" else "Genre Manager")
+        self.resize(940, 620)
+        self.setMinimumSize(680, 420)
+        self.entries = owner._load_presets()[kind]
+        self.current_key = None
+        self._loading = False
+        root = QVBoxLayout(self)
+        info = QLabel("Select a title to view, edit, or reuse its lyrics." if kind == "lyrics" else
+                      "Choose a genre and subgenre. Saving captures the active tab's style and generation settings.")
+        info.setWordWrap(True)
+        root.addWidget(info)
+        main = QHBoxLayout()
+        root.addLayout(main, 1)
+        left = QVBoxLayout()
+        main.addLayout(left, 1)
+        left.addWidget(QLabel("Saved lyrics" if kind == "lyrics" else "Genres / Subgenres"))
+        self.items = QListWidget()
+        left.addWidget(self.items, 1)
+        right = QVBoxLayout()
+        main.addLayout(right, 3)
+        form = QFormLayout()
+        right.addLayout(form)
+        self.title = QLineEdit()
+        form.addRow("Title" if kind == "lyrics" else "Genre", self.title)
+        self.subgenre = None
+        if kind == "genres":
+            self.subgenre = QLineEdit()
+            self.subgenre.setPlaceholderText("e.g. Deep House")
+            form.addRow("Subgenre", self.subgenre)
+        self.content = QPlainTextEdit()
+        self.content.setPlaceholderText("Paste or edit lyrics here..." if kind == "lyrics" else "Enter the YuE2 style / genre description...")
+        right.addWidget(QLabel("Lyrics" if kind == "lyrics" else "Style description"))
+        right.addWidget(self.content, 1)
+        self.steps = self.seed = self.duration = self.instrumental = None
+        if kind == "genres":
+            options = QHBoxLayout()
+            right.addLayout(options)
+            self.steps = SafeSpinBox(); self.steps.setRange(1, 100)
+            self.seed = SafeSpinBox(); self.seed.setRange(-1, 2147483647); self.seed.setSpecialValueText("Random (-1)")
+            self.duration = SafeSpinBox(); self.duration.setRange(1, YUE2_MAX_DURATION_SECONDS); self.duration.setSuffix(" s")
+            for label, widget in (("Steps", self.steps), ("Seed", self.seed), ("Duration", self.duration)):
+                options.addWidget(QLabel(label)); options.addWidget(widget)
+            self.instrumental = QCheckBox("Instrumental")
+            right.addWidget(self.instrumental)
+        buttons = QHBoxLayout()
+        root.addLayout(buttons)
+        new_btn = QPushButton("New")
+        new_btn.clicked.connect(self.new_entry)
+        capture_btn = QPushButton("Capture current lyrics" if kind == "lyrics" else "Capture current settings")
+        capture_btn.clicked.connect(self.capture)
+        save_btn = QPushButton("Save preset")
+        save_btn.clicked.connect(self.save_entry)
+        delete_btn = QPushButton("Delete")
+        delete_btn.clicked.connect(self.delete_entry)
+        apply_btn = QPushButton("Use in active tab")
+        apply_btn.clicked.connect(self.apply_entry)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        for b in (new_btn, capture_btn, save_btn, delete_btn, apply_btn, close_btn):
+            buttons.addWidget(b)
+        self.items.currentRowChanged.connect(self.select_entry)
+        self.refresh()
+        self.new_entry()
+
+    def _key(self, entry):
+        if self.kind == "lyrics":
+            return entry.get("title", "").casefold()
+        return (entry.get("genre", "").casefold(), entry.get("subgenre", "").casefold())
+
+    def _values(self):
+        if self.kind == "lyrics":
+            return {"title": self.title.text().strip(), "lyrics": self.content.toPlainText()}
+        return {"genre": self.title.text().strip(), "subgenre": self.subgenre.text().strip(),
+                "style": self.content.toPlainText(), "steps": self.steps.value(),
+                "seed": self.seed.value(), "duration_seconds": self.duration.value(),
+                "instrumental": self.instrumental.isChecked()}
+
+    def _edited(self):
+        if self.current_key is None:
+            return False
+        original = next((e for e in self.entries if self._key(e) == self.current_key), None)
+        return original is not None and self._values() != original
+
+    def _confirm_discard(self):
+        return not self._edited() or QMessageBox.question(
+            self, "Unsaved changes", "Discard changes to this preset?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+
+    def refresh(self, key=None):
+        self._loading = True
+        self.entries.sort(key=lambda e: self._key(e))
+        self.items.clear()
+        for e in self.entries:
+            self.items.addItem(e["title"] if self.kind == "lyrics" else
+                               e["genre"] + ("  /  " + e["subgenre"] if e.get("subgenre") else ""))
+        self._loading = False
+        if key is not None:
+            for i, e in enumerate(self.entries):
+                if self._key(e) == key:
+                    self.items.setCurrentRow(i)
+                    break
+
+    def select_entry(self, row):
+        if self._loading or row < 0 or row >= len(self.entries):
+            return
+        if not self._confirm_discard():
+            self._loading = True
+            old = next((i for i, e in enumerate(self.entries) if self._key(e) == self.current_key), -1)
+            self.items.setCurrentRow(old)
+            self._loading = False
+            return
+        entry = self.entries[row]
+        self.current_key = self._key(entry)
+        self.title.setText(entry["title"] if self.kind == "lyrics" else entry["genre"])
+        self.content.setPlainText(entry["lyrics"] if self.kind == "lyrics" else entry["style"])
+        if self.kind == "genres":
+            self.subgenre.setText(entry.get("subgenre", ""))
+            self.steps.setValue(int(entry.get("steps", 32)))
+            self.seed.setValue(int(entry.get("seed", -1)))
+            self.duration.setValue(int(entry.get("duration_seconds", 180)))
+            self.instrumental.setChecked(bool(entry.get("instrumental", False)))
+
+    def new_entry(self):
+        if not self._confirm_discard():
+            return
+        self._loading = True
+        self.items.clearSelection()
+        self.items.setCurrentRow(-1)
+        self._loading = False
+        self.current_key = None
+        self.title.clear(); self.content.clear()
+        if self.kind == "genres":
+            self.subgenre.clear()
+        self.capture()
+        self.title.setFocus()
+
+    def capture(self):
+        source = self.owner._active_song_widgets()
+        self.content.setPlainText(source["lyrics"].toPlainText() if self.kind == "lyrics"
+                                  else source["style"].toPlainText())
+        if self.kind == "genres":
+            self.steps.setValue(source["steps"].value())
+            self.seed.setValue(source["seed"].value())
+            self.duration.setValue(source["duration"].value())
+            self.instrumental.setChecked(source["instrumental"].isChecked())
+
+    def _persist(self):
+        return self.owner._save_presets(self.kind, self.entries)
+
+    def save_entry(self):
+        entry = self._values()
+        if not entry["title" if self.kind == "lyrics" else "genre"]:
+            QMessageBox.warning(self, "Missing name", "Enter a title or genre name first.")
+            return
+        key = self._key(entry)
+        if key != self.current_key and any(self._key(e) == key for e in self.entries):
+            QMessageBox.warning(self, "Already exists", "A preset with this name already exists.")
+            return
+        old_entries = [dict(e) for e in self.entries]
+        if self.current_key is not None:
+            self.entries = [e for e in self.entries if self._key(e) != self.current_key]
+        self.entries.append(entry)
+        if not self._persist():
+            self.entries = old_entries
+            return
+        self.current_key = None
+        self.refresh(key)
+
+    def delete_entry(self):
+        if self.current_key is None:
+            return
+        if QMessageBox.question(self, "Delete preset", "Permanently delete this preset?",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        old = list(self.entries)
+        self.entries = [e for e in self.entries if self._key(e) != self.current_key]
+        if not self._persist():
+            self.entries = old
+            return
+        self.current_key = None
+        self.refresh()
+        self.new_entry()
+
+    def apply_entry(self):
+        entry = self._values()
+        if not self.content.toPlainText().strip():
+            QMessageBox.warning(self, "Empty preset", "Enter or select content to use.")
+            return
+        target = self.owner._active_song_widgets()
+        if self.kind == "lyrics":
+            target["lyrics"].setPlainText(entry["lyrics"])
+        else:
+            target["style"].setPlainText(entry["style"])
+            target["steps"].setValue(entry["steps"])
+            target["seed"].setValue(entry["seed"])
+            target["duration"].setValue(entry["duration_seconds"])
+            target["instrumental"].setChecked(entry["instrumental"])
+        self.accept()
+
+    def closeEvent(self, event):
+        if self._confirm_discard():
+            event.accept()
+        else:
+            event.ignore()
+
+
 class YuE2Window(QMainWindow):
     """Standalone-friendly YuE2 helper. FrameVision can instantiate YuE2Window directly."""
 
@@ -952,7 +1169,38 @@ class YuE2Window(QMainWindow):
         self.tabs.addTab(self._build_settings_tab(), "Settings")
         self.tabs.addTab(self._build_log_tab(), "Logs")
 
+        footer = QHBoxLayout()
+        footer.addWidget(QLabel("Presets:"))
+        lyrics_manager = QPushButton("Lyrics Manager")
+        lyrics_manager.clicked.connect(lambda: Yue2PresetManager(self, "lyrics").exec())
+        genre_manager = QPushButton("Genre Manager")
+        genre_manager.clicked.connect(lambda: Yue2PresetManager(self, "genres").exec())
+        footer.addWidget(lyrics_manager)
+        footer.addWidget(genre_manager)
+        footer.addStretch(1)
+        outer.addLayout(footer)
         self.setCentralWidget(central)
+
+    def _active_song_widgets(self):
+        # Non-song tabs use the direct generation editor as a sensible default.
+        prefix = {1: "cover", 2: "score"}.get(self.tabs.currentIndex(), "gen")
+        return {key: getattr(self, prefix + "_" + key) for key in
+                ("lyrics", "style", "steps", "seed", "duration", "instrumental")}
+
+    def _load_presets(self):
+        data = _read_json(PRESETS_PATH, {"lyrics": [], "genres": []})
+        return {kind: [item for item in data.get(kind, []) if isinstance(item, dict)]
+                if isinstance(data.get(kind), list) else [] for kind in ("lyrics", "genres")}
+
+    def _save_presets(self, kind, entries):
+        data = self._load_presets()
+        data[kind] = entries
+        try:
+            _write_json_atomic(PRESETS_PATH, data)
+            return True
+        except Exception as exc:
+            QMessageBox.critical(self, "Preset save failed", f"Could not save {PRESETS_PATH}:\n{exc}")
+            return False
 
     @staticmethod
     def _scroll_tab(content: QWidget) -> QScrollArea:
