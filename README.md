@@ -23,9 +23,9 @@ Because a.i. never sleeps😄
 ---
                               
 
--> Small update v2.5.6 brings Hye2 and Qwen edit/image 2.1
+-> Small update v2.5.6 brings Hue2 and Qwen edit/image 2.1
 
-also were added since last release : lora trainer and 
+also were added since last release : lora trainer, train your own loras for minimax, Krea2, and much more
 
 ---
 - Comes with a simple setup menu and a one click installer for the main app,
