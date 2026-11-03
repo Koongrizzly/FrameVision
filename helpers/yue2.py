@@ -1135,8 +1135,12 @@ class YuE2Window(QMainWindow):
         self._process.line.connect(self.log)
         self._process.completed.connect(self._generation_done)
 
+        self._loading_settings = True
         self._build_ui()
-        self._load_settings_to_ui()
+        try:
+            self._load_settings_to_ui()
+        finally:
+            self._loading_settings = False
         self._refresh_runtime_status()
         self.log(f"[YuE2] Helper started | project={PROJECT_ROOT}")
         self.log(f"[YuE2] Log file: {self._log_file}")
@@ -1490,8 +1494,9 @@ class YuE2Window(QMainWindow):
 
         self.queue_check = QCheckBox("Use FrameVision Queue for generation")
         self.queue_check.setToolTip("When enabled, Generate submits a YuE2 job to FrameVision's shared queue instead of starting it immediately. Jobs run in the FrameVision worker.")
+        self.queue_check.setToolTip("Default: Off\nSubmit to FrameVision worker when embedded; standalone generation remains unchanged.")
         self.queue_check.setVisible(self._embedded_in_framevision)
-        self.queue_check.toggled.connect(lambda _checked: self.save_settings(quiet=True))
+        self.queue_check.toggled.connect(lambda _checked: self.save_settings(quiet=True) if not getattr(self, "_loading_settings", False) else None)
         layout.addWidget(self.queue_check)
 
         semantic_box = QGroupBox("Semantic music-token sampling")
@@ -1503,6 +1508,37 @@ class YuE2Window(QMainWindow):
         self.semantic_window_spin = SafeSpinBox(); self.semantic_window_spin.setRange(1, 100000)
         self.semantic_min_tokens_spin = SafeSpinBox(); self.semantic_min_tokens_spin.setRange(0, 24576)
         self.semantic_max_tokens_spin = SafeSpinBox(); self.semantic_max_tokens_spin.setRange(1, 24576)
+        # Defaults are references, not forced values: saved user settings always take precedence.
+        _default_tooltips = {
+            "semantic_temperature_spin": ("semantic_temperature", "Controls randomness of music-token sampling; higher is more exploratory."),
+            "semantic_top_p_spin": ("semantic_top_p", "Nucleus sampling threshold for music tokens."),
+            "semantic_top_k_spin": ("semantic_top_k", "Limits the number of candidate music tokens."),
+            "semantic_rep_spin": ("semantic_repetition_penalty", "Discourages repeating previously generated music tokens."),
+            "semantic_window_spin": ("semantic_penalty_window", "Number of recent tokens considered for repetition penalties."),
+            "semantic_min_tokens_spin": ("semantic_min_tokens", "Minimum tokens for advanced/manual use; duration may override this."),
+            "semantic_max_tokens_spin": ("semantic_max_tokens", "Maximum tokens for advanced/manual use; duration may override this."),
+            "abc_temperature_spin": ("abc_temperature", "Randomness in symbolic ABC planning."),
+            "abc_top_p_spin": ("abc_top_p", "Nucleus sampling threshold for ABC planning."),
+            "abc_top_k_spin": ("abc_top_k", "Maximum number of candidate tokens for ABC planning."),
+            "abc_rep_spin": ("abc_repetition_penalty", "Repetition penalty during ABC planning."),
+            "abc_window_spin": ("abc_penalty_window", "Recent token window for ABC repetition penalty."),
+            "abc_min_tokens_spin": ("abc_min_tokens", "Minimum ABC planning token count."),
+            "abc_max_tokens_spin": ("abc_max_tokens", "Maximum ABC planning token count."),
+            "weight_type_combo": ("weight_type", "Shared precision override; native uses the GGUF precision."),
+            "model_weight_type_combo": ("model_weight_type", "Main model precision; native follows the selected GGUF."),
+            "vae_weight_type_combo": ("vae_weight_type", "VAE precision; native follows the selected GGUF."),
+            "model_weight_context_spin": ("model_weight_context_mb", "Memory reserved for main model weights (MiB)."),
+            "vae_weight_context_spin": ("vae_weight_context_mb", "Memory reserved for VAE weights (MiB)."),
+            "ar_prefill_arena_spin": ("ar_prefill_graph_arena_mb", "Autoregressive prefill workspace (MiB)."),
+            "ar_decode_arena_spin": ("ar_decode_graph_arena_mb", "Autoregressive decode workspace (MiB)."),
+            "nar_arena_spin": ("nar_graph_arena_mb", "Non-autoregressive workspace (MiB)."),
+            "vae_arena_spin": ("vae_graph_arena_mb", "VAE workspace (MiB)."),
+        }
+        for _attr, (_key, _explanation) in _default_tooltips.items():
+            # Widgets later in this method receive their tooltip after creation.
+            _widget = getattr(self, _attr, None)
+            if _widget is not None:
+                _widget.setToolTip(f"Default: {DEFAULTS[_key]}\n{_explanation}")
         semantic_form.addRow("Temperature", self.semantic_temperature_spin)
         semantic_form.addRow("Top P", self.semantic_top_p_spin)
         semantic_form.addRow("Top K", self.semantic_top_k_spin)
@@ -1547,6 +1583,10 @@ class YuE2Window(QMainWindow):
         self.ar_decode_arena_spin = SafeSpinBox(); self.ar_decode_arena_spin.setRange(1, 65536)
         self.nar_arena_spin = SafeSpinBox(); self.nar_arena_spin.setRange(1, 65536)
         self.vae_arena_spin = SafeSpinBox(); self.vae_arena_spin.setRange(1, 65536)
+        for _attr, (_key, _explanation) in _default_tooltips.items():
+            _widget = getattr(self, _attr, None)
+            if _widget is not None:
+                _widget.setToolTip(f"Default: {DEFAULTS[_key]}\n{_explanation}")
         advanced_runtime_form.addRow("Shared weight type", self.weight_type_combo)
         advanced_runtime_form.addRow("Main model weight type", self.model_weight_type_combo)
         advanced_runtime_form.addRow("VAE weight type", self.vae_weight_type_combo)
@@ -1694,6 +1734,8 @@ class YuE2Window(QMainWindow):
         self._refresh_sheetsage_status()
 
     def save_settings(self, quiet: bool = False) -> None:
+        if getattr(self, "_loading_settings", False):
+            return
         source_lyrics = self.gen_lyrics.toPlainText().strip()
         source_style = self.gen_style.toPlainText().strip()
         self.settings.update({
