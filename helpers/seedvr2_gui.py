@@ -1470,6 +1470,16 @@ class SeedVR2Window(QMainWindow):
     def _runner_path(self):
         return Path(__file__).resolve().with_name("seedvr2_official_runner.py")
 
+    def _valid_attention_mode(self):
+        """Never pass an empty or unsupported attention mode to inference_cli.py."""
+        mode = self.attention_mode.currentText().strip()
+        # The community inference CLI does not accept the UI's 'auto' choice.
+        if mode == "auto":
+            mode = "sageattn_2"
+        if mode not in {"sageattn_2", "sageattn_3", "flash_attn_2", "flash_attn_3", "sdpa"}:
+            mode = "sageattn_2"
+        return mode
+
     def _command(self):
         seed = self.seed.value()
         if seed < 0:
@@ -1493,7 +1503,7 @@ class SeedVR2Window(QMainWindow):
             "--max-resolution", str(max_resolution),
             "--batch-size", str(self._combo_int_value(self.batch_size, 21)), "--chunk-size", str(self.chunk_size.value()),
             "--temporal-overlap", str(self.temporal_overlap.value()), "--prepend-frames", str(self.prepend_frames.value()),
-            "--blocks-to-swap", str(self.blocks_to_swap.value()), "--attention-mode", self.attention_mode.currentText(),
+            "--blocks-to-swap", str(self.blocks_to_swap.value()), "--attention-mode", self._valid_attention_mode(),
             "--color-correction", self.color_correction.currentText(), "--seed", str(seed),
             "--vae-encode-tile-size", str(self.vae_encode_tile_size.value()), "--vae-encode-overlap", str(self.vae_encode_overlap.value()),
             "--vae-decode-tile-size", str(self.vae_decode_tile_size.value()), "--vae-decode-overlap", str(self.vae_decode_overlap.value()),
@@ -1736,7 +1746,7 @@ class SeedVR2Window(QMainWindow):
         # Machine / VRAM.
         self.blocks_to_swap.setValue(int(self.settings.value("blocks_to_swap", 32)))
         self.attention_mode.setCurrentText(str(self.settings.value("attention_mode", "sageattn_2")))
-        if self.attention_mode.currentIndex() < 0: self.attention_mode.setCurrentText("sageattn_2")
+        if self.attention_mode.currentIndex() < 0: self.attention_mode.setCurrentIndex(0)
         self.cpu_offload.setChecked(self._setting_bool(self.settings, "cpu_offload", True))
 
         # Original backend advanced settings.
@@ -1819,7 +1829,7 @@ class SeedVR2Window(QMainWindow):
 
         # Machine / VRAM.
         self.settings.setValue("blocks_to_swap", self.blocks_to_swap.value())
-        self.settings.setValue("attention_mode", self.attention_mode.currentText())
+        self.settings.setValue("attention_mode", self._valid_attention_mode())
         self.settings.setValue("cpu_offload", self.cpu_offload.isChecked())
 
         # Original backend advanced settings.

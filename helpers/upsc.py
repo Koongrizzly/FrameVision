@@ -1422,6 +1422,8 @@ class UpscPane(QtWidgets.QWidget):
 # UI helpers
 
     def _auto_save_if_enabled(self, *args, **kwargs):
+        if getattr(self, "_fv_settings_initializing", False):
+            return
         try:
             self._save_settings()
         except Exception:
@@ -1791,11 +1793,34 @@ class UpscPane(QtWidgets.QWidget):
             pass
 
     def _save_settings(self):
+        # Do not persist partially built widgets during embedded-tab startup.
+        if getattr(self, "_fv_settings_initializing", False):
+            return
         try:
-            d = self._gather_settings()
             p = self._settings_path()
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(d, indent=2), encoding="utf-8")
+            # Preserve settings owned by extension panes, and fields omitted from
+            # a partial snapshot, rather than truncating the JSON to current UI.
+            previous = {}
+            if p.exists():
+                previous = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(previous, dict):
+                    raise ValueError("Refusing to replace non-object settings JSON")
+            d = dict(previous)
+            d.update(self._gather_settings())
+            # Never let this pane silently recreate an existing corrupt JSON.
+            tmp = p.with_name(p.name + ".tmp")
+            try:
+                with tmp.open("w", encoding="utf-8") as fh:
+                    json.dump(d, fh, indent=2, ensure_ascii=False)
+                    fh.write("\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, p)
+            finally:
+                if tmp.exists():
+                    try: tmp.unlink()
+                    except OSError: pass
             try:
                 self._append_log(f"[settings] Saved to: {p}")
             except Exception:
@@ -4792,6 +4817,9 @@ try:
 
         _fv_hypir_orig_init = _PaneH.__init__
         def _fv_hypir_init(self, *a, **k):
+            # A nested pane is not ready to persist until *all* extension widgets
+            # have been created, restored and their callbacks have settled.
+            self._fv_settings_initializing = True
             _fv_hypir_orig_init(self, *a, **k)
 
             # HYPIR controls page. It is added after all legacy model pages so
@@ -5073,20 +5101,6 @@ try:
             try: self.spin_hypir_overlap.valueChanged.connect(_hypir_sync_tile_controls)
             except Exception: pass
 
-            # Persist HYPIR values through the same presets/setsave/upsc_settings.json.
-            for obj, signal_name in (
-                (self.edit_hypir_prompt, "textChanged"),
-                (self.spin_hypir_seed, "valueChanged"),
-                (self.spin_hypir_patch, "valueChanged"),
-                (self.spin_hypir_overlap, "valueChanged"),
-                (self.chk_hypir_video, "toggled"),
-                (self.spin_hypir_batch, "valueChanged"),
-            ):
-                try:
-                    getattr(obj, signal_name).connect(self._auto_save_if_enabled)
-                except Exception:
-                    pass
-
             # Load HYPIR-specific values and the safer engine-name key after the
             # page exists. Legacy engine_index remains supported by the old loader.
             try:
@@ -5127,6 +5141,21 @@ try:
             _hypir_apply_engine_ui()
             _hypir_refresh_runtime_ui()
 
+            # Persist HYPIR values through the same presets/setsave/upsc_settings.json.
+            for obj, signal_name in (
+                (self.edit_hypir_prompt, "textChanged"),
+                (self.spin_hypir_seed, "valueChanged"),
+                (self.spin_hypir_patch, "valueChanged"),
+                (self.spin_hypir_overlap, "valueChanged"),
+                (self.chk_hypir_video, "toggled"),
+                (self.spin_hypir_batch, "valueChanged"),
+            ):
+                try:
+                    getattr(obj, signal_name).connect(self._auto_save_if_enabled)
+                except Exception:
+                    pass
+
+
             # Prevent accidental mouse-wheel changes across value controls unless
             # the user has explicitly focused the control.
             try:
@@ -5149,6 +5178,8 @@ try:
                     except Exception: pass
             except Exception:
                 pass
+
+            self._fv_settings_initializing = False
 
         _PaneH.__init__ = _fv_hypir_init
 except Exception as _fv_hypir_patch_error:

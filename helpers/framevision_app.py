@@ -189,12 +189,24 @@ from pathlib import Path
 import os
 from datetime import datetime
 from PySide6.QtCore import QUrl, Qt, QTimer, QUrl, Signal, QRect, QEasingCurve, QPropertyAnimation, QByteArray, QEvent
-from PySide6.QtCore import QUrl, QSettings
+from PySide6.QtCore import QUrl
+
+def _fv_read_ui_setting(key, default=None):
+    """JSON-only FrameVision UI preferences; no registry/QSettings access."""
+    try:
+        p = Path(__file__).resolve().parent.parent / "presets" / "setsave" / "framevision_ui_settings.json"
+        if p.is_file():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data.get(key, default)
+    except Exception:
+        pass
+    return default
 
 def _fv_startup_lazy_load_tools_enabled() -> bool:
     """Settings > Fast startup / load some tools when opened."""
     try:
-        return bool(QSettings("FrameVision", "FrameVision").value("startup_lazy_load_tools", False, type=bool))
+        return bool(_fv_read_ui_setting("startup_lazy_load_tools", False))
     except Exception:
         pass
     try:
@@ -3922,9 +3934,8 @@ class HUD(QWidget):
         safe = False
         try:
             import os
-            from PySide6.QtCore import QUrl, QSettings
             env = os.environ.get('FRAMEVISION_SAFE','0').lower() in ('1','true','on','yes')
-            ini = str(QSettings('FrameVision','FrameVision').value('perf_safe','0')).lower() in ('1','true','on','yes')
+            ini = str(_fv_read_ui_setting('perf_safe', '0')).lower() in ('1','true','on','yes')
             safe = bool(env or ini)
         except Exception:
             safe = False
@@ -4490,7 +4501,7 @@ class MainWindow(QMainWindow):
         return out
 
     def _load_saved_tab_order_ids(self) -> list[str]:
-        """Load saved tab order, preferring the JSON fallback over QSettings."""
+        """Load saved tab order from JSON only."""
         try:
             p = self._tab_order_store_path()
             if p.exists():
@@ -4501,11 +4512,7 @@ class MainWindow(QMainWindow):
                     return ids
         except Exception:
             pass
-        try:
-            s = QSettings("FrameVision", "FrameVision")
-            return self._coerce_tab_order_ids(s.value("main_tabs_order", None))
-        except Exception:
-            return []
+        return []
 
     def _save_tab_order_ids(self):
         if getattr(self, "_tab_order_applying", False):
@@ -4513,15 +4520,6 @@ class MainWindow(QMainWindow):
         ids = self._current_tab_order_ids()
         if not ids:
             return
-        try:
-            s = QSettings("FrameVision", "FrameVision")
-            s.setValue("main_tabs_order", ids)
-            try:
-                s.sync()
-            except Exception:
-                pass
-        except Exception:
-            pass
         try:
             import json as _json, time as _time
             p = self._tab_order_store_path()
@@ -4684,11 +4682,7 @@ class MainWindow(QMainWindow):
 
     def _install_tab_reorder_behavior(self):
         """Wire up movable tabs + persistence."""
-        try:
-            s = QSettings("FrameVision", "FrameVision")
-            en = s.value("tabs_reorder_enabled", False, type=bool)
-        except Exception:
-            en = False
+        en = _fv_read_ui_setting("tabs_reorder_enabled", False)
         try:
             self.set_tabs_reorder_enabled(bool(en))
         except Exception:
