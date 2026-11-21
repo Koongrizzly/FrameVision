@@ -43,11 +43,13 @@ def _app_root_for_paths() -> Path:
 
 # Portable settings always live in the application root presets/setsave folder.
 SETTINGS_FILE = _app_root_for_paths() / "presets" / "setsave" / "seedvr2_settings.json"
+LATE_SETTINGS_FILE = SETTINGS_FILE.with_name("seedvr2_settings_late.json")
 
 class JsonSettings:
     """Minimal QSettings-compatible portable store with atomic writes."""
-    def __init__(self, path):
+    def __init__(self, path, writable=True):
         self.path = Path(path)
+        self.writable = writable
         self.data = {}
         self._batch = False
         if self.path.is_file():
@@ -71,6 +73,8 @@ class JsonSettings:
             self.sync()
 
     def sync(self):
+        if not self.writable:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         try:
@@ -714,14 +718,37 @@ class SeedVR2Window(QMainWindow):
         self.standalone_install_worker: StandaloneInstallWorker | None = None
         # Registry settings are deliberately ignored, including old standalone
         # namespaces that contained stale/incompatible values.
-        self.settings = JsonSettings(SETTINGS_FILE)
+        self.settings = JsonSettings(SETTINGS_FILE, writable=False)
         self._settings_dirty = False
         self._settings_ready = False
         self._build_ui()
         self._load_settings()
         self._autofill_ckpts()
         self._enable_json_autosave()
-        self._settings_ready = True
+        # Keep the original load, then let the host finish its own startup restore.
+        # No preference writes are permitted during either restore.
+        self.tabs.setEnabled(False)
+        QTimer.singleShot(0, self._schedule_late_settings_restore)
+
+    def _schedule_late_settings_restore(self):
+        QTimer.singleShot(2000, self._restore_late_settings)
+
+    def _restore_late_settings(self):
+        self._settings_ready = False
+        self._settings_dirty = False
+        self._settings_save_timer.stop()
+        late = JsonSettings(LATE_SETTINGS_FILE, writable=False)
+        self.settings = late
+        try:
+            if late.data:
+                self._load_settings()
+                self._autofill_ckpts()
+            # On the first run, retain the displayed values without creating a file.
+            # The user can configure them and use Save settings to seed the new JSON.
+        finally:
+            late.writable = True
+            self._settings_ready = True
+            self.tabs.setEnabled(True)
 
     def _build_ui(self):
         # Three-tab layout: everyday controls, rarely changed quality/model controls,
@@ -802,6 +829,11 @@ class SeedVR2Window(QMainWindow):
         self.validate_btn = QPushButton("Validate")
         self.run_btn = QPushButton("Run SeedVR2")
         self.queue_btn = QPushButton("Add to queue")
+        self.batch_btn = QPushButton("Batch…")
+        self.batch_btn.setToolTip("Queue multiple videos or images using the current SeedVR2 settings.")
+        self.batch_btn.clicked.connect(self.queue_batch)
+        self.queue_status = QLabel("")
+        self.queue_status.setWordWrap(True)
         self.queue_btn.setToolTip(
             "Queue this SeedVR2 render with exactly the settings shown in this tab. "
             "The queue worker runs the SeedVR2 command directly and does not apply the normal Upscale codec/FPS pipeline."
@@ -809,15 +841,19 @@ class SeedVR2Window(QMainWindow):
         self.cancel_btn = QPushButton("Cancel"); self.cancel_btn.setEnabled(False)
         self.open_btn = QPushButton("Open output folder")
         self.save_settings_btn = QPushButton("Save settings")
-        self.save_settings_btn.setToolTip("Save all SeedVR2 settings to presets/setsave/seedvr2_settings.json")
+        self.save_settings_btn.setToolTip("Save all SeedVR2 settings to presets/setsave/seedvr2_settings_late.json")
         self.save_settings_btn.clicked.connect(self._save_settings)
+        self.restore_settings_btn = QPushButton("Restore settings")
+        self.restore_settings_btn.setToolTip("Reload seedvr2_settings_late.json without saving.")
+        self.restore_settings_btn.clicked.connect(self._restore_late_settings)
         self.validate_btn.clicked.connect(lambda: self._validate(show=True))
         self.run_btn.clicked.connect(self.run)
         self.queue_btn.clicked.connect(self.queue_run)
         self.cancel_btn.clicked.connect(self.cancel)
         self.open_btn.clicked.connect(self.open_output_folder)
-        for b in (self.validate_btn, self.run_btn, self.queue_btn, self.cancel_btn, self.open_btn, self.save_settings_btn): run_layout.addWidget(b)
+        for b in (self.validate_btn, self.run_btn, self.queue_btn, self.batch_btn, self.cancel_btn, self.open_btn, self.save_settings_btn, self.restore_settings_btn): run_layout.addWidget(b)
         simple.addWidget(run_group)
+        simple.addWidget(self.queue_status)
 
         preview_group = QGroupBox("Finished result preview")
         pv = QVBoxLayout(preview_group)
@@ -1418,24 +1454,26 @@ class SeedVR2Window(QMainWindow):
                 if q.exists():
                     self.vae_edit.setText(str(q)); break
 
-    def _validate(self, show=True):
+    def _validate(self, show=True, *, input_path=None, output_path=None, success_message=True):
         errors = []
         py = Path(self.python_edit.text().strip())
         dit = Path(self.dit_edit.text().strip())
         vae = Path(self.vae_edit.text().strip())
-        inp = Path(self.input_edit.text().strip())
+        input_path = self.input_edit.text().strip() if input_path is None else str(input_path)
+        output_path = self.output_edit.text().strip() if output_path is None else str(output_path)
+        inp = Path(input_path)
         community = True
 
-        if not py.exists(): errors.append("Python executable does not exist.")
-        if not dit.exists(): errors.append("DiT checkpoint does not exist.")
-        if not vae.exists(): errors.append("VAE checkpoint does not exist.")
-        if not self.input_edit.text().strip(): errors.append("Select an input video or image.")
-        elif not inp.exists(): errors.append("Input file does not exist.")
-        if not self.output_edit.text().strip():
+        if not py.is_file(): errors.append("Python executable does not exist.")
+        if not dit.is_file(): errors.append("DiT checkpoint does not exist.")
+        if not vae.is_file(): errors.append("VAE checkpoint does not exist.")
+        if not input_path: errors.append("Select an input video or image.")
+        elif not inp.is_file(): errors.append("Input file does not exist.")
+        if not output_path:
             errors.append("Select an output path.")
-        elif self.input_edit.text().strip():
+        elif input_path:
             source_is_image = inp.suffix.lower() in IMAGE_SUFFIXES
-            output_suffix = Path(self.output_edit.text().strip()).suffix.lower()
+            output_suffix = Path(output_path).suffix.lower()
             if source_is_image and output_suffix not in IMAGE_SUFFIXES:
                 errors.append("Image inputs must have an image output filename (.png, .jpg, .jpeg, .webp, .bmp or .tif), not MP4.")
             elif not source_is_image and output_suffix != ".mp4":
@@ -1459,10 +1497,14 @@ class SeedVR2Window(QMainWindow):
             if self.vae_decode_overlap.value() >= self.vae_decode_tile_size.value():
                 errors.append("VAE decode overlap must be smaller than decode tile size.")
 
+        if self.color_correction.currentText() not in {"lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"}:
+            errors.append("Select a valid color correction mode.")
+        if input_path and output_path and Path(input_path).resolve() == Path(output_path).resolve():
+            errors.append("Input and output must be different files.")
         if errors:
             if show: QMessageBox.critical(self, "Validation failed", "\n".join(errors))
             return False
-        if show:
+        if show and success_message:
             mode = "Community SeedVR2 backend"
             QMessageBox.information(self, "Validation", f"{mode}: paths and settings look valid.")
         return True
@@ -1480,12 +1522,14 @@ class SeedVR2Window(QMainWindow):
             mode = "sageattn_2"
         return mode
 
-    def _command(self):
+    def _command(self, input_path=None, output_path=None):
+        input_path = self.input_edit.text().strip() if input_path is None else str(input_path)
+        output_path = self.output_edit.text().strip() if output_path is None else str(output_path)
         seed = self.seed.value()
         if seed < 0:
             import secrets
             seed = secrets.randbelow(2_147_483_647)
-        src_w, src_h = self._probe_input_resolution(self.input_edit.text().strip())
+        src_w, src_h = self._probe_input_resolution(input_path)
         scale = self._combo_int_value(self.community_scale, 2)
         if src_w and src_h:
             target_resolution = min(src_w, src_h) * scale
@@ -1497,7 +1541,7 @@ class SeedVR2Window(QMainWindow):
         args = [
             str(self._community_runner_path()),
             "--repo", self.community_repo_edit.text().strip(),
-            "--input", self.input_edit.text().strip(), "--output", self.output_edit.text().strip(),
+            "--input", input_path, "--output", output_path,
             "--dit", self.dit_edit.text().strip(), "--vae", self.vae_edit.text().strip(),
             "--resolution", str(target_resolution),
             "--max-resolution", str(max_resolution),
@@ -1508,79 +1552,129 @@ class SeedVR2Window(QMainWindow):
             "--vae-encode-tile-size", str(self.vae_encode_tile_size.value()), "--vae-encode-overlap", str(self.vae_encode_overlap.value()),
             "--vae-decode-tile-size", str(self.vae_decode_tile_size.value()), "--vae-decode-overlap", str(self.vae_decode_overlap.value()),
         ]
-        if self.crash_safe.isChecked() and Path(self.input_edit.text().strip()).suffix.lower() not in IMAGE_SUFFIXES: args.append("--crash-safe")
+        if self.crash_safe.isChecked() and Path(input_path).suffix.lower() not in IMAGE_SUFFIXES: args.append("--crash-safe")
         if self.uniform_batch.isChecked(): args.append("--uniform-batch-size")
         if self.vae_encode_tiled.isChecked(): args.append("--vae-encode-tiled")
         if self.vae_decode_tiled.isChecked(): args.append("--vae-decode-tiled")
         if self.cpu_offload.isChecked(): args.append("--cpu-offload")
         return self.python_edit.text().strip(), args
 
-    def queue_run(self):
-        """Queue the exact SeedVR2 command produced by this GUI.
-
-        This intentionally does not use FrameVision's generic upscale_video/upscale_photo
-        queue functions. Those functions have their own decode/encode/FPS pipeline. A
-        SeedVR2 queue item is a first-class external SeedVR2 job so all resolution, model,
-        memory, output FPS and backend choices remain owned by the SeedVR2 runners.
-        """
-        if self.proc is not None:
-            QMessageBox.warning(self, "SeedVR2 queue", "A local SeedVR2 run is already active. Cancel or finish it before queueing another run from this tab.")
-            return
-
-        self._ensure_unique_output_path()
-        if not self._validate(show=True):
-            return
-        self._save_settings()
-
-        program, args = self._command()
+    def _queue_job(self, input_path, output_path):
+        program, args = self._command(input_path, output_path)
         cmd = [str(program)] + [str(x) for x in args]
-        input_path = self.input_edit.text().strip()
-        output_path = self.output_edit.text().strip()
-        out_dir = str(Path(output_path).resolve().parent) if output_path else ""
-        backend_name = "community"
-
-        job = {
-            "name": "SeedVR2",
-            "label": "SeedVR2",
-            "category": "upscale",
-            "engine": "seedvr2",
-            "seedvr2_backend": backend_name,
-            "input": input_path,
-            "output": output_path,
-            "outfile": output_path,
-            "out_dir": out_dir,
-            "cmd": cmd,
-            "cwd": str(Path(__file__).resolve().parent),
-            # Keep the child process deterministic on Windows. No codec/FPS values
-            # are injected here; they stay entirely in the command built above.
+        return {
+            "name": "SeedVR2", "label": "SeedVR2", "category": "upscale",
+            "engine": "seedvr2", "seedvr2_backend": "community",
+            "input": str(input_path), "output": str(output_path),
+            "outfile": str(output_path),
+            "out_dir": str(Path(output_path).resolve().parent),
+            "cmd": cmd, "cwd": str(Path(__file__).resolve().parent),
             "env": {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
         }
 
+    @staticmethod
+    def _seedvr2_enqueue_fn():
         try:
-            try:
-                from helpers import queue_adapter as qa
-            except Exception:
-                import queue_adapter as qa
+            from helpers import queue_adapter as qa
+        except ImportError:
+            import queue_adapter as qa
+        fn = getattr(qa, "enqueue_seedvr2", None) or getattr(qa, "enqueue", None)
+        if not callable(fn):
+            raise RuntimeError("SeedVR2 queue function is unavailable.")
+        return fn
 
-            enqueue_fn = getattr(qa, "enqueue_seedvr2", None) or getattr(qa, "enqueue", None)
-            if not callable(enqueue_fn):
-                raise RuntimeError("helpers/queue_adapter.py does not expose a SeedVR2 queue function.")
-            enqueue_fn(job)
+    def queue_run(self):
+        if self.proc is not None:
+            QMessageBox.warning(self, "SeedVR2 queue", "Finish or cancel the local run first.")
+            return
+        self._ensure_unique_output_path()
+        if not self._validate(show=True, success_message=False):
+            return
+        self._autosave_if_dirty()
+        try:
+            job = self._queue_job(self.input_edit.text().strip(), self.output_edit.text().strip())
+            self._seedvr2_enqueue_fn()(job)
         except Exception as exc:
             QMessageBox.critical(self, "SeedVR2 queue", f"Could not add SeedVR2 to the queue:\n{exc}")
             return
+        self.log.append("QUEUED: " + shlex.join(job["cmd"]))
+        self.queue_status.setText("Added 1 SeedVR2 job to queue.")
 
-        self.log.append("QUEUED: " + shlex.join(cmd))
-        self.log.append("Queue mode preserves the SeedVR2 command exactly; normal Upscale FPS/codec processing is bypassed.")
-        QMessageBox.information(self, "SeedVR2 queue", "SeedVR2 was added to the FrameVision queue with the current settings.")
+    def queue_batch(self):
+        if self.proc is not None:
+            QMessageBox.warning(self, "SeedVR2 batch", "Finish or cancel the local run first.")
+            return
+        try:
+            try:
+                from helpers.batch import BatchSelectDialog
+            except ImportError:
+                from batch import BatchSelectDialog
+            start = self.input_edit.text().strip()
+            files, conflict = BatchSelectDialog.pick(
+                self, title="SeedVR2 batch", exts=BatchSelectDialog.VIDEO_EXTS | IMAGE_SUFFIXES,
+                start_dir=str(Path(start).parent) if start else "")
+        except Exception as exc:
+            QMessageBox.critical(self, "SeedVR2 batch", str(exc))
+            return
+        if not files:
+            return
+        # Never change the single-file widgets or saved settings to build batch jobs.
+        # Reserve outputs across the batch, including files not yet rendered.
+        def key(path):
+            return os.path.normcase(str(Path(path).resolve()))
+        sources = {key(x) for x in files}
+        reserved = set()
+        planned = []
+        skipped = 0
+        seen = set()
+        for filename in files:
+            src = Path(filename).resolve()
+            if key(src) in seen:
+                continue
+            seen.add(key(src))
+            suffix = src.suffix.lower() if src.suffix.lower() in IMAGE_SUFFIXES else ".mp4"
+            base = src.with_name(src.stem + "_seedvr2" + suffix)
+            out = base
+            if conflict == "skip" and (out.exists() or key(out) in reserved or key(out) in sources):
+                skipped += 1
+                continue
+            # Even in overwrite mode, never overwrite another selected input or
+            # give two jobs in this batch the same output path.
+            n = 2
+            while key(out) in reserved or key(out) in sources or (conflict == "version" and out.exists()):
+                out = base.with_name(f"{base.stem}_{n:03d}{base.suffix}")
+                n += 1
+            reserved.add(key(out))
+            planned.append((str(src), str(out)))
+        if not planned:
+            self.queue_status.setText(f"No jobs queued; {skipped} existing outputs skipped.")
+            return
+        # Validate every planned pair before adding any jobs.
+        for inp, out in planned:
+            if not self._validate(show=True, input_path=inp, output_path=out, success_message=False):
+                self.queue_status.setText("Batch not queued: validation failed.")
+                return
+        added = 0
+        try:
+            enqueue = self._seedvr2_enqueue_fn()
+            for inp, out in planned:
+                job = self._queue_job(inp, out)
+                enqueue(job)
+                added += 1
+                self.log.append("QUEUED: " + shlex.join(job["cmd"]))
+        except Exception as exc:
+            self.queue_status.setText(f"Queued {added}/{len(planned)} jobs; {skipped} skipped.")
+            QMessageBox.critical(self, "SeedVR2 batch", f"Batch stopped after {added} jobs:\n{exc}")
+            return
+        self.queue_status.setText(f"Added {added} SeedVR2 jobs to queue; {skipped} skipped.")
 
     def run(self):
         if self.proc is not None: return
         # Resolve a fresh output name before validation/launch. This protects prior
         # renders even when the previous output path is still stored in settings.
         self._ensure_unique_output_path()
-        if not self._validate(show=True): return
-        self._save_settings()
+        if not self._validate(show=True, success_message=False): return
+        self._autosave_if_dirty()
         program, args = self._command()
         self.log.clear()
         self.log.append("RUN: " + shlex.join([program] + args))
@@ -1614,7 +1708,7 @@ class SeedVR2Window(QMainWindow):
         if code == 0:
             self._load_preview(self.output_edit.text().strip())
             self.tabs.setCurrentIndex(0)
-            QMessageBox.information(self, "SeedVR2", "Inference finished. The result is loaded in the Simple tab preview.")
+            self.queue_status.setText("SeedVR2 finished.")
         else:
             QMessageBox.warning(self, "SeedVR2", "Inference failed. See the System / Log tab for the exact runtime error.")
 
@@ -1714,8 +1808,8 @@ class SeedVR2Window(QMainWindow):
             (self.input_edit,"input"), (self.output_edit,"output")
         ]:
             v = self.settings.value(key, "")
-            if v:
-                edit.setText(str(v))
+            if key in self.settings.data:
+                edit.setText(str(v or ""))
 
         # Simple tab.
         self.backend.setCurrentIndex(0)
@@ -1795,6 +1889,8 @@ class SeedVR2Window(QMainWindow):
         # Those paths will be saved via the explicit Save button / Run action.
 
     def _save_settings(self):
+        if not self._settings_ready or self.settings.path != LATE_SETTINGS_FILE:
+            return
         self.settings._batch = True
         for key in ("repo", "width", "height", "model_size", "steps", "cfg", "cfg_rescale", "sp_size", "color_fix", "backend"):
             self.settings.data.pop(key, None)

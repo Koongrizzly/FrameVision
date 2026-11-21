@@ -76,6 +76,20 @@ def _name(w: QWidget, fallback_prefix: str) -> str:
     # No objectName -> use stable path
     return _stable_path_name(w, fallback_prefix)
 
+def _owns_settings(w: QWidget) -> bool:
+    """Exclude independently managed panes and their descendants."""
+    cur = w
+    while cur is not None:
+        if bool(cur.property("_fv_own_settings")):
+            return True
+        cur = cur.parentWidget()
+    return False
+
+
+def _legacy_children(root: QWidget, cls):
+    return [w for w in root.findChildren(cls) if not _owns_settings(w)]
+
+
 def restore_all(root: QWidget) -> None:
     if not _keep_enabled():
         return
@@ -113,7 +127,7 @@ def restore_all(root: QWidget) -> None:
                 except Exception: pass
 
     # Tabs — restore saved index only; then save on change
-    for tabw in root.findChildren(QTabWidget):
+    for tabw in _legacy_children(root, QTabWidget):
         try:
             key = KEY_TABS.format(name=_name(tabw, "tab"))
             idx = s.value(key, None, type=int)
@@ -130,7 +144,7 @@ def restore_all(root: QWidget) -> None:
             pass
 
     # Splitters — restore + live-save when moved
-    for spl in root.findChildren(QSplitter):
+    for spl in _legacy_children(root, QSplitter):
         try:
             key = KEY_SPLIT.format(name=_name(spl, "split"))
             ba = s.value(key, None)
@@ -147,7 +161,7 @@ def restore_all(root: QWidget) -> None:
             pass
 
     # Collapsible GroupBoxes (checkable)
-    for gb in root.findChildren(QGroupBox):
+    for gb in _legacy_children(root, QGroupBox):
         try:
             if gb.isCheckable():
                 key = KEY_GBOX.format(name=_name(gb, "gbox"))
@@ -165,10 +179,10 @@ def restore_all(root: QWidget) -> None:
             pass
 
     # Custom collapsible sections (any widget containing a checkable QToolButton)
-    for sec in root.findChildren(QWidget):
+    for sec in _legacy_children(root, QWidget):
         try:
             tb = sec.findChild(QToolButton)
-            if tb and tb.isCheckable():
+            if tb and not _owns_settings(tb) and tb.isCheckable():
                 key = KEY_GBOX.format(name=_name(sec, "gbox"))
                 val = s.value(key, None, type=bool)
                 if val is not None:
@@ -182,7 +196,7 @@ def restore_all(root: QWidget) -> None:
             pass
 
     # Header state
-    for view in list(root.findChildren(QTreeView)) + list(root.findChildren(QTableView)):
+    for view in list(_legacy_children(root, QTreeView)) + list(_legacy_children(root, QTableView)):
         try:
             hdr = view.header()
             key = KEY_HDR.format(name=_name(view, "view"))
@@ -204,7 +218,7 @@ def save_all(root: QWidget) -> None:
         except Exception: pass
 
     # Tabs
-    for tabw in root.findChildren(QTabWidget):
+    for tabw in _legacy_children(root, QTabWidget):
         try:
             key = KEY_TABS.format(name=_name(tabw, "tab"))
             s.setValue(key, int(tabw.currentIndex()))
@@ -212,7 +226,7 @@ def save_all(root: QWidget) -> None:
             pass
 
     # Splitters
-    for spl in root.findChildren(QSplitter):
+    for spl in _legacy_children(root, QSplitter):
         try:
             key = KEY_SPLIT.format(name=_name(spl, "split"))
             s.setValue(key, spl.saveState())
@@ -220,7 +234,7 @@ def save_all(root: QWidget) -> None:
             pass
 
     # Collapsible GroupBoxes
-    for gb in root.findChildren(QGroupBox):
+    for gb in _legacy_children(root, QGroupBox):
         try:
             if gb.isCheckable():
                 key = KEY_GBOX.format(name=_name(gb, "gbox"))
@@ -229,17 +243,17 @@ def save_all(root: QWidget) -> None:
             pass
 
     # Custom collapsible sections
-    for sec in root.findChildren(QWidget):
+    for sec in _legacy_children(root, QWidget):
         try:
             tb = sec.findChild(QToolButton)
-            if tb and tb.isCheckable():
+            if tb and not _owns_settings(tb) and tb.isCheckable():
                 key = KEY_GBOX.format(name=_name(sec, "gbox"))
                 s.setValue(key, bool(tb.isChecked()))
         except Exception:
             pass
 
     # Headers
-    for view in list(root.findChildren(QTreeView)) + list(root.findChildren(QTableView)):
+    for view in list(_legacy_children(root, QTreeView)) + list(_legacy_children(root, QTableView)):
         try:
             hdr = view.header()
             key = KEY_HDR.format(name=_name(view, "view"))

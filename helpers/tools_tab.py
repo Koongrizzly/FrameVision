@@ -1181,6 +1181,11 @@ class InstantToolsPane(QWidget):
             pass
 
         if _upsc is not None:
+            # Upscale and its embedded SeedVR2 own their settings JSON.
+            # Never let either legacy FrameVision persistence layer touch them.
+            _upsc.setProperty("_fv_skip_snapshot", True)
+            _upsc.setProperty("_fv_skip_restore", True)
+            _upsc.setProperty("_fv_own_settings", True)
             try:
                 _upsc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             except Exception:
@@ -1724,13 +1729,15 @@ class InstantToolsPane(QWidget):
         except Exception:
             pass
         # Build default whitelist (all except Trim and Audio)
-        default_whitelist = [k for k in self._sections_map.keys() if k not in ("Trim Lab","Sound Lab","Background Remover","LoRA Trainer")]
+        default_whitelist = [k for k in self._sections_map.keys() if k not in ("Trim Lab","Sound Lab","Background Remover","LoRA Trainer","Upscale")]
         try:
             import json as _json
             wl_txt = self._qs.value("ToolsPane/remember_whitelist_json", "", type=str) or ""
             self._remember_whitelist = set(_json.loads(wl_txt)) if wl_txt else set(default_whitelist)
         except Exception:
             self._remember_whitelist = set(default_whitelist)
+        # Existing Registry whitelists may still include Upscale. Ignore that entry.
+        self._remember_whitelist.discard("Upscale")
         # Helper: live read of the global "remember" toggle (checkbox if available, else QSettings)
         def _remember_enabled_now() -> bool:
             try:
@@ -1767,7 +1774,7 @@ class InstantToolsPane(QWidget):
             if self.remember_menu:
                 self.remember_menu.clear()
                 for name in self._sections_map.keys():
-                    if name in ("Trim Lab","Sound Lab"): 
+                    if name in ("Trim Lab","Sound Lab","Upscale"): 
                         continue
                     act = self.remember_menu.addAction(name)
                     act.setCheckable(True); act.setChecked(name in self._remember_whitelist)
@@ -1897,7 +1904,7 @@ class InstantToolsPane(QWidget):
                         expanded = True
                     content = getattr(sec, "content", sec)
                     entry = {"expanded": bool(expanded)}
-                    if name in self._remember_whitelist:
+                    if name != "Upscale" and name in self._remember_whitelist:
                         entry["snap"] = _widget_snapshot(content)
                     data["sections"][name] = entry
                 self._qs.setValue("ToolsPane/saved_json", _json.dumps(data))
@@ -1918,7 +1925,7 @@ class InstantToolsPane(QWidget):
                     if not entry:
                         continue
                     snap = entry.get("snap")
-                    if snap and (name in self._remember_whitelist):
+                    if name != "Upscale" and snap and (name in self._remember_whitelist):
                         content = getattr(sec, "content", sec)
                         _widget_restore(content, snap)
                     if "expanded" in entry:
@@ -1980,11 +1987,15 @@ class InstantToolsPane(QWidget):
                     pass
             try:
                 for _name, _sec in self._sections_map.items():
+                    if _name == "Upscale":
+                        continue
                     _root = getattr(_sec, 'content', _sec)
                     _wire(_root)
             except Exception:
                 pass
         def _toggle_remember_tool(name, on):
+            if name == "Upscale":
+                return
             try:
                 if on: self._remember_whitelist.add(name)
                 else: self._remember_whitelist.discard(name)

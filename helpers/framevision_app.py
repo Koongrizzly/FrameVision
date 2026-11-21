@@ -2414,7 +2414,8 @@ class VideoPane(QWidget):
         # QtMultimedia backend stalls/crashes when swapping sources while the compare
         # right-player is still winding down.
         try:
-            if getattr(self, "_compare_active", False) and not getattr(self, "_compare_opening", False):
+            if (getattr(self, "_compare_active", False) or
+                    getattr(self, "_compare_pending", False)) and not getattr(self, "_compare_opening", False):
                 try:
                     # Matches the manual workaround ("Stop" first), but automatic.
                     self._handle_stop()
@@ -3636,12 +3637,20 @@ class VideoPane(QWidget):
 
 
     def open_compare(self, left_path: str, right_path: str, kind: str, scale_mode: str = None):
-        try:
-            try:
-                self.close_compare()
-            except Exception:
-                pass
+        """Replace a comparison only after the previous Qt video backend has unwound."""
+        self.close_compare()
+        self._compare_pending = True
+        session = int(getattr(self, "_compare_session", 0))
+        # On Windows QtMultimedia's decoder teardown is asynchronous. Building
+        # another pair in the same event-loop turn can crash the process.
+        QTimer.singleShot(220, lambda: self._start_compare(
+            left_path, right_path, kind, scale_mode, session))
 
+    def _start_compare(self, left_path, right_path, kind, scale_mode, session):
+        if session != getattr(self, "_compare_session", 0):
+            return  # Another compare/open/close superseded this request.
+        self._compare_pending = False
+        try:
             self._compare_opening = True
             try:
                 self.open(Path(left_path))
@@ -3707,44 +3716,49 @@ class VideoPane(QWidget):
 
                 self._compare_right_frame = None
                 try:
-                    self._compare_right_player = QMediaPlayer(self)
-                    self._compare_right_audio = None  # compare-right is silent (prevents audio clock drift)
-
-                    self._compare_right_sink = QVideoSink(self)
-                    self._compare_right_player.setVideoSink(self._compare_right_sink)
-                    try:
-                        self._compare_right_sink.videoFrameChanged.connect(self._on_compare_right_frame)
-                    except Exception:
-                        pass
+                    # Keep the right-side QtMultimedia backend alive across comparisons.
+                    # Destroying it while the left player is also being rebuilt is prone
+                    # to native FFmpeg/Windows decoder deadlocks on the second compare.
+                    right_player = getattr(self, "_compare_right_player", None)
+                    if right_player is None:
+                        right_player = QMediaPlayer(self)
+                        self._compare_right_player = right_player
+                    self._compare_right_audio = None  # right comparison stays silent
+                    right_sink = getattr(self, "_compare_right_sink", None)
+                    if right_sink is None:
+                        right_sink = QVideoSink(self)
+                        self._compare_right_sink = right_sink
+                        right_player.setVideoSink(right_sink)
+                    def _session_frame(frame, _session=session):
+                        if _session == getattr(self, "_compare_session", 0):
+                            self._on_compare_right_frame(frame)
+                    self._compare_right_frame_slot = _session_frame
+                    self._compare_right_sink.videoFrameChanged.connect(_session_frame)
 
                     rp = Path(str(right_path))
-                    self._compare_right_player.setSource(QUrl.fromLocalFile(str(rp)))
+                    # An old comparison may have left the media position and rate behind.
+                    right_player.setSource(QUrl.fromLocalFile(str(rp)))
                     # Ensure initial alignment happens after the backend has actually loaded the media.
                     try:
-                        def _rp_loaded(st):
+                        def _rp_loaded(st, _player=right_player, _session=session):
+                            if (_session != getattr(self, "_compare_session", 0)
+                                    or _player is not getattr(self, "_compare_right_player", None)):
+                                return
                             try:
                                 from PySide6.QtMultimedia import QMediaPlayer as _QMP
                                 if st == _QMP.LoadedMedia:
+                                    _player.setPosition(int(self.player.position() or 0))
+                                    _player.setPlaybackRate(self.player.playbackRate())
+                                    if self.player.playbackState() == _QMP.PlayingState:
+                                        _player.play()
                                     try:
-                                        self._compare_right_player.setPosition(int(self.player.position() or 0))
-                                    except Exception:
+                                        _player.mediaStatusChanged.disconnect(_rp_loaded)
+                                    except (RuntimeError, TypeError):
                                         pass
-                                    try:
-                                        self._compare_right_player.setPlaybackRate(self.player.playbackRate())
-                                    except Exception:
-                                        pass
-                                    try:
-                                        if self.player.playbackState() == _QMP.PlayingState:
-                                            self._compare_right_player.play()
-                                    except Exception:
-                                        pass
-                                    try:
-                                        self._compare_right_player.mediaStatusChanged.disconnect(_rp_loaded)
-                                    except Exception:
-                                        pass
-                            except Exception:
+                            except (RuntimeError, TypeError):
                                 pass
-                        self._compare_right_player.mediaStatusChanged.connect(_rp_loaded)
+                        self._compare_right_status_slot = _rp_loaded
+                        right_player.mediaStatusChanged.connect(_rp_loaded)
                     except Exception:
                         pass
 
@@ -3768,9 +3782,9 @@ class VideoPane(QWidget):
                     except Exception:
                         pass
                 except Exception:
-                    self._compare_right_player = None
-                    self._compare_right_audio = None
-                    self._compare_right_sink = None
+                    # Keep existing native objects for the next reset/retry.
+                    self._compare_active = False
+                    self._compare_end_video_sync()
 
             try:
                 self._refresh_label_pixmap()
@@ -3786,90 +3800,69 @@ class VideoPane(QWidget):
             pass
 
     def close_compare(self):
-        try:
-            self._compare_active = False
-            self._compare_kind = None
-        except Exception:
-            pass
+        """Reset comparison state without destroying reusable multimedia backends.
 
-
-        try:
-            self._update_compare_info_labels()
-        except Exception:
-            pass
-
-
+        The right-hand native decoder remains allocated (but unloaded) so that
+        consecutive comparisons don't race QtMultimedia's asynchronous teardown.
+        """
+        self._compare_session = int(getattr(self, "_compare_session", 0)) + 1
+        self._compare_pending = False
+        self._compare_active = False
+        self._compare_kind = None
+        self._compare_dragging = False
+        self._compare_present_pending = False
+        self._compare_right_frame = None
+        self._compare_right_image_pm_orig = None
+        self._compare_left_path = None
+        self._compare_right_path = None
+        self._compare_divider_x = None
+        self._compare_right_ox = None
+        self._compare_right_w = None
+        self._compare_right_h = None
+        self._compare_last_accept_ts = 0.0
+        self._compare_last_present_ts = 0.0
+        self._compare_last_hard_sync = 0.0
         try:
             self._compare_end_video_sync()
         except Exception:
             pass
-
-        try:
-            rp = getattr(self, "_compare_right_player", None)
-            if rp is not None:
+        rp = getattr(self, "_compare_right_player", None)
+        rs = getattr(self, "_compare_right_sink", None)
+        # Disconnect session callbacks BEFORE unloading media. Unloading can emit
+        # mediaStatusChanged and videoFrameChanged synchronously.
+        if rs is not None:
+            slot = getattr(self, "_compare_right_frame_slot", None)
+            if slot is not None:
                 try:
-                    rp.stop()
-                except Exception:
+                    rs.videoFrameChanged.disconnect(slot)
+                except (RuntimeError, TypeError):
                     pass
+        self._compare_right_frame_slot = None
+        if rp is not None:
+            slot = getattr(self, "_compare_right_status_slot", None)
+            if slot is not None:
                 try:
-                    rp.setSource(QUrl())
-                except Exception:
+                    rp.mediaStatusChanged.disconnect(slot)
+                except (RuntimeError, TypeError):
                     pass
-        except Exception:
-            pass
-
-        try:
-            rs = getattr(self, "_compare_right_sink", None)
-            if rs is not None:
-                try:
-                    rs.videoFrameChanged.disconnect(self._on_compare_right_frame)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-
-        # Fully dispose compare-right multimedia objects (avoids leaks / backend freezes).
-        try:
-            rp = getattr(self, "_compare_right_player", None)
-            rs = getattr(self, "_compare_right_sink", None)
-            ra = getattr(self, "_compare_right_audio", None)
-            if rp is not None:
-                try:
-                    rp.setVideoSink(None)
-                except Exception:
-                    pass
-                try:
-                    rp.setAudioOutput(None)
-                except Exception:
-                    pass
-            for obj in (rs, ra, rp):
-                try:
-                    if obj is not None:
-                        obj.deleteLater()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-
-        for k in ["_compare_right_player","_compare_right_audio","_compare_right_sink",
-                  "_compare_right_frame","_compare_right_image_pm_orig",
-                  "_compare_left_path","_compare_right_path"]:
+            self._compare_right_status_slot = None
             try:
-                setattr(self, k, None)
-            except Exception:
+                rp.stop()
+            except (RuntimeError, TypeError):
                 pass
-
+            try:
+                rp.setSource(QUrl())
+            except (RuntimeError, TypeError):
+                pass
+        try:
+            self._update_compare_info_labels()
+        except Exception:
+            pass
         try:
             self.compare_slider.hide()
-        except Exception:
-            pass
-        try:
             self.slider.show()
         except Exception:
             pass
-
         try:
             self._refresh_label_pixmap()
         except Exception:
