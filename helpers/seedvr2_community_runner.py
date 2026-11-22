@@ -375,6 +375,13 @@ def main() -> int:
     if args.crash_safe and not args._segment_worker and not is_image:
         return _run_checkpointed(args, src, final, dit, vae)
 
+    # Configure allocator BEFORE model registry imports torch.
+    # Override for A/B testing with FV_SEEDVR2_ALLOCATOR=backend:cudaMallocAsync.
+    if sys.platform == "win32":
+        allocator = os.environ.get("FV_SEEDVR2_ALLOCATOR", "backend:native")
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = allocator
+        os.environ["PYTORCH_ALLOC_CONF"] = allocator
+        print(f"SeedVR2 allocator requested: {allocator}", flush=True)
     _register_selected_models(repo, dit, vae)
 
     cli_args = [
